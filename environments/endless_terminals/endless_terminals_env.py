@@ -35,6 +35,61 @@ if str(_repo_root) not in sys.path:
 from atroposlib.envs.base import ScoredDataGroup, ScoredDataItem
 from atroposlib.type_definitions import Item
 
+# Monkey-patch atroposlib's ManagedServer to forward chat_template_kwargs from
+# extra_body into apply_chat_template. Should be upstreamed to atroposlib.
+def _patch_managed_server():
+    import inspect
+    from atroposlib.envs.server_handling import managed_server as _ms
+
+    _ManagedServer = _ms.ManagedServer
+
+    # Only patch if not already applied 
+    if "extra_template_kwargs" in inspect.signature(_ManagedServer._convert_messages_to_prompt).parameters:
+        return
+
+    def _convert_messages_to_prompt(self, messages, tools=None, extra_template_kwargs=None):
+        if tools and self._get_translator():
+            messages = self._get_translator().convert_messages_for_template(messages)
+        if self.tokenizer is None:
+            return "\n".join([f"{m['role']}: {m.get('content', '')}" for m in messages])
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            add_generation_prompt = len(messages) == 0 or messages[-1].get("role") != "assistant"
+            if not self._preserve_think_blocks:
+                messages = self._protect_think_blocks(messages)
+            template_kwargs = {"tokenize": False, "add_generation_prompt": add_generation_prompt}
+            if tools:
+                template_kwargs["tools"] = tools
+            if extra_template_kwargs:
+                template_kwargs.update(extra_template_kwargs)
+            prompt = self.tokenizer.apply_chat_template(messages, **template_kwargs)
+            prompt = prompt.replace(self._THINK_OPEN, "<think>")
+            prompt = prompt.replace(self._THINK_CLOSE, "</think>")
+            return prompt
+        return "\n".join([f"{m['role']}: {m.get('content', '')}" for m in messages])
+
+    _orig_chat_completion = _ManagedServer.chat_completion
+
+    async def chat_completion(self, **kwargs):
+        extra_body = kwargs.get("extra_body", {}) or {}
+        chat_template_kwargs = extra_body.get("chat_template_kwargs", None)
+        # Stash on instance so _convert_messages_to_prompt picks it up
+        self._pending_chat_template_kwargs = chat_template_kwargs
+        try:
+            return await _orig_chat_completion(self, **kwargs)
+        finally:
+            self._pending_chat_template_kwargs = None
+
+    def _convert_messages_to_prompt_with_stash(self, messages, tools=None, extra_template_kwargs=None):
+        if extra_template_kwargs is None:
+            extra_template_kwargs = getattr(self, "_pending_chat_template_kwargs", None)
+        return _convert_messages_to_prompt(self, messages, tools=tools, extra_template_kwargs=extra_template_kwargs)
+
+    _ManagedServer._convert_messages_to_prompt = _convert_messages_to_prompt_with_stash
+    _ManagedServer.chat_completion = chat_completion
+    logger.info("Patched ManagedServer to support chat_template_kwargs in extra_body")
+
+_patch_managed_server()
+
 from environments.hermes_base_env import HermesAgentBaseEnv, HermesAgentEnvConfig
 from environments.agent_loop import AgentResult
 from environments.tool_context import ToolContext
@@ -101,6 +156,11 @@ class EndlessTerminalsEnvConfig(HermesAgentEnvConfig):
         description="Fraction of dataset to hold out for evaluation (0.0-1.0)"
     )
 
+    max_concurrent_containers: int = Field(
+        default=16,
+        description="Max number of Docker containers running simultaneously"
+    )
+
 
 class EndlessTerminalsEnv(HermesAgentBaseEnv):
     """
@@ -156,6 +216,9 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
 
         # Metrics tracking for wandb - single buffer with dicts
         self._metrics_buffer = []
+
+        # Semaphore to cap concurrent Docker containers
+        self._container_sem = asyncio.Semaphore(self.config.max_concurrent_containers)
 
         # Debug: check server config
         if hasattr(self, 'server') and hasattr(self.server, 'servers'):
@@ -600,34 +663,49 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
             # Run the agent loop
             result: AgentResult
             managed_state: Optional[Dict[str, Any]] = None
-
-            if self._use_managed_server():
-                # Phase 2: ManagedServer with parser
-                from environments.tool_call_parsers import get_parser
-                try:
-                    tc_parser = get_parser(self.config.tool_call_parser)
-                except KeyError:
-                    logger.warning(
-                        "Tool call parser '%s' not found, falling back to 'hermes'",
-                        self.config.tool_call_parser,
-                    )
-                    tc_parser = get_parser("hermes")
-
-                try:
-                    # Try with tool_call_parser (newer ManagedServer API)
+            async with self._container_sem:
+                if self._use_managed_server():
+                    # Phase 2: ManagedServer with parser
+                    from environments.tool_call_parsers import get_parser
                     try:
-                        managed_ctx = self.server.managed_server(
-                            tokenizer=self.tokenizer,
-                            tool_call_parser=tc_parser,
+                        tc_parser = get_parser(self.config.tool_call_parser)
+                    except KeyError:
+                        logger.warning(
+                            "Tool call parser '%s' not found, falling back to 'hermes'",
+                            self.config.tool_call_parser,
                         )
-                    except TypeError:
-                        # Fall back to tokenizer-only (ServerManager API)
-                        logger.info("Server doesn't support tool_call_parser, using tokenizer-only mode")
-                        managed_ctx = self.server.managed_server(tokenizer=self.tokenizer)
+                        tc_parser = get_parser("hermes")
 
-                    async with managed_ctx as managed:
+                    try:
+                        # Try with tool_call_parser
+                        try:
+                            managed_ctx = self.server.managed_server(
+                                tokenizer=self.tokenizer,
+                                tool_call_parser=tc_parser,
+                            )
+                        except TypeError:
+                            # Fall back to tokenizer-only
+                            logger.info("Server doesn't support tool_call_parser, using tokenizer-only mode")
+                            managed_ctx = self.server.managed_server(tokenizer=self.tokenizer)
+
+                        async with managed_ctx as managed:
+                            agent = HermesAgentLoop(
+                                server=managed,
+                                tool_schemas=tools,
+                                valid_tool_names=valid_names,
+                                max_turns=self.config.max_agent_turns,
+                                task_id=task_id,
+                                temperature=self.config.agent_temperature,
+                                max_tokens=self.config.max_token_length,
+                                extra_body=self.config.extra_body,
+                            )
+                            result = await agent.run(messages)
+
+                            managed_state = managed.get_state()
+                    except NotImplementedError:
+                        logger.warning("ManagedServer not available. Falling back to direct server mode.")
                         agent = HermesAgentLoop(
-                            server=managed,
+                            server=self.server,
                             tool_schemas=tools,
                             valid_tool_names=valid_names,
                             max_turns=self.config.max_agent_turns,
@@ -637,11 +715,8 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
                             extra_body=self.config.extra_body,
                         )
                         result = await agent.run(messages)
-
-                        # Get state directly from managed server while still in context
-                        managed_state = managed.get_state()
-                except NotImplementedError:
-                    logger.warning("ManagedServer not available. Falling back to direct server mode.")
+                else:
+                    # Phase 1: OpenAI server
                     agent = HermesAgentLoop(
                         server=self.server,
                         tool_schemas=tools,
@@ -653,19 +728,6 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
                         extra_body=self.config.extra_body,
                     )
                     result = await agent.run(messages)
-            else:
-                # Phase 1: OpenAI server
-                agent = HermesAgentLoop(
-                    server=self.server,
-                    tool_schemas=tools,
-                    valid_tool_names=valid_names,
-                    max_turns=self.config.max_agent_turns,
-                    task_id=task_id,
-                    temperature=self.config.agent_temperature,
-                    max_tokens=self.config.max_token_length,
-                    extra_body=self.config.extra_body,
-                )
-                result = await agent.run(messages)
 
             # Skip reward computation if agent produced no output
             only_system_and_user = all(
@@ -734,11 +796,14 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
                 masks = node.masked_tokens
                 if hasattr(node, "logprobs") and node.logprobs:
                     inference_logprobs = node.logprobs
+                    real_logprobs = [lp for lp in inference_logprobs if lp != 1.0]
+                    logger.info(f"Phase 2: {len(tokens)} tokens, {len(real_logprobs)} generated, logprob_mean={sum(real_logprobs)/max(len(real_logprobs),1):.3f}")
                 else:
                     inference_logprobs = [1.0] * len(tokens)
-                logger.debug(f"Phase 2: returning trajectory with {len(tokens)} tokens from node")
+                    logger.warning(f"Phase 2: node has no logprobs! Falling back to placeholders.")
             else:
-                # Phase 1: create placeholder tokens for OpenAI-style servers
+                # Phase 1: placeholder tokens
+                logger.warning(f"Phase 1 fallback: managed_state empty, using placeholder logprobs. IS loss will be zero!")
                 full_text = "\n".join(
                     msg.get("content", "") for msg in result.messages if msg.get("content")
                 )
@@ -748,7 +813,6 @@ class EndlessTerminalsEnv(HermesAgentBaseEnv):
                     tokens = list(range(min(len(full_text) // 4, 128)))
                 masks = [-100] + tokens[1:]
                 inference_logprobs = [1.0] * len(tokens)
-                logger.debug(f"Phase 1: returning placeholder trajectory with {len(tokens)} tokens")
 
             if not tokens:
                 return None, []
