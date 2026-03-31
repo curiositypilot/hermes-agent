@@ -1029,7 +1029,11 @@ def terminal_tool(
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
 
-            session_key = os.getenv("HERMES_SESSION_KEY", "")
+            try:
+                from tools.approval import get_session_key
+                session_key = get_session_key()
+            except ImportError:
+                session_key = os.getenv("HERMES_SESSION_KEY", "")
             effective_cwd = workdir or cwd
             try:
                 if env_type == "local":

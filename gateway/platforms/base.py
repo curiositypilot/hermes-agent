@@ -238,6 +238,26 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".csv": "text/csv",
+    ".json": "application/json",
+    ".xml": "application/xml",
+    ".yaml": "application/x-yaml",
+    ".yml": "application/x-yaml",
+    ".log": "text/plain",
+    ".py": "text/x-python",
+    ".js": "text/javascript",
+    ".ts": "text/typescript",
+    ".sh": "text/x-shellscript",
+    ".env": "text/plain",
+    ".toml": "text/plain",
+    ".ini": "text/plain",
+    ".cfg": "text/plain",
+    ".conf": "text/plain",
+    ".sql": "text/plain",
+    ".rst": "text/x-rst",
+    ".epub": "application/epub+zip",
 }
 
 
@@ -1129,8 +1149,16 @@ class BasePlatformAdapter(ABC):
                 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Skipped when the chat has voice mode disabled (/voice off)
+                # or when voice.auto_tts is false in config.yaml
                 _tts_path = None
-                if (event.message_type == MessageType.VOICE
+                _auto_tts_enabled = False
+                try:
+                    from hermes_cli.config import load_config as _load_cfg
+                    _auto_tts_enabled = _load_cfg().get("voice", {}).get("auto_tts", False)
+                except Exception:
+                    pass
+                if (_auto_tts_enabled
+                        and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
                         and event.source.chat_id not in self._auto_tts_disabled_chats):

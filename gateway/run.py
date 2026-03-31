@@ -1416,6 +1416,41 @@ class GatewayRunner:
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
 
+        # Flush memories for all active sessions before tearing down.
+        # Run flushes in parallel with a hard timeout so shutdown isn't blocked
+        # indefinitely (e.g. when --replace sends SIGKILL after 10s).
+        _SHUTDOWN_FLUSH_TIMEOUT = 30  # seconds total for all flushes
+        try:
+            self.session_store._ensure_loaded()
+            flush_tasks = []
+            for key, entry in list(self.session_store._entries.items()):
+                if entry.session_id in self.session_store._pre_flushed_sessions:
+                    continue
+                flush_tasks.append(
+                    self._async_flush_memories(entry.session_id, key)
+                )
+            if flush_tasks:
+                logger.info(
+                    "Flushing memories for %d active session(s) before shutdown...",
+                    len(flush_tasks),
+                )
+                done, pending = await asyncio.wait(
+                    [asyncio.ensure_future(t) for t in flush_tasks],
+                    timeout=_SHUTDOWN_FLUSH_TIMEOUT,
+                )
+                if pending:
+                    logger.warning(
+                        "Shutdown flush timed out — %d/%d sessions flushed, "
+                        "%d skipped",
+                        len(done), len(flush_tasks), len(pending),
+                    )
+                    for t in pending:
+                        t.cancel()
+                else:
+                    logger.info("All %d shutdown flushes completed", len(done))
+        except Exception as e:
+            logger.debug("Shutdown memory flush error: %s", e)
+
         for platform, adapter in list(self.adapters.items()):
             try:
                 await adapter.cancel_background_tasks()
@@ -2109,7 +2144,35 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
-        
+
+        # Per-topic WIP file injection: if this is a forum topic (thread_id),
+        # load the corresponding WIP file so the agent has topic progress context.
+        if source.thread_id:
+            _wip_path = _hermes_home / "workspace" / "wip" / f"topic-{source.thread_id}.md"
+            if _wip_path.exists():
+                try:
+                    _wip_content = _wip_path.read_text(encoding="utf-8").strip()
+                    if _wip_content:
+                        context_prompt += (
+                            f"\n\n## Topic WIP (thread {source.thread_id})\n\n"
+                            f"This file tracks progress for this topic. "
+                            f"Path: `{_wip_path}`\n"
+                            f"Update it when meaningful progress is made, decisions are taken, "
+                            f"or blockers are identified. Keep it concise and current.\n\n"
+                            f"{_wip_content}"
+                        )
+                except Exception as _wip_err:
+                    logger.debug("Could not read topic WIP %s: %s", _wip_path, _wip_err)
+            else:
+                # No WIP file yet — tell the agent it can create one
+                context_prompt += (
+                    f"\n\n## Topic WIP (thread {source.thread_id})\n\n"
+                    f"No WIP file exists yet for this topic. "
+                    f"Path: `{_wip_path}`\n"
+                    f"Create it when there's meaningful work to track — decisions, progress, blockers. "
+                    f"Keep it concise and current."
+                )
+
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if getattr(session_entry, 'was_auto_reset', False):
@@ -3941,6 +4004,24 @@ class GatewayRunner:
             model = _resolve_gateway_model(user_config)
             platform_key = _platform_config_key(source.platform)
 
+            # Per-topic model override (same as _run_agent)
+            _topic_overrides = user_config.get("topic_models") or {}
+            if _topic_overrides and source.thread_id:
+                _topic_key = f"{source.platform.value}:{source.chat_id}:{source.thread_id}"
+                _topic_cfg = _topic_overrides.get(_topic_key) or {}
+                if _topic_cfg:
+                    _tm = _topic_cfg.get("model")
+                    if _tm:
+                        model = str(_tm)
+                    if _topic_cfg.get("base_url"):
+                        runtime_kwargs["base_url"] = str(_topic_cfg["base_url"])
+                    if _topic_cfg.get("api_key"):
+                        runtime_kwargs["api_key"] = str(_topic_cfg["api_key"])
+                    if _topic_cfg.get("provider"):
+                        runtime_kwargs["provider"] = str(_topic_cfg["provider"])
+                    if _topic_cfg.get("api_mode"):
+                        runtime_kwargs["api_mode"] = str(_topic_cfg["api_mode"])
+
             from hermes_cli.tools_config import _get_platform_tools
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
@@ -5545,6 +5626,10 @@ class GatewayRunner:
             # Pass session_key to process registry via env var so background
             # processes can be mapped back to this gateway session
             os.environ["HERMES_SESSION_KEY"] = session_key or ""
+            # Also set thread-local for approval.py — the env var is process-wide
+            # and races when multiple topics run agents concurrently
+            from tools.approval import set_session_key as _set_sk
+            _set_sk(session_key or "")
 
             # Read from env var or use default (same as CLI)
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -5578,6 +5663,27 @@ class GatewayRunner:
                     "api_calls": 0,
                     "tools": [],
                 }
+
+            # --- Per-topic model override ---
+            # config.yaml `topic_models` maps "platform:chat_id:thread_id"
+            # to {model, base_url, api_key, provider} for per-topic routing.
+            _topic_overrides = user_config.get("topic_models") or {}
+            if _topic_overrides and source.thread_id:
+                _topic_key = f"{source.platform.value}:{source.chat_id}:{source.thread_id}"
+                _topic_cfg = _topic_overrides.get(_topic_key) or {}
+                if _topic_cfg:
+                    _tm = _topic_cfg.get("model")
+                    if _tm:
+                        model = str(_tm)
+                        logger.info("Topic model override: %s → %s", _topic_key, model)
+                    if _topic_cfg.get("base_url"):
+                        runtime_kwargs["base_url"] = str(_topic_cfg["base_url"])
+                    if _topic_cfg.get("api_key"):
+                        runtime_kwargs["api_key"] = str(_topic_cfg["api_key"])
+                    if _topic_cfg.get("provider"):
+                        runtime_kwargs["provider"] = str(_topic_cfg["provider"])
+                    if _topic_cfg.get("api_mode"):
+                        runtime_kwargs["api_mode"] = str(_topic_cfg["api_mode"])
 
             pr = self._provider_routing
             honcho_manager, honcho_config = self._get_or_create_gateway_honcho(session_key)
@@ -5771,15 +5877,35 @@ class GatewayRunner:
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
 
-            # Extract actual token counts from the agent instance used for this run
+            # Extract actual token counts from the agent instance used for this run.
+            # Use the canonical counters (session_input_tokens etc.) which are
+            # populated by normalize_usage() in run_conversation, falling back to
+            # the legacy prompt/completion counters for older agent versions.
+            _agent = agent_holder[0]
             _last_prompt_toks = 0
             _input_toks = 0
             _output_toks = 0
-            _agent = agent_holder[0]
-            if _agent and hasattr(_agent, "context_compressor"):
-                _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
-                _input_toks = getattr(_agent, "session_prompt_tokens", 0)
-                _output_toks = getattr(_agent, "session_completion_tokens", 0)
+            _cache_read_toks = 0
+            _cache_write_toks = 0
+            _reasoning_toks = 0
+            _estimated_cost = None
+            _cost_status = None
+            _cost_source = None
+            _provider = None
+            _base_url = None
+            if _agent:
+                if hasattr(_agent, "context_compressor"):
+                    _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
+                _input_toks = getattr(_agent, "session_input_tokens", 0) or getattr(_agent, "session_prompt_tokens", 0)
+                _output_toks = getattr(_agent, "session_output_tokens", 0) or getattr(_agent, "session_completion_tokens", 0)
+                _cache_read_toks = getattr(_agent, "session_cache_read_tokens", 0)
+                _cache_write_toks = getattr(_agent, "session_cache_write_tokens", 0)
+                _reasoning_toks = getattr(_agent, "session_reasoning_tokens", 0)
+                _estimated_cost = getattr(_agent, "session_estimated_cost_usd", None)
+                _cost_status = getattr(_agent, "session_cost_status", None)
+                _cost_source = getattr(_agent, "session_cost_source", None)
+                _provider = getattr(_agent, "provider", None)
+                _base_url = getattr(_agent, "base_url", None)
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
@@ -5793,6 +5919,14 @@ class GatewayRunner:
                     "last_prompt_tokens": _last_prompt_toks,
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
+                    "cache_read_tokens": _cache_read_toks,
+                    "cache_write_tokens": _cache_write_toks,
+                    "reasoning_tokens": _reasoning_toks,
+                    "estimated_cost_usd": _estimated_cost,
+                    "cost_status": _cost_status,
+                    "cost_source": _cost_source,
+                    "provider": _provider,
+                    "base_url": _base_url,
                     "model": _resolved_model,
                 }
             
@@ -5882,6 +6016,14 @@ class GatewayRunner:
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
+                "cache_read_tokens": _cache_read_toks,
+                "cache_write_tokens": _cache_write_toks,
+                "reasoning_tokens": _reasoning_toks,
+                "estimated_cost_usd": _estimated_cost,
+                "cost_status": _cost_status,
+                "cost_source": _cost_source,
+                "provider": _provider,
+                "base_url": _base_url,
                 "model": _resolved_model,
                 "session_id": effective_session_id,
             }

@@ -186,7 +186,7 @@ class TestDeliverResultWrapping:
         assert "Cronjob Response: daily-report" in sent_content
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
-        assert "The agent cannot see this message" in sent_content
+        assert "Replying to this message will give the agent context" in sent_content
 
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""

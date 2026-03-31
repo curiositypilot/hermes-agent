@@ -194,12 +194,49 @@ def _deliver_result(job: dict, content: str) -> None:
         pass
 
     if wrap_response:
+        # Wrap with metadata so that when a user replies to this message,
+        # the interactive agent can retrieve the full cron context.
         task_name = job.get("name", job["id"])
+        job_id = job["id"]
+
+        # Find the most recent artifact for this job
+        artifact_dir = _hermes_home / "cron" / "output" / job_id
+        session_id = ""
+        artifact_path = ""
+        if artifact_dir.is_dir():
+            artifacts = sorted(artifact_dir.glob("*.md"))
+            if artifacts:
+                artifact_path = str(artifacts[-1])
+                # Extract session_id from artifact content (first few lines)
+                try:
+                    with open(artifacts[-1]) as f:
+                        for line in f:
+                            if line.startswith("**Session:**"):
+                                session_id = line.split("**Session:**")[1].strip()
+                                break
+                except Exception:
+                    pass
+
+        # Build session_id from job metadata if not found in artifact
+        if not session_id:
+            session_id = f"cron_{job_id}_latest"
+
+        footer_parts = [
+            f"\n\n---",
+            f"Cron: {task_name} | Job: {job_id}",
+        ]
+        if artifact_path:
+            footer_parts.append(f"Artifact: {artifact_path}")
+        footer_parts.append(
+            "Replying to this message will give the agent context. "
+            "For full cron session, the agent can use session_search or read the artifact file."
+        )
+
         delivery_content = (
             f"Cronjob Response: {task_name}\n"
             f"-------------\n\n"
             f"{content}\n\n"
-            f"Note: The agent cannot see this message, and therefore cannot respond to it."
+            + "\n".join(footer_parts)
         )
     else:
         delivery_content = content
@@ -452,6 +489,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
+**Session:** {_cron_session_id}
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 

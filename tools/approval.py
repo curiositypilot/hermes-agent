@@ -146,6 +146,22 @@ _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _permanent_approved: set = set()
 
+# Thread-local storage for session key — avoids race conditions when
+# multiple gateway sessions run concurrently in different threads.
+# The env var HERMES_SESSION_KEY is process-wide and gets overwritten
+# by concurrent agents, causing approvals to leak between topics.
+_thread_local = threading.local()
+
+
+def set_session_key(session_key: str) -> None:
+    """Set the session key for the current thread."""
+    _thread_local.session_key = session_key
+
+
+def get_session_key() -> str:
+    """Get the session key for the current thread, falling back to env var."""
+    return getattr(_thread_local, "session_key", None) or os.getenv("HERMES_SESSION_KEY", "default")
+
 
 def submit_pending(session_key: str, approval: dict):
     """Store a pending approval request for a session."""
@@ -441,7 +457,7 @@ def check_dangerous_command(command: str, env_type: str,
     if not is_dangerous:
         return {"approved": True, "message": None}
 
-    session_key = os.getenv("HERMES_SESSION_KEY", "default")
+    session_key = get_session_key()
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
@@ -567,7 +583,7 @@ def check_all_command_guards(command: str, env_type: str,
     # Collect warnings that need approval
     warnings = []  # list of (pattern_key, description, is_tirith)
 
-    session_key = os.getenv("HERMES_SESSION_KEY", "default")
+    session_key = get_session_key()
 
     # Tirith block/warn → approvable warning with rich findings.
     # Previously, tirith "block" was a hard block with no approval prompt.
