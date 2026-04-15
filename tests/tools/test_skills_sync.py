@@ -10,6 +10,8 @@ from tools.skills_sync import (
     _discover_bundled_skills,
     _compute_relative_dest,
     _dir_hash,
+    bundled_skills_auto_sync_enabled,
+    maybe_auto_sync_bundled_skills,
     sync_skills,
     MANIFEST_FILE,
     SKILLS_DIR,
@@ -468,6 +470,37 @@ class TestSyncSkills:
         new_bundled_hash = _dir_hash(bundled / "old-skill")
         assert manifest["old-skill"] == new_bundled_hash
         assert manifest["old-skill"] != old_hash
+
+
+class TestBundledSkillAutoSync:
+    def test_disabled_by_default(self):
+        assert bundled_skills_auto_sync_enabled(config={"skills": {}}) is False
+
+    def test_enabled_when_config_flag_is_true(self):
+        assert bundled_skills_auto_sync_enabled(
+            config={"skills": {"auto_sync_bundled": True}}
+        ) is True
+
+    def test_maybe_auto_sync_skips_when_disabled(self):
+        with patch("tools.skills_sync.sync_skills") as mock_sync:
+            result = maybe_auto_sync_bundled_skills(
+                quiet=True,
+                config={"skills": {"auto_sync_bundled": False}},
+            )
+
+        assert result is None
+        mock_sync.assert_not_called()
+
+    def test_maybe_auto_sync_runs_when_enabled(self):
+        expected = {"copied": ["x"], "updated": [], "skipped": 0, "user_modified": [], "cleaned": [], "total_bundled": 1}
+        with patch("tools.skills_sync.sync_skills", return_value=expected) as mock_sync:
+            result = maybe_auto_sync_bundled_skills(
+                quiet=True,
+                config={"skills": {"auto_sync_bundled": True}},
+            )
+
+        assert result == expected
+        mock_sync.assert_called_once_with(quiet=True)
 
 
 class TestGetBundledDir:

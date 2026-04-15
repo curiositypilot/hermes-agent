@@ -152,6 +152,31 @@ def _dir_hash(directory: Path) -> str:
     return hasher.hexdigest()
 
 
+def bundled_skills_auto_sync_enabled(config: dict | None = None) -> bool:
+    """Return whether bundled repo skills should auto-sync on startup.
+
+    Defaults to False so user skill libraries are not mutated implicitly on
+    CLI/gateway launch. Explicit sync flows (like install/update commands)
+    can still call sync_skills() directly.
+    """
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            config = {}
+
+    return bool((config or {}).get("skills", {}).get("auto_sync_bundled", False))
+
+
+def maybe_auto_sync_bundled_skills(quiet: bool = False, config: dict | None = None) -> dict | None:
+    """Run bundled skill sync only when startup auto-sync is enabled."""
+    if not bundled_skills_auto_sync_enabled(config=config):
+        return None
+    return sync_skills(quiet=quiet)
+
+
 def sync_skills(quiet: bool = False) -> dict:
     """
     Sync bundled skills into ~/.hermes/skills/ using the manifest.

@@ -403,6 +403,42 @@ def test_cmd_update_succeeds_with_extras(monkeypatch, tmp_path):
     assert ".[all]" in install_cmds[0]
 
 
+def test_cmd_update_does_not_sync_bundled_skills_after_update(monkeypatch, tmp_path, capsys):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    def fake_run(cmd, **kwargs):
+        if cmd == ["git", "fetch", "origin"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+            return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+        if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
+            return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    sync_calls = []
+    profile_seed_calls = []
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "tools.skills_sync.sync_skills",
+        lambda quiet=True: sync_calls.append(quiet),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.seed_profile_skills",
+        lambda *args, **kwargs: profile_seed_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda: [])
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    assert sync_calls == []
+    assert profile_seed_calls == []
+    assert "Syncing bundled skills" not in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # ff-only fallback to reset --hard on diverged history
 # ---------------------------------------------------------------------------

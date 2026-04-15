@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 
 def test_top_level_skills_flag_defaults_to_chat(monkeypatch):
@@ -75,3 +76,27 @@ def test_continue_worktree_and_skills_flags_work_together(monkeypatch):
         "skills": ["hermes-agent-dev"],
         "command": "chat",
     }
+
+
+def test_main_skips_bundled_skill_auto_sync_by_default(monkeypatch):
+    import hermes_cli.main as main_mod
+
+    sync_calls = []
+    cli_calls = []
+
+    monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
+    monkeypatch.setattr(
+        "tools.skills_sync.maybe_auto_sync_bundled_skills",
+        lambda quiet=True, config=None: sync_calls.append((quiet, config)),
+    )
+    monkeypatch.setitem(sys.modules, "cli", SimpleNamespace(main=lambda **kwargs: cli_calls.append(kwargs)))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "chat", "-q", "hello"],
+    )
+
+    main_mod.main()
+
+    assert sync_calls == [(True, None)]
+    assert cli_calls == [{"verbose": False, "quiet": False, "query": "hello", "worktree": False, "checkpoints": False, "pass_session_id": False}]

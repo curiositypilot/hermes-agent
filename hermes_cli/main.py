@@ -619,10 +619,11 @@ def cmd_chat(args):
     except Exception:
         pass
 
-    # Sync bundled skills on every CLI launch (fast -- skips unchanged skills)
+    # Optionally sync bundled repo skills on CLI launch.
+    # Disabled by default so startup doesn't mutate user skill libraries.
     try:
-        from tools.skills_sync import sync_skills
-        sync_skills(quiet=True)
+        from tools.skills_sync import maybe_auto_sync_bundled_skills
+        maybe_auto_sync_bundled_skills(quiet=True)
     except Exception:
         pass
 
@@ -3636,53 +3637,6 @@ def cmd_update(args):
         except Exception:
             pass  # non-fatal — worst case a lazy import fails gracefully
         
-        # Sync bundled skills (copies new, updates changed, respects user deletions)
-        try:
-            from tools.skills_sync import sync_skills
-            print()
-            print("→ Syncing bundled skills...")
-            result = sync_skills(quiet=True)
-            if result["copied"]:
-                print(f"  + {len(result['copied'])} new: {', '.join(result['copied'])}")
-            if result.get("updated"):
-                print(f"  ↑ {len(result['updated'])} updated: {', '.join(result['updated'])}")
-            if result.get("user_modified"):
-                print(f"  ~ {len(result['user_modified'])} user-modified (kept)")
-            if result.get("cleaned"):
-                print(f"  − {len(result['cleaned'])} removed from manifest")
-            if not result["copied"] and not result.get("updated"):
-                print("  ✓ Skills are up to date")
-        except Exception as e:
-            logger.debug("Skills sync during update failed: %s", e)
-
-        # Sync bundled skills to all other profiles
-        try:
-            from hermes_cli.profiles import list_profiles, get_active_profile_name, seed_profile_skills
-            active = get_active_profile_name()
-            other_profiles = [p for p in list_profiles() if p.name != active]
-            if other_profiles:
-                print()
-                print("→ Syncing bundled skills to other profiles...")
-                for p in other_profiles:
-                    try:
-                        r = seed_profile_skills(p.path, quiet=True)
-                        if r:
-                            copied = len(r.get("copied", []))
-                            updated = len(r.get("updated", []))
-                            modified = len(r.get("user_modified", []))
-                            parts = []
-                            if copied: parts.append(f"+{copied} new")
-                            if updated: parts.append(f"↑{updated} updated")
-                            if modified: parts.append(f"~{modified} user-modified")
-                            status = ", ".join(parts) if parts else "up to date"
-                        else:
-                            status = "sync failed"
-                        print(f"  {p.name}: {status}")
-                    except Exception as pe:
-                        print(f"  {p.name}: error ({pe})")
-        except Exception:
-            pass  # profiles module not available or no profiles
-
         # Sync Honcho host blocks to all profiles
         try:
             from plugins.memory.honcho.cli import sync_honcho_profiles_quiet
@@ -4444,6 +4398,7 @@ For more help on a command:
     # gateway restart
     gateway_restart = gateway_subparsers.add_parser("restart", help="Restart gateway service")
     gateway_restart.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_restart.add_argument("--force", action="store_true", help="Restart even if the gateway reports active jobs")
     
     # gateway status
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
