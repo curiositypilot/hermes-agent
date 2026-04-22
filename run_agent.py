@@ -763,6 +763,7 @@ class AIAgent:
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
         persist_session: bool = True,
+        extra_body: Dict[str, Any] = None,
     ):
         """
         Initialize the AI Agent.
@@ -830,6 +831,7 @@ class AIAgent:
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
+        self.extra_body = extra_body
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -6831,6 +6833,25 @@ class AIAgent:
                 "sessionId": self.session_id or "hermes",
                 "promptId": str(uuid.uuid4()),
             }
+
+        # Ollama num_ctx: override the 2048 default so the model actually
+        # uses the context window it was trained for.  Passed via the OpenAI
+        # SDK's extra_body → options.num_ctx, which Ollama's OpenAI-compat
+        # endpoint forwards to the runner as --ctx-size.
+        if self._ollama_num_ctx:
+            options = extra_body.get("options", {})
+            options["num_ctx"] = self._ollama_num_ctx
+            extra_body["options"] = options
+
+        if self._is_qwen_portal():
+            extra_body["vl_high_resolution_images"] = True
+        # Merge user-supplied extra_body from config (e.g. topic_models.extra_body)
+        if self.extra_body:
+            for k, v in self.extra_body.items():
+                extra_body.setdefault(k, v)
+
+        if extra_body:
+            api_kwargs["extra_body"] = extra_body
 
         # Ephemeral max output override — consume immediately so the next
         # turn doesn't inherit it.

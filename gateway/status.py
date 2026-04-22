@@ -162,6 +162,8 @@ def _build_runtime_status_record() -> dict[str, Any]:
         "restart_requested": False,
         "active_agents": 0,
         "platforms": {},
+        "active_jobs_count": 0,
+        "active_jobs": [],
         "updated_at": _utc_now_iso(),
     })
     return payload
@@ -259,6 +261,8 @@ def write_runtime_status(
     platform_state: Any = _UNSET,
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
+    active_jobs_count: Any = _UNSET,
+    active_jobs: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -277,6 +281,10 @@ def write_runtime_status(
         payload["restart_requested"] = bool(restart_requested)
     if active_agents is not _UNSET:
         payload["active_agents"] = max(0, int(active_agents))
+    if active_jobs_count is not _UNSET:
+        payload["active_jobs_count"] = max(0, int(active_jobs_count))
+    if active_jobs is not _UNSET:
+        payload["active_jobs"] = active_jobs
 
     if platform is not _UNSET:
         platform_payload = payload["platforms"].get(platform, {})

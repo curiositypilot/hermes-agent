@@ -1,0 +1,46 @@
+input_dir: "./input"
+output_dir: "./output"
+
+transcription:
+  engine: "faster-whisper"
+  model: "large-v3"
+  language: null
+  device: "cuda"
+  compute_type: "float16"
+  word_timestamps: true
+
+windowing:
+  target_seconds: 16
+  overlap_seconds: 3
+
+policy:
+  redact_threshold: 3
+  review_threshold: 2
+  pre_pad_ms: 180
+  post_pad_ms: 220
+  merge_gap_sec: 0.4
+
+classification:
+  api_base: "http://127.0.0.1:11434/v1"
+  api_key: ""
+  model: "qwen2.5:14b-instruct"
+  temperature: 0
+  timeout_seconds: 120
+  max_retries: 2
+  max_tokens: 512
+  extra_body: {}
+
+redaction:
+  mode: "mute"
+  output_format: "wav"
+
+batch:
+  recursive: false
+  skip_existing: true
+  supported_extensions:
+    - ".mp3"
+    - ".wav"
+    - ".m4a"
+    - ".mp4"
+    - ".mov"
+    - ".mkv"

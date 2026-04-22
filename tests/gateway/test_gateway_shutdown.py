@@ -5,6 +5,7 @@ import pytest
 
 from gateway.platforms.base import MessageEvent
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import build_session_key
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
@@ -33,6 +34,31 @@ async def test_cancel_background_tasks_cancels_inflight_message_processing():
     assert adapter._background_tasks == set()
     assert adapter._active_sessions == {}
     assert adapter._pending_messages == {}
+
+
+def test_update_runtime_busy_state_reports_only_real_running_agents(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {
+        "pending": _AGENT_PENDING_SENTINEL,
+        "real": MagicMock(),
+    }
+    runner._running_agents_ts = {"real": 100.0}
+    runner._running_agents["real"].get_activity_summary.return_value = {
+        "current_tool": "terminal",
+        "last_activity_desc": "running tests",
+        "seconds_since_activity": 4.2,
+    }
+
+    calls = []
+    monkeypatch.setattr("gateway.status.write_runtime_status", lambda **kwargs: calls.append(kwargs))
+
+    runner._update_runtime_busy_state()
+
+    assert len(calls) == 1
+    assert calls[0]["active_jobs_count"] == 1
+    assert calls[0]["active_jobs"][0]["session_key"] == "real"
+    assert calls[0]["active_jobs"][0]["current_tool"] == "terminal"
+    assert calls[0]["active_jobs"][0]["last_activity_desc"] == "running tests"
 
 
 @pytest.mark.asyncio

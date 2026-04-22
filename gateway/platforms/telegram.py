@@ -2988,7 +2988,17 @@ class TelegramAdapter(BasePlatformAdapter):
         # Resolve DM topic name and skill binding
         thread_id_raw = message.message_thread_id
         thread_id_str = str(thread_id_raw) if thread_id_raw is not None else None
-        if chat_type == "group" and thread_id_str is None and getattr(chat, "is_forum", False):
+        # Telegram forum supergroups have a built-in General topic that may be
+        # surfaced as a topic message without a concrete message_thread_id.
+        # Internally map that path to a stable synthetic thread id so the main
+        # topic participates in the same session/routing machinery as other
+        # topics instead of falling back to the bare chat session.
+        if (
+            chat_type == "group"
+            and thread_id_str is None
+            and getattr(chat, "is_forum", False)
+            and getattr(message, "is_topic_message", False)
+        ):
             thread_id_str = self._GENERAL_TOPIC_THREAD_ID
         chat_topic = None
         topic_skill = None

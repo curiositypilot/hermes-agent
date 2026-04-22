@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import patch, call
 
+import pytest
+
 import hermes_cli.gateway as gateway
 
 
@@ -267,6 +269,38 @@ def test_find_gateway_pids_falls_back_to_pid_file_when_process_scan_fails(monkey
 # ---------------------------------------------------------------------------
 # _wait_for_gateway_exit
 # ---------------------------------------------------------------------------
+
+
+def test_systemd_restart_refuses_when_gateway_has_active_jobs_without_force(monkeypatch, capsys):
+    monkeypatch.setattr(gateway, "_select_systemd_scope", lambda system: system)
+    monkeypatch.setattr(gateway, "refresh_systemd_unit_if_needed", lambda system=False: None)
+    monkeypatch.setattr(
+        gateway,
+        "_get_active_jobs_snapshot",
+        lambda: {
+            "active_jobs_count": 1,
+            "active_jobs": [
+                {
+                    "session_key": "telegram:abc",
+                    "current_tool": "terminal",
+                    "last_activity_desc": "running tests",
+                }
+            ],
+        },
+    )
+
+    calls = []
+    monkeypatch.setattr(gateway.subprocess, "run", lambda *args, **kwargs: calls.append(args) or SimpleNamespace(returncode=0))
+
+    with pytest.raises(SystemExit) as exc:
+        gateway.systemd_restart(force=False)
+
+    assert exc.value.code == 1
+    assert calls == []
+    out = capsys.readouterr().out
+    assert "Refusing to restart gateway" in out
+    assert "1 active job" in out
+    assert "--force" in out
 
 
 class TestWaitForGatewayExit:

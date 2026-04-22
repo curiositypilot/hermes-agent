@@ -246,3 +246,52 @@ class TestBasePlatformTopicSessions:
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.CANCELLED),
         ]
+
+    @pytest.mark.asyncio
+    async def test_cancel_session_task_cancels_only_matching_topic(self):
+        adapter = DummyTelegramAdapter()
+        release = asyncio.Event()
+
+        async def handler(_event):
+            await release.wait()
+            return "ack"
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event_a = _make_event("-1001", "17585", message_id="a")
+        event_b = _make_event("-1001", "17586", message_id="b")
+        session_a = build_session_key(event_a.source)
+        session_b = build_session_key(event_b.source)
+
+        await adapter.handle_message(event_a)
+        await adapter.handle_message(event_b)
+        await asyncio.sleep(0)
+
+        cancelled = await adapter.cancel_session_task(session_a)
+
+        assert cancelled is True
+        assert session_a not in adapter._active_sessions
+        assert session_b in adapter._active_sessions
+
+        release.set()
+        await asyncio.gather(*list(adapter._background_tasks), return_exceptions=True)
+
+        assert ("complete", "a", ProcessingOutcome.CANCELLED) in adapter.processing_hooks
+        assert ("complete", "b", ProcessingOutcome.SUCCESS) in adapter.processing_hooks
+
+    @pytest.mark.asyncio
+    async def test_typing_pause_is_scoped_to_topic(self):
+        adapter = DummyTelegramAdapter()
+
+        adapter.pause_typing_for_chat("-1001", metadata={"thread_id": "17585"})
+
+        assert adapter._is_typing_paused("-1001", metadata={"thread_id": "17585"}) is True
+        assert adapter._is_typing_paused("-1001", metadata={"thread_id": "17586"}) is False
+
+        adapter.resume_typing_for_chat("-1001", metadata={"thread_id": "17585"})
+
+        assert adapter._is_typing_paused("-1001", metadata={"thread_id": "17585"}) is False

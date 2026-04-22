@@ -373,6 +373,61 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
+def _apply_topic_runtime_override(runtime_kwargs: dict, topic_cfg: dict) -> dict:
+    """Return coherent runtime kwargs for a per-topic provider override.
+
+    Topic overrides may set only ``provider``/``model`` and omit endpoint/key.
+    In that case, re-resolve the provider runtime instead of mixing the new
+    provider with the old provider's base_url/api_key (e.g. OpenRouter model on
+    the ChatGPT Codex base URL).
+    """
+    if not isinstance(topic_cfg, dict) or not topic_cfg:
+        return dict(runtime_kwargs or {})
+
+    runtime = dict(runtime_kwargs or {})
+
+    has_runtime_override = any(
+        topic_cfg.get(key)
+        for key in ("provider", "base_url", "api_key")
+    )
+    if not has_runtime_override:
+        return runtime
+
+    from hermes_cli.runtime_provider import (
+        resolve_runtime_provider,
+        format_runtime_provider_error,
+    )
+
+    requested_provider = str(
+        topic_cfg.get("provider")
+        or runtime.get("provider")
+        or os.getenv("HERMES_INFERENCE_PROVIDER")
+        or ""
+    ).strip()
+    explicit_base_url = str(topic_cfg.get("base_url") or "").strip() or None
+    explicit_api_key = str(topic_cfg.get("api_key") or "").strip() or None
+
+    try:
+        resolved = resolve_runtime_provider(
+            requested=requested_provider or None,
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+        )
+    except Exception as exc:
+        raise RuntimeError(format_runtime_provider_error(exc)) from exc
+
+    runtime.update({
+        "api_key": resolved.get("api_key"),
+        "base_url": resolved.get("base_url"),
+        "provider": resolved.get("provider"),
+        "api_mode": resolved.get("api_mode"),
+        "command": resolved.get("command"),
+        "args": list(resolved.get("args") or []),
+        "credential_pool": resolved.get("credential_pool"),
+    })
+    return runtime
+
+
 def _build_media_placeholder(event) -> str:
     """Build a text placeholder for media-only events so they aren't dropped.
 
@@ -1011,6 +1066,52 @@ class GatewayRunner:
     @property
     def exit_code(self) -> Optional[int]:
         return self._exit_code
+
+    def _update_runtime_busy_state(self) -> None:
+        """Persist a lightweight snapshot of live non-sentinel gateway jobs."""
+        try:
+            from gateway.status import write_runtime_status
+        except Exception:
+            return
+
+        active_jobs: list[dict[str, Any]] = []
+        now = time.time()
+        for session_key, agent in list(getattr(self, "_running_agents", {}).items()):
+            if agent is _AGENT_PENDING_SENTINEL:
+                continue
+
+            job = {
+                "session_key": session_key,
+                "started_at": getattr(self, "_running_agents_ts", {}).get(session_key),
+                "age_seconds": None,
+                "current_tool": None,
+                "last_activity_desc": None,
+                "seconds_since_activity": None,
+            }
+            started_at = job["started_at"]
+            if isinstance(started_at, (int, float)):
+                job["age_seconds"] = round(max(0.0, now - float(started_at)), 1)
+            if agent and hasattr(agent, "get_activity_summary"):
+                try:
+                    summary = agent.get_activity_summary() or {}
+                    job["current_tool"] = summary.get("current_tool")
+                    job["last_activity_desc"] = summary.get("last_activity_desc")
+                    idle = summary.get("seconds_since_activity")
+                    if isinstance(idle, (int, float)):
+                        job["seconds_since_activity"] = round(float(idle), 1)
+                except Exception:
+                    pass
+            active_jobs.append(job)
+
+        write_runtime_status(active_jobs_count=len(active_jobs), active_jobs=active_jobs)
+
+    def _set_running_agent(self, session_key: str, agent: Any) -> None:
+        self._running_agents[session_key] = agent
+        self._update_runtime_busy_state()
+
+    def _clear_running_agent(self, session_key: str) -> None:
+        self._release_running_agent_state(session_key)
+
 
     def _session_key_for_source(self, source: SessionSource) -> str:
         """Resolve the current session key for a source, honoring gateway config when available."""
@@ -2703,12 +2804,14 @@ class GatewayRunner:
                 self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
                 self._exit_reason = self._exit_reason or "Gateway restart requested"
 
+            self._update_runtime_busy_state()
             self._draining = False
             self._update_runtime_status("stopped", self._exit_reason)
             logger.info("Gateway stopped")
 
         self._stop_task = asyncio.create_task(_stop_impl())
         await self._stop_task
+
     
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""
@@ -3221,6 +3324,7 @@ class GatewayRunner:
                 )
                 self._release_running_agent_state(_quick_key)
 
+
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
@@ -3251,6 +3355,7 @@ class GatewayRunner:
                 logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key[:20])
                 return "⚡ Stopped. You can continue this session."
 
+
             # /reset and /new must bypass the running-agent guard so they
             # actually dispatch as commands instead of being queued as user
             # text (which would be fed back to the agent with the same
@@ -3268,6 +3373,7 @@ class GatewayRunner:
                 )
                 # Clean up the running agent entry so the reset handler
                 # doesn't think an agent is still active.
+
                 return await self._handle_reset_command(event)
 
             # /queue <prompt> — queue without interrupting
@@ -3435,6 +3541,7 @@ class GatewayRunner:
                 if event.get_command() == "stop":
                     # Force-clean the sentinel so the session is unlocked.
                     self._release_running_agent_state(_quick_key)
+
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key[:20])
                     return "⚡ Force-stopped. The agent was still starting — session unlocked."
                 # Queue the message so it will be picked up after the
@@ -3800,6 +3907,7 @@ class GatewayRunner:
         if _is_shared_multi_user and source.user_name:
             message_text = f"[{source.user_name}] {message_text}"
 
+
         if event.media_urls:
             image_paths = []
             audio_paths = []
@@ -4025,7 +4133,7 @@ class GatewayRunner:
                             f"Adjust reset timing in config.yaml under session_reset."
                         )
                         try:
-                            session_info = self._format_session_info()
+                            session_info = self._format_session_info(source)
                             if session_info:
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
@@ -4771,12 +4879,16 @@ class GatewayRunner:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
     
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: "SessionSource | None" = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
         users can immediately see if context detection went wrong (e.g.
         local models falling to the 128K default).
+
+        When a message source is provided, apply any per-topic override so the
+        reset/new-session banner reflects the actual routed model for that
+        thread instead of the global default.
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
@@ -4785,6 +4897,7 @@ class GatewayRunner:
         provider = None
         base_url = None
         api_key = None
+        data = {}
 
         try:
             cfg_path = _hermes_home / "config.yaml"
@@ -4805,6 +4918,7 @@ class GatewayRunner:
         except Exception:
             pass
 
+        runtime = None
         # Resolve runtime credentials for probing
         try:
             runtime = _resolve_runtime_agent_kwargs()
@@ -4812,7 +4926,24 @@ class GatewayRunner:
             base_url = base_url or runtime.get("base_url")
             api_key = runtime.get("api_key")
         except Exception:
-            pass
+            runtime = None
+
+        if source and getattr(source, "thread_id", None):
+            try:
+                topic_overrides = data.get("topic_models") or {}
+                topic_key = f"{source.platform.value}:{source.chat_id}:{source.thread_id}"
+                topic_cfg = topic_overrides.get(topic_key) or {}
+                if topic_cfg:
+                    topic_model = topic_cfg.get("model")
+                    if topic_model:
+                        model = str(topic_model)
+                    if any(topic_cfg.get(key) for key in ("provider", "base_url", "api_key")):
+                        runtime = _apply_topic_runtime_override(runtime or {}, topic_cfg)
+                        provider = runtime.get("provider") or provider
+                        base_url = runtime.get("base_url") or base_url
+                        api_key = runtime.get("api_key") or api_key
+            except Exception:
+                pass
 
         context_length = get_model_context_length(
             model,
@@ -4926,7 +5057,7 @@ class GatewayRunner:
 
         # Resolve session config info to surface to the user
         try:
-            session_info = self._format_session_info()
+            session_info = self._format_session_info(source)
         except Exception:
             session_info = ""
 
@@ -5110,10 +5241,11 @@ class GatewayRunner:
         The session is preserved so the user can continue the conversation.
         """
         source = event.source
-        session_entry = self.session_store.get_or_create_session(source)
-        session_key = session_entry.session_key
+        session_key = self._session_key_for_source(source)
+
 
         agent = self._running_agents.get(session_key)
+        adapter = self.adapters.get(source.platform)
         if agent is _AGENT_PENDING_SENTINEL:
             # Force-clean the sentinel so the session is unlocked.
             await self._interrupt_and_clear_session(
@@ -5134,7 +5266,15 @@ class GatewayRunner:
                 invalidation_reason="stop_command_handler",
             )
             return "⚡ Stopped. You can continue this session."
+
         else:
+            if adapter and hasattr(adapter, 'cancel_session_task'):
+                try:
+                    cancelled = await adapter.cancel_session_task(session_key)
+                except Exception:
+                    cancelled = False
+                if cancelled:
+                    return "⚡ Force-stopped. The session is unlocked — you can send a new message."
             return "No active task to stop."
 
     async def _handle_restart_command(self, event: MessageEvent) -> str:
@@ -7138,6 +7278,7 @@ class GatewayRunner:
         # Clear any running agent for this session key
         self._release_running_agent_state(session_key)
 
+
         # Switch the session entry to point at the old session
         new_entry = self.session_store.switch_session(session_key, target_id)
         if not new_entry:
@@ -7557,7 +7698,10 @@ class GatewayRunner:
         # Resume typing indicator — agent is about to continue processing.
         _adapter = self.adapters.get(source.platform)
         if _adapter:
-            _adapter.resume_typing_for_chat(source.chat_id)
+            _adapter.resume_typing_for_chat(
+                source.chat_id,
+                metadata={"thread_id": source.thread_id} if source.thread_id else None,
+            )
 
         count_msg = f" ({count} commands)" if count > 1 else ""
         logger.info("User approved %d dangerous command(s) via /approve%s", count, scope_msg)
@@ -7594,7 +7738,10 @@ class GatewayRunner:
         # Resume typing indicator — agent continues (with BLOCKED result).
         _adapter = self.adapters.get(source.platform)
         if _adapter:
-            _adapter.resume_typing_for_chat(source.chat_id)
+            _adapter.resume_typing_for_chat(
+                source.chat_id,
+                metadata={"thread_id": source.thread_id} if source.thread_id else None,
+            )
 
         count_msg = f" ({count} commands)" if count > 1 else ""
         logger.info("User denied %d dangerous command(s) via /deny", count)
@@ -8602,6 +8749,7 @@ class GatewayRunner:
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
+        self._update_runtime_busy_state()
 
     def _begin_session_run_generation(self, session_key: str) -> int:
         """Claim a fresh run generation token for ``session_key``.
@@ -8673,6 +8821,11 @@ class GatewayRunner:
             running_agent.interrupt(interrupt_reason)
         self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         adapter = self.adapters.get(source.platform)
+        if adapter and hasattr(adapter, "cancel_session_task"):
+            try:
+                await adapter.cancel_session_task(session_key)
+            except Exception:
+                logger.debug("Session task cancel failed for %s", session_key[:20], exc_info=True)
         if adapter and hasattr(adapter, "interrupt_session_activity"):
             await adapter.interrupt_session_activity(session_key, source.chat_id)
         if adapter and hasattr(adapter, "get_pending_message"):
@@ -9550,6 +9703,24 @@ class GatewayRunner:
                     "tools": [],
                 }
 
+            # --- Per-topic model override ---
+            # config.yaml `topic_models` maps "platform:chat_id:thread_id"
+            # to {model, base_url, api_key, provider} for per-topic routing.
+            _topic_overrides = user_config.get("topic_models") or {}
+            if _topic_overrides and source.thread_id:
+                _topic_key = f"{source.platform.value}:{source.chat_id}:{source.thread_id}"
+                _topic_cfg = _topic_overrides.get(_topic_key) or {}
+                if _topic_cfg:
+                    _tm = _topic_cfg.get("model")
+                    if _tm:
+                        model = str(_tm)
+                        logger.info("Topic model override: %s → %s", _topic_key, model)
+                    runtime_kwargs = _apply_topic_runtime_override(runtime_kwargs, _topic_cfg)
+                    if _topic_cfg.get("api_mode"):
+                        runtime_kwargs["api_mode"] = str(_topic_cfg["api_mode"])
+                    if _topic_cfg.get("extra_body"):
+                        runtime_kwargs["extra_body"] = dict(_topic_cfg["extra_body"])
+
             pr = self._provider_routing
             reasoning_config = self._load_reasoning_config()
             self._reasoning_config = reasoning_config
@@ -9869,7 +10040,10 @@ class GatewayRunner:
                 # is active.  The approval message send auto-clears the Slack
                 # status; pausing prevents _keep_typing from re-setting it.
                 # Typing resumes in _handle_approve_command/_handle_deny_command.
-                _status_adapter.pause_typing_for_chat(_status_chat_id)
+                _status_adapter.pause_typing_for_chat(
+                    _status_chat_id,
+                    metadata={"thread_id": source.thread_id} if source.thread_id else None,
+                )
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
@@ -10136,9 +10310,10 @@ class GatewayRunner:
             while agent_holder[0] is None:
                 await asyncio.sleep(0.05)
             if session_key:
-                self._running_agents[session_key] = agent_holder[0]
+                self._set_running_agent(session_key, agent_holder[0])
                 if self._draining:
                     self._update_runtime_status("draining")
+
         
         tracking_task = asyncio.create_task(track_agent())
         
@@ -10647,6 +10822,7 @@ class GatewayRunner:
                 self._release_running_agent_state(session_key)
             if self._draining:
                 self._update_runtime_status("draining")
+
             
             # Wait for cancelled tasks
             for task in [progress_task, interrupt_monitor, tracking_task, _notify_task]:
@@ -10856,10 +11032,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             )
             return False
 
-    # Sync bundled skills on gateway start (fast -- skips unchanged)
+    # Optionally sync bundled repo skills on gateway start.
+    # Disabled by default so daemon restarts don't mutate user skill libraries.
     try:
-        from tools.skills_sync import sync_skills
-        sync_skills(quiet=True)
+        from tools.skills_sync import maybe_auto_sync_bundled_skills
+        maybe_auto_sync_bundled_skills(quiet=True)
     except Exception:
         pass
 

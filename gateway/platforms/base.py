@@ -913,10 +913,13 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        # Per-session background task registry so /stop can cancel exactly one
+        # running job/topic without touching sibling sessions in the same chat.
+        self._session_tasks: Dict[str, asyncio.Task] = {}
         # Chats where auto-TTS on voice input is disabled (set by /voice off)
         self._auto_tts_disabled_chats: set = set()
         # Chats where typing indicator is paused (e.g. during approval waits).
-        # _keep_typing skips send_typing when the chat_id is in this set.
+        # _keep_typing skips send_typing when the chat/thread scope key is in this set.
         self._typing_paused: set = set()
 
     @property
@@ -1134,6 +1137,17 @@ class BasePlatformAdapter(ABC):
         Default is a no-op for platforms with one-shot typing indicators.
         """
         pass
+
+    @staticmethod
+    def _typing_scope_key(chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+        """Return a chat/thread scoped key for typing state."""
+        if metadata and metadata.get("thread_id"):
+            return f"{chat_id}::{metadata['thread_id']}"
+        return str(chat_id)
+
+    def _is_typing_paused(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Return True when typing is paused for this exact chat/thread scope."""
+        return self._typing_scope_key(chat_id, metadata) in self._typing_paused
     
     async def send_image(
         self,
@@ -1446,11 +1460,12 @@ class BasePlatformAdapter(ABC):
         for Slack's Assistant API where ``assistant_threads_setStatus`` disables
         the compose box — pausing lets the user type ``/approve`` or ``/deny``.
         """
+        _typing_key = self._typing_scope_key(chat_id, metadata)
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
-                if chat_id not in self._typing_paused:
+                if _typing_key not in self._typing_paused:
                     await self.send_typing(chat_id, metadata=metadata)
                 if stop_event is None:
                     await asyncio.sleep(interval)
@@ -1472,19 +1487,19 @@ class BasePlatformAdapter(ABC):
                     await self.stop_typing(chat_id)
                 except Exception:
                     pass
-            self._typing_paused.discard(chat_id)
+            self._typing_paused.discard(_typing_key)
 
-    def pause_typing_for_chat(self, chat_id: str) -> None:
+    def pause_typing_for_chat(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Pause typing indicator for a chat (e.g. during approval waits).
 
         Thread-safe (CPython GIL) — can be called from the sync agent thread
         while ``_keep_typing`` runs on the async event loop.
         """
-        self._typing_paused.add(chat_id)
+        self._typing_paused.add(self._typing_scope_key(chat_id, metadata))
 
-    def resume_typing_for_chat(self, chat_id: str) -> None:
+    def resume_typing_for_chat(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Resume typing indicator for a chat after approval resolves."""
-        self._typing_paused.discard(chat_id)
+        self._typing_paused.discard(self._typing_scope_key(chat_id, metadata))
 
     async def interrupt_session_activity(self, session_key: str, chat_id: str) -> None:
         """Signal the active session loop to stop and clear typing immediately."""
@@ -1761,6 +1776,7 @@ class BasePlatformAdapter(ABC):
         task = asyncio.create_task(self._process_message_background(event, session_key))
         try:
             self._background_tasks.add(task)
+            self._session_tasks[session_key] = task
         except TypeError:
             # Some tests stub create_task() with lightweight sentinels that are not
             # hashable and do not support lifecycle callbacks.
@@ -1768,6 +1784,7 @@ class BasePlatformAdapter(ABC):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
+            task.add_done_callback(lambda _t, _key=session_key: self._session_tasks.pop(_key, None))
     
     @staticmethod
     def _get_human_delay() -> float:
@@ -1871,11 +1888,23 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
                 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
-                # Skipped when the chat has voice mode disabled (/voice off)
+                # Skipped when:
+                #   - the chat has voice mode disabled (/voice off), or
+                #   - `tts.enabled: false` is set in ~/.hermes/config.yaml (global kill-switch)
                 _tts_path = None
+                _tts_globally_enabled = True
+                try:
+                    from tools.tts_tool import _load_tts_config as _load_tts_cfg
+                    _tts_cfg = _load_tts_cfg()
+                    if _tts_cfg.get("enabled") is False:
+                        _tts_globally_enabled = False
+                except Exception:
+                    pass  # Non-fatal — fall through to default behavior
+
                 if (event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
+                        and _tts_globally_enabled
                         and event.source.chat_id not in self._auto_tts_disabled_chats):
                     try:
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
@@ -2168,8 +2197,27 @@ class BasePlatformAdapter(ABC):
             # will be in self._background_tasks now.  Re-check.
         self._background_tasks.clear()
         self._expected_cancelled_tasks.clear()
+        self._session_tasks.clear()
         self._pending_messages.clear()
         self._active_sessions.clear()
+
+    async def cancel_session_task(self, session_key: str) -> bool:
+        """Cancel the active background task for exactly one session."""
+        task = self._session_tasks.pop(session_key, None)
+        if not task or task.done():
+            self._active_sessions.pop(session_key, None)
+            return False
+        self._expected_cancelled_tasks.add(task)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("[%s] Session task cancellation raised for %s", self.name, session_key, exc_info=True)
+        self._background_tasks.discard(task)
+        self._active_sessions.pop(session_key, None)
+        return True
 
     def has_pending_interrupt(self, session_key: str) -> bool:
         """Check if there's a pending interrupt for a session."""

@@ -5,6 +5,8 @@ from unittest.mock import patch, MagicMock
 from pathlib import Path
 
 from gateway.run import GatewayRunner
+from gateway.session import SessionSource
+from gateway.config import Platform
 
 
 @pytest.fixture()
@@ -108,3 +110,36 @@ class TestFormatSessionInfo:
             info = runner._format_session_info()
         assert "4K" in info
         assert "config" in info
+
+    def test_topic_override_shown_for_thread_source(self, runner, tmp_path):
+        config_yaml = (
+            "model:\n"
+            "  default: gpt-5.4\n"
+            "  provider: openai-codex\n"
+            "  base_url: https://chatgpt.com/backend-api/codex\n"
+            "topic_models:\n"
+            "  telegram:-1003882011045:1720:\n"
+            "    model: gemma-4-26B-A4B-it-Claude-Opus-Distill.q4_k_m.gguf\n"
+            "    base_url: http://127.0.0.1:8080/v1\n"
+            "    api_key: local\n"
+            "    provider: custom\n"
+            "    api_mode: chat_completions\n"
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1003882011045",
+            chat_type="group",
+            thread_id="1720",
+        )
+        p1, p2, p3 = _patch_info(
+            tmp_path,
+            config_yaml,
+            "gpt-5.4",
+            {"provider": "openai-codex", "base_url": "https://chatgpt.com/backend-api/codex", "api_key": "***"},
+        )
+        with p1, p2, p3:
+            info = runner._format_session_info(source)
+        assert "gemma-4-26B-A4B-it-Claude-Opus-Distill.q4_k_m.gguf" in info
+        assert "Provider: custom" in info
+        assert "127.0.0.1:8080" in info
+        assert "gpt-5.4" not in info

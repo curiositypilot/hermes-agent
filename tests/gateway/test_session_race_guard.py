@@ -26,6 +26,7 @@ class _FakeAdapter:
         self._pending_messages = {}
         self._active_sessions = {}
         self.interrupted_sessions = []
+        self.cancelled_sessions = []
 
     async def send(self, chat_id, text, **kwargs):
         pass
@@ -35,6 +36,10 @@ class _FakeAdapter:
         event = self._active_sessions.get(session_key)
         if event is not None:
             event.set()
+
+    async def cancel_session_task(self, session_key):
+        self.cancelled_sessions.append(session_key)
+        return True
 
 
 def _make_runner():
@@ -377,8 +382,9 @@ async def test_stop_during_sentinel_force_cleans_session():
 async def test_stop_hard_kills_running_agent():
     """When /stop arrives while a real agent is running, it must:
     1. Call interrupt() on the agent
-    2. Force-clean _running_agents to unlock the session
-    3. Return a confirmation message
+    2. Cancel the active background task for this session
+    3. Force-clean _running_agents to unlock the session
+    4. Return a confirmation message
     This fixes the bug where a hung agent kept the session locked
     forever — showing 'writing...' but never producing output."""
     runner = _make_runner()
@@ -398,6 +404,9 @@ async def test_stop_hard_kills_running_agent():
 
     # Agent must have been interrupted
     fake_agent.interrupt.assert_called_once_with("Stop requested")
+
+    adapter = runner.adapters[Platform.TELEGRAM]
+    assert adapter.cancelled_sessions == [session_key]
 
     # Session must be unlocked
     assert session_key not in runner._running_agents, (

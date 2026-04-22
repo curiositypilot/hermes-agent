@@ -448,12 +448,14 @@ def test_cache_dm_topic_from_message_no_overwrite():
 
 
 def _make_mock_message(chat_id=111, chat_type="private", text="hello", thread_id=None,
-                       user_id=42, user_name="Test User", forum_topic_created=None):
+                       user_id=42, user_name="Test User", forum_topic_created=None,
+                       is_topic_message=False, is_forum=False):
     """Create a mock Telegram Message for _build_message_event tests."""
     chat = SimpleNamespace(
         id=chat_id,
         type=chat_type,
         title=None,
+        is_forum=is_forum,
     )
     # Add full_name attribute for DM chats
     if not hasattr(chat, "full_name"):
@@ -469,6 +471,7 @@ def _make_mock_message(chat_id=111, chat_type="private", text="hello", thread_id
         from_user=user,
         text=text,
         message_thread_id=thread_id,
+        is_topic_message=is_topic_message,
         message_id=1001,
         reply_to_message=None,
         date=None,
@@ -604,6 +607,35 @@ def test_group_topic_no_skill_binding():
     )
     event = adapter._build_message_event(msg, MessageType.TEXT)
 
+    assert event.auto_skill is None
+    assert event.source.chat_topic == "General"
+
+
+
+def test_group_general_topic_synthesizes_thread_id_one():
+    """Forum-group General topic should map to synthetic thread_id=1 when Telegram omits it."""
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter(group_topics_config=[
+        {
+            "chat_id": -1001234567890,
+            "topics": [
+                {"name": "General", "thread_id": 1},
+            ],
+        }
+    ])
+
+    msg = _make_mock_message(
+        chat_id=-1001234567890,
+        chat_type=_ChatType.SUPERGROUP,
+        thread_id=None,
+        text="hey",
+        is_topic_message=True,
+        is_forum=True,
+    )
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.source.thread_id == "1"
     assert event.auto_skill is None
     assert event.source.chat_topic == "General"
 

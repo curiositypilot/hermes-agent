@@ -1496,14 +1496,30 @@ def systemd_stop(system: bool = False):
 
 
 
-def systemd_restart(system: bool = False):
+def systemd_restart(system: bool = False, force: bool = False):
     system = _select_systemd_scope(system)
     if system:
         _require_root_for_system_service("restart")
-    refresh_systemd_unit_if_needed(system=system)
+
     from gateway.status import get_running_pid
 
     pid = get_running_pid()
+    try:
+        busy = _get_active_jobs_snapshot(running_pid=pid)
+    except TypeError:
+        busy = _get_active_jobs_snapshot()
+    active_count = int(busy.get("active_jobs_count") or 0)
+    if active_count > 0 and not force:
+        print(f"✗ Refusing to restart gateway: {active_count} active job{'s' if active_count != 1 else ''} still running.")
+        for job in (busy.get("active_jobs") or [])[:5]:
+            session_key = job.get("session_key") or "unknown-session"
+            current_tool = job.get("current_tool") or job.get("last_activity_desc") or "working"
+            print(f"  - {session_key}: {current_tool}")
+        print("Use --force to restart anyway.")
+        sys.exit(1)
+
+    refresh_systemd_unit_if_needed(system=system)
+
     if pid is not None and _request_gateway_self_restart(pid):
         # SIGUSR1 sent — the gateway will drain active agents, exit with
         # code 75, and systemd will restart it after RestartSec (30s).
@@ -2427,6 +2443,28 @@ def _platform_status(platform: dict) -> str:
     return "not configured"
 
 
+def _get_active_jobs_snapshot(running_pid: int | None = None) -> dict:
+    """Return persisted active-job data only when it belongs to the live gateway PID."""
+    try:
+        from gateway.status import get_running_pid, read_runtime_status
+    except Exception:
+        return {"active_jobs_count": 0, "active_jobs": []}
+
+    if running_pid is None:
+        running_pid = get_running_pid()
+    if running_pid is None:
+        return {"active_jobs_count": 0, "active_jobs": []}
+
+    state = read_runtime_status() or {}
+    if state.get("pid") != running_pid:
+        return {"active_jobs_count": 0, "active_jobs": []}
+
+    return {
+        "active_jobs_count": int(state.get("active_jobs_count") or 0),
+        "active_jobs": list(state.get("active_jobs") or []),
+    }
+
+
 def _runtime_health_lines() -> list[str]:
     """Summarize the latest persisted gateway runtime health state."""
     try:
@@ -2458,6 +2496,10 @@ def _runtime_health_lines() -> list[str]:
         lines.append(f"⏳ Gateway draining for {action} ({count} active agent(s))")
     elif gateway_state == "stopped" and exit_reason:
         lines.append(f"⚠ Last shutdown reason: {exit_reason}")
+
+    active_count = int(state.get("active_jobs_count") or 0)
+    if active_count > 0:
+        lines.append(f"⚡ Active jobs: {active_count}")
 
     return lines
 
@@ -3664,6 +3706,7 @@ def gateway_command(args):
         service_available = False
         system = getattr(args, 'system', False)
         restart_all = getattr(args, 'all', False)
+        force = getattr(args, 'force', False)
         service_configured = False
 
         if restart_all:
@@ -3700,7 +3743,7 @@ def gateway_command(args):
         if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
             service_configured = True
             try:
-                systemd_restart(system=system)
+                systemd_restart(system=system, force=force)
                 service_available = True
             except subprocess.CalledProcessError:
                 pass
@@ -3734,6 +3777,13 @@ def gateway_command(args):
                 print("✗ Gateway service restart failed.")
                 print("  The service definition exists, but the service manager did not recover it.")
                 print("  Fix the service, then retry: hermes gateway start")
+                sys.exit(1)
+
+            busy = _get_active_jobs_snapshot()
+            active_count = int(busy.get("active_jobs_count") or 0)
+            if active_count > 0 and not force:
+                print(f"✗ Refusing to restart gateway: {active_count} active job{'s' if active_count != 1 else ''} still running.")
+                print("Use --force to restart anyway.")
                 sys.exit(1)
 
             # Manual restart: stop only this profile's gateway
