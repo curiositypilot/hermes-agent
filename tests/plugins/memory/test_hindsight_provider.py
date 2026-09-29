@@ -918,6 +918,103 @@ class TestRecallStatus:
 
 
 # ---------------------------------------------------------------------------
+# Auto-recall relevance floor / prefer_observations
+# ---------------------------------------------------------------------------
+
+
+def _auto_recall_kwargs(p, query="replace the brake pads on my car"):
+    """Run one background auto-recall and return the kwargs the client saw."""
+    p.queue_prefetch(query)
+    if p._prefetch_thread:
+        p._prefetch_thread.join(timeout=5.0)
+    p.prefetch(query)
+    return p._client.arecall.await_args.kwargs
+
+
+class TestRecallRelevanceFloor:
+    def test_defaults_send_neither_kwarg(self, provider):
+        # Default config keeps today's request shape exactly.
+        assert provider._recall_min_reranker is None
+        assert provider._recall_prefer_observations is False
+        kwargs = _auto_recall_kwargs(provider)
+        assert "min_scores" not in kwargs
+        assert "prefer_observations" not in kwargs
+        provider.handle_tool_call("hindsight_recall", {"query": "q"})
+        assert "min_scores" not in provider._client.arecall.await_args.kwargs
+
+    def test_floor_reaches_auto_recall_as_reranker_min_score(self, provider_with_config):
+        p = provider_with_config(recall_min_reranker=0.1)
+        assert _auto_recall_kwargs(p)["min_scores"] == {"reranker": 0.1}
+
+    def test_floor_reaches_recall_sync_path(self, provider_with_config):
+        p = provider_with_config(recall_min_reranker="0.2", recall_sync=True)
+        p.prefetch("pizza dough")
+        assert p._client.arecall.await_args.kwargs["min_scores"] == {"reranker": 0.2}
+
+    def test_floor_does_not_filter_explicit_tool_recall(self, provider_with_config):
+        # The model asked for this search; it judges relevance itself.
+        p = provider_with_config(recall_min_reranker=0.1)
+        p.handle_tool_call("hindsight_recall", {"query": "brake pads"})
+        assert "min_scores" not in p._client.arecall.await_args.kwargs
+
+    def test_floor_abstention_injects_nothing(self, provider_with_config):
+        # Server returns nothing above the floor -> no block, no indicator.
+        p = provider_with_config(recall_min_reranker=0.1, recall_sync=True)
+        p._client.arecall = AsyncMock(return_value=SimpleNamespace(results=[]))
+        assert p.prefetch("replace the brake pads on my car") == ""
+        assert p.recall_status() is None
+
+    @pytest.mark.parametrize("value", ["", None, "abc", -0.1, 1.5, True])
+    def test_invalid_or_blank_floor_means_no_floor(self, provider_with_config, value):
+        p = provider_with_config(recall_min_reranker=value)
+        assert p._recall_min_reranker is None
+        assert "min_scores" not in _auto_recall_kwargs(p)
+
+    def test_zero_floor_is_a_real_floor(self, provider_with_config):
+        # 0 is a valid (if permissive) floor, distinct from unset.
+        p = provider_with_config(recall_min_reranker=0)
+        assert _auto_recall_kwargs(p)["min_scores"] == {"reranker": 0.0}
+
+    @pytest.mark.parametrize("value", [True, "true", "1"])
+    def test_prefer_observations_reaches_auto_and_tool_recall(self, provider_with_config, value):
+        p = provider_with_config(recall_prefer_observations=value,
+                                 recall_types=["observation", "world", "experience"])
+        assert _auto_recall_kwargs(p)["prefer_observations"] is True
+        p.handle_tool_call("hindsight_recall", {"query": "q"})
+        assert p._client.arecall.await_args.kwargs["prefer_observations"] is True
+
+    def test_schema_lists_new_keys_with_todays_defaults(self, provider):
+        fields = {f["key"]: f for f in provider.get_config_schema()}
+        assert fields["recall_min_reranker"]["default"] == ""
+        assert fields["recall_prefer_observations"]["default"] is False
+
+    @pytest.mark.asyncio
+    async def test_pinned_client_serializes_floor_and_prefer_observations(self, provider_with_config):
+        hindsight_client = pytest.importorskip(
+            "hindsight_client", reason="pinned hindsight-client SDK not installed"
+        )
+        p = provider_with_config(recall_min_reranker=0.1, recall_prefer_observations=True,
+                                 recall_types=["observation", "world"])
+        # Capture the kwargs _recall builds, then feed them to the real SDK.
+        p._client.arecall = AsyncMock(return_value=SimpleNamespace(results=[]))
+        p._recall("brake pads", auto=True)
+        kwargs = dict(p._client.arecall.await_args.kwargs)
+        bank_id = kwargs.pop("bank_id")
+
+        client = hindsight_client.Hindsight(base_url="http://localhost:9999", api_key="test-key")
+        client._memory_api.recall_memories = AsyncMock(return_value=SimpleNamespace(results=[]))
+        try:
+            await client.arecall(bank_id=bank_id, **kwargs)
+            body = client._memory_api.recall_memories.await_args.args[1].to_dict()
+            assert body["min_scores"]["reranker"] == 0.1
+            # Unset floors serialize as null, which the server treats as "no floor".
+            assert not any(v for k, v in body["min_scores"].items() if k != "reranker")
+            assert body["prefer_observations"] is True
+        finally:
+            await client.aclose()
+
+
+# ---------------------------------------------------------------------------
 # sync_turn tests
 # ---------------------------------------------------------------------------
 

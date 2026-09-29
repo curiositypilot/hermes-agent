@@ -79,6 +79,8 @@ Config file: `~/.hermes/hindsight/config.json`
 | `auto_recall` | `true` | Automatically recall memories before each turn |
 | `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
 | `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
+| `recall_min_reranker` | — | Auto-recall relevance floor (0–1), sent as `min_scores: {"reranker": X}`. Results scoring below it are dropped server-side, so an off-topic turn injects nothing instead of the top-N zero-score matches. Unset applies no floor. The explicit `hindsight_recall` tool is never filtered. |
+| `recall_prefer_observations` | `false` | When `recall_types` mixes `observation` with `world`/`experience`, drop raw facts that an included observation was consolidated from (backfilled with the next results). Applies to auto-recall and the tool. |
 
 > **Behavior change — `recall_types` defaults to `observation` only.**
 >

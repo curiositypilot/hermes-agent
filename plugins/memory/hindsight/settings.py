@@ -91,6 +91,21 @@ def _parse_int_setting(value: Any, default: int) -> int:
         return default
 
 
+def _parse_score_floor(value: Any) -> float | None:
+    """Parse an optional 0-1 score floor; unset/blank/invalid/out-of-range -> None (no floor)."""
+    if value is None or (isinstance(value, str) and not value.strip()) or isinstance(value, bool):
+        return None
+    try:
+        floor = float(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid Hindsight score floor %r; applying no floor", value)
+        return None
+    if not 0.0 <= floor <= 1.0:
+        logger.warning("Hindsight score floor %r outside 0-1; applying no floor", value)
+        return None
+    return floor
+
+
 def _daemon_llm_provider(provider: str) -> str:
     return "openai" if provider in _OPENAI_WIRE_PROVIDERS else provider
 

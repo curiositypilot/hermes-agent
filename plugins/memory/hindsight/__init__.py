@@ -45,7 +45,7 @@ from .settings import (
     _DEFAULT_TIMEOUT, _HINDSIGHT_GLYPH, _MIN_CLIENT_VERSION, _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
     _PROVIDER_DEFAULT_MODELS, _STREAM_ERROR_PREFIX, _VALID_BUDGETS, _daemon_llm_provider,
     _normalize_observation_scopes, _normalize_retain_contexts, _normalize_retain_tags,
-    _parse_bool_setting, _parse_int_setting, _resolve_bank_id_template,
+    _parse_bool_setting, _parse_int_setting, _parse_score_floor, _resolve_bank_id_template,
 )
 
 logger = logging.getLogger(__name__)
@@ -464,6 +464,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
+            {"key": "recall_min_reranker", "description": "Auto-recall relevance floor (0-1): drop results whose normalized reranker score is below it, so an off-topic turn injects nothing. Blank applies no floor. The explicit hindsight_recall tool is not filtered.", "default": ""},
+            {"key": "recall_prefer_observations", "description": "When recall_types mixes observation with raw world/experience facts, drop raw facts an included observation was consolidated from (applies to auto-recall and the hindsight_recall tool)", "default": False},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
             {"key": "port_health_grace_timeout", "description": "Seconds to wait for a slow daemon /health before treating it as stale (raise on busy/low-resource hosts; blank uses the 30s default)", "default": "", "when": {"mode": "local_embedded"}},
@@ -839,6 +841,10 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = list([] if configured_types is None else configured_types) or ["observation"]
         self._recall_prompt_preamble = cfg.get("recall_prompt_preamble", "")
         self._recall_indicator = bool(cfg.get("recall_indicator", True))
+        # Auto-recall abstention: a server-side reranker floor (min_scores.reranker) so an
+        # off-topic turn injects nothing instead of the top-N zero-score results. None = no floor.
+        self._recall_min_reranker = _parse_score_floor(cfg.get("recall_min_reranker"))
+        self._recall_prefer_observations = _parse_bool_setting(cfg.get("recall_prefer_observations"), False)
 
     def _start_embedded_daemon(self) -> None:
         """Start the embedded daemon on a background thread (Rich output -> log file)."""
@@ -923,12 +929,22 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Prefetch: skipped (%s)", why)
         return why is not None
 
-    def _recall(self, query: str) -> list:
+    def _recall(self, query: str, *, auto: bool = False) -> list:
+        """One recall. *auto* marks the injected auto-recall path, the only one the
+        ``recall_min_reranker`` floor applies to: an explicit hindsight_recall is a
+        deliberate search whose relevance the model judges itself, and the reranker's
+        absolute scores are not calibrated across queries."""
         kwargs: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
         if self._recall_tags:
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
         if self._recall_types:
             kwargs["types"] = self._recall_types
+        # Only sent when enabled, so default requests stay byte-identical (and older
+        # clients without these kwargs keep working).
+        if self._recall_prefer_observations:
+            kwargs["prefer_observations"] = True
+        if auto and self._recall_min_reranker is not None:
+            kwargs["min_scores"] = {"reranker": self._recall_min_reranker}
         resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
         return resp.results or []
 
@@ -949,7 +965,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 return self._reflect(query) or "", 0
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
-            results = self._recall(query)
+            results = self._recall(query, auto=True)
             logger.debug("Recall: returned %d results", len(results))
             return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
         except Exception as e:
