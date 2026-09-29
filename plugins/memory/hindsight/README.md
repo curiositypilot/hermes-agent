@@ -93,6 +93,9 @@ Config file: `~/.hermes/hindsight/config.json`
 | Key | Default | Description |
 |-----|---------|-------------|
 | `auto_retain` | `true` | Automatically retain conversation turns |
+| `retain_contexts` | `["primary", "cron"]` | Agent contexts whose turns are auto-retained (`primary`, `cron`, `subagent`, `flush`); `[]` retains nothing automatically |
+| `retain_kanban_workers` | `true` | Auto-retain turns of Kanban worker sessions (`HERMES_KANBAN_TASK` set) |
+| `retain_lineage_tags` | `true` | Tag auto-retained turns `session:<id>` / `parent:<id>`. Each tag set is its own consolidation scope; set `false` to let conversation facts consolidate together (ids stay in metadata) |
 | `retain_async` | `true` | Process retain asynchronously on the Hindsight server |
 | `retain_every_n_turns` | `1` | Retain every N turns (1 = every turn) |
 | `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
@@ -101,6 +104,11 @@ Config file: `~/.hermes/hindsight/config.json`
 | `retain_indicator` | `true` | Show a `👁️ Hindsight — saving to memory…` status line when a turn is saved. Turn off for customer-facing agents. |
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
 | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
+
+Auto-retain also skips turns whose assistant text is empty or a `[stream error …]` placeholder,
+and the environment variable `HINDSIGHT_AUTO_RETAIN=0` switches it off for one process (probe and
+test launchers). Each skipped turn logs one debug line with the reason. Explicit
+`hindsight_retain` tool calls are never gated.
 
 ### Integration
 

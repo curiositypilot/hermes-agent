@@ -53,6 +53,8 @@ def _clean_env(tmp_path, monkeypatch):
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_OBSERVATION_SCOPES",
         "HINDSIGHT_RETAIN_SOURCE",
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
+        # Process-level auto-retain switches: this suite may itself run inside a Kanban worker.
+        "HINDSIGHT_AUTO_RETAIN", "HERMES_KANBAN_TASK",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -1034,6 +1036,216 @@ class TestSyncTurn:
         assert p1._document_id != p2._document_id
         assert p1._document_id.startswith("resumed-session-")
         assert p2._document_id.startswith("resumed-session-")
+
+
+# ---------------------------------------------------------------------------
+# Auto-retain writer controls
+# ---------------------------------------------------------------------------
+
+
+def _write_config(tmp_path, monkeypatch, **overrides):
+    config = {"mode": "cloud", "apiKey": "k", "api_url": "http://localhost:9999", "bank_id": "test-bank",
+              "retain_async": False, **overrides}
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+
+def _init_provider(tmp_path, *, agent_context=None, **kwargs):
+    """A provider initialized the way agent_init hands kwargs over (agent_context optional)."""
+    p = HindsightMemoryProvider()
+    init_kwargs = {"session_id": "sess-1", "hermes_home": str(tmp_path), "platform": "cli", **kwargs}
+    if agent_context is not None:
+        init_kwargs["agent_context"] = agent_context
+    p.initialize(**init_kwargs)
+    p._client = _make_mock_client()
+    return p
+
+
+def _retained_items(p) -> list:
+    p._retain_queue.join()
+    return [item for call in p._client.aretain_batch.call_args_list for item in call.kwargs["items"]]
+
+
+class TestAutoRetainWriterControls:
+    """Each switch defaults to the pre-switch behaviour; set, it drops the turn with one debug
+    line naming the reason. Explicit hindsight_retain tool calls are never gated."""
+
+    @pytest.fixture()
+    def debug_log(self, caplog):
+        caplog.set_level("DEBUG", logger="plugins.memory.hindsight")
+        return lambda: [r.getMessage() for r in caplog.records if r.getMessage().startswith("sync_turn: skipped")]
+
+    # -- 1. agent_context / retain_contexts -------------------------------------------------
+
+    @pytest.mark.parametrize("agent_context", [None, "primary", "cron"])
+    def test_default_contexts_retain(self, tmp_path, monkeypatch, agent_context):
+        _write_config(tmp_path, monkeypatch)
+        p = _init_provider(tmp_path, agent_context=agent_context)
+        p.sync_turn("hello", "hi there")
+        assert len(_retained_items(p)) == 1
+
+    def test_context_outside_retain_contexts_is_skipped(self, tmp_path, monkeypatch, debug_log):
+        _write_config(tmp_path, monkeypatch, retain_contexts=["primary"])
+        cron = _init_provider(tmp_path, agent_context="cron")
+        cron.sync_turn("run the digest", "digest sent")
+        assert _retained_items(cron) == []
+        assert debug_log() == ["sync_turn: skipped (agent_context='cron' not in retain_contexts ['primary'])"]
+
+        primary = _init_provider(tmp_path, agent_context="primary")
+        primary.sync_turn("hello", "hi there")
+        assert len(_retained_items(primary)) == 1
+
+    def test_retain_contexts_accepts_csv_and_real_agent_init_kwargs(self, tmp_path, monkeypatch):
+        """The kwargs agent_init actually builds carry agent_context; a CSV config names them."""
+        from agent.agent_init import _GATEWAY_IDENTITY_PARAMS, _memory_provider_init_kwargs
+
+        _write_config(tmp_path, monkeypatch, retain_contexts="primary")
+        fake_agent = SimpleNamespace(session_id="sess-cron", _session_db=None, _emit_warning=None,
+                                     _emit_status=None, session_cwd=None,
+                                     **{f"_{name}": None for name in _GATEWAY_IDENTITY_PARAMS})
+        results = {}
+        for platform in ("cron", "telegram"):
+            p = HindsightMemoryProvider()
+            p.initialize(**_memory_provider_init_kwargs(fake_agent, platform))
+            p._client = _make_mock_client()
+            p.sync_turn("hello", "hi there")
+            results[platform] = len(_retained_items(p))
+        assert results == {"cron": 0, "telegram": 1}
+
+    def test_empty_retain_contexts_disables_every_context(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch, retain_contexts=[])
+        p = _init_provider(tmp_path, agent_context="primary")
+        p.sync_turn("hello", "hi there")
+        assert _retained_items(p) == []
+
+    # -- 2. Kanban workers -------------------------------------------------------------------
+
+    def test_kanban_worker_retains_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
+        _write_config(tmp_path, monkeypatch)
+        p = _init_provider(tmp_path)
+        p.sync_turn("hello", "hi there")
+        assert len(_retained_items(p)) == 1
+
+    def test_kanban_worker_skipped_when_disabled(self, tmp_path, monkeypatch, debug_log):
+        _write_config(tmp_path, monkeypatch, retain_kanban_workers=False)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
+        worker = _init_provider(tmp_path)
+        worker.sync_turn("hello", "hi there")
+        assert _retained_items(worker) == []
+        assert debug_log() == [
+            "sync_turn: skipped (Kanban worker (HERMES_KANBAN_TASK=t_test) with retain_kanban_workers=false)"]
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK")
+        interactive = _init_provider(tmp_path)
+        interactive.sync_turn("hello", "hi there")
+        assert len(_retained_items(interactive)) == 1
+
+    # -- 3. kill switch ------------------------------------------------------------------------
+
+    @pytest.mark.parametrize("value", ["0", "false", "off"])
+    def test_kill_switch_disables_auto_retain_but_not_the_tool(self, tmp_path, monkeypatch, debug_log, value):
+        monkeypatch.setenv("HINDSIGHT_AUTO_RETAIN", value)
+        _write_config(tmp_path, monkeypatch)
+        p = _init_provider(tmp_path)
+        p.sync_turn("hello", "hi there")
+        assert _retained_items(p) == []
+        assert debug_log() == ["sync_turn: skipped (HINDSIGHT_AUTO_RETAIN=0 kill switch)"]
+
+        # A deliberate write still goes through.
+        result = json.loads(p.handle_tool_call("hindsight_retain", {"content": "MB prefers tea"}))
+        assert result == {"result": "Memory stored successfully."}
+        assert [i["content"] for i in _retained_items(p)] == ["MB prefers tea"]
+
+    def test_kill_switch_set_to_one_keeps_auto_retain(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HINDSIGHT_AUTO_RETAIN", "1")
+        _write_config(tmp_path, monkeypatch)
+        p = _init_provider(tmp_path)
+        p.sync_turn("hello", "hi there")
+        assert len(_retained_items(p)) == 1
+
+    # -- 4. stream-error / empty turns -------------------------------------------------------------
+
+    @pytest.mark.parametrize(("assistant", "reason"), [
+        ("", "empty assistant response"),
+        ("   \n", "empty assistant response"),
+        (None, "empty assistant response"),
+        ('[stream error: Upstream stream HTTP 400: {"error": {}}]', "assistant response is a stream error"),
+        ("  [stream error: connection reset]", "assistant response is a stream error"),
+    ])
+    def test_error_and_empty_turns_are_skipped(self, provider, debug_log, assistant, reason):
+        provider.sync_turn("hello", assistant)
+        assert _retained_items(provider) == []
+        assert provider._session_turns == []  # never buffered into a later batch either
+        assert debug_log() == [f"sync_turn: skipped ({reason})"]
+
+    def test_skipped_turn_does_not_leak_into_the_next_batch(self, provider_with_config):
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+        p.sync_turn("q1", "[stream error: boom]")
+        p.sync_turn("q2", "a2")
+        assert _retained_items(p) == []  # only one real turn buffered so far
+        p.sync_turn("q3", "a3")
+        (item,) = _retained_items(p)
+        users = [turn[0]["content"] for turn in json.loads(item["content"])]
+        assert users == ["User: q2", "User: q3"]
+
+    def test_text_mentioning_stream_error_later_is_kept(self, provider):
+        provider.sync_turn("what is a [stream error", "It is the placeholder text for a failed stream.")
+        assert len(_retained_items(provider)) == 1
+
+    # -- 5. lineage tags ------------------------------------------------------------------------------
+
+    def test_lineage_tags_on_by_default(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch, retain_tags=["project:x"])
+        p = _init_provider(tmp_path, parent_session_id="sess-0")
+        p.sync_turn("hello", "hi there")
+        (item,) = _retained_items(p)
+        assert item["tags"] == ["project:x", "session:sess-1", "parent:sess-0"]
+
+    def test_lineage_tags_off_keeps_ids_in_metadata(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch, retain_lineage_tags=False, retain_tags=["project:x"])
+        p = _init_provider(tmp_path, parent_session_id="sess-0")
+        p.sync_turn("hello", "hi there")
+        (item,) = _retained_items(p)
+        assert item["tags"] == ["project:x"]
+        assert item["metadata"]["session_id"] == "sess-1"
+        assert item["metadata"]["parent_session_id"] == "sess-0"
+
+    def test_lineage_tags_off_and_no_retain_tags_sends_no_tags_key(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch, retain_lineage_tags="false")
+        p = _init_provider(tmp_path, parent_session_id="sess-0")
+        p.sync_turn("hello", "hi there")
+        (item,) = _retained_items(p)
+        assert "tags" not in item
+
+    # -- 7. named observation scope (tag taxonomy option C) -------------------------------------------
+
+    @pytest.mark.parametrize("raw", [
+        [["scope:personal"]], '[["scope:personal"]]', ["scope:personal"], '["scope:personal"]',
+    ])
+    def test_named_observation_scope_survives_normalizer(self, raw):
+        assert _normalize_observation_scopes(raw) == [["scope:personal"]]
+
+    @pytest.mark.parametrize("raw", ["shared", [[]], "[[]]", "", None])
+    def test_unnamed_scopes_are_dropped(self, raw):
+        assert _normalize_observation_scopes(raw) is None
+
+    @pytest.mark.parametrize("source", ["config", "env"])
+    def test_named_scope_reaches_the_retain_item(self, tmp_path, monkeypatch, source):
+        if source == "config":
+            _write_config(tmp_path, monkeypatch, observation_scopes=[["scope:personal"]],
+                          retain_lineage_tags=False)
+        else:
+            monkeypatch.setenv("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", '[["scope:personal"]]')
+            _write_config(tmp_path, monkeypatch, retain_lineage_tags=False)
+        p = _init_provider(tmp_path)
+        p.sync_turn("hello", "hi there")
+        p.handle_tool_call("hindsight_retain", {"content": "MB prefers tea"})
+        items = _retained_items(p)
+        assert [i["observation_scopes"] for i in items] == [[["scope:personal"]]] * 2
+        assert all("tags" not in i for i in items)
 
 
 # ---------------------------------------------------------------------------

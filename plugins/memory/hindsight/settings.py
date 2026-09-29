@@ -42,6 +42,42 @@ _PROVIDER_DEFAULT_MODELS = {
 # The embedded daemon speaks OpenAI wire format for these providers.
 _OPENAI_WIRE_PROVIDERS = {"openai_compatible", "openrouter"}
 _OBSERVATION_SCOPE_KEYWORDS = {"per_tag", "combined", "all_combinations"}
+# ``agent_context`` values the agent hands initialize() (agent/memory_provider.py). Auto-retain runs
+# for these by default; "subagent"/"flush" never reach this provider today (delegated children run
+# with skip_memory=True), so the default only has to name the contexts that do.
+_KNOWN_AGENT_CONTEXTS = {"primary", "cron", "subagent", "flush"}
+_DEFAULT_RETAIN_CONTEXTS = ("primary", "cron")
+# Assistant text the runtime substitutes for a failed stream; such a turn carries no knowledge.
+_STREAM_ERROR_PREFIX = "[stream error"
+_FALSE_STRINGS = {"0", "false", "no", "off"}
+_TRUE_STRINGS = {"1", "true", "yes", "on"}
+
+
+def _parse_bool_setting(value: Any, default: bool) -> bool:
+    """Parse a boolean config/env value ("0"/"false"/"no"/"off" and friends); unknown -> *default*."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in _FALSE_STRINGS:
+        return False
+    if text in _TRUE_STRINGS:
+        return True
+    logger.warning("Invalid boolean Hindsight setting %r; using default %s", value, default)
+    return default
+
+
+def _normalize_retain_contexts(value: Any) -> tuple[str, ...]:
+    """``retain_contexts`` (list or comma-separated) -> tuple of agent contexts that auto-retain.
+    Unset/blank keeps the default; an explicit empty list disables auto-retain in every context."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return _DEFAULT_RETAIN_CONTEXTS
+    contexts = tuple(c.lower() for c in _normalize_retain_tags(value))
+    if unknown := [c for c in contexts if c not in _KNOWN_AGENT_CONTEXTS]:
+        logger.warning("Unknown Hindsight retain_contexts %s (known: %s); those never match",
+                       unknown, sorted(_KNOWN_AGENT_CONTEXTS))
+    return contexts
 
 
 def _parse_int_setting(value: Any, default: int) -> int:

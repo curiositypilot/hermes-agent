@@ -6,6 +6,8 @@ config.json (legacy, shared), else env: HINDSIGHT_API_KEY / BANK_ID / BUDGET /
 API_URL / MODE / TIMEOUT / IDLE_TIMEOUT / RETAIN_TAGS / RETAIN_OBSERVATION_SCOPES /
 RETAIN_SOURCE / RETAIN_USER_PREFIX / RETAIN_ASSISTANT_PREFIX, and
 HINDSIGHT_EMBED_PORT_HEALTH_GRACE_TIMEOUT (config.json port_health_grace_timeout).
+HINDSIGHT_AUTO_RETAIN=0 is a per-process kill switch for automatic turn retains (probe/test
+launchers); explicit hindsight_retain tool calls are unaffected.
 """
 
 from __future__ import annotations
@@ -41,15 +43,19 @@ from .embedded import (
 from .settings import (
     _DEFAULT_API_URL, _DEFAULT_IDLE_TIMEOUT, _DEFAULT_LOCAL_URL, _DEFAULT_RETAIN_SOURCE,
     _DEFAULT_TIMEOUT, _HINDSIGHT_GLYPH, _MIN_CLIENT_VERSION, _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
-    _PROVIDER_DEFAULT_MODELS, _VALID_BUDGETS, _daemon_llm_provider,
-    _normalize_observation_scopes, _normalize_retain_tags, _parse_int_setting,
-    _resolve_bank_id_template,
+    _PROVIDER_DEFAULT_MODELS, _STREAM_ERROR_PREFIX, _VALID_BUDGETS, _daemon_llm_provider,
+    _normalize_observation_scopes, _normalize_retain_contexts, _normalize_retain_tags,
+    _parse_bool_setting, _parse_int_setting, _resolve_bank_id_template,
 )
 
 logger = logging.getLogger(__name__)
 
 _LOCAL_MODES = {"local", "local_embedded"}
 _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
+# Process-level switches, deliberately read from os.environ rather than the secret scope: they
+# describe THIS process (a Kanban worker the dispatcher spawned, a probe launcher), not a profile.
+_KANBAN_TASK_ENV = "HERMES_KANBAN_TASK"
+_AUTO_RETAIN_KILL_SWITCH_ENV = "HINDSIGHT_AUTO_RETAIN"
 
 
 def _ensure_client_dependency() -> None:
@@ -302,7 +308,7 @@ _SESSION_KWARGS = (
 )
 # Retain metadata keys, each stamped from the attribute of the same name when set.
 _METADATA_ATTRS = (
-    "session_id", "platform", "user_id", "user_name", "chat_id", "chat_name",
+    "session_id", "parent_session_id", "platform", "user_id", "user_name", "chat_id", "chat_name",
     "chat_type", "thread_id", "agent_identity",
 )
 _SYSTEM_PROMPT_TAILS = {
@@ -338,6 +344,7 @@ class HindsightMemoryProvider(MemoryProvider):
         for name in _SESSION_KWARGS:
             setattr(self, f"_{name}", "")
         self._session_id = self._parent_session_id = self._document_id = ""
+        self._agent_context = "primary"
         self._status_callback: Optional[Callable[[str], None]] = None
 
         # Retain: single-writer model — sync_turn() enqueues, one writer thread
@@ -446,6 +453,9 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
             {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
+            {"key": "retain_contexts", "description": "Agent contexts whose turns are auto-retained (list or comma-separated; values: primary, cron, subagent, flush). Default keeps interactive and cron sessions; [] retains nothing automatically. Env HINDSIGHT_AUTO_RETAIN=0 disables auto-retain for one process regardless.", "default": ["primary", "cron"]},
+            {"key": "retain_kanban_workers", "description": "Auto-retain turns of Kanban worker sessions (processes with HERMES_KANBAN_TASK set)", "default": True},
+            {"key": "retain_lineage_tags", "description": "Tag auto-retained turns with session:<id> / parent:<id>. Each tag set is its own consolidation scope, so these tags stop conversation facts from consolidating together; session ids stay in metadata either way.", "default": True},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
             {"key": "prefetch_waits_for_retain", "description": "Have the background next-turn prefetch wait for the just-completed retain to become recall-visible on the server (local queue drain + async operation completion) before recalling, so recall includes the just-completed turn (runs off the reply path, adds no response latency)", "default": True},
@@ -679,7 +689,11 @@ class HindsightMemoryProvider(MemoryProvider):
         # Gated presentation for automatic startup warnings (agent._emit_warning on CLI).
         self._warning_callback = kwargs.get("warning_callback") if callable(kwargs.get("warning_callback")) else None
         self._platform = str(kwargs.get("platform") or "cli")
-        # session_id stays in tags so processes for one session remain filterable together.
+        # "primary" | "cron" | "subagent" | "flush" (agent_init._memory_provider_init_kwargs);
+        # older callers omit it, and they only ever ran interactive sessions.
+        self._agent_context = str(kwargs.get("agent_context") or "primary").strip().lower()
+        # session_id stays in tags (unless retain_lineage_tags=false) so processes for one
+        # session remain filterable together.
         self._document_id = _mint_document_id(self._session_id)
         _maybe_upgrade_client()
 
@@ -717,10 +731,13 @@ class HindsightMemoryProvider(MemoryProvider):
                          self._bank_id_template, self._agent_identity, self._agent_workspace,
                          self._platform, self._user_id, self._bank_id)
         logger.debug("Hindsight config: auto_retain=%s, auto_recall=%s, retain_every_n=%d, "
-                     "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, tags=%s, recall_tags=%s",
+                     "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, tags=%s, recall_tags=%s, "
+                     "agent_context=%s, retain_contexts=%s, retain_kanban_workers=%s, retain_lineage_tags=%s, "
+                     "auto_retain_blocked=%s",
                      self._auto_retain, self._auto_recall, self._retain_every_n_turns,
                      self._retain_async, self._retain_context, self._recall_max_tokens, self._recall_max_input_chars,
-                     self._tags, self._recall_tags)
+                     self._tags, self._recall_tags, self._agent_context, list(self._retain_contexts),
+                     self._retain_kanban_workers, self._retain_lineage_tags, self._auto_retain_block_reason)
 
         if self._mode == "local_embedded":
             self._start_embedded_daemon()
@@ -766,6 +783,7 @@ class HindsightMemoryProvider(MemoryProvider):
             or "Assistant"
         )
         self._apply_retain_policy(cfg)
+        self._auto_retain_block_reason = self._resolve_auto_retain_block()
 
     def _apply_retain_policy(self, cfg: dict) -> None:
         """Pure-config retain knobs (no env/secret reads; ``{}`` yields the defaults)."""
@@ -781,6 +799,26 @@ class HindsightMemoryProvider(MemoryProvider):
         # for the queue to drain AND the server-side op(s) to complete.
         self._prefetch_waits_for_retain = cfg.get("prefetch_waits_for_retain", True)
         self._prefetch_retain_drain_timeout = float(cfg.get("prefetch_retain_drain_timeout", 10.0))
+        # Writer controls. Every default reproduces the pre-switch behaviour: primary AND cron
+        # sessions retain, Kanban workers retain, and turns carry session:/parent: lineage tags.
+        self._retain_contexts = _normalize_retain_contexts(cfg.get("retain_contexts"))
+        self._retain_kanban_workers = _parse_bool_setting(cfg.get("retain_kanban_workers"), True)
+        # Each distinct tag set is its own consolidation scope on the server, so per-session tags
+        # keep conversation facts from ever consolidating with each other. session_id and
+        # parent_session_id stay in the item metadata either way.
+        self._retain_lineage_tags = _parse_bool_setting(cfg.get("retain_lineage_tags"), True)
+        self._auto_retain_block_reason: str | None = None
+
+    def _resolve_auto_retain_block(self) -> str | None:
+        """Why auto-retain is off for this whole process/session, or None. Evaluated once at
+        initialize(): agent context and process env do not change over a provider's life."""
+        if not _parse_bool_setting(os.environ.get(_AUTO_RETAIN_KILL_SWITCH_ENV), True):
+            return f"{_AUTO_RETAIN_KILL_SWITCH_ENV}=0 kill switch"
+        if self._agent_context not in self._retain_contexts:
+            return f"agent_context={self._agent_context!r} not in retain_contexts {list(self._retain_contexts)}"
+        if not self._retain_kanban_workers and (task := os.environ.get(_KANBAN_TASK_ENV, "").strip()):
+            return f"Kanban worker ({_KANBAN_TASK_ENV}={task}) with retain_kanban_workers=false"
+        return None
 
     def _apply_recall_settings(self, cfg: dict) -> None:
         """Recall knobs are pure config too (``{}`` yields the defaults)."""
@@ -1026,7 +1064,8 @@ class HindsightMemoryProvider(MemoryProvider):
         writer runs after later sync_turn() calls mutate _session_turns/_turn_index/_session_id."""
         content = "[" + ",".join(turns) + "]"
         metadata = self._build_metadata(message_count=len(turns) * 2, turn_index=self._turn_index)
-        lineage = (("session", self._session_id), ("parent", self._parent_session_id))
+        lineage = ((("session", self._session_id), ("parent", self._parent_session_id))
+                   if self._retain_lineage_tags else ())
         tags = [f"{kind}:{sid}" for kind, sid in lineage if sid] or None
         bank_id, retain_async, retain_context = self._bank_id, self._retain_async, self._retain_context
 
@@ -1044,10 +1083,24 @@ class HindsightMemoryProvider(MemoryProvider):
 
         return _job
 
+    @staticmethod
+    def _turn_skip_reason(assistant_content: Any) -> str | None:
+        """Per-turn content gate: a turn with no assistant text, or whose text is the runtime's
+        ``[stream error ...]`` placeholder, carries nothing worth extracting."""
+        text = str(assistant_content or "").strip()
+        if not text:
+            return "empty assistant response"
+        if text.startswith(_STREAM_ERROR_PREFIX):
+            return "assistant response is a stream error"
+        return None
+
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Enqueue a retain for the current turn (non-blocking; writer thread). Dropped
         once shutdown() fired so post-exit retains never reach aiohttp during teardown."""
-        why = "auto_retain disabled" if not self._auto_retain else "shutting down" if self._shutting_down.is_set() else None
+        why = ("auto_retain disabled" if not self._auto_retain
+               else "shutting down" if self._shutting_down.is_set()
+               else self._auto_retain_block_reason
+               or self._turn_skip_reason(assistant_content))
         if why:
             logger.debug("sync_turn: skipped (%s)", why)
             return
