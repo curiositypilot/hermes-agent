@@ -47,15 +47,11 @@ def test_marker_fires_only_on_single_credential_entitlement_400_and_fallback_wal
         SimpleNamespace(status_code=403, message="model is not supported when using Codex with a ChatGPT account."),
     ):
         assert _mark_entitlement_rejected_model(agent, err) is False
-    # Pool still has an entry eligible for this model: rotation owns it, no session marker (#71970).
+    # Fork: no pool rotation or bench for entitlement 400s, so the marker fires on the first
+    # rejection even while other pool entries look available.
     pool = MagicMock()
     pool.has_available.return_value = True
     agent._credential_pool = pool
-    assert _mark_entitlement_rejected_model(agent, _entitlement_error("gpt-5.6-sol")) is False
-    pool.has_available.assert_called_once_with(model="gpt-5.6-sol")
-    assert getattr(agent, "_entitlement_rejected_models", None) is None
-    # Every pool entry is benched for the model: the fail-closed marker fires even with a pool.
-    pool.has_available.return_value = False
     assert _mark_entitlement_rejected_model(agent, _entitlement_error("gpt-5.6-sol")) is True
 
     agent._credential_pool = None
