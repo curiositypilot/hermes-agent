@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from agent.usage_pricing import (
     _OFFICIAL_DOCS_PRICING,
     CanonicalUsage,
@@ -467,6 +469,36 @@ def test_normalize_usage_native_anthropic_no_cache_observability(caplog):
     assert result.input_tokens == 100
     assert result.cache_read_tokens == 50
     assert result.cache_write_tokens == 10
+
+
+@pytest.mark.parametrize("provider,api_mode", [
+    ("anthropic", None),
+    ("anthropic", "anthropic_messages"),
+    ("openai-codex", "codex_responses"),
+])
+def test_normalize_usage_reads_chat_shape_under_native_wire_names(provider, api_mode):
+    """The aux client's Anthropic/Codex adapters re-emit usage in Chat Completions
+    shape. The provider/api_mode must not force the native shape onto it: that
+    read all zeros and aux accounting dropped the call (vision on anthropic)."""
+    usage = SimpleNamespace(prompt_tokens=106, completion_tokens=24, total_tokens=130)
+
+    result = normalize_usage(usage, provider=provider, api_mode=api_mode)
+
+    assert (result.input_tokens, result.output_tokens) == (106, 24)
+    assert result == normalize_usage(usage)
+
+
+def test_normalize_usage_native_anthropic_shape_wins_when_both_present():
+    """Native Anthropic input_tokens excludes cached tokens, so a usage object that
+    carries native fields keeps the native (no-subtraction) reading."""
+    usage = SimpleNamespace(
+        input_tokens=100, output_tokens=20, cache_read_input_tokens=50,
+        prompt_tokens=999, completion_tokens=999,
+    )
+
+    result = normalize_usage(usage, provider="anthropic", api_mode="anthropic_messages")
+
+    assert (result.input_tokens, result.output_tokens, result.cache_read_tokens) == (100, 20, 50)
 
 
 # ---------------------------------------------------------------------------
