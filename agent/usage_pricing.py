@@ -508,6 +508,15 @@ def normalize_usage(
         shape = _CODEX_USAGE_SHAPE
     else:
         shape = _CHAT_USAGE_SHAPE
+    # The provider/api_mode names the wire, not the object in hand: the aux client's
+    # Anthropic and Codex adapters re-emit usage in Chat Completions shape
+    # (prompt_tokens/completion_tokens). Reading that with the native shape yields
+    # all zeros, and zero usage is dropped from session accounting, so fall back
+    # to the Chat shape when only its fields are populated.
+    if shape is not _CHAT_USAGE_SHAPE and not _first_nonzero(
+        u, ("input_tokens",), ("output_tokens",)
+    ) and _first_nonzero(u, ("prompt_tokens",), ("completion_tokens",)):
+        shape = _CHAT_USAGE_SHAPE
     prompt_total, output_tokens, cache_read_tokens, cache_write_tokens = (
         _first_nonzero(u, *paths) for paths in shape
     )

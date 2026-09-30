@@ -189,6 +189,30 @@ class TestAmbientAccountingContext:
         assert rows[0]["input_tokens"] == 100
         assert rows[0]["output_tokens"] == 20
 
+    def test_anthropic_aux_usage_is_recorded(self, db):
+        """The Anthropic aux adapter emits Chat-shaped usage; provider='anthropic'
+        must still produce a row (vision on claude-sonnet recorded nothing)."""
+        from agent.aux_accounting import (
+            record_aux_usage,
+            reset_accounting_context,
+            set_accounting_context,
+        )
+
+        db.create_session("s1", source="cli")
+        token = set_accounting_context(db, "s1")
+        try:
+            record_aux_usage(
+                _mk_response(model="claude-sonnet-5-5", prompt=106, completion=24),
+                "vision", provider="anthropic",
+            )
+        finally:
+            reset_accounting_context(token)
+        rows = _usage_rows(db, "s1")
+        assert [(r["task"], r["billing_provider"], r["model"]) for r in rows] == [
+            ("vision", "anthropic", "claude-sonnet-5-5")
+        ]
+        assert (rows[0]["input_tokens"], rows[0]["output_tokens"]) == (106, 24)
+
 
     def test_moa_tasks_excluded(self, db):
         """MoA advisor usage is already folded into the main-loop delta by
