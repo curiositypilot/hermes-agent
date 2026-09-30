@@ -852,18 +852,25 @@ def _memory_query_text(original_user_message: Any) -> str:
 
 def _memory_turn_start_and_prefetch(
     agent: Any, original_user_message: Any, turn_author: Optional[Dict[str, Any]] = None,
+    memory_query: Optional[str] = None,
 ) -> str:
     """Notify memory providers of the new turn, then prefetch external memory once
     before the tool loop (skipped on trivial prompts with no semantic signal).
-    Returns the prefetch text (``""`` when nothing was injected)."""
+    Returns the prefetch text (``""`` when nothing was injected).
+
+    ``memory_query``: the caller's own topic text for this turn when the message the model
+    receives is mostly scaffolding (a cron run's hint + skills + script output wrap the
+    job's prompt). Blank/None keeps the message text as the query."""
     if not agent._memory_manager:
         return ""
-    _query = _memory_query_text(original_user_message)
+    _message_text = _memory_query_text(original_user_message)
+    _override = memory_query.strip() if isinstance(memory_query, str) else ""
+    _query = _override or _message_text
     # The author rides along so a provider can attribute THIS turn, not whoever opened the session.
     _author = turn_author if isinstance(turn_author, dict) else {}
     with suppress(Exception):
         agent._memory_manager.on_turn_start(
-            agent._user_turn_count, _query,
+            agent._user_turn_count, _message_text,
             author_id=_author.get("id") or None, author_name=_author.get("name") or None,
             author_is_bot=bool(_author.get("is_bot")),
         )
@@ -983,6 +990,7 @@ def build_turn_context(
     persist_user_message: Optional[Any], persist_user_timestamp: Optional[float]=None,
     persist_user_platform_id: Optional[str]=None, *, persist_user_display_kind: Optional[str]=None,
     persist_user_display_metadata: Optional[Dict[str, Any]]=None, turn_author: Optional[Dict[str, Any]]=None,
+    memory_query: Optional[str]=None,
     restore_or_build_system_prompt,
     install_safe_stdio, sanitize_surrogates, summarize_user_message_for_log, set_session_context,
     set_current_write_origin, ra, moa_active: bool=False,
@@ -1121,7 +1129,8 @@ def build_turn_context(
     )
 
     _bind_interrupt_scope(agent, ra)
-    ext_prefetch_cache = _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
+    ext_prefetch_cache = _memory_turn_start_and_prefetch(
+        agent, original_user_message, turn_author, memory_query=memory_query)
 
     # Title the session now: titling depends only on the user's ask (before any injected
     # context lands on list content), so it runs concurrently with the turn. Daemon thread,

@@ -44,8 +44,9 @@ from .settings import (
     _DEFAULT_API_URL, _DEFAULT_IDLE_TIMEOUT, _DEFAULT_LOCAL_URL, _DEFAULT_RETAIN_SOURCE,
     _DEFAULT_TIMEOUT, _HINDSIGHT_GLYPH, _MIN_CLIENT_VERSION, _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
     _PROVIDER_DEFAULT_MODELS, _STREAM_ERROR_PREFIX, _VALID_BUDGETS, _daemon_llm_provider,
-    _normalize_observation_scopes, _normalize_retain_contexts, _normalize_retain_tags,
-    _parse_bool_setting, _parse_int_setting, _parse_score_floor, _resolve_bank_id_template,
+    _KANBAN_QUERY_BODY_CHARS, _kanban_recall_query, _kanban_recall_tags, _normalize_observation_scopes,
+    _normalize_retain_contexts, _normalize_retain_tags, _parse_bool_setting, _parse_int_setting,
+    _parse_score_floor, _resolve_bank_id_template,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 # Process-level switches, deliberately read from os.environ rather than the secret scope: they
 # describe THIS process (a Kanban worker the dispatcher spawned, a probe launcher), not a profile.
 _KANBAN_TASK_ENV = "HERMES_KANBAN_TASK"
+_KANBAN_TENANT_ENV = "HERMES_TENANT"
 _AUTO_RETAIN_KILL_SWITCH_ENV = "HINDSIGHT_AUTO_RETAIN"
 
 
@@ -465,6 +467,10 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "recall_min_reranker", "description": "Auto-recall relevance floor (0-1): drop results whose normalized reranker score is below it, so an off-topic turn injects nothing. Blank applies no floor. The explicit hindsight_recall tool is not filtered.", "default": ""},
+            {"key": "recall_kanban_card_query", "description": "In Kanban workers (HERMES_KANBAN_TASK set), auto-recall with the card's title + the start of its body instead of the dispatcher's topic-free 'work kanban task <id>' message", "default": False},
+            {"key": "recall_kanban_body_chars", "description": "Card-body characters appended to the title for recall_kanban_card_query (0 = title only). Longer queries dilute the reranker score", "default": _KANBAN_QUERY_BODY_CHARS},
+            {"key": "recall_kanban_tags", "description": "Auto-recall tag filter for Kanban workers, replacing recall_tags there (comma-separated or list; '{tenant}' expands to the card's tenant and the tag is dropped for untenanted cards), e.g. 'project:{tenant},scope:personal'. Blank keeps recall_tags", "default": ""},
+            {"key": "recall_kanban_tags_match", "description": "Tag matching mode for recall_kanban_tags ('any' also returns untagged memories)", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_prefer_observations", "description": "When recall_types mixes observation with raw world/experience facts, drop raw facts an included observation was consolidated from (applies to auto-recall and the hindsight_recall tool)", "default": False},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -845,6 +851,43 @@ class HindsightMemoryProvider(MemoryProvider):
         # off-topic turn injects nothing instead of the top-N zero-score results. None = no floor.
         self._recall_min_reranker = _parse_score_floor(cfg.get("recall_min_reranker"))
         self._recall_prefer_observations = _parse_bool_setting(cfg.get("recall_prefer_observations"), False)
+        # Kanban-worker auto-recall (Retrieval·W2). Both default off: today's query and filter.
+        self._recall_kanban_card_query = _parse_bool_setting(cfg.get("recall_kanban_card_query"), False)
+        self._recall_kanban_body_chars = max(
+            0, _parse_int_setting(cfg.get("recall_kanban_body_chars"), _KANBAN_QUERY_BODY_CHARS))
+        self._recall_kanban_tag_templates = _normalize_retain_tags(cfg.get("recall_kanban_tags"))
+        self._recall_kanban_tags_match = cfg.get("recall_kanban_tags_match") or "any"
+        self._kanban_recall: tuple[str, list[str]] | None = None  # resolved lazily, once
+
+    def _kanban_recall_context(self) -> tuple[str, list[str]]:
+        """``(card query, recall tags)`` for a Kanban worker process, ``("", [])`` otherwise or
+        when the knobs are off. Resolved on first auto-recall and cached: the card a worker
+        serves never changes over the process's life. A card that cannot be read degrades to
+        today's behaviour (turn text, recall_tags), never to a failed recall."""
+        if self._kanban_recall is not None:
+            return self._kanban_recall
+        query, tags = "", []
+        task_id = os.environ.get(_KANBAN_TASK_ENV, "").strip()
+        if task_id and (self._recall_kanban_card_query or self._recall_kanban_tag_templates):
+            tenant = os.environ.get(_KANBAN_TENANT_ENV, "").strip()
+            task = None
+            if self._recall_kanban_card_query or not tenant:
+                try:
+                    from hermes_cli import kanban_db as kb
+                    from hermes_cli.kanban_db_connect import connect_closing
+
+                    with connect_closing() as conn:
+                        task = kb.get_task(conn, task_id)
+                except Exception as exc:
+                    logger.debug("Hindsight: could not read Kanban card %s for recall: %s", task_id, exc)
+            if task is not None:
+                tenant = tenant or str(getattr(task, "tenant", "") or "").strip()
+                if self._recall_kanban_card_query:
+                    query = _kanban_recall_query(task.title, task.body, self._recall_kanban_body_chars)
+            tags = _kanban_recall_tags(self._recall_kanban_tag_templates, tenant)
+            logger.debug("Hindsight: Kanban recall for %s: query_len=%d tags=%s", task_id, len(query), tags)
+        self._kanban_recall = (query, tags)
+        return self._kanban_recall
 
     def _start_embedded_daemon(self) -> None:
         """Start the embedded daemon on a background thread (Rich output -> log file)."""
@@ -935,7 +978,10 @@ class HindsightMemoryProvider(MemoryProvider):
         deliberate search whose relevance the model judges itself, and the reranker's
         absolute scores are not calibrated across queries."""
         kwargs: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
-        if self._recall_tags:
+        kanban_tags = self._kanban_recall_context()[1] if auto else []
+        if kanban_tags:
+            kwargs.update(tags=kanban_tags, tags_match=self._recall_kanban_tags_match)
+        elif self._recall_tags:
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
         if self._recall_types:
             kwargs["types"] = self._recall_types
@@ -957,6 +1003,8 @@ class HindsightMemoryProvider(MemoryProvider):
     def _do_recall(self, query: str) -> tuple[str, int]:
         """One recall/reflect for *query* (background prefetch and ``recall_sync`` paths)
         -> (text, memory count); the count is 0 for reflect (synthesis) and on error."""
+        # A Kanban worker's turns all serve one card; its title/body is the topic.
+        query = self._kanban_recall_context()[0] or query
         if self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
         try:

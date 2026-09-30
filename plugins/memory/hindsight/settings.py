@@ -130,6 +130,37 @@ def _normalize_retain_tags(value: Any) -> List[str]:
     return normalized
 
 
+# Kanban card text used as the worker's recall query (Retrieval·W2): the dispatcher's
+# first message is the topic-free "work kanban task <id>". Default body share is 200 chars:
+# measured on 5 live cards, the normalized reranker score of the best hit fell to <=0.04 with
+# 600 body chars (spec, card bodies open with boilerplate) vs up to 0.51 at 200, so a
+# recall_min_reranker floor would abstain on nearly every card at 600.
+_KANBAN_QUERY_BODY_CHARS = 200
+
+
+def _kanban_recall_query(title: Any, body: Any, body_chars: int = _KANBAN_QUERY_BODY_CHARS) -> str:
+    """Card title + the first *body_chars* of its body; ``""`` when the card has neither."""
+    title_text = str(title or "").strip()
+    body_text = str(body or "").strip()[:max(0, body_chars)].strip()
+    return "\n\n".join(part for part in (title_text, body_text) if part)
+
+
+def _kanban_recall_tags(templates: Any, tenant: str) -> List[str]:
+    """Expand ``recall_kanban_tags`` templates for one worker. ``{tenant}`` is the card's
+    tenant (``HERMES_TENANT``); a template naming ``{tenant}`` is dropped when the card has
+    none, so an untenanted card never filters on a literal ``project:``."""
+    tenant = str(tenant or "").strip()
+    tags: list[str] = []
+    for template in _normalize_retain_tags(templates):
+        if "{tenant}" in template:
+            if not tenant:
+                continue
+            template = template.replace("{tenant}", tenant)
+        if template not in tags:
+            tags.append(template)
+    return tags
+
+
 def _normalize_observation_scopes(value: Any) -> Any:
     """Normalize observation_scopes to a keyword string, ``list[list[str]]`` (one inner
     list per consolidation pass), or ``None`` (Hindsight's ``combined`` default).

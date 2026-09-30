@@ -918,6 +918,129 @@ class TestRecallStatus:
 
 
 # ---------------------------------------------------------------------------
+# Kanban-worker auto-recall: card query + tenant tags (Retrieval·W2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def kanban_card(tmp_path, monkeypatch):
+    """A real card on an isolated board; returns a factory ``(title, body, tenant) -> id``
+    that also points this process at it the way the dispatcher does (HERMES_KANBAN_TASK)."""
+    home = tmp_path / "kanban-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_TENANT", raising=False)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    def _make(title, body=None, tenant=None, *, set_tenant_env=True):
+        with connect_closing() as conn:
+            tid = kb.create_task(conn, title=title, body=body, tenant=tenant, assignee="w")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        if tenant and set_tenant_env:
+            monkeypatch.setenv("HERMES_TENANT", tenant)
+        return tid
+    return _make
+
+
+_DISPATCH_MESSAGE = "work kanban task t_0000"
+
+
+class TestKanbanRecall:
+    def test_defaults_keep_the_turn_text_and_recall_tags(self, provider_with_config, kanban_card):
+        kanban_card("Rotate brake pads", "Order pads for the Octavia.", tenant="garage")
+        p = provider_with_config(recall_tags="x")
+        kwargs = _auto_recall_kwargs(p, _DISPATCH_MESSAGE)
+        assert kwargs["query"] == _DISPATCH_MESSAGE
+        assert kwargs["tags"] == "x"
+
+    def test_card_query_replaces_dispatch_message(self, provider_with_config, kanban_card):
+        body = "Order pads for the Octavia. " * 40  # > 600 chars
+        kanban_card("Rotate brake pads", body)
+        p = provider_with_config(recall_kanban_card_query=True, recall_max_input_chars=5000)
+        query = _auto_recall_kwargs(p, _DISPATCH_MESSAGE)["query"]
+        assert query.startswith("Rotate brake pads\n\nOrder pads for the Octavia.")
+        assert len(query) <= len("Rotate brake pads\n\n") + p._recall_kanban_body_chars
+        assert _DISPATCH_MESSAGE not in query
+
+    @pytest.mark.parametrize("chars", [0, 600])
+    def test_body_chars_bounds_the_body_share(self, provider_with_config, kanban_card, chars):
+        kanban_card("Rotate brake pads", "x" * 1000)
+        p = provider_with_config(recall_kanban_card_query=True, recall_kanban_body_chars=chars,
+                                 recall_max_input_chars=5000)
+        query = _auto_recall_kwargs(p, _DISPATCH_MESSAGE)["query"]
+        assert query.count("x") == chars
+        assert query.startswith("Rotate brake pads")
+
+    def test_card_query_reaches_recall_sync_and_is_still_truncated(self, provider_with_config, kanban_card):
+        kanban_card("Rotate brake pads", "Order pads " * 100)
+        p = provider_with_config(recall_kanban_card_query=True, recall_sync=True, recall_max_input_chars=50)
+        p.prefetch(_DISPATCH_MESSAGE)
+        query = p._client.arecall.await_args.kwargs["query"]
+        assert query.startswith("Rotate brake pads") and len(query) == 50
+
+    def test_tenant_tags_replace_recall_tags_for_auto_recall_only(self, provider_with_config, kanban_card):
+        kanban_card("Rotate brake pads", tenant="garage")
+        p = provider_with_config(recall_tags="x", recall_kanban_tags="project:{tenant},scope:personal")
+        kwargs = _auto_recall_kwargs(p, _DISPATCH_MESSAGE)
+        assert kwargs["tags"] == ["project:garage", "scope:personal"]
+        assert kwargs["tags_match"] == "any"
+        # The explicit tool is a deliberate search: the configured recall_tags still govern it.
+        p.handle_tool_call("hindsight_recall", {"query": "q"})
+        assert p._client.arecall.await_args.kwargs["tags"] == "x"
+
+    def test_tenant_read_from_card_when_env_absent(self, provider_with_config, kanban_card):
+        kanban_card("Rotate brake pads", tenant="garage", set_tenant_env=False)
+        p = provider_with_config(recall_kanban_tags=["project:{tenant}"], recall_kanban_tags_match="any_strict")
+        kwargs = _auto_recall_kwargs(p, _DISPATCH_MESSAGE)
+        assert kwargs["tags"] == ["project:garage"]
+        assert kwargs["tags_match"] == "any_strict"
+
+    def test_untenanted_card_drops_tenant_templates(self, provider_with_config, kanban_card):
+        kanban_card("Rotate brake pads")
+        p = provider_with_config(recall_kanban_tags="project:{tenant}")
+        assert "tags" not in _auto_recall_kwargs(p, _DISPATCH_MESSAGE)
+
+    def test_non_worker_process_is_unaffected(self, provider_with_config, monkeypatch):
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        p = provider_with_config(recall_kanban_card_query=True, recall_kanban_tags="project:{tenant},scope:personal")
+        kwargs = _auto_recall_kwargs(p, "brake pads")
+        assert kwargs["query"] == "brake pads"
+        assert "tags" not in kwargs
+
+    def test_unreadable_card_falls_back_to_turn_text(self, provider_with_config, kanban_card, monkeypatch):
+        kanban_card("Rotate brake pads")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing")
+        p = provider_with_config(recall_kanban_card_query=True)
+        assert _auto_recall_kwargs(p, _DISPATCH_MESSAGE)["query"] == _DISPATCH_MESSAGE
+
+    def test_card_is_read_once_per_process(self, provider_with_config, kanban_card, monkeypatch):
+        kanban_card("Rotate brake pads")
+        p = provider_with_config(recall_kanban_card_query=True, recall_sync=True)
+        from hermes_cli import kanban_db as kb
+
+        calls = []
+        real = kb.get_task
+        monkeypatch.setattr(kb, "get_task", lambda conn, tid: calls.append(tid) or real(conn, tid))
+        p.prefetch("turn one")
+        p.prefetch("turn two")
+        assert len(calls) == 1
+        assert p._client.arecall.await_args.kwargs["query"].startswith("Rotate brake pads")
+
+    def test_schema_lists_kanban_keys_with_todays_defaults(self, provider):
+        fields = {f["key"]: f for f in provider.get_config_schema()}
+        assert fields["recall_kanban_card_query"]["default"] is False
+        assert fields["recall_kanban_body_chars"]["default"] == provider._recall_kanban_body_chars
+        assert fields["recall_kanban_tags"]["default"] == ""
+        assert fields["recall_kanban_tags_match"]["default"] == "any"
+
+
+# ---------------------------------------------------------------------------
 # Auto-recall relevance floor / prefer_observations
 # ---------------------------------------------------------------------------
 

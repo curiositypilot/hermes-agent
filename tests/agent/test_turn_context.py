@@ -292,6 +292,29 @@ def test_prefetch_runs_for_substantive_user_message():
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
+def test_memory_query_replaces_the_message_as_recall_query():
+    # Cron: the model receives hint + skills + job prompt; recall searches the job's own prompt.
+    agent, mm = _agent_with_memory_manager()
+    ctx = _build(agent, user_message="[SYSTEM: cron hint ...]\n\nwhat moved in the ledger?",
+                 memory_query="  what moved in the ledger?  ")
+    mm.prefetch_all.assert_called_once_with("what moved in the ledger?", session_id=agent.session_id)
+    # The model still receives the full assembled message.
+    assert ctx.user_message.startswith("[SYSTEM: cron hint")
+
+
+def test_memory_query_is_still_subject_to_the_trivial_prompt_skip():
+    agent, mm = _agent_with_memory_manager()
+    _build(agent, user_message="a long assembled cron prompt about the finance ledger", memory_query="ok")
+    mm.prefetch_all.assert_not_called()
+
+
+def test_blank_memory_query_keeps_the_message_text():
+    agent, mm = _agent_with_memory_manager()
+    query = "what did we decide about the deploy pipeline?"
+    _build(agent, user_message=query, memory_query="   ")
+    mm.prefetch_all.assert_called_once_with(query, session_id=agent.session_id)
+
+
 # ── Per-turn author ──────────────────────────────────────────────────────────
 
 

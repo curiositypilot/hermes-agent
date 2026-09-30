@@ -50,6 +50,21 @@ def _job_skill_names(job: dict) -> list[str]:
     return [str(name).strip() for name in skills if str(name).strip()]
 
 
+def _cron_memory_query(job: dict, extra_prompt: Optional[str] = None) -> str:
+    """The recall query for a cron run: the job's own user-authored text, not the assembled
+    prompt. The assembled prompt leads with skill bodies and the fixed ``_CRON_HINT``, and
+    memory providers truncate their query (Hindsight: ``recall_max_input_chars``), so a
+    no-skill job used to recall against the hint alone. Script output, monitor data,
+    ``context_from`` and the notepad are runtime data, not the topic, and stay out.
+    A job with no prompt (skill-only) falls back to its name + skill names."""
+    query = str(job.get("prompt") or "").strip()
+    if extra_prompt and str(extra_prompt).strip():
+        query = f"{query}\n\n{str(extra_prompt).strip()}".strip()
+    if query:
+        return query
+    return " ".join(p for p in (str(job.get("name") or "").strip(), *_job_skill_names(job)) if p)
+
+
 _MAX_CONTEXT_CHARS = 8000
 
 _SELF_CONTEXT_INTRO = (
