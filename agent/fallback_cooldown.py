@@ -79,12 +79,11 @@ def _arm_rate_limit_cooldown(
 def _mark_entitlement_rejected_model(agent, api_error) -> bool:
     """Record a Codex ChatGPT-account 400 that rejects the current model for this account.
 
-    Pool rotation runs first (recover_with_credential_pool benches (credential, model) and
-    moves to the next entitled entry, #71970); this runs only once no pool entry is left for
-    the model, so the (provider, model) pair is treated as dead for the session: the fallback
-    walk skips it and restore_primary_runtime stops switching back — otherwise every turn
-    re-fails on the primary, announces an unverified "Primary model restored", and oscillates
-    forever (#106475).
+    The (provider, model) pair is treated as dead for this session only: the fallback walk skips
+    it and restore_primary_runtime stops switching back — otherwise every turn re-fails on the
+    primary, announces an unverified "Primary model restored", and oscillates forever (#106475).
+    Fork: nothing is persisted and no pool entry is benched or rotated (a rejection says nothing
+    about tomorrow's plan), so the marker fires on the first rejection, pool or not.
     """
     if getattr(api_error, "status_code", None) != 400:
         return False
@@ -96,9 +95,6 @@ def _mark_entitlement_rejected_model(agent, api_error) -> bool:
     model = str(getattr(agent, "model", "") or "").strip()
     if not provider or not model:
         return False
-    pool = getattr(agent, "_credential_pool", None)
-    if pool is not None and pool.has_available(model=model):
-        return False  # another pool entry is still eligible for this model; rotation owns it
     rejected = getattr(agent, "_entitlement_rejected_models", None)
     if rejected is None:
         rejected = agent._entitlement_rejected_models = set()

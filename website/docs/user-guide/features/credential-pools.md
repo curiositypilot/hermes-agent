@@ -206,7 +206,7 @@ The pool handles different errors differently:
 | **429 Rate Limit** | Retry same key once (transient). Second consecutive 429 rotates to next key | 1 hour |
 | **402 Billing/Quota** | Immediately rotate to next key | 1 hour |
 | **401 Auth Expired** | Try refreshing the OAuth token first. Rotate only if refresh fails | 5 minutes |
-| **400 Codex model entitlement** (`The '<model>' model is not supported when using Codex with a ChatGPT account.`) | Bench this key for the rejected model only and rotate to the next key; other models keep using the key. Other 400s never rotate | Until `hermes auth reset` (per model; an entitlement is a plan property, not a window) |
+| **400 Codex model entitlement** (`The '<model>' model is not supported when using Codex with a ChatGPT account.`) | No rotation and no bench: the key stays healthy for every model. The session falls back and skips that model until restart | — |
 | **All keys exhausted** | Fall through to `fallback_model` if configured | — |
 
 Provider-supplied `reset_at` timestamps override these default cooldowns.

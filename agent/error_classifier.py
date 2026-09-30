@@ -50,7 +50,7 @@ class FailoverReason(enum.Enum):
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator account data/privacy policy excluded the only endpoint
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — deterministic per-request, don't retry unchanged
-    model_entitlement = "model_entitlement"  # This account cannot use the requested model — rotate credential (model-scoped), else fall back
+    model_entitlement = "model_entitlement"  # This account cannot use the requested model — fall back; no credential rotation, no bench
     incomplete_response = "incomplete_response"  # Codex/Responses turn stuck emitting reasoning only (no answer, no tool call) after replay + nudge — hand to a different provider
     format_error = "format_error"        # 400 bad request — abort or strip + retry
     role_alternation = "role_alternation"  # Strict chat template rejected adjacent same-role messages — merge them for this destination and retry
@@ -459,8 +459,9 @@ _V_AUTH_FALLBACK = _v(_R.auth, **_ABORT_FALLBACK)
 _V_MODEL_NOT_FOUND = _v(_R.model_not_found, **_ABORT_FALLBACK)
 _V_UPSTREAM_BLOCKED = _v(_R.upstream_blocked, **_ABORT_FALLBACK)
 _V_CONTENT_BLOCKED = _v(_R.content_policy_blocked, **_ABORT_FALLBACK)
-# Another account in the same pool may hold the entitlement; the credential itself is healthy.
-_V_MODEL_ENTITLEMENT = _v(_R.model_entitlement, retryable=False, **_ROTATE_FALLBACK)
+# Fork: plans gain models as they roll out, so a rejection is not benched and does not rotate the
+# (healthy) credential; the turn falls back and the next request probes the model again.
+_V_MODEL_ENTITLEMENT = _v(_R.model_entitlement, **_ABORT_FALLBACK)
 _V_FORMAT_ERROR = _v(_R.format_error, **_ABORT_FALLBACK)
 # A different provider (direct instead of the aggregator; another host's TLS chain) can fix these.
 _V_POLICY_BLOCKED = _v(_R.provider_policy_blocked, **_ABORT_FALLBACK)

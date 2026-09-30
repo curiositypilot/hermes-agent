@@ -1,11 +1,11 @@
-"""A Codex ChatGPT-account model entitlement 400 rotates to the next pool credential (#71970).
+"""A Codex ChatGPT-account model entitlement 400 benches nothing and rotates nothing (fork).
 
-The exact normalized rejection benches only (credential, model) and hands the next eligible entry
-back; every other 400 stays a plain request failure. Once every entry rejects the model, the
-single-credential handling from #106475 takes over.
+Plans gain models as they roll out, so a rejection today says nothing about tomorrow: the
+credential stays healthy for every model, no ``model_cooldowns`` row is written, and the
+session falls back and skips the slug until restart (#106475 marker). Every other 400 stays
+a plain request failure.
 """
 import json
-import time
 import types
 from unittest.mock import MagicMock
 
@@ -51,16 +51,16 @@ def pool(tmp_path, monkeypatch):
     return load_pool("openai-codex")
 
 
-def test_entitlement_400_benches_only_that_model_and_rotates(pool):
+def test_entitlement_400_falls_back_without_rotating_or_benching(pool):
     verdict = classify_api_error(_entitlement_400(), provider="openai-codex", model=MODEL)
     assert verdict.reason == FailoverReason.model_entitlement
-    assert verdict.should_rotate_credential and verdict.should_fallback and not verdict.retryable
+    assert verdict.should_fallback and not verdict.should_rotate_credential and not verdict.retryable
 
     generic = classify_api_error(_Err(400, {"detail": "Invalid request: bad field"}), provider="openai-codex", model=MODEL)
     assert generic.reason == FailoverReason.format_error and not generic.should_rotate_credential
 
-    # Drive the production recovery entry point (turn recovery -> recover_with_credential_pool),
-    # not the pool directly: the classifier verdict must reach the model-scoped bench.
+    # Drive the production recovery entry point (turn recovery -> recover_with_credential_pool):
+    # the verdict must not reach the pool at all.
     assert pool.select(model=MODEL).id == "cred-0"
     agent = types.SimpleNamespace(
         provider="openai-codex", model=MODEL, base_url="https://chatgpt.com/backend-api/codex",
@@ -69,34 +69,23 @@ def test_entitlement_400_benches_only_that_model_and_rotates(pool):
     )
     assert recover_with_credential_pool(
         agent, status_code=400, has_retried_429=False, classified_reason=verdict.reason,
-    ) == (True, False)
-    agent._swap_credential.assert_called_once()
-    assert agent._swap_credential.call_args.args[0].id == "cred-1"
-    first = pool.entries()[0]
-    assert first.last_status is None  # credential-wide state untouched: other models stay usable
-    assert set(first.model_cooldowns) == {MODEL}
-    # An entitlement is a plan property, not a window: no hourly re-probe, only reset clears it.
-    assert first.model_cooldowns[MODEL] > time.time() + 24 * 3600
+    ) == (False, False)
+    agent._swap_credential.assert_not_called()
+    for entry in pool.entries():
+        assert entry.last_status is None and not entry.model_cooldowns
+    assert pool.select(model=MODEL).id == "cred-0"
     assert pool.select(model=OTHER_MODEL).id == "cred-0"
-    assert pool.reset_statuses() >= 1 and not pool.entries()[0].model_cooldowns
 
 
-def test_all_entries_rejecting_falls_back_to_session_marker(pool):
+def test_first_rejection_marks_the_slug_for_the_session_even_with_a_pool(pool):
     from agent.fallback_cooldown import _is_entitlement_rejected, _mark_entitlement_rejected_model
 
     agent = types.SimpleNamespace(
         provider="openai-codex", model=MODEL, _credential_pool=pool,
         _buffer_diagnostic_status=lambda *_a, **_k: None,
     )
-    pool.mark_exhausted_and_rotate(
-        status_code=400, api_key_hint=TOKENS[0], credential_id="cred-0", failure_reason="model_entitlement", model=MODEL,
-    )
-    # cred-1 is still eligible for the model: rotation owns the recovery, no session-wide marker.
-    assert _mark_entitlement_rejected_model(agent, _entitlement_400()) is False
-    assert not _is_entitlement_rejected(agent, "openai-codex", MODEL)
-
-    assert pool.mark_exhausted_and_rotate(
-        status_code=400, api_key_hint=TOKENS[1], credential_id="cred-1", failure_reason="model_entitlement", model=MODEL,
-    ) is None
     assert _mark_entitlement_rejected_model(agent, _entitlement_400()) is True
     assert _is_entitlement_rejected(agent, "openai-codex", MODEL)
+    assert not _is_entitlement_rejected(agent, "openai-codex", OTHER_MODEL)
+    # Session-only: the pool on disk carries no trace, so a fresh session probes the model again.
+    assert all(not e.model_cooldowns for e in pool.entries())
