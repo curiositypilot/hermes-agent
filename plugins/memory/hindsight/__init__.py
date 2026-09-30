@@ -313,6 +313,42 @@ _METADATA_ATTRS = (
     "session_id", "parent_session_id", "platform", "user_id", "user_name", "chat_id", "chat_name",
     "chat_type", "thread_id", "agent_identity",
 )
+# Source envelope on auto-retained chat turns (retain profile v1.15.0 reads these; keys and the
+# trust value match memory-system evals/retain_quality/configs/universal_v3.json).
+_ENVELOPE_TITLE_MAX = 120
+
+
+def _first_line(text: Any, limit: int = _ENVELOPE_TITLE_MAX) -> str:
+    """First non-empty line of *text*, capped at *limit* chars ('' when none)."""
+    for line in str(text or "").splitlines():
+        if line := line.strip():
+            return line[:limit].rstrip()
+    return ""
+
+
+def _lookup_session_title(hermes_home: Any, session_id: str) -> str:
+    """Session title from ``<hermes_home>/state.db``; '' on any miss or error (fail open).
+
+    Plain read-only sqlite so a retain never opens a writer, runs schema init or blocks on the
+    gateway's write lock."""
+    if not hermes_home or not session_id:
+        return ""
+    try:
+        import sqlite3
+        db_path = Path(hermes_home) / "state.db"
+        if not db_path.is_file():
+            return ""
+        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True, timeout=1.0)
+        try:
+            row = conn.execute("SELECT title FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        finally:
+            conn.close()
+        return _first_line(row[0]) if row and row[0] else ""
+    except Exception:
+        logger.debug("Hindsight envelope: session title lookup failed", exc_info=True)
+        return ""
+
+
 _SYSTEM_PROMPT_TAILS = {
     "context": "Relevant memories are automatically injected into context.",
     "tools": ("Use hindsight_recall to search, hindsight_reflect for synthesis, "
@@ -346,6 +382,10 @@ class HindsightMemoryProvider(MemoryProvider):
         for name in _SESSION_KWARGS:
             setattr(self, f"_{name}", "")
         self._session_id = self._parent_session_id = self._document_id = ""
+        # Envelope inputs: the home handed to initialize() (fallback only; a bound context
+        # override wins per call), the session's first user line and the latest turn time.
+        self._handed_hermes_home = ""
+        self._first_user_line = self._last_turn_at = ""
         self._agent_context = "primary"
         self._status_callback: Optional[Callable[[str], None]] = None
 
@@ -710,6 +750,8 @@ class HindsightMemoryProvider(MemoryProvider):
             setattr(self, f"_{name}", str(kwargs.get(name) or "").strip())
         self._turn_index = self._last_retained_turn_count = 0
         self._session_turns = []
+        self._handed_hermes_home = str(kwargs.get("hermes_home") or "").strip()
+        self._first_user_line = self._last_turn_at = ""
         self._mode = cfg.get("mode", "cloud")
         self._timeout = self._int_setting("timeout", "HINDSIGHT_TIMEOUT", _DEFAULT_TIMEOUT)
         self._idle_timeout = self._int_setting("idle_timeout", "HINDSIGHT_IDLE_TIMEOUT", _DEFAULT_IDLE_TIMEOUT)
@@ -1082,6 +1124,9 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
         now = _event_timestamp()  # one turn -> both messages share the event timestamp
+        self._last_turn_at = now
+        if not self._first_user_line:
+            self._first_user_line = _first_line(user_content)
         return [{"role": role, "content": f"{prefix}: {content}", "timestamp": now} for role, prefix, content in
                 (("user", self._retain_user_prefix, user_content), ("assistant", self._retain_assistant_prefix, assistant_content))]
 
@@ -1096,6 +1141,30 @@ class HindsightMemoryProvider(MemoryProvider):
             metadata["source"] = self._retain_source
         metadata.update({name: value for name in _METADATA_ATTRS if (value := getattr(self, f"_{name}"))})
         return metadata
+
+    def _envelope_home(self) -> str:
+        """Profile home for the title lookup: the caller-bound context override, else the home
+        handed to initialize(). Never ``os.environ`` (plugins/AGENTS.md lifecycle-scope rule)."""
+        from hermes_constants import get_hermes_home_override
+        return get_hermes_home_override() or self._handed_hermes_home
+
+    def _source_envelope(self, *, hermes_home: str, session_id: str, first_user_line: str,
+                         occurred_at: str) -> Dict[str, str]:
+        """Source envelope for an auto-retained chat document. Title = the SessionDB title, else
+        the session's first user line; with neither, the title keys are omitted (fail open)."""
+        platform = self._platform or "cli"
+        envelope = {
+            "source_kind": "chat",
+            "source_origin": platform,
+            "source_site_or_author": f"hermes {platform} session",
+            "trust": "self",
+        }
+        title = _lookup_session_title(hermes_home, session_id) or first_user_line
+        if title:
+            envelope["source_title"] = envelope["session_topic"] = title
+        if occurred_at:
+            envelope["occurred_at"] = occurred_at
+        return envelope
 
     def _build_retain_kwargs(self, content: str, *, context: str | None = None,
                              metadata: Dict[str, str] | None = None, tags: List[str] | None = None,
@@ -1132,8 +1201,13 @@ class HindsightMemoryProvider(MemoryProvider):
                    if self._retain_lineage_tags else ())
         tags = [f"{kind}:{sid}" for kind, sid in lineage if sid] or None
         bank_id, retain_async, retain_context = self._bank_id, self._retain_async, self._retain_context
+        envelope_args = {"hermes_home": self._envelope_home(), "session_id": self._session_id,
+                         "first_user_line": self._first_user_line, "occurred_at": self._last_turn_at}
 
         def _job() -> None:
+            # Title looked up on the writer thread: off the turn path, and the first turn's
+            # auto-title has had a moment to land.
+            metadata.update(self._source_envelope(**envelope_args))
             item = self._build_retain_kwargs(content, context=retain_context, metadata=metadata,
                                              tags=tags, update_mode=update_mode)
             logger.debug("Hindsight %s: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
@@ -1317,6 +1391,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._parent_session_id = str(parent_session_id).strip()
         self._session_id, self._document_id = new_id, _mint_document_id(new_id)
         self._session_turns = []
+        self._first_user_line = self._last_turn_at = ""
         self._turn_counter = self._turn_index = self._last_retained_turn_count = 0
         logger.debug("Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",
                      self._session_id, self._parent_session_id, reset, self._document_id)
