@@ -1288,6 +1288,98 @@ def _retained_items(p) -> list:
     return [item for call in p._client.aretain_batch.call_args_list for item in call.kwargs["items"]]
 
 
+def _titled_state_db(home, session_id: str, title: str) -> None:
+    """A real SessionDB under *home* holding one titled session."""
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=Path(home) / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+        db.set_session_title(session_id, title)
+    finally:
+        db.close()
+
+
+class TestSourceEnvelope:
+    """Auto-retained chat documents carry the source envelope (universal_v3 envelope_keys)."""
+
+    def test_envelope_uses_session_title_from_handed_home(self, tmp_path, monkeypatch):
+        event_time = datetime(2026, 10, 1, 9, 30, tzinfo=ZoneInfo("Europe/Lisbon"))
+        monkeypatch.setattr("plugins.memory.hindsight._hermes_now", lambda: event_time)
+        _write_config(tmp_path, monkeypatch)
+        home = tmp_path / "profile-home"
+        home.mkdir()
+        _titled_state_db(home, "sess-1", "Mortgage offer comparison")
+        p = _init_provider(tmp_path, platform="telegram", hermes_home=str(home))
+
+        p.sync_turn("compare the two bank offers\nsecond line", "done")
+        [item] = _retained_items(p)
+
+        md = item["metadata"]
+        assert md["source_kind"] == "chat"
+        assert md["source_origin"] == "telegram"
+        assert md["source_site_or_author"] == "hermes telegram session"
+        assert md["trust"] == "self"
+        assert md["source_title"] == md["session_topic"] == "Mortgage offer comparison"
+        assert md["occurred_at"] == event_time.isoformat(timespec="seconds")
+        # Existing writer controls are untouched.
+        assert md["session_id"] == "sess-1" and md["platform"] == "telegram"
+        assert item["tags"] == ["session:sess-1"]
+
+    def test_untitled_session_falls_back_to_first_user_line(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch)
+        p = _init_provider(tmp_path, platform="cli")  # tmp_path holds no state.db
+
+        p.sync_turn("  \n" + "x" * 200 + "\nmore", "ok")
+        p.sync_turn("a later question", "ok")
+        items = _retained_items(p)
+
+        assert len(items) == 2
+        for item in items:
+            assert item["metadata"]["source_title"] == "x" * 120
+            assert item["metadata"]["session_topic"] == "x" * 120
+            assert item["metadata"]["source_origin"] == "cli"
+
+    def test_no_title_omits_title_keys_and_still_retains(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch)
+        (tmp_path / "state.db").write_text("not a sqlite database")  # lookup must fail open
+        p = _init_provider(tmp_path)
+
+        p.sync_turn("   ", "an answer")
+        [item] = _retained_items(p)
+
+        md = item["metadata"]
+        assert "source_title" not in md and "session_topic" not in md
+        assert md["source_kind"] == "chat" and md["trust"] == "self"
+
+    def test_envelope_keys_match_universal_v3(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch)
+        p = _init_provider(tmp_path)
+        p.sync_turn("hello", "hi")
+        [item] = _retained_items(p)
+        # universal_v3.json envelope_keys minus retrieved_at (web sources only).
+        v3_keys = {"source_kind", "source_origin", "source_title", "source_site_or_author",
+                   "occurred_at", "session_topic", "trust"}
+        assert v3_keys <= set(item["metadata"])
+
+    def test_session_switch_resets_first_user_line(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch)
+        p = _init_provider(tmp_path)
+        p.sync_turn("first session topic", "ok")
+        p.on_session_switch("sess-2")
+        p.sync_turn("second session topic", "ok")
+        titles = [i["metadata"]["session_topic"] for i in _retained_items(p)]
+        # Overwrite mode also flushes the old session's turns on switch, under the old topic.
+        assert set(titles[:-1]) == {"first session topic"}
+        assert titles[-1] == "second session topic"
+
+    def test_tool_retain_has_no_envelope(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch)
+        p = _init_provider(tmp_path)
+        p.handle_tool_call("hindsight_retain", {"content": "a fact"})
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert "source_kind" not in item["metadata"]
+
+
 class TestAutoRetainWriterControls:
     """Each switch defaults to the pre-switch behaviour; set, it drops the turn with one debug
     line naming the reason. Explicit hindsight_retain tool calls are never gated."""
