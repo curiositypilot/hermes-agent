@@ -201,6 +201,56 @@ class TestHomeDotfilesGuard:
         assert cc.is_coding_context(platform="cli", cwd=proj, config=cfg) is True
 
 
+class TestHermesRootGuard:
+    """``~/.hermes`` under git (backups) is config, not a project: a Kanban scratch workspace
+    (``<root>/kanban/workspaces/<task>``) must not inherit the coding posture from it."""
+
+    def _hermes_root_repo(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        root = home / ".hermes"
+        root.mkdir(parents=True)
+        _git_init(root)  # commits a main.py: the repo "holds code" like a real backup does (scripts/)
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        import hermes_constants
+        hermes_constants._default_hermes_root_memo = None
+        return root
+
+    def test_kanban_scratch_workspace_under_hermes_root_is_general(self, tmp_path, monkeypatch):
+        root = self._hermes_root_repo(tmp_path, monkeypatch)
+        ws = root / "kanban" / "workspaces" / "t_abc"
+        ws.mkdir(parents=True)
+        (ws / "notes.md").write_text("findings\n")
+        cfg = {"agent": {"coding_context": "auto"}}
+        assert cc.is_coding_context(platform="cli", cwd=ws, config=cfg) is False
+        assert cc.is_coding_context(platform="cli", cwd=root, config=cfg) is False
+
+    def test_profile_home_resolves_to_the_same_root(self, tmp_path, monkeypatch):
+        root = self._hermes_root_repo(tmp_path, monkeypatch)
+        profile = root / "profiles" / "coder"
+        profile.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        import hermes_constants
+        hermes_constants._default_hermes_root_memo = None
+        ws = root / "kanban" / "workspaces" / "t_def"
+        ws.mkdir(parents=True)
+        assert cc.is_coding_context(platform="cli", cwd=ws, config={"agent": {"coding_context": "auto"}}) is False
+
+    def test_real_project_under_hermes_root_still_detects(self, tmp_path, monkeypatch):
+        root = self._hermes_root_repo(tmp_path, monkeypatch)
+        proj = root / "hermes-agent" / ".worktrees" / "t_xyz"
+        proj.mkdir(parents=True)
+        (proj / "pyproject.toml").write_text("[project]\nname='x'\n")
+        assert cc.is_coding_context(platform="cli", cwd=proj, config={"agent": {"coding_context": "auto"}}) is True
+
+    def test_hermes_root_marker_file_is_not_a_project(self, tmp_path, monkeypatch):
+        root = self._hermes_root_repo(tmp_path, monkeypatch)
+        (root / "Makefile").write_text("backup:\n\t@true\n")
+        ws = root / "kanban" / "workspaces" / "t_mk"
+        ws.mkdir(parents=True)
+        assert cc.is_coding_context(platform="cli", cwd=ws, config={"agent": {"coding_context": "auto"}}) is False
+
+
 
 # ── prompt assembly integration ─────────────────────────────────────────────
 

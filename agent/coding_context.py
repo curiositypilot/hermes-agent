@@ -217,6 +217,23 @@ def _home() -> Optional[Path]:
         return None
 
 
+def _hermes_root() -> Optional[Path]:
+    """The Hermes root dir (``~/.hermes`` or the Docker/custom root). Like ``$HOME`` it is
+    config, not a project: users keep it under git (backups, dotfiles) and the dispatcher's
+    scratch workspaces (``<root>/kanban/workspaces/<task>``) sit inside it, so a repo rooted
+    here must not flip every worker and every ``hermes`` session under it into the coding
+    posture. A real project under the root (a worktree, a checkout) still has its own markers."""
+    try:
+        from hermes_constants import get_default_hermes_root
+        return get_default_hermes_root().resolve()
+    except Exception:
+        return None
+
+
+def _non_project_roots() -> tuple:
+    return tuple(p for p in (_home(), _hermes_root()) if p is not None)
+
+
 def _marker_root(cwd: Path) -> Optional[Path]:
     """Nearest ancestor (≤6 levels) that looks like a project root, or ``None``. ``$HOME``
     and the shared temp root are skipped: a Makefile/AGENTS.md in the home dir is global
@@ -226,7 +243,7 @@ def _marker_root(cwd: Path) -> Optional[Path]:
         temp_root = Path(tempfile.gettempdir()).resolve()
     except Exception:
         temp_root = None
-    skip = (_home(), temp_root)
+    skip = (*_non_project_roots(), temp_root)
     for parent in (current, *current.parents)[:7]:
         if parent not in skip and any((parent / marker).exists() for marker in _PROJECT_MARKERS):
             return parent
@@ -272,7 +289,7 @@ def _detect_profile(mode: str, platform: str, cwd: Path) -> ContextProfile:
     if _marker_root(cwd) is not None:
         return CODING_PROFILE
     git_root = _git_root(cwd)
-    if git_root is not None and git_root != _home() and _has_code_files(git_root):
+    if git_root is not None and git_root not in _non_project_roots() and _has_code_files(git_root):
         return CODING_PROFILE
     return GENERAL_PROFILE
 

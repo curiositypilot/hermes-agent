@@ -112,6 +112,14 @@ TOOLSETS = {
         "iframes, hold-click)",
         [t for t in _HERMES_CORE_TOOLS if t.startswith("browser_")],
     ),
+    # Subtraction handle only: the vault tools stay in `browser` (and core); naming this set in
+    # disabled_toolsets / kanban.worker_disabled_toolsets strips them where no user can answer the
+    # unlock/consent prompt (headless workers). Not configurable per platform on purpose.
+    "browser_vault": _ts(
+        "Browser credential vault (saved logins, cards, addresses via the user's password manager); "
+        "rides with `browser`",
+        [t for t in _HERMES_CORE_TOOLS if t.startswith("browser_vault_")],
+    ),
     "cronjob": _ts(
         "Cronjob management tool - create, list, update, pause, resume, remove, and "
         "trigger scheduled tasks",

@@ -1713,6 +1713,9 @@ class TurnRunner:
                 kwargs["persist_user_display_kind"] = ctx.persist_user_display_kind
             if ctx.persist_user_display_metadata:
                 kwargs["persist_user_display_metadata"] = ctx.persist_user_display_metadata
+            if ctx.memory_query and _accepts_keyword(agent.run_conversation, "memory_query"):
+                # Reply turn: recall keyed on the user's words, not the head of the quoted message.
+                kwargs["memory_query"] = ctx.memory_query
             if ctx.moa_config is not None:
                 kwargs["moa_config"] = ctx.moa_config
             if persist_user_timestamp_override is not None:

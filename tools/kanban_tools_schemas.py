@@ -370,35 +370,29 @@ KANBAN_ATTACHMENTS_SCHEMA = _schema(
 KANBAN_CREATE_SCHEMA = _schema(
     "kanban_create",
     (
-        "Create a new kanban task, optionally as a child of the current "
-        "one (pass the current task id in ``parents``). Used by "
-        "orchestrator workers to fan out — decompose work into child "
-        "tasks with specific assignees, link them into a pipeline, "
-        "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "Create a kanban task, optionally as a child of the current one "
+        "(pass the current task id in ``parents``). Orchestrators fan out "
+        "with it: child tasks with specific assignees, linked into a "
+        "pipeline, then complete your own task. The dispatcher picks new "
+        "tasks up on its next tick and spawns the assigned profiles."
     ),
     {
         "title": _prop("string", "Short task title (required)."),
         "assignee": _prop("string", (
-                "Profile name that should execute this task "
-                "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                "Required — tasks without an assignee are never "
-                "dispatched."
+                "Profile name that executes this task (e.g. 'researcher-a', "
+                "'reviewer'). Required: a task without one is never dispatched."
         )),
         "body": _prop("string", (
-                "Opening post: full spec, acceptance criteria, "
-                "links. The assigned worker reads this as part of "
-                "its context."
+                "Opening post: full spec, acceptance criteria, links. "
+                "The assigned worker reads it as context."
         )),
         "parents": {
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "Parent task ids. The new task stays in 'todo' "
-                "until every parent reaches 'done'; then it "
-                "auto-promotes to 'ready'. Typical fan-in: list "
-                "all the researcher task ids when creating a "
-                "synthesizer task."
+                "Parent task ids. The task waits in 'todo' until every "
+                "parent is 'done', then auto-promotes to 'ready' (fan-in: "
+                "list all researcher ids on a synthesizer task)."
             ),
         },
         "tenant": _prop("string", (
@@ -406,100 +400,85 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "Defaults to HERMES_TENANT env if set."
         )),
         "priority": _prop("integer", (
-                "Dispatcher tiebreaker. Higher = picked sooner "
-                "when multiple ready tasks share an assignee."
+                "Dispatcher tiebreaker: higher is picked sooner among "
+                "ready tasks sharing an assignee."
         )),
         "workspace_kind": {
             "type": "string",
             "enum": ["scratch", "dir", "worktree"],
             "description": (
-                "Workspace flavor: 'scratch' (fresh tmp dir, "
-                "default), 'dir' (shared directory, requires "
-                "absolute workspace_path), 'worktree' (git worktree)."
+                "'scratch' (fresh tmp dir, default), 'dir' (shared "
+                "directory, needs absolute workspace_path), 'worktree' "
+                "(git worktree)."
             ),
         },
         "workspace_path": _prop("string", (
-                "Absolute path for 'dir' or 'worktree' workspace. "
-                "Relative paths are rejected at dispatch."
+                "Absolute path for 'dir' or 'worktree'; relative paths "
+                "are rejected at dispatch."
         )),
         "project": _prop("string", (
-                "Optional project id or slug to link the task to. When "
-                "set, the task becomes a git worktree under the project's "
-                "primary repo with a deterministic branch (project slug + "
-                "task id), instead of a random branch."
+                "Optional project id or slug. The task then becomes a git "
+                "worktree under the project's primary repo on a "
+                "deterministic branch (project slug + task id)."
         )),
         "triage": _prop("boolean", (
-                "If true, task lands in 'triage' instead of 'todo' "
-                "— a specifier profile is expected to flesh out "
-                "the body before work starts."
+                "If true the task lands in 'triage' instead of 'todo', "
+                "for a specifier profile to flesh out the body first."
         )),
         "idempotency_key": _prop("string", (
-                "If a non-archived task with this key already "
-                "exists, return that task's id instead of creating "
-                "a duplicate. Useful for retry-safe automation."
+                "If a non-archived task with this key exists, return its "
+                "id instead of creating a duplicate (retry-safe automation)."
         )),
         "max_runtime_seconds": _prop("integer", (
-                "Per-task runtime cap. When exceeded, the "
-                "dispatcher SIGTERMs the worker and re-queues the "
-                "task with outcome='timed_out'."
+                "Runtime cap: past it the dispatcher SIGTERMs the worker "
+                "and re-queues the task with outcome='timed_out'."
         )),
         "initial_status": {
             "type": "string",
             "enum": ["running", "blocked"],
             "description": (
-                "Initial card status. Use 'blocked' for tasks that "
-                "require immediate human ops (R3 gate) to skip the "
-                "brief running-to-blocked transition. Defaults to "
-                "'running', which preserves the usual dispatch path."
+                "Initial card status. 'blocked' for tasks needing "
+                "immediate human ops (R3 gate); default 'running' keeps "
+                "the usual dispatch path."
             ),
         },
         "skills": {
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "Skill names to force-load into the dispatched "
-                "worker. The kanban lifecycle is already injected "
-                "automatically; use this to pin a task to a specialist "
-                "context — e.g. ['translation'] for a translation "
-                "task, ['github-code-review'] for a reviewer task. "
-                "The names must match skills installed on the "
+                "Skill names to force-load into the worker (the kanban "
+                "lifecycle is injected already), e.g. ['translation'] or "
+                "['github-code-review']. Must be installed on the "
                 "assignee's profile."
             ),
         },
         "goal_mode": _prop("boolean", (
-                "Run the dispatched worker in a goal loop. When true, "
-                "after each turn an auxiliary judge checks the worker's "
-                "response against this card's title/body; if the work "
-                "isn't done and budget remains, the worker keeps going "
-                "in the same session until the judge agrees it's "
-                "complete (or the goal-turn budget is exhausted, which "
-                "blocks the task for human review). Use this for "
-                "open-ended cards where one shot rarely finishes the "
-                "work. Defaults to false (classic single-shot worker)."
+                "Run the worker in a goal loop: after each turn an "
+                "auxiliary judge checks the response against the card's "
+                "title/body and the worker keeps going in the same session "
+                "until the judge agrees it is done or the turn budget runs "
+                "out (which blocks the task for review). For open-ended "
+                "cards one shot rarely finishes. Default false."
         )),
         "completion_contract": _prop("string", (
             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
         )),
         "goal_max_turns": _prop("integer", (
-                "Turn budget for goal_mode workers. Caps how many "
-                "continuation turns the worker may take before the task "
-                "is blocked for review. Ignored unless goal_mode is "
-                "true. Defaults to the goal-engine default (20)."
+                "Turn budget for goal_mode workers before the task is "
+                "blocked for review. Ignored unless goal_mode is true; "
+                "defaults to the goal-engine default (20)."
         )),
         "model": _prop("string", (
-                "Pin the dispatched worker to this model instead of "
-                "the assignee profile's configured model. Use the "
-                "exact model name the target provider expects. Omit "
-                "to use the profile default."
+                "Pin the worker to this model instead of the assignee "
+                "profile's. Use the exact name the provider expects."
         )),
         "provider": _prop("string", (
-                "Provider the 'model' belongs to (e.g. 'openrouter', "
-                "'anthropic', 'nous'). Set this whenever the model "
-                "is not from the assignee profile's configured "
-                "provider — a model name alone is resolved against "
-                "the profile's provider and will fail if it belongs "
-                "to a different one. Requires 'model'."
+                "Provider of 'model' (e.g. 'openrouter', 'anthropic', "
+                "'nous'). Required whenever the model is not from the "
+                "assignee profile's provider: a bare model name resolves "
+                "against the profile's provider and fails otherwise. "
+                "Requires 'model'."
         )),
         "complexity": {
             "type": "string",

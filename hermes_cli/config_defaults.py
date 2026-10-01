@@ -1296,6 +1296,10 @@ DEFAULT_CONFIG = {
         # External memory provider plugin (empty = built-in only); only ONE at a time: "openviking",
         # "mem0", "hindsight", "holographic", "retaindb", "byterover".
         "provider": "",
+        # Seconds the turn waits for an external provider's auto-recall before the first API call.
+        # A slow backend still runs to completion off-thread but is skipped on later turns until it
+        # returns. Raising this makes every turn wait longer, so prefer speeding up the backend.
+        "external_prefetch_timeout_seconds": 8.0,
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
@@ -1867,6 +1871,12 @@ DEFAULT_CONFIG = {
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
         "worker_log_backup_count": 1,
+        # Toolsets a dispatcher-spawned worker never gets, subtracted from the assignee's CLI
+        # selection at spawn and again at schema assembly. Workers run headless: `clarify` has
+        # nobody to answer and the browser vault needs a user-side unlock/consent prompt. MCP
+        # server names work too ("granola" meeting notes: 8k schema chars per worker turn, no
+        # worker use); a name the profile does not enable is a no-op.
+        "worker_disabled_toolsets": ["clarify", "browser_vault", "granola"],
         # Profile for the root/orchestration task after Triage decomposition; "" = default profile.
         # Does not control the decomposer LLM path (see auxiliary.kanban_decomposer).
         "orchestrator_profile": "",

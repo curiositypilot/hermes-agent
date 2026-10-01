@@ -61,6 +61,36 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
     return message_text[len(prefix):] if message_text.startswith(prefix) else message_text
 
 
+# Mirrors the auto-recall input cap of the bundled memory provider (Hindsight
+# ``recall_max_input_chars``, default 800): the provider still applies its own cap, this only
+# decides how much of the quoted message's TAIL rides behind the user's own words.
+REPLY_MEMORY_QUERY_CHARS = 800
+
+
+def reply_memory_query(event: Any, message_text: Any, *, budget: int = REPLY_MEMORY_QUERY_CHARS) -> Optional[str]:
+    """Memory-recall query for a reply turn: the user's own words FIRST, then the tail of the
+    quoted message. ``_prepend_inbound_reply_context`` puts the quote ahead of the user's text in
+    the model-facing message, so a provider that head-truncates its query (800 chars) saw only the
+    quote and dropped what the user actually asked on nearly every reply turn. ``None`` when this is
+    not a reply turn (or the envelope is not the one we built): the caller keeps the message text."""
+    reply_text = getattr(event, "reply_to_text", None)
+    if not reply_text or not getattr(event, "reply_to_message_id", None) or not isinstance(message_text, str):
+        return None
+    body = strip_discord_triggering_note(event, message_text)
+    _who = " your previous message" if getattr(event, "reply_to_is_own_message", False) else ""
+    prefix = f'[Replying to{_who}: "{reply_text}"]\n\n'
+    if not body.startswith(prefix):
+        return None
+    user_text = body[len(prefix):].strip()
+    quote = str(reply_text).strip()
+    if not user_text:
+        return quote or None
+    tail = budget - len(user_text) - 2
+    if tail <= 0 or not quote:
+        return user_text
+    return f"{user_text}\n\n{quote[-tail:]}"
+
+
 class GatewayInboundMixin:
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 

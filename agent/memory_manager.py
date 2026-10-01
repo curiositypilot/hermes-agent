@@ -472,7 +472,7 @@ class MemoryManager:
         with self._external_prefetch_lock:
             existing = self._external_prefetch_threads.get(provider.name)
             if existing is not None and existing.is_alive():
-                logger.debug("Memory provider '%s' prefetch is still running; skipping this turn", provider.name)
+                logger.info("Memory provider '%s' prefetch is still running; skipping this turn", provider.name)
                 return ""
             self._external_prefetch_threads[provider.name] = thread
             thread.start()

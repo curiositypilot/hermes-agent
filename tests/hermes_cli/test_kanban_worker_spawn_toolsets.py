@@ -217,3 +217,108 @@ toolsets:
     assert "kanban_complete" in names
     assert "kanban_list" not in names
     assert resolved != ["kanban"]
+
+
+def _write_profile(tmp_path, cli_toolsets: list[str], kanban_yaml: str = "") -> tuple:
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    body = "platform_toolsets:\n  cli:\n" + "".join(f"    - {t}\n" for t in cli_toolsets)
+    profile.joinpath("config.yaml").write_text(body + kanban_yaml, encoding="utf-8")
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    return root, profile
+
+
+def test_worker_pin_drops_headless_toolsets_by_default(monkeypatch, tmp_path):
+    """A dispatcher-spawned worker is headless: ``clarify`` (nobody answers) and an MCP server
+    named in ``kanban.worker_disabled_toolsets`` leave the ``--toolsets`` pin, so the worker
+    neither sees the schema nor spawns the server. Everything else the profile enables stays."""
+    root, profile = _write_profile(
+        tmp_path, ["browser", "clarify", "terminal", "web", "granola"],
+        "kanban:\n  worker_disabled_toolsets: [clarify, browser_vault, granola]\n")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    resolved = kbd._resolve_worker_cli_toolsets(str(profile))
+
+    assert resolved is not None
+    assert {"browser", "terminal", "web"} <= set(resolved)
+    assert "clarify" not in resolved
+    assert "granola" not in resolved
+
+
+def test_worker_pin_default_trim_without_config_key(monkeypatch, tmp_path):
+    """No ``kanban.worker_disabled_toolsets`` key anywhere: the built-in default still drops
+    ``clarify`` AND the ``granola`` MCP server from the pin when the profile enables them, so
+    a stock install never spawns the meeting-notes server inside a headless worker."""
+    root, profile = _write_profile(tmp_path, ["clarify", "granola", "terminal", "web"])
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    resolved = kbd._resolve_worker_cli_toolsets(str(profile))
+
+    assert resolved is not None
+    assert {"terminal", "web"} <= set(resolved)
+    assert "clarify" not in resolved
+    assert "granola" not in resolved
+
+
+def test_worker_disabled_defaults_agree_between_code_and_config():
+    """The in-code fallback (key absent) and the registered DEFAULT_CONFIG value are the same
+    list, so a profile that never wrote the key and one that merged defaults trim identically."""
+    from hermes_cli.config import DEFAULT_CONFIG
+    from tools.kanban_toolset_context import DEFAULT_WORKER_DISABLED_TOOLSETS, worker_disabled_toolsets
+
+    registered = DEFAULT_CONFIG["kanban"]["worker_disabled_toolsets"]
+    assert list(registered) == list(DEFAULT_WORKER_DISABLED_TOOLSETS)
+    assert worker_disabled_toolsets({}) == list(DEFAULT_WORKER_DISABLED_TOOLSETS)
+    assert worker_disabled_toolsets(DEFAULT_CONFIG) == list(DEFAULT_WORKER_DISABLED_TOOLSETS)
+    assert {"clarify", "browser_vault", "granola"} <= set(DEFAULT_WORKER_DISABLED_TOOLSETS)
+
+
+def test_worker_pin_explicit_empty_list_keeps_everything(monkeypatch, tmp_path):
+    root, profile = _write_profile(tmp_path, ["clarify", "terminal"], "kanban:\n  worker_disabled_toolsets: []\n")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    assert "clarify" in kbd._resolve_worker_cli_toolsets(str(profile))
+
+
+def test_owned_worker_schema_strips_vault_tools_but_keeps_browser(monkeypatch, tmp_path):
+    """The vault tools ride inside ``browser`` so the pin cannot drop them; schema assembly
+    subtracts ``browser_vault`` for the dispatcher-owned worker only. A delegated child of the
+    worker (same env, not the owner) and an ordinary CLI session keep today's set."""
+    root, _profile = _write_profile(tmp_path, ["browser", "terminal"])
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_spawn_tools")
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    from model_tools import _select_tool_names
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+
+    owned = _select_tool_names(["browser", "terminal", "clarify"], None, quiet_mode=True)
+    assert "browser_navigate" in owned and "terminal" in owned
+    assert not {t for t in owned if t.startswith("browser_vault_")}
+    assert "clarify" not in owned
+
+    monkeypatch.setenv(DELEGATED_CHILD_ENV_MARKER, str(root / "kanban"))
+    child = _select_tool_names(["browser", "terminal", "clarify"], None, quiet_mode=True)
+    assert "browser_vault_list" in child and "clarify" in child
+
+    monkeypatch.delenv(DELEGATED_CHILD_ENV_MARKER)
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    plain = _select_tool_names(["browser", "terminal", "clarify"], None, quiet_mode=True)
+    assert "browser_vault_list" in plain and "clarify" in plain
+
+
+def test_browser_vault_toolset_is_a_subtraction_handle_only():
+    """``browser_vault`` names exactly the vault members of ``browser``: disabling it must not
+    touch the rest of the browser surface, and it is not a per-platform checklist entry."""
+    from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS
+    from toolsets import resolve_toolset
+
+    vault = set(resolve_toolset("browser_vault", include_registry=False))
+    browser = set(resolve_toolset("browser", include_registry=False))
+    assert vault and vault < browser
+    assert all(t.startswith("browser_vault_") for t in vault)
+    assert {t for t in browser if t.startswith("browser_vault_")} == vault
+    assert "browser_vault" not in {key for key, _, _ in CONFIGURABLE_TOOLSETS}

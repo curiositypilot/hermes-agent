@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from agent.conversation_compression import recover_rotated_compression_session
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
-from agent.memory_provider import is_trivial_prompt
+from agent.memory_provider import is_synthetic_prompt, is_trivial_prompt
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
@@ -876,7 +876,14 @@ def _memory_turn_start_and_prefetch(
         )
     ext_prefetch_cache = ""
     with suppress(Exception):
-        if not is_trivial_prompt(_query):
+        # A notice the runtime injected (process completion, delegation result) is not a topic:
+        # recall on it is empty and its external round-trip can leave a stuck thread that
+        # skips the next human turn. Logged at INFO so a missing memory block has a cause.
+        if is_synthetic_prompt(_query):
+            logger.info("Memory prefetch skipped: synthetic turn (query_len=%d)", len(_query))
+        elif is_trivial_prompt(_query):
+            logger.info("Memory prefetch skipped: trivial prompt (query_len=%d)", len(_query))
+        else:
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
     # Deterministic recall indicator via _emit_status so the model can't silently
     # drop injected memory.
