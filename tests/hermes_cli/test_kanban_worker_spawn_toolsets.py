@@ -248,13 +248,32 @@ def test_worker_pin_drops_headless_toolsets_by_default(monkeypatch, tmp_path):
 
 
 def test_worker_pin_default_trim_without_config_key(monkeypatch, tmp_path):
-    root, profile = _write_profile(tmp_path, ["clarify", "terminal", "web"])
+    """No ``kanban.worker_disabled_toolsets`` key anywhere: the built-in default still drops
+    ``clarify`` AND the ``granola`` MCP server from the pin when the profile enables them, so
+    a stock install never spawns the meeting-notes server inside a headless worker."""
+    root, profile = _write_profile(tmp_path, ["clarify", "granola", "terminal", "web"])
     monkeypatch.setenv("HERMES_HOME", str(root))
     from hermes_cli import kanban_db_dispatch as kbd
 
     resolved = kbd._resolve_worker_cli_toolsets(str(profile))
 
-    assert "clarify" not in resolved and {"terminal", "web"} <= set(resolved)
+    assert resolved is not None
+    assert {"terminal", "web"} <= set(resolved)
+    assert "clarify" not in resolved
+    assert "granola" not in resolved
+
+
+def test_worker_disabled_defaults_agree_between_code_and_config():
+    """The in-code fallback (key absent) and the registered DEFAULT_CONFIG value are the same
+    list, so a profile that never wrote the key and one that merged defaults trim identically."""
+    from hermes_cli.config import DEFAULT_CONFIG
+    from tools.kanban_toolset_context import DEFAULT_WORKER_DISABLED_TOOLSETS, worker_disabled_toolsets
+
+    registered = DEFAULT_CONFIG["kanban"]["worker_disabled_toolsets"]
+    assert list(registered) == list(DEFAULT_WORKER_DISABLED_TOOLSETS)
+    assert worker_disabled_toolsets({}) == list(DEFAULT_WORKER_DISABLED_TOOLSETS)
+    assert worker_disabled_toolsets(DEFAULT_CONFIG) == list(DEFAULT_WORKER_DISABLED_TOOLSETS)
+    assert {"clarify", "browser_vault", "granola"} <= set(DEFAULT_WORKER_DISABLED_TOOLSETS)
 
 
 def test_worker_pin_explicit_empty_list_keeps_everything(monkeypatch, tmp_path):

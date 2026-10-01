@@ -28,8 +28,10 @@ def scoped_kanban_toolset_selection(toolsets: Optional[Iterable[str]]) -> Iterat
         _requested.reset(token)
 
 
-# ``kanban.worker_disabled_toolsets`` when the key is absent from config entirely.
-DEFAULT_WORKER_DISABLED_TOOLSETS: tuple[str, ...] = ("clarify", "browser_vault")
+# ``kanban.worker_disabled_toolsets`` when the key is absent from config entirely. ``granola`` is
+# an MCP server name (meeting notes): a name the profile does not enable is a no-op at both
+# layers (set difference in the dispatcher pin; ``validate_toolset`` filter at schema assembly).
+DEFAULT_WORKER_DISABLED_TOOLSETS: tuple[str, ...] = ("clarify", "browser_vault", "granola")
 
 
 def worker_disabled_toolsets(config: Optional[dict] = None) -> list[str]:

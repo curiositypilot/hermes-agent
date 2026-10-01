@@ -1873,9 +1873,10 @@ DEFAULT_CONFIG = {
         "worker_log_backup_count": 1,
         # Toolsets a dispatcher-spawned worker never gets, subtracted from the assignee's CLI
         # selection at spawn and again at schema assembly. Workers run headless: `clarify` has
-        # nobody to answer and the browser vault needs a user-side unlock/consent prompt. Add MCP
-        # server names here (e.g. "granola") to keep a server's schemas out of every worker turn.
-        "worker_disabled_toolsets": ["clarify", "browser_vault"],
+        # nobody to answer and the browser vault needs a user-side unlock/consent prompt. MCP
+        # server names work too ("granola" meeting notes: 8k schema chars per worker turn, no
+        # worker use); a name the profile does not enable is a no-op.
+        "worker_disabled_toolsets": ["clarify", "browser_vault", "granola"],
         # Profile for the root/orchestration task after Triage decomposition; "" = default profile.
         # Does not control the decomposer LLM path (see auxiliary.kanban_decomposer).
         "orchestrator_profile": "",
