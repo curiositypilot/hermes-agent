@@ -17,7 +17,7 @@ from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
-from agent.skill_commands import extract_user_instruction_from_skill_message
+from agent.skill_commands import extract_user_text_for_memory
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
 from tools.registry import tool_error
 
@@ -440,9 +440,10 @@ class MemoryManager:
                                       level=logging.WARNING)
         return "\n\n".join(b for b in blocks if b and b.strip())
 
-    # A /skill or /bundle turn embeds the whole skill body in the model-facing message;
-    # providers get just the user's instruction (None for a bare invocation).
-    _strip_skill_scaffolding = staticmethod(extract_user_instruction_from_skill_message)
+    # A /skill or /bundle turn embeds the whole skill body in the model-facing message, and a
+    # topic-bound session's first turn carries auto-loaded skill blocks; providers get just the
+    # user's own text (None for a bare invocation).
+    _strip_skill_scaffolding = staticmethod(extract_user_text_for_memory)
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Merge non-empty prefetch context from all providers (failures are non-fatal)."""

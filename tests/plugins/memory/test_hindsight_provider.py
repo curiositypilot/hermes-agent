@@ -1348,6 +1348,70 @@ def _retained_items(p) -> list:
     return [item for call in p._client.aretain_batch.call_args_list for item in call.kwargs["items"]]
 
 
+def _retained_user_texts(p) -> list:
+    """User messages (prefix included) of the session as last retained: this mock server has no
+    append support, so each retain resends the whole session and the last item is the document."""
+    return [msg["content"] for turn in json.loads(_retained_items(p)[-1]["content"])
+            for msg in turn if msg["role"] == "user"]
+
+
+# Shaped like session 20261001_010410_96d63b3c: a reply to a cron brief (not in this session),
+# later a reply quoting one of this session's own assistant messages (rendered, no markdown).
+_CRON_BRIEF = (
+    "Cronjob Response: kanban-orchestrator\n(job_id: 580e25b75ad8)\n-------------\n\n"
+    "2 decisions needed · 1 stray card closed · 2 finished cards checked\n"
+    "1. Fork·land (t_bc22f8eb): before t_8c9f428d can merge, your desktop session must commit "
+    "its uncommitted tier-routing + reviewer-routing code. Go? Rec: yes.\n"
+    "2. Job leads (t_53798475): apply to Blackwall ML (contract). Rec: no.\n"
+    "Reply e.g. '1 yes, 2 yes yes no'."
+)
+_ASSISTANT_PLAN = (
+    "Both **greenhouse** workers are running again with your answers.\n\n"
+    "1. Mask intake (`t_e71d6279`): since the hole is low on a wall, the airflow plan flips:\n"
+    "   - Exhaust fan goes high on the opposite wall, intake stays passive.\n"
+    "   - Negative pressure keeps spores from leaking into the hallway.\n"
+    "2. Harness (t_5c1d0a2e): Phase 2 wiring uses the 12V rail and a relay board, see "
+    "[the plan](https://example.com/plan)."
+)
+
+
+class TestReplyQuoteCollapse:
+    def test_quote_of_in_session_assistant_message_is_collapsed(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch)
+        p = _init_provider(tmp_path, platform="telegram")
+        p.sync_turn(f'[Replying to: "{_CRON_BRIEF}"]\n\n1. yes\n2. no', "Done: #1 merged.")
+        p.sync_turn("what about the greenhouse?", _ASSISTANT_PLAN)
+        rendered = _ASSISTANT_PLAN.replace("**", "").replace("`", "").replace(
+            "[the plan](https://example.com/plan)", "the plan")
+        p.sync_turn(f'[Replying to: "{rendered}"]\n\n1. do you have metal mesh?', "Yes, 2 m².")
+
+        users = _retained_user_texts(p)
+        assert len(users) == 3
+        # Cron brief is not in the session: the only copy of what MB answered, kept whole.
+        assert _CRON_BRIEF in users[0] and users[0].endswith("1. yes\n2. no")
+        collapsed = users[2]
+        assert collapsed.startswith('User: [Replying to: "' + rendered[:40])
+        assert ' …"]\n\n1. do you have metal mesh?' in collapsed
+        assert "Negative pressure" not in collapsed
+        assert len(collapsed) < len(rendered)
+
+    def test_quote_not_in_session_kept_even_after_assistant_turns(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch)
+        p = _init_provider(tmp_path, platform="telegram")
+        p.sync_turn("hi", _ASSISTANT_PLAN)
+        p.sync_turn(f'[Replying to your previous message: "{_CRON_BRIEF}"]\n\nok', "Noted.")
+        assert _CRON_BRIEF in _retained_user_texts(p)[1]
+
+    def test_session_switch_forgets_previous_assistant_messages(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch)
+        p = _init_provider(tmp_path, platform="telegram")
+        p.sync_turn("plan?", _ASSISTANT_PLAN)
+        p.on_session_switch("sess-2")
+        p.sync_turn(f'[Replying to: "{_ASSISTANT_PLAN}"]\n\nstill valid?', "Yes.")
+        # In the new session's document the quote is the only copy, so it stays whole.
+        assert _ASSISTANT_PLAN in _retained_user_texts(p)[-1]
+
+
 def _titled_state_db(home, session_id: str, title: str) -> None:
     """A real SessionDB under *home* holding one titled session."""
     from hermes_state import SessionDB

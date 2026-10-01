@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -375,6 +376,50 @@ def _first_line(text: Any, limit: int = _ENVELOPE_TITLE_MAX) -> str:
     return ""
 
 
+# Reply-quote collapse (retain path only). The gateway prepends ``[Replying to…: "<full quoted
+# message>"]`` to a reply turn (gateway/run_inbound.py::_prepend_inbound_reply_context); when the
+# quote repeats an assistant message already retained in this session, the transcript would carry
+# the same text twice, in different extraction chunks, and the bank gets exact fact twins.
+_REPLY_QUOTE_RE = re.compile(r'\[Replying to[^:\]\n]*: "')
+_REPLY_QUOTE_END = '"]'
+_REPLY_QUOTE_MATCH_CHARS = 300   # normalized quote head that must occur in an earlier assistant message
+_REPLY_QUOTE_KEEP_CHARS = 160    # raw quote head kept as the pointer
+_SESSION_ASSISTANT_TEXTS_MAX = 500
+_MD_LINK_RE = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
+_MD_CHARS_RE = re.compile(r"[*_`~#>|\\]")
+
+
+def _normalize_for_quote_match(text: str) -> str:
+    """Whitespace/markdown-insensitive form: a Telegram quote is the rendered message, the
+    retained assistant turn is the raw markdown."""
+    text = _MD_CHARS_RE.sub("", _MD_LINK_RE.sub(r"\1", text))
+    return " ".join(text.split()).lower()
+
+
+def _collapse_repeated_reply_quote(user_content: str, assistant_texts: List[str]) -> str:
+    """Shorten a leading reply quote to its first ~160 chars + `` …`` when it repeats an assistant
+    message in *assistant_texts* (normalized). Quotes of anything else (cron briefs, digests, other
+    chats) stay whole: they are the only copy of what the user is answering."""
+    if not assistant_texts or not isinstance(user_content, str):
+        return user_content
+    match = _REPLY_QUOTE_RE.match(user_content)
+    if not match:
+        return user_content
+    end = user_content.find(_REPLY_QUOTE_END + "\n\n", match.end())
+    if end < 0:
+        if not user_content.endswith(_REPLY_QUOTE_END):
+            return user_content
+        end = len(user_content) - len(_REPLY_QUOTE_END)
+    quote = user_content[match.end():end]
+    needle = _normalize_for_quote_match(quote)[:_REPLY_QUOTE_MATCH_CHARS]
+    if len(quote) <= _REPLY_QUOTE_KEEP_CHARS or not needle:
+        return user_content
+    if not any(needle in text for text in assistant_texts):
+        return user_content
+    short = quote[:_REPLY_QUOTE_KEEP_CHARS].rstrip() + " …"
+    return user_content[:match.end()] + short + user_content[end:]
+
+
 def _lookup_session_title(hermes_home: Any, session_id: str) -> str:
     """Session title from ``<hermes_home>/state.db``; '' on any miss or error (fail open).
 
@@ -452,6 +497,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_user_prefix, self._retain_assistant_prefix = "User", "Assistant"
         self._turn_counter = self._turn_index = 0
         self._session_turns: list[str] = []  # ALL turns for the session
+        self._session_assistant_texts: list[str] = []  # normalized, for reply-quote collapse
         self._last_retained_turn_count = 0  # append-mode delta watermark
         # Server-side async retain ops still in flight: aretain_batch returns on
         # *acceptance*, not durability, so the prefetch gates on these via
@@ -799,6 +845,7 @@ class HindsightMemoryProvider(MemoryProvider):
             setattr(self, f"_{name}", str(kwargs.get(name) or "").strip())
         self._turn_index = self._last_retained_turn_count = 0
         self._session_turns = []
+        self._session_assistant_texts = []
         self._handed_hermes_home = str(kwargs.get("hermes_home") or "").strip()
         self._first_user_line = self._last_turn_at = ""
         self._mode = cfg.get("mode", "cloud")
@@ -1181,6 +1228,11 @@ class HindsightMemoryProvider(MemoryProvider):
         self._last_turn_at = now
         if not self._first_user_line:
             self._first_user_line = _first_line(user_content)
+        user_content = _collapse_repeated_reply_quote(user_content, self._session_assistant_texts)
+        # Kept across append-mode retains (which clear _session_turns) so a reply to any earlier
+        # turn of this session is recognised; reset on session switch.
+        self._session_assistant_texts.append(_normalize_for_quote_match(str(assistant_content or "")))
+        del self._session_assistant_texts[:-_SESSION_ASSISTANT_TEXTS_MAX]
         return [{"role": role, "content": f"{prefix}: {content}", "timestamp": now} for role, prefix, content in
                 (("user", self._retain_user_prefix, user_content), ("assistant", self._retain_assistant_prefix, assistant_content))]
 
@@ -1445,6 +1497,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._parent_session_id = str(parent_session_id).strip()
         self._session_id, self._document_id = new_id, _mint_document_id(new_id)
         self._session_turns = []
+        self._session_assistant_texts = []
         self._first_user_line = self._last_turn_at = ""
         self._turn_counter = self._turn_index = self._last_retained_turn_count = 0
         logger.debug("Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",

@@ -560,7 +560,7 @@ class GatewayTurnMixin:
         """Prepend topic/channel-bound skill payload(s) to ``event.text`` on a new session."""
         _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
         try:
-            from agent.skill_commands import _load_skill_payload, _build_skill_message
+            from agent.skill_commands import _load_skill_payload, _build_skill_message, auto_load_activation_note
             _combined_parts: list[str] = []
             _loaded_names: list[str] = []
             for _sname in _skill_names:
@@ -569,11 +569,8 @@ class GatewayTurnMixin:
                     logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
                     continue
                 _loaded_skill, _skill_dir, _display_name = _loaded
-                _part = _build_skill_message(
-                    _loaded_skill, _skill_dir,
-                    f'[IMPORTANT: The "{_display_name}" skill is auto-loaded. '
-                    f"Follow its instructions for this session.]",
-                )
+                # Memory providers drop this block (agent.skill_commands.strip_auto_loaded_skill_blocks).
+                _part = _build_skill_message(_loaded_skill, _skill_dir, auto_load_activation_note(_display_name))
                 if _part:
                     _combined_parts.append(_part)
                     _loaded_names.append(_sname)

@@ -125,3 +125,97 @@ class TestMemoryManagerStripsScaffolding:
         mgr.flush_pending(timeout=5.0)
         assert provider.synced == []
 
+
+
+# ---------------------------------------------------------------------------
+# Auto-loaded skill blocks (gateway topic binding / skills.auto_load)
+# ---------------------------------------------------------------------------
+
+_CRON_BRIEF_REPLY = (
+    '[Replying to: "Cronjob Response: kanban-orchestrator\n(job_id: 580e25b75ad8)\n-------------\n\n'
+    "2 decisions needed\n1. Fork·land (t_bc22f8eb): commit the routing code? Rec: yes.\n"
+    "Reply e.g. '1 yes, 2 no'.\"]"
+)
+_SKILL_BODY = (
+    "---\nname: kanban-dispatch\ndescription: \"Use when distributing work.\"\n---\n\n"
+    "# Kanban dispatch\n\nGateway-restarting work is interactive: a worker cannot restart it.\n"
+    "Config changes apply on the next tick, no restart."
+)
+
+
+def _auto_load_block(tmp_path, name="kanban-dispatch", body=_SKILL_BODY, *, with_files=True, setup=False):
+    """A real gateway auto-load block, built with the production builders."""
+    from agent.skill_commands import _build_skill_message, auto_load_activation_note
+
+    skill_dir = tmp_path / name
+    (skill_dir / "scripts").mkdir(parents=True, exist_ok=True)
+    if with_files:
+        (skill_dir / "scripts" / "dispatch.py").write_text("print('x')\n")
+    loaded = {"name": name, "content": body}
+    if setup:
+        loaded["setup_skipped"] = True
+    return _build_skill_message(loaded, skill_dir, auto_load_activation_note(name))
+
+
+def _gateway_turn(blocks, user_text):
+    """``_hmwa_auto_load_skills`` shape: blocks then the user's (reply-prefixed) text."""
+    return "\n\n".join([*blocks, user_text])
+
+
+class TestAutoLoadedSkillStrip:
+    def test_first_turn_keeps_cron_quote_and_user_text(self, tmp_path):
+        from agent.skill_commands import extract_user_text_for_memory
+
+        user_text = f"{_CRON_BRIEF_REPLY}\n\n1. please do this yourself\n2. no"
+        turn = _gateway_turn([_auto_load_block(tmp_path)], user_text)
+        assert "Gateway-restarting" in turn  # the model-facing message carries the skill
+
+        cleaned = extract_user_text_for_memory(turn)
+        assert cleaned == user_text
+        assert "Kanban dispatch" not in cleaned and "Skill directory" not in cleaned
+
+    def test_bundle_of_blocks_all_stripped(self, tmp_path):
+        from agent.skill_commands import extract_user_text_for_memory
+
+        blocks = [
+            _auto_load_block(tmp_path, "kanban-dispatch"),
+            _auto_load_block(tmp_path, "sdlc-review", "# Review\n\nAlways verify.", with_files=False, setup=True),
+        ]
+        assert extract_user_text_for_memory(_gateway_turn(blocks, "any blockers?")) == "any blockers?"
+
+    def test_block_with_no_user_text_is_skipped(self, tmp_path):
+        from agent.skill_commands import extract_user_text_for_memory
+
+        assert extract_user_text_for_memory(_auto_load_block(tmp_path)) is None
+
+    def test_config_auto_load_note_is_recognised(self, tmp_path):
+        from agent.skill_commands import _build_skill_message, strip_auto_loaded_skill_blocks
+
+        skill_dir = tmp_path / "s"
+        skill_dir.mkdir()
+        note = ('[IMPORTANT: The "s" skill is auto-loaded via config (skills.auto_load). '
+                "Treat its instructions as active guidance for the duration of this session unless "
+                "the user overrides them.]")
+        block = _build_skill_message({"name": "s", "content": "body"}, skill_dir, note)
+        assert strip_auto_loaded_skill_blocks(block + "\n\nhello") == "hello"
+
+    def test_plain_text_and_mentions_are_untouched(self):
+        from agent.skill_commands import extract_user_text_for_memory
+
+        text = 'why does it say [IMPORTANT: The "x" skill is auto-loaded] in my prompt?'
+        assert extract_user_text_for_memory(text) == text
+        assert extract_user_text_for_memory("hello") == "hello"
+
+    def test_memory_manager_fan_out_strips_auto_load(self, tmp_path):
+        mgr, provider = _manager_with_recorder()
+        user_text = f"{_CRON_BRIEF_REPLY}\n\n1. yes"
+        turn = _gateway_turn([_auto_load_block(tmp_path)], user_text)
+
+        mgr.sync_all(turn, "Done.")
+        mgr.queue_prefetch_all(turn)
+        mgr.prefetch_all(turn)
+        mgr.flush_pending(timeout=5.0)
+
+        assert provider.synced == [user_text]
+        assert provider.queued == [user_text]
+        assert provider.prefetched == [user_text]

@@ -37,7 +37,7 @@ from urllib.request import url2pathname
 from agent.message_content import flatten_message_text
 from agent.memory_provider import MemoryProvider, spawn_context_thread
 from agent.secret_scope import get_secret
-from agent.skill_commands import extract_user_instruction_from_skill_message
+from agent.skill_commands import extract_user_text_for_memory
 from hermes_cli import __version__ as _HERMES_VERSION
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
@@ -187,9 +187,9 @@ def _format_openviking_exception(error: Exception) -> str:
 
 
 def _derive_openviking_user_text(content: Any) -> str:
-    """Strip Hermes slash-skill scaffolding before sending content to OpenViking
+    """Strip Hermes slash-skill and auto-loaded skill scaffolding before sending content to OpenViking
     (MemoryManager already does this for the fan-out; kept for direct hook callers)."""
-    return extract_user_instruction_from_skill_message(content) or ""
+    return extract_user_text_for_memory(content) or ""
 
 
 def _preview(value: Any, limit: int = 160) -> str:

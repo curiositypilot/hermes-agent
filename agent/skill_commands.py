@@ -41,6 +41,13 @@ _BUNDLE_MARKER = " skill bundle,"
 _BUNDLE_USER_INSTRUCTION = "\nUser instruction: "
 _BUNDLE_FIRST_SKILL_BLOCK = "\n\n[Loaded as part of the "
 
+# Auto-loaded skill markers (gateway topic/channel binding via ``auto_load_activation_note``,
+# config ``skills.auto_load`` via ``build_auto_load_prompt``). Both notes start with this
+# prefix + quoted name + marker; ``strip_auto_loaded_skill_blocks`` removes the block for memory.
+_AUTO_LOAD_PREFIX = '[IMPORTANT: The "'
+_AUTO_LOAD_MARKER = '" skill is auto-loaded'
+_AUTO_LOAD_NOTE_RE = re.compile(r'(?:^|(?<=\n))' + re.escape(_AUTO_LOAD_PREFIX) + r'[^"\n]*' + re.escape(_AUTO_LOAD_MARKER))
+
 # The skill name sits in the first quoted span of the activation note, for both
 # the single-skill and the bundle header ("work" / "/clean /work").
 _SKILL_NAME_RE = re.compile(re.escape(_SKILL_INVOCATION_PREFIX) + r'"([^"]*)"')
@@ -92,6 +99,83 @@ def extract_user_instruction_from_skill_message(content: Any) -> Optional[str]:
         # The instruction follows the skill body (which may quote the marker): LAST marker is the user's.
         return _cut_after(content, _SINGLE_SKILL_INSTRUCTION, _RUNTIME_NOTE, content.rfind)
     return None
+
+
+def auto_load_activation_note(name: str) -> str:
+    """Activation note the gateway puts above a topic/channel-bound skill (``_hmwa_auto_load_skills``).
+    Single construction site so ``strip_auto_loaded_skill_blocks`` recognises it byte-for-byte."""
+    return f'{_AUTO_LOAD_PREFIX}{name}{_AUTO_LOAD_MARKER}. Follow its instructions for this session.]'
+
+
+def _consume_skill_block_tail(lines: list[str], idx: int) -> int:
+    """Index of the first line after the optional blocks ``_build_skill_message`` appends below the
+    ``_SKILL_DIR_NOTE`` line (skill config, setup note, supporting files); blank lines between them
+    are consumed too, so the returned index is the first line of whatever follows the block."""
+    n = len(lines)
+    while True:
+        j = idx
+        while j < n and not lines[j].strip():
+            j += 1
+        if j >= n:
+            return n
+        line = lines[j]
+        if line.startswith(_SKILL_CONFIG_HEADER):
+            while j < n and lines[j] != "]":
+                j += 1
+            idx = j + 1
+        elif line.startswith(_SKILL_SETUP_HEADER):
+            while j < n and not lines[j].rstrip().endswith("]"):
+                j += 1
+            idx = j + 1
+        elif line == _SUPPORTING_FILES_NOTE:
+            j += 1
+            while j < n and lines[j].startswith("- "):
+                j += 1
+            k = j
+            while k < n and not lines[k].strip():
+                k += 1
+            idx = k + 1 if k < n and lines[k].startswith(_SUPPORTING_FILES_LOAD_LINE) else j
+        else:
+            return idx
+
+
+def strip_auto_loaded_skill_blocks(content: Any) -> Any:
+    """Remove every gateway/config auto-loaded skill block (activation note + skill body + the
+    ``[Skill directory: …]`` / ``_SKILL_DIR_NOTE`` lines and the optional blocks after them) from a
+    user turn, keeping any text before (a reply quote) and after (what the user typed). Memory path
+    only: the model-facing message is never changed. A block without the directory note has no
+    reliable end, so it is left in place. Non-strings are returned unchanged."""
+    if not isinstance(content, str) or _AUTO_LOAD_MARKER not in content:
+        return content
+    out: list[str] = []
+    rest = content
+    while True:
+        match = _AUTO_LOAD_NOTE_RE.search(rest)
+        if not match:
+            break
+        note_end = rest.find("\n" + _SKILL_DIR_NOTE, match.end())
+        if note_end < 0:
+            break
+        before = rest[:match.start()]
+        lines = rest[note_end + 1:].split("\n")
+        tail_idx = _consume_skill_block_tail(lines, 1)
+        out.append(before)
+        rest = "\n".join(lines[tail_idx:])
+    out.append(rest)
+    parts = [p.strip() for p in out if p.strip()]
+    return "\n\n".join(parts)
+
+
+def extract_user_text_for_memory(content: Any) -> Optional[str]:
+    """What memory providers should see of a user turn: auto-loaded skill blocks removed, then the
+    ``/skill`` scaffolding reduced to the user's instruction. ``None`` when nothing user-authored is
+    left (a bare ``/skill`` invocation or an auto-load block with no text)."""
+    if not isinstance(content, str):
+        return None
+    stripped = strip_auto_loaded_skill_blocks(content)
+    if stripped is not content and not stripped:
+        return None
+    return extract_user_instruction_from_skill_message(stripped)
 
 
 def describe_skill_invocation(content: Any, separator: str = " — ") -> Optional[str]:
@@ -201,7 +285,7 @@ def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None
         if not resolved:
             return
         parts.append("")
-        parts.append(f"[Skill config (from {display_hermes_home()}/config.yaml):")
+        parts.append(f"{_SKILL_CONFIG_HEADER}{display_hermes_home()}/config.yaml):")
         parts.extend(f"  {key} = {str(value) if value else '(not set)'}" for key, value in resolved.items())
         parts.append("]")
     except Exception:
@@ -217,6 +301,12 @@ _SETUP_SKIPPED_NOTE = (
     "Required environment setup was skipped. Continue loading the skill "
     "and explain any reduced functionality if it matters."
 )
+# Optional block headers ``_build_skill_message`` appends after ``_SKILL_DIR_NOTE``; shared with
+# ``_consume_skill_block_tail`` so the memory-path stripper finds the end of an auto-loaded block.
+_SKILL_CONFIG_HEADER = "[Skill config (from "
+_SKILL_SETUP_HEADER = "[Skill setup note: "
+_SUPPORTING_FILES_NOTE = "[This skill has supporting files (paths relative to the skill directory above):]"
+_SUPPORTING_FILES_LOAD_LINE = "Load any of these with skill_view(name="
 
 
 def _setup_note(loaded_skill: dict[str, Any]) -> Optional[str]:
@@ -259,17 +349,17 @@ def _build_skill_message(
     _inject_skill_config(loaded_skill, parts)
     setup_note = _setup_note(loaded_skill)
     if setup_note:
-        parts += ["", f"[Skill setup note: {setup_note}]"]
+        parts += ["", f"{_SKILL_SETUP_HEADER}{setup_note}]"]
     supporting = _supporting_files(loaded_skill, skill_dir)
     if supporting and skill_dir:
         try:
             skill_view_target = str(skill_dir.relative_to(_skills_dir()))
         except ValueError:
             skill_view_target = skill_dir.name  # external dir — use the skill name
-        parts += ["", "[This skill has supporting files (paths relative to the skill directory above):]"]
+        parts += ["", _SUPPORTING_FILES_NOTE]
         parts += [f"- {sf}" for sf in supporting]
         parts.append(
-            f'\nLoad any of these with skill_view(name="{skill_view_target}", '
+            f'\n{_SUPPORTING_FILES_LOAD_LINE}"{skill_view_target}", '
             f'file_path="<path>"), or run scripts directly by absolute path '
             f"(e.g. `node {skill_dir}/scripts/foo.js`)."
         )
