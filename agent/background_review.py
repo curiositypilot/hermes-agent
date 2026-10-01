@@ -1308,7 +1308,11 @@ def spawn_background_review_thread(
     if task_cfg is None:
         task_cfg = _background_review_task_config()
     # Per-agent overrides (agent._MEMORY_REVIEW_PROMPT etc.) keep working.
-    name = _PROMPT_NAME_BY_SCOPE[(review_memory, review_skills)]
+    # Fork: pick the prompt by the scope the fork can actually act on. With both built-in stores off,
+    # _review_tool_whitelist withholds the memory tool, so the memory/combined prompts would route
+    # facts to MEMORY.md/USER.md stores that do not exist (/refine always passes review_memory=True).
+    memory_on = bool(getattr(agent, "_memory_enabled", True) or getattr(agent, "_user_profile_enabled", True))
+    name = _PROMPT_NAME_BY_SCOPE[(review_memory and memory_on, review_skills)]
     prompt = getattr(agent, name, globals()[name])
     if focus := (focus or "").strip():
         prompt = (

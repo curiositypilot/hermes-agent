@@ -1916,6 +1916,15 @@ def _compressor_max_tokens(agent):
     return None
 
 
+def _builtin_memory_configured(_agent_cfg) -> bool:
+    """True unless the profile turned BOTH built-in stores off; fails open like the store flags."""
+    try:
+        from tools.memory_tool import get_builtin_memory_store_flags
+        return any(get_builtin_memory_store_flags(_agent_cfg))
+    except Exception:
+        return True
+
+
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
     _selected_engine = _select_context_engine(_agent_cfg)
     if _selected_engine is not None:
@@ -1957,6 +1966,10 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             proactive_prune_min_reclaim_tokens=cs.proactive_prune_min_reclaim,
             min_tail_user_messages=cs.min_tail_users, tail_mode=cs.tail_mode,
             custom_providers=_custom_providers,
+            # Fork: both config flags off = no MEMORY.md/USER.md block exists, so the handoff must not
+            # call it authoritative. Config, not agent._memory_enabled: skip_memory agents (subagents,
+            # review fork) leave those False even when the profile's stores are on.
+            builtin_memory_enabled=_builtin_memory_configured(_agent_cfg),
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):

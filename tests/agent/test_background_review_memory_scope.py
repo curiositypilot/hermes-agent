@@ -71,6 +71,26 @@ class TestSpawnForwardsScope:
             assert captured["review_memory"] is True
 
 
+class TestPromptFollowsMemoryFlags:
+    """Fork: with both built-in stores off the fork never gets the memory tool, so a
+    memory-scope trigger (``/refine`` always passes review_memory=True) must not hand it
+    a prompt that routes facts to MEMORY.md/USER.md."""
+
+    def test_memory_off_profile_gets_skill_prompt(self):
+        agent = _review_agent(memory_enabled=False, user_profile_enabled=False)
+        _target, prompt = bg.spawn_background_review_thread(
+            agent, [], review_memory=True, review_skills=True, task_cfg={})
+        assert prompt == bg._SKILL_REVIEW_PROMPT
+        assert "USER.md" not in prompt and "MEMORY.md" not in prompt
+
+    def test_either_store_on_keeps_memory_prompt(self):
+        for flags in ((True, False), (False, True)):
+            agent = _review_agent(*flags)
+            _target, prompt = bg.spawn_background_review_thread(
+                agent, [], review_memory=True, review_skills=True, task_cfg={})
+            assert prompt == bg._COMBINED_REVIEW_PROMPT
+
+
 class TestExplicitRefineOrigin:
     """``/refine`` (explicit) must not inherit the unattended-review origin: the user asked
     for that review, so its fork keeps the full memory operation set and the delete gate

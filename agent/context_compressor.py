@@ -289,6 +289,24 @@ SUMMARY_PREFIX = (
     "The current session state (files, config, etc.) may reflect work "
     "described here — avoid repeating it:"
 )
+# Fork: with both built-in stores off (memory.memory_enabled and memory.user_profile_enabled false)
+# there is no MEMORY.md/USER.md block, so the clause above points the model at a dead store. That
+# profile gets this variant instead. Derived by replacement so upstream edits to SUMMARY_PREFIX merge
+# cleanly; a test fails if the clause text drifts and the replacement stops applying.
+_BUILTIN_MEMORY_AUTHORITY_CLAUSE = (
+    "IMPORTANT: Your persistent memory (MEMORY.md, USER.md) in the system prompt is ALWAYS authoritative "
+    "and active — never ignore or deprioritize memory content due to this compaction note. "
+)
+_SYSTEM_PROMPT_AUTHORITY_CLAUSE = (
+    "IMPORTANT: Everything in the system prompt (persona, context files, memory-provider context) is "
+    "ALWAYS authoritative and active — never ignore or deprioritize it due to this compaction note. "
+)
+SUMMARY_PREFIX_NO_BUILTIN_MEMORY = SUMMARY_PREFIX.replace(
+    _BUILTIN_MEMORY_AUTHORITY_CLAUSE, _SYSTEM_PROMPT_AUTHORITY_CLAUSE
+)
+# Every prefix a live build may write today; both are detected regardless of this profile's flags,
+# because a session can resume under a profile whose memory flags changed since the handoff was written.
+_LIVE_SUMMARY_PREFIXES = (SUMMARY_PREFIX, SUMMARY_PREFIX_NO_BUILTIN_MEMORY)
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 
 # Underscore prefix ON PURPOSE: wire sanitizers strip ``_``-keys; strict gateways
@@ -1975,6 +1993,10 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     """Default context engine: prune tool results, protect head/tail, summarize the middle
     with an LLM, and iteratively update the previous summary on later compactions."""
 
+    # Handoff prefix this instance writes. Class default keeps ``__new__``-built instances on the
+    # upstream text; __init__ swaps in the no-built-in-memory variant when both stores are off.
+    summary_prefix: str = SUMMARY_PREFIX
+
     @property
     def name(self) -> str:
         return "compressor"
@@ -2642,9 +2664,16 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
-        custom_providers: list | None = None,
+        custom_providers: list | None = None, builtin_memory_enabled: bool = True,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
+        # Fixed for the compressor's life, so the handoff text is byte-stable within a session.
+        # False = memory.memory_enabled and memory.user_profile_enabled are both off: no MEMORY.md/USER.md
+        # block exists, so the handoff and compaction note must not call it authoritative.
+        self.builtin_memory_enabled = bool(builtin_memory_enabled)
+        if not self.builtin_memory_enabled:
+            self.summary_prefix = SUMMARY_PREFIX_NO_BUILTIN_MEMORY
+            self._COMPRESSION_NOTE = self._COMPRESSION_NOTE_NO_BUILTIN_MEMORY
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
         # Per-model context_length overrides live in custom_providers; without them deferred
@@ -3459,7 +3488,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         # path.
         _pruned_names = _collect_ghosted_skill_names(turns_to_summarize)
         del _pruned_names[_MAX_PRUNED_SKILL_MARKERS:]
-        summary = self._with_summary_prefix(_redact_compaction_text(body.strip()))
+        summary = self._with_summary_prefix(_redact_compaction_text(body.strip()), self.summary_prefix)
         if len(summary) > _FALLBACK_SUMMARY_MAX_CHARS:
             summary = summary[: _FALLBACK_SUMMARY_MAX_CHARS - 42].rstrip() + "\n...[fallback summary truncated]"
         # Re-inject AFTER the size cap: markers live at the end, where truncation cuts.
@@ -3863,7 +3892,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             self._last_summary_error = None
             for flag, _class, _msg in _TERMINAL_SUMMARY_FAILURES:
                 setattr(self, flag, False)
-            return self._with_summary_prefix(summary)
+            return self._with_summary_prefix(summary, self.summary_prefix)
         except Exception as e:
             return self._on_summary_failure(e, turns_to_summarize, focus_topic, memory_context)
 
@@ -4091,7 +4120,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Drop merged prior-tail content up to the delimiter so it never leaks into the next prompt.
         if _MERGED_SUMMARY_DELIMITER in text:
             text = text.split(_MERGED_SUMMARY_DELIMITER, 1)[1].strip()
-        for prefix in (SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES):
+        for prefix in (*_LIVE_SUMMARY_PREFIXES, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES):
             if text.startswith(prefix):
                 text = text[len(prefix):].lstrip()
                 break
@@ -4103,15 +4132,17 @@ Write only the summary body. Do not include any preamble or prefix."""
         return text
 
     @classmethod
-    def _with_summary_prefix(cls, summary: str) -> str:
-        """Normalize summary text to the current compaction handoff format."""
+    def _with_summary_prefix(cls, summary: str, prefix: Optional[str] = None) -> str:
+        """Normalize summary text to the current compaction handoff format. Instance callers pass
+        ``prefix=self.summary_prefix`` (the no-built-in-memory variant when both stores are off)."""
+        prefix = prefix or SUMMARY_PREFIX
         text = cls._strip_summary_prefix(summary)
-        return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
+        return f"{prefix}\n{text}" if text else prefix
 
     @staticmethod
     def _starts_with_summary_prefix(text: str) -> bool:
         """Return True if *text* begins with any known handoff prefix."""
-        return text.startswith((SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES))
+        return text.startswith((*_LIVE_SUMMARY_PREFIXES, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES))
 
     @classmethod
     def classify_summary_content(cls, content: Any) -> Optional[str]:
@@ -5067,6 +5098,12 @@ Write only the summary body. Do not include any preamble or prefix."""
         return True
 
     _COMPRESSION_NOTE = "[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work. Your persistent memory (MEMORY.md, USER.md) remains fully authoritative regardless of compaction.]"
+    # Fork: both built-in stores off — no MEMORY.md/USER.md block exists (see SUMMARY_PREFIX_NO_BUILTIN_MEMORY).
+    _COMPRESSION_NOTE_NO_BUILTIN_MEMORY = _COMPRESSION_NOTE.replace(
+        "Your persistent memory (MEMORY.md, USER.md) remains fully authoritative regardless of compaction.",
+        "The system prompt (persona, context files, memory-provider context) remains fully authoritative "
+        "regardless of compaction.",
+    )
 
     def _assemble_head(self, messages: List[Dict[str, Any]], compress_start: int) -> List[Dict[str, Any]]:
         """Protected head with the compaction note on the system prompt and stale handoffs stripped."""

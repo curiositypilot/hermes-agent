@@ -248,3 +248,160 @@ def test_frozen_prefix_generations_match_historical_tuple():
     )
 
 
+# ── Fork: handoff text when both built-in memory stores are off ─────────────
+# With memory.memory_enabled and memory.user_profile_enabled false there is no
+# MEMORY.md/USER.md block in the system prompt, so the compaction handoff and
+# the system-prompt compaction note must not call that dead store authoritative.
+
+_DEAD_STORE_TEXT = ("MEMORY.md", "USER.md")
+
+
+def _compressor(**kwargs):
+    from unittest.mock import patch
+
+    from agent.context_compressor import ContextCompressor
+
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        return ContextCompressor(
+            model="test/model", quiet_mode=True, protect_first_n=2, protect_last_n=2, **kwargs
+        )
+
+
+def _conversation():
+    return [{"role": "system", "content": "sys"}] + [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+        for i in range(10)
+    ]
+
+
+def _all_text(messages):
+    from agent.context_compressor import _content_text_for_contains
+
+    return "\n".join(_content_text_for_contains(m.get("content")) for m in messages)
+
+
+def test_no_builtin_memory_prefix_keeps_every_other_directive():
+    """The variant swaps only the memory clause: every behavioural directive of
+    the live prefix survives, and the swap really applied (a drifted clause would
+    silently leave the dead-store text in place)."""
+    from agent.context_compressor import SUMMARY_PREFIX_NO_BUILTIN_MEMORY
+
+    variant = SUMMARY_PREFIX_NO_BUILTIN_MEMORY
+    assert variant != SUMMARY_PREFIX
+    assert not any(token in variant for token in _DEAD_STORE_TEXT)
+    assert "system prompt" in variant and "authoritative" in variant
+    lower, live = variant.lower(), SUMMARY_PREFIX.lower()
+    for directive in (
+        "topic overlap", "latest user message wins", "if no user message appears after this summary",
+        "must never become the active turn", "your tools remain fully active", HISTORICAL_TASK_HEADING.lower(),
+    ):
+        assert directive in live and directive in lower
+    # Same opening as the live prefix: hermes_state_common previews match on it.
+    assert variant.split("Do NOT answer", 1)[0] == SUMMARY_PREFIX.split("Do NOT answer", 1)[0]
+
+
+def test_compressor_handoff_text_follows_builtin_memory_flag():
+    on, off = _compressor(), _compressor(builtin_memory_enabled=False)
+    assert on.summary_prefix == SUMMARY_PREFIX
+    assert any(token in on._COMPRESSION_NOTE for token in _DEAD_STORE_TEXT)
+    assert off.summary_prefix != SUMMARY_PREFIX
+    assert not any(token in off.summary_prefix for token in _DEAD_STORE_TEXT)
+    assert not any(token in off._COMPRESSION_NOTE for token in _DEAD_STORE_TEXT)
+    # The per-instance swap must not leak into other compressors.
+    assert _compressor()._COMPRESSION_NOTE == on._COMPRESSION_NOTE
+
+
+def test_compaction_with_builtin_memory_off_never_mentions_dead_store():
+    """End to end through compress(): the deterministic-fallback handoff and the
+    note appended to the system prompt carry no MEMORY.md/USER.md text."""
+    from unittest.mock import patch
+
+    from agent.context_compressor import ContextCompressor
+
+    off = _compressor(builtin_memory_enabled=False)
+    with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+        result = off.compress(_conversation())
+    text = _all_text(result)
+    assert not any(token in text for token in _DEAD_STORE_TEXT)
+    assert any(off.summary_prefix in _all_text([m]) for m in result)
+    assert off._COMPRESSION_NOTE in _all_text(result[:1])
+    assert any(ContextCompressor._is_context_summary_message(m) for m in result)
+
+
+def test_compaction_with_builtin_memory_on_is_unchanged():
+    from unittest.mock import patch
+
+    on = _compressor()
+    with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+        result = on.compress(_conversation())
+    assert any(SUMMARY_PREFIX in _all_text([m]) for m in result)
+    assert on._COMPRESSION_NOTE in _all_text(result[:1])
+
+
+def test_llm_summary_and_micro_marker_use_instance_prefix():
+    from unittest.mock import MagicMock, patch
+
+    off = _compressor(builtin_memory_enabled=False)
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].message.content = "## Historical Task Snapshot\nwork happened"
+    with patch("agent.context_compressor.call_llm", return_value=response):
+        summary = off._generate_summary([
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "done"},
+        ])
+    assert summary.startswith(off.summary_prefix)
+    assert not any(token in summary for token in _DEAD_STORE_TEXT)
+    marker = off._render_micro_marker_content("rolling body", off.summary_prefix)
+    assert marker.startswith(off.summary_prefix)
+    assert off.classify_summary_content(marker) == "standalone"
+
+
+def test_both_live_prefixes_detected_regardless_of_flag():
+    """A session can resume under a profile whose memory flags flipped since the
+    handoff was written: summaries written with either live prefix (including
+    every summary written before this change) must stay detectable and
+    strippable, and re-normalize to the compressor's own prefix."""
+    from agent.context_compressor import (
+        _HISTORICAL_SUMMARY_PREFIXES,
+        SUMMARY_PREFIX_NO_BUILTIN_MEMORY,
+        ContextCompressor,
+    )
+
+    assert SUMMARY_PREFIX_NO_BUILTIN_MEMORY not in _HISTORICAL_SUMMARY_PREFIXES
+    off = _compressor(builtin_memory_enabled=False)
+    for written_with in (SUMMARY_PREFIX, SUMMARY_PREFIX_NO_BUILTIN_MEMORY):
+        content = written_with + "\nBODY"
+        assert ContextCompressor.classify_summary_content(content) == "standalone"
+        assert ContextCompressor._strip_summary_prefix(content) == "BODY"
+        assert off._with_summary_prefix(content, off.summary_prefix) == off.summary_prefix + "\nBODY"
+    # Static callers with no prefix keep the upstream text.
+    assert ContextCompressor._with_summary_prefix("BODY") == SUMMARY_PREFIX + "\nBODY"
+
+
+def test_agent_init_reads_builtin_memory_flags_from_config(tmp_path, monkeypatch):
+    """Real resolution chain: config memory flags → agent_init → compressor."""
+    import pytest
+
+    from hermes_cli import config as config_mod
+    from run_agent import AIAgent
+
+    def _make(memory_section):
+        cfg = {"memory": memory_section, "compression": {"enabled": True}}
+        monkeypatch.setattr(config_mod, "load_config_readonly", lambda: cfg)
+        return AIAgent(
+            base_url="https://openrouter.ai/api/v1", api_key="test-key", provider="openrouter",
+            model="anthropic/claude-sonnet-4", enabled_toolsets=[], disabled_toolsets=[],
+            quiet_mode=True, skip_memory=True, skip_context_files=True,
+        )
+
+    off = _make({"memory_enabled": False, "user_profile_enabled": False})
+    if type(off.context_compressor).__name__ != "ContextCompressor":
+        pytest.skip("external context engine selected")
+    assert off.context_compressor.summary_prefix != SUMMARY_PREFIX
+    assert not any(token in off.context_compressor._COMPRESSION_NOTE for token in _DEAD_STORE_TEXT)
+    # Either store on (or the flags absent) keeps the upstream text.
+    for section in ({"memory_enabled": False, "user_profile_enabled": True}, {}):
+        assert _make(section).context_compressor.summary_prefix == SUMMARY_PREFIX
+
+

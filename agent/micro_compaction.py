@@ -36,6 +36,9 @@ def _is_micro_marker(entry: Any) -> bool:
 class MicroCompactionMixin:
     """Rolling micro-compaction; host must be a ``ContextCompressor``."""
 
+    # Provided by the host (fork: no-built-in-memory variant when both stores are off).
+    summary_prefix: str
+
     def _resolve_compact_cursor(self, messages: List[Dict[str, Any]], head_end: int, tail_start: int) -> int:
         """Index of the first message not yet absorbed into the rolling summary: the in-memory
         cursor when valid, else just past the last summary marker."""
@@ -179,7 +182,7 @@ class MicroCompactionMixin:
         # history we lack.
         entry = next((e for e in reversed(messages) if _is_micro_marker(e)), None)
         if entry is not None:
-            entry["content"] = self._render_micro_marker_content(fresh_summary)
+            entry["content"] = self._render_micro_marker_content(fresh_summary, self.summary_prefix)
             # Content changed: clear the persisted stamp so the DB sync rewrites the row. An
             # in-place pop on a live dict would be identity-skipped by the bounded flush scan;
             # flag the finalizer.
@@ -374,7 +377,7 @@ class MicroCompactionMixin:
             return messages
 
         summary_msg = {
-            "role": "assistant", "content": self._render_micro_marker_content(summary_text),
+            "role": "assistant", "content": self._render_micro_marker_content(summary_text, self.summary_prefix),
             cc.COMPRESSED_SUMMARY_METADATA_KEY: True,
             # Micro marker: eligible for supersede/defrag; batch markers never carry this key.
             cc.MICRO_COMPACT_MARKER_KEY: True,
@@ -394,10 +397,12 @@ class MicroCompactionMixin:
         return result
 
     @staticmethod
-    def _render_micro_marker_content(summary_text: str) -> str:
-        """Assemble the marker content wrapper around *summary_text*."""
+    def _render_micro_marker_content(summary_text: str, prefix: Optional[str] = None) -> str:
+        """Assemble the marker content wrapper around *summary_text*. Instance callers pass
+        ``self.summary_prefix`` (fork: the no-built-in-memory variant when both stores are off)."""
         cc = _cc()
-        return f"{cc.SUMMARY_PREFIX}\n\n{cc.HISTORICAL_TASK_HEADING}\n{summary_text.strip()}\n\n{cc._SUMMARY_END_MARKER}"
+        prefix = prefix or cc.SUMMARY_PREFIX
+        return f"{prefix}\n\n{cc.HISTORICAL_TASK_HEADING}\n{summary_text.strip()}\n\n{cc._SUMMARY_END_MARKER}"
 
     def _merge_adjacent_user_turns(self, result: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Merge consecutive plain-text real user turns left by a supersede. Same ``\\n\\n`` join as
