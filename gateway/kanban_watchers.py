@@ -299,6 +299,15 @@ class GatewayKanbanWatchersMixin:
                     # See #49638.
                     if _ad_enabled:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
+                    # kanban.routing.auto_label: estimate S/M/L for unlabeled
+                    # ready/todo cards BEFORE dispatch so this tick routes them.
+                    # Optional pre-pass: it must never cost the tick itself.
+                    _auto_label = getattr(dispatcher, "auto_label_tick", None)
+                    if _auto_label is not None:
+                        try:
+                            await _to_thread_process_service(_auto_label)
+                        except Exception:
+                            logger.exception("kanban auto-label: pre-pass failed; dispatching anyway")
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)

@@ -501,6 +501,17 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "the profile's provider and will fail if it belongs "
                 "to a different one. Requires 'model'."
         )),
+        "complexity": {
+            "type": "string",
+            "enum": ["S", "M", "L"],
+            "description": (
+                "Size label for model routing: 'S' (small, localized "
+                "change), 'M' (multi-file), 'L' (broad or ambiguous). "
+                "When the board has tier routing enabled and no 'model' "
+                "is pinned, the dispatcher picks the worker model for "
+                "this tier and skips rate-limited providers. Set it on "
+                "every child card you create; omit only when unsure."),
+        },
     },
     ["title", "assignee"],
 )

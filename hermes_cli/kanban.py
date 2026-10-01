@@ -213,6 +213,7 @@ def _profile_author() -> str:
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
+    "set-complexity",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
@@ -377,6 +378,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
             max_retries=max_retries, model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            complexity=getattr(args, "complexity", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
@@ -522,6 +524,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         field("model", f"{task.model_override}{_prov}")
+    if task.complexity:
+        field("complexity", task.complexity)
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
@@ -601,6 +605,101 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         print(f"Set model override on {args.task_id}: {label} (applies on next dispatch)")
     else:
         print(f"Cleared model override on {args.task_id} (worker uses its profile default)")
+    return 0
+
+
+def _cmd_set_complexity(args: argparse.Namespace) -> int:
+    raw = (args.complexity or "").strip()
+    try:
+        with kbc.connect_closing() as conn:
+            if raw.lower() == "auto":
+                from hermes_cli import kanban_routing as kr
+                task = kb.get_task(conn, args.task_id)
+                if task is None:
+                    return _err(f"no such task: {args.task_id}")
+                est = kr.estimate_complexity(task.title, task.body, task_id=task.id)
+                if not (est.get("ok") and est.get("complexity")):
+                    return _err(f"kanban: estimate failed: {est.get('reason') or 'no complexity in reply'}", 1)
+                ok = kb.set_complexity(conn, args.task_id, est["complexity"], source="estimator")
+                if ok:
+                    why = f" — {est['rationale']}" if est.get("rationale") else ""
+                    print(f"Estimated {args.task_id}: {est['complexity']} (~{est.get('est_tokens') or '?'} tokens){why}")
+                    return 0
+            else:
+                ok = kb.set_complexity(conn, args.task_id, raw)
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    value = kb.normalize_complexity(raw)
+    print(f"Set complexity on {args.task_id}: {value} (applies on next dispatch)" if value
+          else f"Cleared complexity on {args.task_id}")
+    return 0
+
+
+def _cmd_route(args: argparse.Namespace) -> int:
+    """Routing preview: tier table with live availability, plus one task's decision."""
+    from hermes_cli import kanban_routing as kr
+
+    cfg = kr.load_routing_config(_kanban_config())
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id) if args.task_id else None
+        if args.task_id and task is None:
+            return _err(f"no such task: {args.task_id}")
+        ctx = kr.RoutingContext(conn, cfg)
+        home = kr.resolve_profile_home(task.assignee if task else None)
+        tiers = []
+        for tier in kr.TIER_ORDER:
+            rows = []
+            for cand in cfg.tiers.get(tier, ()):
+                avail = ctx.availability(cand, home)
+                rows.append({**cand.as_dict(), "available": avail.available, "reason": avail.reason,
+                             "until": int(avail.until) if avail.until else None})
+            tiers.append({"tier": tier, "candidates": rows})
+        review = []
+        for cand in cfg.review:
+            avail = ctx.availability(cand, home)
+            review.append({**cand.as_dict(), "available": avail.available, "reason": avail.reason,
+                           "until": int(avail.until) if avail.until else None})
+        lane = "review" if task is not None and task.status == "review" else "ready"
+        decision = ctx.decide_for_lane(task, lane, home) if task is not None else None
+    if getattr(args, "json", False):
+        _print_json({
+            "enabled": cfg.enabled, "unlabeled": cfg.unlabeled, "escalate": cfg.escalate,
+            "on_exhausted": cfg.on_exhausted, "cooldown_seconds": cfg.cooldown_seconds,
+            "auto_label": cfg.auto_label, "tiers": tiers, "review": review,
+            "task": None if task is None else {
+                "id": task.id, "complexity": task.complexity, "lane": lane,
+                **({"decision": decision.label(), **decision.event_payload()} if decision is not None
+                   else {"decision": "pinned / profile model (no kanban.routing.review)"}),
+            },
+        })
+        return 0
+    state = "ENABLED" if cfg.enabled else "disabled (kanban.routing.enabled: false — dispatch ignores tiers)"
+    print(f"Routing: {state}")
+    print(f"  unlabeled={cfg.unlabeled}  escalate={cfg.escalate}  on_exhausted={cfg.on_exhausted}  "
+          f"cooldown={cfg.cooldown_seconds}s  auto_label={cfg.auto_label}")
+    def _rows(heading: str, cands: list[dict], empty: str) -> None:
+        print(f"\n{heading}:" + ("" if cands else f"  ({empty})"))
+        for c in cands:
+            mark = "ok " if c["available"] else "-- "
+            label = f"{c['provider']}:{c['model']}" if c["provider"] else c["model"]
+            extra = f" reasoning={c['reasoning']}" if c["reasoning"] else ""
+            until = f" until {_fmt_ts(c['until'])}" if c["until"] else ""
+            print(f"  {mark}{label}{extra}  [{c['reason']}{until}]")
+
+    for t in tiers:
+        _rows(f"Tier {t['tier']}", t["candidates"], "no candidates")
+    _rows("Review lane", review, "not set: reviewers use the card pin / profile model")
+    if task is not None:
+        print(f"\nTask {task.id} (lane={lane}, complexity={task.complexity or '-'}, assignee={task.assignee or '-'}):")
+        if decision is None:
+            print("  -> pinned / profile model (no kanban.routing.review)")
+            return 0
+        print(f"  -> {decision.label()}")
+        for s in decision.skipped:
+            where = f"{s['tier']} " if s.get("tier") else ""
+            print(f"     skipped {where}{s.get('provider') or ''}:{s['model']} ({s['reason']})")
     return 0
 
 
@@ -1327,6 +1426,7 @@ _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "set-complexity": _cmd_set_complexity, "route": _cmd_route,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,

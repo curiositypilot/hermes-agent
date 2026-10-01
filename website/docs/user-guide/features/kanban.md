@@ -668,6 +668,41 @@ hermes kanban set-model t_abcd none    # clear the override
 
 The dispatcher spawns the worker with the pinned model (`--provider <name>` is passed when set; `--provider` requires a model). The dashboard's per-task model dropdown drives the same `model_override` field. With no override, the worker uses its profile's configured model.
 
+### Complexity labels and tier routing
+
+Label a card `S` (small, localized), `M` (multi-file) or `L` (broad or ambiguous) and, with `kanban.routing` enabled, the dispatcher picks the worker model from that tier's list at spawn time — skipping any candidate whose provider is currently rate-limited:
+
+```yaml
+kanban:
+  routing:
+    enabled: true
+    tiers:
+      S: [{model: gemini-flash-latest, provider: antigravity}]
+      M: [{model: gpt-5.6-terra, provider: openai-codex}, {model: claude-sonnet-5-5, provider: anthropic}]
+      L: [{model: claude-opus-5-5, provider: anthropic, reasoning: high}, {model: gpt-6-astra, provider: openai-codex}]
+    unlabeled: profile      # or S/M/L — tier for cards with no label
+    escalate: true          # all S candidates limited → try M, then L
+    on_exhausted: wait      # or profile — spawn on the assignee's own model instead of holding
+    cooldown_seconds: 900   # skip a candidate this long after a worker hit its rate limit
+    auto_label: false       # estimate S/M/L for unlabeled ready cards via auxiliary.kanban_estimator
+    review:                 # optional: reviewer model for review-lane runs (sdlc-review)
+      - {model: gpt-6.1-sol, provider: openai-codex, reasoning: high}
+      - {model: claude-opus-5-5, provider: anthropic, reasoning: high}
+```
+
+```bash
+hermes kanban create "rename a flag" --assignee coder --complexity S
+hermes kanban set-complexity t_abcd L        # or 'none', or 'auto' (aux-model estimate)
+hermes kanban route t_abcd                   # tier table with live availability + this card's pick
+hermes kanban dispatch --dry-run             # shows 'routed <id>: tier S -> provider:model'
+```
+
+A candidate is **unavailable** when the assignee profile's credential pool has every credential for that provider `exhausted` (429/quota, until its reset) or benched for that model, or when a routed worker on this board exited `rate_limited` on it within `cooldown_seconds`. Providers with no pool entries (inline keys, local proxies) count as available. The check reads `auth.json` only — it never refreshes tokens or makes an API call.
+
+Precedence: a pinned `--model` always wins, then the tier, then the profile default. The routed model is **not** saved on the card: every retry routes again, and a card whose last run hit a quota wall skips the usual rate-limit cooldown when its new route is a different model. Each routed run gets a `routed` event (tier, model, provider, skipped candidates) — `hermes kanban show` lists it, so you can check afterwards which model did the work. When no candidate is available and `on_exhausted: wait`, the card stays `ready` with guard reason `tier_exhausted` (no failure counted) and one `routing_held` event. Orchestrator workers set the label with `kanban_create(complexity=...)`; the dashboard's **Estimate** button saves its S/M/L result on unlabeled cards.
+
+Review runs ignore the tiers. With `review` set, every review-lane spawn takes the first available candidate from that list, which replaces the card's pinned model and reasoning effort (those were chosen for the implementer, and a reviewer on a different model catches different defects). The `routed` event then carries `lane: review`, and a list with no available candidate holds the card in `review` as `tier_exhausted` (or spawns on the profile model with `on_exhausted: profile`). Without `review`, reviewers run the card pin or the reviewer profile's model. `hermes kanban route <id>` shows the review list and, for a card in `review`, its pick.
+
 ### Cost strategy: frontier orchestrator, inexpensive workers
 
 Kanban's per-profile configs make the planner/worker cost split natural. Decomposing a project into well-scoped cards takes frontier-level judgment; executing a card that already carries a clear goal, context, and handoff evidence usually doesn't — and the workers are where the vast majority of tokens are spent, so the worker model is where the cost lives. Run your orchestrator/dispatcher profile on a frontier model and point worker profiles at inexpensive models. Each profile has its own `config.yaml` under `~/.hermes/profiles/<name>/`, and the dispatcher injects the profile-scoped `HERMES_HOME` when it spawns `hermes -p <assignee>`, so each worker reads its own profile's model settings:

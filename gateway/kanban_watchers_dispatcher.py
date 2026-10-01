@@ -274,6 +274,39 @@ class _KanbanDispatcher:
                         os.environ["HERMES_KANBAN_BOARD"] = prev_env
         return successes
 
+    def auto_label_tick(self) -> int:
+        """``kanban.routing.auto_label``: aux-estimate S/M/L for up to
+        ``auto_label_per_tick`` unlabeled ready/todo cards per board, before
+        dispatch fans out. Config re-read live; a no-op unless routing AND
+        auto_label are both on. Returns the number labelled."""
+        try:
+            from hermes_cli import kanban_routing as _kr
+            cfg = _kr.load_routing_config()
+        except Exception as exc:  # pragma: no cover
+            logger.debug("kanban auto-label: routing config unavailable (%s)", exc)
+            return 0
+        if not (cfg.enabled and cfg.auto_label):
+            return 0
+        labelled = 0
+        with _default_profile_secret_scope():
+            for slug in self._board_slugs():
+                conn = None
+                try:
+                    conn = _kbc().connect(board=slug)
+                    for tid, size in _kr.auto_label(conn, cfg.auto_label_per_tick):
+                        if size:
+                            labelled += 1
+                            logger.info("kanban auto-label [%s]: %s → %s", slug, tid, size)
+                        else:
+                            logger.info("kanban auto-label [%s]: %s estimate failed (left unlabeled)", slug, tid)
+                except Exception:
+                    logger.exception("kanban auto-label: board %s failed", slug)
+                finally:
+                    if conn is not None:
+                        with contextlib.suppress(Exception):
+                            conn.close()
+        return labelled
+
     @staticmethod
     def _decompose_one(_decomp: Any, slug: str, tid: str) -> int:
         """Decompose one triage task; returns 1 on success, 0 otherwise."""
@@ -332,4 +365,6 @@ def _log_spawn_results(results: Optional[list]) -> bool:
                 res.promoted,
                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
             )
+            for tid, label in getattr(res, "routed", None) or ():
+                logger.info("kanban dispatcher [%s]: %s routed: %s", slug, tid, label)
     return any_spawned

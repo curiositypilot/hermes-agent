@@ -19,7 +19,7 @@ _TASK_DICT_FIELDS = (
     "id", "title", "body", "assignee", "status", "priority", "tenant",
     "workspace_kind", "workspace_path", "branch_name", "project_id",
     "created_by", "created_at", "started_at", "completed_at", "result",
-    "skills", "max_runtime_seconds", "max_retries", "model_override", "provider_override",
+    "skills", "max_runtime_seconds", "max_retries", "model_override", "provider_override", "complexity",
     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
 )
 _SHOW_RUN_FIELDS = (
@@ -75,7 +75,8 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    size = f" ({t.complexity})" if getattr(t, "complexity", None) else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}{size}  {t.title}"
 
 
 def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:

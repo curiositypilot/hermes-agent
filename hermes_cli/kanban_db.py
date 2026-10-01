@@ -111,6 +111,23 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Complexity labels driving ``kanban.routing`` tier selection (S = small/localized,
+# M = multi-file, L = broad or ambiguous); NULL = unlabeled.
+VALID_COMPLEXITIES = ("S", "M", "L")
+
+
+def normalize_complexity(value: Optional[str]) -> Optional[str]:
+    """``S``/``M``/``L`` (case-insensitive; ``small``/``medium``/``large`` accepted);
+    empty/None/``none`` = unlabeled. Anything else raises so a typo never silently
+    routes a card to the unlabeled path."""
+    raw = str(value or "").strip().upper()
+    if not raw or raw in {"NONE", "-", "NULL"}:
+        return None
+    raw = {"SMALL": "S", "MEDIUM": "M", "LARGE": "L"}.get(raw, raw)
+    if raw in VALID_COMPLEXITIES:
+        return raw
+    raise ValueError(f"complexity must be one of {', '.join(VALID_COMPLEXITIES)} (or none), got {value!r}")
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """``VALID_REASONING_EFFORTS`` or ``"none"`` (thinking off), case-insensitive;
@@ -732,6 +749,7 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    complexity: Optional[str] = None         # VALID_COMPLEXITIES; NULL = unlabeled (kanban.routing)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -766,6 +784,7 @@ _TASK_OPTIONAL_COLUMNS = (
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
+    "complexity",
 )
 
 
@@ -966,7 +985,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Complexity label (S|M|L). When ``kanban.routing`` is enabled and the task
+    -- has no model_override, the dispatcher picks the worker model from the
+    -- label's tier list, skipping providers that are currently rate-limited.
+    -- NULL = unlabeled (``kanban.routing.unlabeled`` decides).
+    complexity           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1260,6 +1284,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    complexity: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1269,6 +1294,7 @@ def create_task(
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
     worker model (provider requires model); ``reasoning_effort`` is independent.
+    ``complexity`` (S|M|L) selects the ``kanban.routing`` tier when no model is pinned.
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
@@ -1282,6 +1308,7 @@ def create_task(
     completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    complexity = normalize_complexity(complexity)
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -1359,8 +1386,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract, complexity
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1370,6 +1397,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        complexity,
                     ),
                 )
                 for pid in parents:
@@ -1392,6 +1420,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "complexity": complexity,
                     },
                 )
                 if task_status == "blocked":
@@ -1618,6 +1647,18 @@ def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optiona
         conn, task_id, "UPDATE tasks SET reasoning_effort = ? WHERE id = ?", (effort,),
         "reasoning_effort_set", {"reasoning_effort": effort},
         ("reasoning_effort",), archived_msg="cannot set reasoning effort",
+    )
+
+
+def set_complexity(conn: sqlite3.Connection, task_id: str, complexity: Optional[str], *, source: str = "user") -> bool:
+    """Set (empty/``none`` clears) the task's S|M|L label. Applies on the next
+    dispatch, so settable while running. ``source`` (``user`` | ``estimator``)
+    is recorded on the event so auto-labels stay distinguishable."""
+    complexity = normalize_complexity(complexity)
+    return _set_task_override(
+        conn, task_id, "UPDATE tasks SET complexity = ? WHERE id = ?", (complexity,),
+        "complexity_set", {"complexity": complexity, "source": source},
+        ("complexity",), archived_msg="cannot set complexity",
     )
 
 

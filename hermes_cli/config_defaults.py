@@ -1903,6 +1903,34 @@ DEFAULT_CONFIG = {
         # Max triage tasks decomposed per tick, bounding the aux-LLM burst from a bulk load. Excess
         # defers to the next tick.
         "auto_decompose_per_tick": 3,
+        # Complexity-tier model routing (hermes_cli/kanban_routing.py). A ready card with an S/M/L
+        # label and no pinned model gets its worker model from tiers.<label>: the first candidate
+        # whose provider is not rate-limited (credential pool exhausted/benched, or a worker on this
+        # board exited rate_limited on it within cooldown_seconds). Precedence: --model pin > tier >
+        # profile default. Re-read every tick. Example tiers entry:
+        #   S: [{model: gemini-flash-latest, provider: antigravity}]
+        #   L: [{model: claude-opus-5-5, provider: anthropic, reasoning: high}]
+        "routing": {
+            "enabled": False,
+            "tiers": {},
+            # Ordered candidates (same shape as a tier) for review-lane runs (sdlc-review). When
+            # set they replace the card's pinned model and reasoning for the reviewer; empty =
+            # reviewers keep the card pin / profile model. on_exhausted applies here too.
+            "review": [],
+            # Unlabeled cards: "profile" (assignee's own model) or a tier name (S/M/L).
+            "unlabeled": "profile",
+            # When every candidate of the requested tier is unavailable, try the next larger tier.
+            "escalate": True,
+            # When nothing is available: "wait" holds the card (guard reason tier_exhausted, no
+            # failure counted) or "profile" spawns on the assignee's own model.
+            "on_exhausted": "wait",
+            # How long a candidate is skipped after a routed worker exited rate_limited on it.
+            "cooldown_seconds": 900,
+            # Estimate S/M/L with the auxiliary kanban_estimator model for unlabeled ready/todo
+            # cards each tick (one aux call per card, up to auto_label_per_tick).
+            "auto_label": False,
+            "auto_label_per_tick": 3,
+        },
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,

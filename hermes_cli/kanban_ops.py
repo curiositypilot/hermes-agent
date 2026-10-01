@@ -111,6 +111,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, reason) in res.respawn_guarded
             ],
             "rate_limited": res.rate_limited,
+            "routed": [{"task_id": tid, "route": label} for (tid, label) in res.routed],
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
         }, ascii=True)
@@ -132,6 +133,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     tag = " (dry)" if args.dry_run else ""
     for tid, who, ws in res.spawned:
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    for tid, label in res.routed:
+        print(f"  routed {tid}: {label}")
     if res.auto_assigned_default:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "

@@ -13,11 +13,10 @@ import asyncio
 import importlib
 import json
 import logging
-import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
@@ -394,6 +393,7 @@ class CreateTaskBody(BaseModel):
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     reasoning_effort: Optional[str] = None  # none|minimal|…|ultra; None inherits the profile's level
+    complexity: Optional[str] = None  # S|M|L; drives kanban.routing tier selection
     project_id: Optional[str] = None  # None inherits the board's scoped project (if any)
 
 
@@ -512,6 +512,8 @@ class UpdateTaskBody(BaseModel):
     clear_model_override: bool = False
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    complexity: Optional[str] = None  # S|M|L; "none" or clear_complexity=True clears
+    clear_complexity: bool = False
 
 
 class BulkTaskBody(BaseModel):
@@ -530,6 +532,8 @@ class BulkTaskBody(BaseModel):
     clear_model_override: bool = False
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    complexity: Optional[str] = None
+    clear_complexity: bool = False
 
 
 class _StatusRejected(Exception):
@@ -591,10 +595,15 @@ def _apply_reasoning_effort(conn, task_id: str, p) -> bool:
     return kanban_db.set_reasoning_effort(conn, task_id, None if p.clear_reasoning_effort else p.reasoning_effort)
 
 
+def _apply_complexity(conn, task_id: str, p) -> bool:
+    return kanban_db.set_complexity(conn, task_id, None if p.clear_complexity else p.complexity)
+
+
 # Override knobs shared by PATCH and bulk: (payload wants it?, apply, bulk refusal message).
 _OVERRIDE_OPS = (
     (lambda p: p.clear_model_override or p.model_override is not None, _apply_model_override, "model override refused"),
     (lambda p: p.clear_reasoning_effort or p.reasoning_effort is not None, _apply_reasoning_effort, "reasoning override refused"),
+    (lambda p: p.clear_complexity or p.complexity is not None, _apply_complexity, "complexity refused"),
 )
 
 
@@ -1012,16 +1021,9 @@ def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[
 
 
 # Estimate: rough token/complexity read via the auxiliary model. NOT a dollar cost.
-_ESTIMATE_SYSTEM_PROMPT = (
-    "You estimate how much work an autonomous coding agent will spend on a "
-    "kanban task. Given the task title and description, respond with STRICT "
-    "JSON only (no prose, no code fence):\n"
-    '{"est_tokens": <integer total tokens across the whole run>, '
-    '"complexity": "S"|"M"|"L", '
-    '"rationale": "<one short sentence>"}\n'
-    "Base the token figure on a realistic multi-turn agent run (reading files, "
-    "tool calls, edits, retries) — not a single reply. S≈small/localized, "
-    "M≈multi-file, L≈broad or ambiguous. Be honest that this is a rough guess.")
+# The prompt + parser live in ``kanban_routing`` (shared with auto-labelling);
+# re-exported here for existing importers.
+from hermes_cli.kanban_routing import ESTIMATE_SYSTEM_PROMPT as _ESTIMATE_SYSTEM_PROMPT  # noqa: E402,F401
 
 
 class EstimateBody(BaseModel):
@@ -1036,65 +1038,24 @@ def estimate_text_endpoint(payload: EstimateBody):
 
 
 @router.post("/tasks/{task_id}/estimate")
-def estimate_task_endpoint(task_id: str, board: Optional[str] = Query(None)):
-    """Estimate for an existing task; ``{ok, est_tokens, complexity, rationale, model}``."""
+def estimate_task_endpoint(task_id: str, board: Optional[str] = Query(None), persist: bool = Query(True)):
+    """Estimate for an existing task; ``{ok, est_tokens, complexity, rationale, model, persisted}``.
+    With ``persist`` (default) an S/M/L result is saved on an UNLABELED card so the
+    estimate feeds ``kanban.routing``; a label the user already set is never overwritten."""
     with _board_conn(board) as (board, conn):
         task = _require_task(conn, task_id)
-    return _run_estimate(task.title, task.body, task_id=task_id)
-
-
-def _cap(s: Optional[str], n: int) -> str:
-    s = (s or "").strip()
-    return s if len(s) <= n else s[:n] + "…"
+    result = _run_estimate(task.title, task.body, task_id=task_id)
+    result["persisted"] = False
+    if persist and result.get("ok") and result.get("complexity") and not task.complexity:
+        with _board_conn(board) as (board, conn), suppress(ValueError, RuntimeError):
+            result["persisted"] = bool(kanban_db.set_complexity(conn, task_id, result["complexity"], source="estimator"))
+    return result
 
 
 def _run_estimate(title: str, body: Optional[str], *, task_id: Optional[str]) -> dict:
     """Never raises — config/parse/API errors become ``{"ok": False, "reason"}`` so the UI renders them inline."""
-    if not (title or "").strip():
-        return {"ok": False, "reason": "a title is required to estimate"}
-    try:
-        from agent.auxiliary_client import call_llm
-    except Exception:
-        return {"ok": False, "reason": "auxiliary client unavailable"}
-    user_msg = f"Title: {_cap(title, 400)}\n\nDescription:\n{_cap(body, 4000) or '(none)'}"
-    # Headless like specify/decompose's _call_aux: without a bound affinity scope the relay-affinity
-    # headers are omitted and the OpenCode Go relay answers 400 MissingSessionID (#112043). The
-    # create dialog has no task yet, so it shares one stable key.
-    from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
-    affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task_id or 'estimate'}")
-    try:
-        resp = call_llm(
-            task="kanban_estimator",
-            messages=[{"role": "system", "content": _ESTIMATE_SYSTEM_PROMPT}, {"role": "user", "content": user_msg}],
-            temperature=0.0, max_tokens=300, timeout=60)
-    except Exception as exc:
-        return {"ok": False, "reason": f"LLM error: {type(exc).__name__}"}
-    finally:
-        if affinity_token is not None:
-            reset_affinity_scope(affinity_token)
-    try:
-        raw = (resp.choices[0].message.content or "").strip()
-        model = getattr(resp, "model", None)
-    except Exception:
-        raw, model = "", None
-
-    # Same tolerant JSON-blob extraction the specifier uses.
-    try:
-        m = None if raw.lstrip().startswith("{") else re.search(r"\{.*\}", raw, re.DOTALL)
-        obj = json.loads(m.group(0) if m else raw)
-        parsed = obj if isinstance(obj, dict) else None
-    except Exception:
-        parsed = None
-    if not parsed:
-        return {"ok": False, "reason": "could not parse an estimate from the model"}
-    try:
-        est_tokens = int(parsed.get("est_tokens") or 0)
-    except (TypeError, ValueError):
-        est_tokens = 0
-    complexity = str(parsed.get("complexity") or "").strip().upper()
-    return {
-        "ok": True, "est_tokens": est_tokens, "complexity": complexity if complexity in {"S", "M", "L"} else None,
-        "rationale": str(parsed.get("rationale") or "").strip() or None, "model": model}
+    from hermes_cli.kanban_routing import estimate_complexity
+    return estimate_complexity(title, body, task_id=task_id)
 
 
 # --- Plugin config ----------------------------------------------------------

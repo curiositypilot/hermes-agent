@@ -145,6 +145,9 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    routed: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, decision_label)`` for every spawn (or dry-run spawn) that went
+    through ``kanban.routing``: which tier/model the worker got and why."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -1988,6 +1991,97 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _latest_rate_limited_model(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, str]]:
+    """``(provider, model)`` the task's latest run used when it exited ``rate_limited``;
+    ``("", "")`` when that run was not routed (profile default / pinned model); None
+    when the latest finished run was not a rate-limit requeue."""
+    row = conn.execute(
+        "SELECT id, outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if row is None or row["outcome"] != "rate_limited":
+        return None
+    ev = conn.execute(
+        "SELECT payload FROM task_events WHERE run_id = ? AND kind = 'routed' ORDER BY id DESC LIMIT 1",
+        (row["id"],),
+    ).fetchone()
+    payload = _kb._json_dict(ev["payload"]) if ev is not None else {}
+    return (str(payload.get("provider") or ""), str(payload.get("model") or ""))
+
+
+def _route_leaves_limited_model(
+    conn: sqlite3.Connection, task_id: str, route: Optional["_kbr.RouteDecision"],
+) -> bool:
+    """True when ``route`` moves the card OFF the model its last run was rate-limited
+    on, so the ``rate_limit_cooldown`` guard would only idle it."""
+    if route is None or not route.applies_model or route.candidate is None:
+        return False
+    limited = _latest_rate_limited_model(conn, task_id)
+    if limited is None:
+        return False
+    return limited != (route.candidate.provider or "", route.candidate.model)
+
+
+def _lane_route(
+    conn: sqlite3.Connection, routing: Optional["_kbr.RoutingContext"], task_id: str,
+    assignee: Optional[str], lane: str,
+) -> Optional["_kbr.RouteDecision"]:
+    """Routing decision for one ready/review row (None when routing is off)."""
+    if routing is None:
+        return None
+    pending = _kb.get_task(conn, task_id)
+    if pending is None:
+        return None
+    return routing.decide_for_lane(pending, lane, _kbr.resolve_profile_home(assignee))
+
+
+def _routed_guard(
+    conn: sqlite3.Connection, task_id: str, lane: str, route: Optional["_kbr.RouteDecision"],
+) -> Optional[str]:
+    """:func:`check_respawn_guard` adjusted for the route: a card whose last run hit
+    a quota wall escapes the cooldown when routed to another model, and a route
+    with no available candidate holds it as ``tier_exhausted``."""
+    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    if guard_reason == "rate_limit_cooldown" and _route_leaves_limited_model(conn, task_id, route):
+        # The last run hit a quota wall on a model this route no longer uses:
+        # waiting out the cooldown would idle the card for nothing.
+        guard_reason = None
+    if guard_reason is None and route is not None and route.source == "exhausted":
+        guard_reason = "tier_exhausted"
+    return guard_reason
+
+
+def _record_route(conn: sqlite3.Connection, task: "Task", route: "_kbr.RouteDecision") -> None:
+    """``routed`` event on the claimed run: the board-side record of which model
+    ran each attempt (read back by the rate-limit history in ``kanban_routing``).
+    Best-effort — bookkeeping must never block a spawn."""
+    try:
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, task.id, "routed", route.event_payload(), run_id=task.current_run_id)
+    except Exception:
+        _kb._log.debug("kanban routing: could not record route for %s", task.id, exc_info=True)
+
+
+def _record_routing_hold(conn: sqlite3.Connection, task_id: str, route: Optional["_kbr.RouteDecision"]) -> None:
+    """``routing_held`` event, once per hold streak (not every 60 s tick)."""
+    try:
+        last = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        if last is not None and last["kind"] == "routing_held":
+            return
+        payload: dict[str, Any] = {"reason": "tier_exhausted"}
+        if route is not None:
+            payload.update({k: v for k, v in route.event_payload().items()
+                            if k in ("lane", "requested_tier", "skipped")})
+            if route.retry_at:
+                payload["retry_at"] = int(route.retry_at)
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, task_id, "routing_held", payload)
+    except Exception:
+        _kb._log.debug("kanban routing: could not record hold for %s", task_id, exc_info=True)
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2002,10 +2096,13 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    routing: Optional["_kbr.RoutingContext"] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
-    skip is recorded on ``result``.
+    skip is recorded on ``result``. ``routing`` picks the worker model: the
+    card's complexity tier on the ready lane, ``kanban.routing.review`` on the
+    review lane — see ``kanban_routing``.
     """
     task_id = row["id"]
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
@@ -2023,7 +2120,8 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    route = _lane_route(conn, routing, task_id, assignee, lane)
+    guard_reason = _routed_guard(conn, task_id, lane, route)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
@@ -2034,8 +2132,11 @@ def _dispatch_lane_task(
         # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
-            with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+            if guard_reason == "tier_exhausted":
+                _record_routing_hold(conn, task_id, route)
+            else:
+                with _kb.write_txn(conn):
+                    _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
     def _count_spawn(name: str) -> None:
@@ -2046,6 +2147,8 @@ def _dispatch_lane_task(
 
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
+        if route is not None:
+            result.routed.append((task_id, route.label()))
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
@@ -2073,6 +2176,12 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    if route is not None:
+        # Model choice lives only on the in-memory task and the run's ``routed``
+        # event — never on the card — so every retry routes afresh.
+        _kbr.apply_route(claimed, route)
+        _record_route(conn, claimed, route)
+        result.routed.append((claimed.id, route.label()))
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -2234,6 +2343,7 @@ def _any_spawnable_review(
     *,
     per_profile_cap: Optional[int] = None,
     per_profile_running: Optional[dict[str, int]] = None,
+    routing: Optional["_kbr.RoutingContext"] = None,
 ) -> bool:
     """Mirror review dispatch gates before reserving ready-lane capacity.
 
@@ -2255,7 +2365,8 @@ def _any_spawnable_review(
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
             continue
-        if check_respawn_guard(conn, row["id"], lane="review") is None:
+        route = _lane_route(conn, routing, row["id"], assignee, "review")
+        if _routed_guard(conn, row["id"], "review", route) is None:
             return True
     return False
 
@@ -2273,6 +2384,17 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
         if profile_exists is not None and not profile_exists(name):
             return None
     return name
+
+
+def _routing_context(conn: sqlite3.Connection) -> Optional["_kbr.RoutingContext"]:
+    """Per-tick ``kanban.routing`` context, or None when routing is off/unreadable
+    (re-read every tick: config loads are mtime-cached, edits apply live)."""
+    try:
+        cfg = _kbr.load_routing_config()
+    except Exception:
+        _kb._log.debug("kanban routing: config unreadable; routing off this tick", exc_info=True)
+        return None
+    return _kbr.RoutingContext(conn, cfg) if cfg.enabled else None
 
 
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
@@ -2337,16 +2459,19 @@ def _dispatch_once_locked(
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
     # one slot back.
+    routing = _routing_context(conn)
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
         conn, review_rows,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        routing=routing,
     ):
         ready_budget = max(spawn_budget - 1, 0)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        routing=routing,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
@@ -2963,3 +3088,4 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
+from hermes_cli import kanban_routing as _kbr  # noqa: E402
