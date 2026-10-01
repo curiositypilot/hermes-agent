@@ -1054,6 +1054,66 @@ def _auto_recall_kwargs(p, query="replace the brake pads on my car"):
     return p._client.arecall.await_args.kwargs
 
 
+class TestToolTagFilter:
+    """Per-call tags/tags_match/types on hindsight_recall and hindsight_reflect."""
+
+    def test_schemas_expose_optional_filter_params(self):
+        from plugins.memory.hindsight import RECALL_SCHEMA, REFLECT_SCHEMA
+        for schema, extra in ((RECALL_SCHEMA, {"types"}), (REFLECT_SCHEMA, set())):
+            props = schema["parameters"]["properties"]
+            assert {"tags", "tags_match"} | extra <= set(props)
+            assert schema["parameters"]["required"] == ["query"]
+            # The pooled-observation pitfall is spelled out where the model reads it.
+            assert "scope:personal" in props["tags"]["description"]
+
+    def test_recall_tags_and_types_reach_client(self, provider_with_config):
+        p = provider_with_config(recall_tags="default:tag", recall_types="observation")
+        p.handle_tool_call("hindsight_recall", {
+            "query": "q", "tags": ["project:x", "scope:personal"], "tags_match": "any_strict",
+            "types": ["world", "observation"]})
+        kw = p._client.arecall.await_args.kwargs
+        assert kw["tags"] == ["project:x", "scope:personal"]
+        assert kw["tags_match"] == "any_strict"
+        assert kw["types"] == ["world", "observation"]
+
+    def test_recall_tags_match_defaults_to_any(self, provider):
+        provider.handle_tool_call("hindsight_recall", {"query": "q", "tags": ["project:x"]})
+        assert provider._client.arecall.await_args.kwargs["tags_match"] == "any"
+
+    def test_recall_without_tags_keeps_configured_request(self, provider_with_config):
+        p = provider_with_config(recall_tags="default:tag", recall_tags_match="all")
+        p.handle_tool_call("hindsight_recall", {"query": "q"})
+        baseline = dict(p._client.arecall.await_args.kwargs)
+        p.handle_tool_call("hindsight_recall", {"query": "q", "tags": [], "types": None})
+        assert p._client.arecall.await_args.kwargs == baseline
+        assert baseline["tags"] == p._recall_tags and baseline["tags_match"] == "all"
+
+    def test_reflect_tags_reach_client(self, provider):
+        provider.handle_tool_call("hindsight_reflect", {
+            "query": "q", "tags": ["project:work", "scope:personal"], "tags_match": "all"})
+        kw = provider._client.areflect.await_args.kwargs
+        assert kw["tags"] == ["project:work", "scope:personal"] and kw["tags_match"] == "all"
+
+    def test_reflect_without_tags_sends_no_filter(self, provider):
+        provider.handle_tool_call("hindsight_reflect", {"query": "q"})
+        kw = provider._client.areflect.await_args.kwargs
+        assert "tags" not in kw and "tags_match" not in kw
+
+    @pytest.mark.parametrize("tool", ["hindsight_recall", "hindsight_reflect"])
+    def test_invalid_tags_match_is_rejected_clearly(self, provider, tool):
+        result = json.loads(provider.handle_tool_call(
+            tool, {"query": "q", "tags": ["project:x"], "tags_match": "some"}))
+        assert "error" in result and "tags_match" in result["error"] and "any_strict" in result["error"]
+        method = provider._client.arecall if tool == "hindsight_recall" else provider._client.areflect
+        method.assert_not_called()
+
+    def test_invalid_type_is_rejected_clearly(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall", {"query": "q", "types": ["mental_model"]}))
+        assert "error" in result and "types" in result["error"]
+        provider._client.arecall.assert_not_called()
+
+
 class TestRecallRelevanceFloor:
     def test_defaults_send_neither_kwarg(self, provider):
         # Default config keeps today's request shape exactly.
