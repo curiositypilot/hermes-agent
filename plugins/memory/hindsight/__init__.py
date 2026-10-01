@@ -242,25 +242,74 @@ RETAIN_SCHEMA = {
     },
 }
 
+_TAGS_MATCH_MODES = ("any", "all", "any_strict", "all_strict", "exact")
+_RECALL_FACT_TYPES = ("world", "experience", "observation")
+
+_TAGS_PARAM = {"type": "array", "items": {"type": "string"}, "description": (
+    "Optional tag filter, e.g. [\"project:<slug>\", \"scope:personal\"] to scope to one project. "
+    "Always add \"scope:personal\" next to a project tag: consolidated observations carry ONLY "
+    "that tag, so project:<slug> alone hides them. Valid slugs are the 'project' entity-label "
+    "values in the bank config. Omit to use the configured default filter."
+)}
+_TAGS_MATCH_PARAM = {"type": "string", "enum": list(_TAGS_MATCH_MODES), "description": (
+    "How tags match (default 'any'). 'any'/'all' also return untagged memories; "
+    "'any_strict'/'all_strict' exclude them; 'exact' requires the exact tag set."
+)}
+
 RECALL_SCHEMA = {
     "name": "hindsight_recall",
     "description": (
-        "Search long-term memory. Returns memories ranked by relevance using "
-        "semantic search, keyword matching, entity graph traversal, and reranking."
+        "Search long-term memory for specific facts. Returns memories ranked by relevance using "
+        "semantic search, keyword matching, entity graph traversal, and reranking. For broad "
+        "questions (what are my preferences/plans/criteria for X) use hindsight_reflect instead."
     ),
-    "parameters": {"type": "object", "required": ["query"],
-                   "properties": {"query": {"type": "string", "description": "What to search for."}}},
+    "parameters": {"type": "object", "required": ["query"], "properties": {
+        "query": {"type": "string", "description": "What to search for."},
+        "tags": _TAGS_PARAM,
+        "tags_match": _TAGS_MATCH_PARAM,
+        "types": {"type": "array", "items": {"type": "string", "enum": list(_RECALL_FACT_TYPES)},
+                  "description": "Optional fact types to return (default: configured recall_types)."},
+    }},
 }
 
 REFLECT_SCHEMA = {
     "name": "hindsight_reflect",
     "description": (
         "Synthesize a reasoned answer from long-term memories. Unlike recall, "
-        "this reasons across all stored memories to produce a coherent response."
+        "this reasons across all stored memories (mental models first) to produce a coherent "
+        "response. Use it for broad questions: what are my preferences/plans/criteria for X."
     ),
-    "parameters": {"type": "object", "required": ["query"],
-                   "properties": {"query": {"type": "string", "description": "The question to reflect on."}}},
+    "parameters": {"type": "object", "required": ["query"], "properties": {
+        "query": {"type": "string", "description": "The question to reflect on."},
+        "tags": _TAGS_PARAM,
+        "tags_match": _TAGS_MATCH_PARAM,
+    }},
 }
+
+
+def _tool_tag_filter(args: dict, *, with_types: bool) -> dict:
+    """Validated per-call tag/type overrides from a recall/reflect tool call -> client kwargs.
+    Empty when the call gives none, so the request falls back to the configured filter.
+    Raises ValueError with a model-readable message on bad values."""
+    out: dict = {}
+    tags, match = args.get("tags"), args.get("tags_match")
+    if match is not None and match not in _TAGS_MATCH_MODES:
+        raise ValueError(f"invalid tags_match {match!r}; use one of {', '.join(_TAGS_MATCH_MODES)}")
+    if tags:
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",")]
+        if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+            raise ValueError("tags must be a list of strings")
+        if tags := [t.strip() for t in tags if t.strip()]:
+            out.update(tags=tags, tags_match=match or "any")
+    if with_types and (types := args.get("types")):
+        if isinstance(types, str):
+            types = [t.strip() for t in types.split(",") if t.strip()]
+        bad = [t for t in types if t not in _RECALL_FACT_TYPES]
+        if bad:
+            raise ValueError(f"invalid types {bad}; use a subset of {', '.join(_RECALL_FACT_TYPES)}")
+        out["types"] = list(types)
+    return out
 
 
 def _load_config() -> dict:
@@ -1014,7 +1063,7 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Prefetch: skipped (%s)", why)
         return why is not None
 
-    def _recall(self, query: str, *, auto: bool = False) -> list:
+    def _recall(self, query: str, *, auto: bool = False, overrides: dict | None = None) -> list:
         """One recall. *auto* marks the injected auto-recall path, the only one the
         ``recall_min_reranker`` floor applies to: an explicit hindsight_recall is a
         deliberate search whose relevance the model judges itself, and the reranker's
@@ -1027,6 +1076,8 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
         if self._recall_types:
             kwargs["types"] = self._recall_types
+        # Per-call tool overrides (tags + tags_match, types) replace the configured ones.
+        kwargs.update(overrides or {})
         # Only sent when enabled, so default requests stay byte-identical (and older
         # clients without these kwargs keep working).
         if self._recall_prefer_observations:
@@ -1036,9 +1087,10 @@ class HindsightMemoryProvider(MemoryProvider):
         resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
         return resp.results or []
 
-    def _reflect(self, query: str) -> str | None:
+    def _reflect(self, query: str, overrides: dict | None = None) -> str | None:
         resp = self._run_hindsight_operation(
-            lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget)
+            lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget,
+                                           **(overrides or {}))
         )
         return resp.text
 
@@ -1308,7 +1360,7 @@ class HindsightMemoryProvider(MemoryProvider):
         query = args["query"]
         logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                      self._bank_id, len(query), self._budget)
-        results = self._recall(query)
+        results = self._recall(query, overrides=_tool_tag_filter(args, with_types=True))
         logger.debug("Tool hindsight_recall: %d results", len(results))
         return "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
 
@@ -1316,7 +1368,7 @@ class HindsightMemoryProvider(MemoryProvider):
         query = args["query"]
         logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
                      self._bank_id, len(query), self._budget)
-        text = self._reflect(query) or ""
+        text = self._reflect(query, _tool_tag_filter(args, with_types=False)) or ""
         logger.debug("Tool hindsight_reflect: response_len=%d", len(text))
         return text or "No relevant memories found."
 
