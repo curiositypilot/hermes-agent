@@ -39,3 +39,28 @@ def test_cron_session_disables_supermemory_writes(tmp_path, monkeypatch):
         provider.initialize(**_memory_provider_init_kwargs(_fake_agent(), platform))
         by_platform[platform] = provider._write_enabled
     assert by_platform == {"cron": False, "cli": True}
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [(None, None), ({}, None), ({"external_prefetch_timeout_seconds": 3.5}, 3.5),
+     ({"external_prefetch_timeout_seconds": "12"}, 12.0),
+     ({"external_prefetch_timeout_seconds": 0}, None), ({"external_prefetch_timeout_seconds": -1}, None),
+     ({"external_prefetch_timeout_seconds": "nope"}, None)],
+)
+def test_external_prefetch_timeout_config_reader(configured, expected):
+    """``memory.external_prefetch_timeout_seconds`` → MemoryManager ctor; None = keep the 8 s default."""
+    from agent.agent_init import _external_prefetch_timeout
+
+    assert _external_prefetch_timeout(configured) == expected
+
+
+def test_external_prefetch_timeout_default_matches_registered_config():
+    """The DEFAULT_CONFIG value and the MemoryManager fallback agree, so an unset key and the
+    registered default are the same wait."""
+    from agent.memory_manager import MemoryManager
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    registered = DEFAULT_CONFIG["memory"]["external_prefetch_timeout_seconds"]
+    assert MemoryManager()._external_prefetch_timeout == registered
+    assert MemoryManager(external_prefetch_timeout=registered / 2)._external_prefetch_timeout == registered / 2

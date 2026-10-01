@@ -81,6 +81,23 @@ def is_trivial_prompt(text: Optional[str]) -> bool:
     return bool(TRIVIAL_PROMPT_RE.match(stripped))
 
 
+# Machine-authored user turns (background-process completion, async delegation, background
+# subagent notices). One source for the prefetch gate and the session-timeline prompt index.
+SYNTHETIC_PROMPT_RE = re.compile(
+    r"^\s*(?:\[IMPORTANT: Background process |\[ASYNC (?:DELEGATION )?(?:BATCH )?COMPLETE\b|"
+    r"A background fan-out of \d+ subagent\(s\) you dispatched earlier has finished\.|"
+    r"A background subagent you dispatched earlier has finished\.)",
+    re.IGNORECASE,
+)
+
+
+def is_synthetic_prompt(text: Optional[str]) -> bool:
+    """True for a turn the runtime injected (not typed by a person). Recall keyed on a process
+    notice returns nothing useful and its external round-trip can leave a stuck prefetch thread
+    that skips the next human turn."""
+    return bool(text) and bool(SYNTHETIC_PROMPT_RE.match(text))
+
+
 class MemoryProvider(ABC):
     """Abstract base class for memory providers."""
 

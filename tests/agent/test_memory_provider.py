@@ -1444,6 +1444,37 @@ class TestTrivialPromptClassifier:
             assert not is_trivial_prompt(t), f"expected non-trivial: {t!r}"
 
 
+class TestSyntheticPromptClassifier:
+    """is_synthetic_prompt — runtime-injected notices never key a memory prefetch."""
+
+    def test_runtime_notices_match(self):
+        from agent.memory_provider import is_synthetic_prompt
+
+        for t in ("[IMPORTANT: Background process proc_1 completed (exit code 0).",
+                  "  [important: background process proc_2 matched watch pattern \"x\".",
+                  "[ASYNC DELEGATION COMPLETE — d_1]\n...",
+                  "[ASYNC DELEGATION BATCH COMPLETE — d_1]",
+                  "[ASYNC BATCH COMPLETE — d_1]",
+                  "A background fan-out of 3 subagent(s) you dispatched earlier has finished.",
+                  "A background subagent you dispatched earlier has finished. Summary"):
+            assert is_synthetic_prompt(t), f"expected synthetic: {t!r}"
+
+    def test_human_and_other_bracketed_turns_pass_through(self):
+        from agent.memory_provider import is_synthetic_prompt
+
+        for t in ("", None, "what's my name", "[Replying to: \"x\"]\n\nwhat about it?",
+                  "[IMPORTANT: The user has invoked the \"git-backup\" skill",
+                  "the background process finished, what now?"):
+            assert not is_synthetic_prompt(t), f"expected non-synthetic: {t!r}"
+
+    def test_timeline_prompt_index_shares_the_regex(self):
+        # One source: the session timeline hides the same turns the prefetch gate skips.
+        import hermes_state_timeline
+        from agent.memory_provider import SYNTHETIC_PROMPT_RE
+
+        assert hermes_state_timeline._SYNTHETIC_PROMPT is SYNTHETIC_PROMPT_RE
+
+
 # ---------------------------------------------------------------------------
 # System-prompt gate parity — #81014
 # ---------------------------------------------------------------------------

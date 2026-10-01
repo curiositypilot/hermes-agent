@@ -332,6 +332,16 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
     # disabled toolset are strictly stripped out. See issue #17309.
     if disabled_toolsets:
         _apply_toolset_selection(tools, disabled_toolsets, quiet_mode, disable=True)
+    # Dispatcher-owned kanban worker: a headless run never gets the toolsets in
+    # kanban.worker_disabled_toolsets (clarify has nobody to answer; the browser vault needs a
+    # user-side prompt). The dispatcher already drops whole toolsets from the --toolsets pin;
+    # this pass catches tool-level members of a kept toolset (browser_vault_* ride in browser).
+    if (os.environ.get("HERMES_KANBAN_TASK") and not _is_delegated_child_context()
+            and _is_dispatcher_owned_worker()):
+        from tools.kanban_toolset_context import worker_disabled_toolsets
+        _worker_dropped = [name for name in worker_disabled_toolsets() if validate_toolset(name)]
+        if _worker_dropped:
+            _apply_toolset_selection(tools, _worker_dropped, True, disable=True)
     return tools
 
 

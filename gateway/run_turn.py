@@ -2032,6 +2032,8 @@ class GatewayTurnMixin:
         persist_user_display_kind: Optional[str]
         persistence_session_id: Optional[str] = None
         persistence_owner: Optional[str] = None
+        # Recall query when the model-facing text is a reply envelope (user words first); None = message text.
+        memory_query: Optional[str] = None
 
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
@@ -2101,6 +2103,11 @@ class GatewayTurnMixin:
         if message_text is None:
             return None, _session_env_tokens
 
+        # Reply turns: recall keyed on the user's own words first, then the tail of the quote
+        # (the model-facing envelope is quote-first and the provider head-truncates its query).
+        from gateway.run_inbound import reply_memory_query
+        memory_query = reply_memory_query(event, message_text)
+
         message_text, persist_user_message, persist_user_timestamp = (
             self._hmwa_apply_message_timestamp(event, message_text)
         )
@@ -2122,7 +2129,7 @@ class GatewayTurnMixin:
                  if event.message_id else str(uuid.uuid4()))
         return self._PreparedTurn(
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
-            persist_user_display_kind, session_entry.session_id, owner,
+            persist_user_display_kind, session_entry.session_id, owner, memory_query,
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
@@ -2183,6 +2190,7 @@ class GatewayTurnMixin:
                     "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                memory_query=prepared.memory_query,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -3794,6 +3802,8 @@ class GatewayTurnMixin:
         next_inbound_id = None
         # Queued Discord turns carry the same routing note as first turns; persist the authored text.
         next_persist_message = None
+        # Queued reply turns key recall on the user's words first (same as the first-turn path).
+        next_memory_query = None
         next_display_kind = display_kind_for_event(pending_event)
         # See #60671.
         if pending_event is not None:
@@ -3818,8 +3828,9 @@ class GatewayTurnMixin:
             )
             if next_message is None:
                 return result
-            from gateway.run_inbound import strip_discord_triggering_note
+            from gateway.run_inbound import reply_memory_query, strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
+            next_memory_query = reply_memory_query(pending_event, next_message)
             next_message_id = self._reply_anchor_for_event(pending_event)
             next_inbound_id = str(pending_event.message_id) if getattr(pending_event, "message_id", None) else None
             next_channel_prompt = getattr(pending_event, "channel_prompt", None)
@@ -3872,6 +3883,7 @@ class GatewayTurnMixin:
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
                 persist_user_display_metadata=diagnostic_metadata(pending_event) or None,
+                memory_query=next_memory_query,
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -4195,6 +4207,7 @@ class GatewayTurnMixin:
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
         scheduled_heartbeat: bool = False,
+        memory_query: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4232,6 +4245,7 @@ class GatewayTurnMixin:
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
             scheduled_heartbeat=scheduled_heartbeat,
+            memory_query=memory_query,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,

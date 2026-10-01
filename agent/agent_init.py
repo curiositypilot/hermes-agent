@@ -1218,6 +1218,16 @@ def _apply_display_config(agent, _agent_cfg, platform):
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
 
 
+def _external_prefetch_timeout(mem_config: Any) -> Optional[float]:
+    """``memory.external_prefetch_timeout_seconds`` as a positive float, or None for the
+    MemoryManager default (8 s). Invalid/zero/negative values fall back rather than raise."""
+    try:
+        value = float((mem_config or {}).get("external_prefetch_timeout_seconds") or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
     """Scoping kwargs for ``MemoryManager.initialize_all`` (status_callback is CLI-only:
     gateway status travels a different path and the indicator no-ops without it)."""
@@ -1303,7 +1313,8 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
             if not is_core_memory_provider(_mem_provider_name):
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(
+                    external_prefetch_timeout=_external_prefetch_timeout(mem_config))
                 _mp = _load_mem(_mem_provider_name)
                 if _mp is None:
                     # The provider left core for the catalog (or was never installed): fetch it once.

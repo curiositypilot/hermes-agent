@@ -1111,7 +1111,9 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Recall: returned %d results", len(results))
             return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
         except Exception as e:
-            logger.debug("Hindsight recall failed: %s", e, exc_info=True)
+            # INFO (not debug): a turn with no memory block needs a logged cause at the default level.
+            logger.info("Hindsight recall failed: %s", e)
+            logger.debug("Hindsight recall failure detail", exc_info=True)
             return "", 0
 
     def _finish_prefetch(self, result: str, count: int) -> str:

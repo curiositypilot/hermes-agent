@@ -2628,10 +2628,16 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     try:
         from hermes_cli.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
+        from tools.kanban_toolset_context import worker_disabled_toolsets
 
         with _worker_profile_scope(hermes_home):
             cfg = load_config()
-            toolsets = sorted(_get_platform_tools(cfg, "cli"))
+            # Headless-worker trim (kanban.worker_disabled_toolsets): drop whole toolsets and MCP
+            # server names here so the worker never spawns a server whose tools it must not see;
+            # tool-level members of a kept toolset (browser_vault_* inside browser) are stripped
+            # again at schema assembly in model_tools.
+            dropped = set(worker_disabled_toolsets(cfg))
+            toolsets = sorted(t for t in _get_platform_tools(cfg, "cli") if t not in dropped)
         return toolsets or None
     except Exception as exc:
         _kb._log.debug(

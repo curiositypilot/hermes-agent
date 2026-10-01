@@ -2,19 +2,11 @@
 
 from __future__ import annotations
 
-import re
 from contextlib import contextmanager
 
 from agent.compaction_display import project_compaction_message_for_display
 from agent.context_compressor import user_originated_turn_view
-
-
-_SYNTHETIC_PROMPT = re.compile(
-    r"^\s*(?:\[IMPORTANT: Background process |\[ASYNC (?:DELEGATION )?(?:BATCH )?COMPLETE\b|"
-    r"A background fan-out of \d+ subagent\(s\) you dispatched earlier has finished\.|"
-    r"A background subagent you dispatched earlier has finished\.)",
-    re.IGNORECASE,
-)
+from agent.memory_provider import SYNTHETIC_PROMPT_RE as _SYNTHETIC_PROMPT
 
 
 def _prompt_preview(db, content, display_kind, summary):

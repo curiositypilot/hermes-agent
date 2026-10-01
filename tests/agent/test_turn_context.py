@@ -315,6 +315,32 @@ def test_blank_memory_query_keeps_the_message_text():
     mm.prefetch_all.assert_called_once_with(query, session_id=agent.session_id)
 
 
+@pytest.mark.parametrize("notice", [
+    "[IMPORTANT: Background process proc_1 completed (exit code 0).\nOutput: done",
+    "[ASYNC DELEGATION COMPLETE — d_1]\nA background subagent you dispatched earlier has finished.",
+    "[ASYNC DELEGATION BATCH COMPLETE — d_2]\n--- TASK 1/2 ...",
+    "A background subagent you dispatched earlier has finished. Summary: ok",
+])
+def test_prefetch_skipped_for_synthetic_turn_and_logged(notice, caplog):
+    # A runtime-injected notice is not a topic: the external round-trip returns nothing and
+    # can leave a stuck prefetch thread that skips the next human turn. on_turn_start still runs.
+    agent, mm = _agent_with_memory_manager()
+    with caplog.at_level("INFO", logger="agent.turn_context"):
+        ctx = _build(agent, user_message=notice)
+    mm.prefetch_all.assert_not_called()
+    mm.on_turn_start.assert_called_once()
+    assert ctx.ext_prefetch_cache == ""
+    assert any("prefetch skipped: synthetic" in r.getMessage() for r in caplog.records)
+
+
+def test_prefetch_skip_on_trivial_prompt_is_logged(caplog):
+    agent, mm = _agent_with_memory_manager()
+    with caplog.at_level("INFO", logger="agent.turn_context"):
+        _build(agent, user_message="thanks!")
+    mm.prefetch_all.assert_not_called()
+    assert any("prefetch skipped: trivial" in r.getMessage() for r in caplog.records)
+
+
 # ── Per-turn author ──────────────────────────────────────────────────────────
 
 
