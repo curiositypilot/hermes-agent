@@ -145,6 +145,11 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    quota_held: list[tuple[str, str, Optional[int]]] = field(default_factory=list)
+    """``(task_id, reason, retry_at epoch or None)`` held by the quota gate
+    (``kanban.routing.quota_gate``): every usable provider is below a headroom
+    band the card's priority does not meet. Also listed in
+    ``respawn_guarded`` as ``quota_hold``."""
     routed: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, decision_label)`` for every spawn (or dry-run spawn) that went
     through ``kanban.routing``: which tier/model the worker got and why."""
@@ -2043,16 +2048,22 @@ def _routed_guard(
     conn: sqlite3.Connection, task_id: str, lane: str, route: Optional["_kbr.RouteDecision"],
 ) -> Optional[str]:
     """:func:`check_respawn_guard` adjusted for the route: a card whose last run hit
-    a quota wall escapes the cooldown when routed to another model, and a route
-    with no available candidate holds it as ``tier_exhausted``."""
+    a quota wall escapes the cooldown when routed to another model, a route
+    with no available candidate holds it as ``tier_exhausted``, and a route the
+    quota gate refused holds it as ``quota_hold``."""
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason == "rate_limit_cooldown" and _route_leaves_limited_model(conn, task_id, route):
         # The last run hit a quota wall on a model this route no longer uses:
         # waiting out the cooldown would idle the card for nothing.
         guard_reason = None
-    if guard_reason is None and route is not None and route.source == "exhausted":
-        guard_reason = "tier_exhausted"
+    if guard_reason is None and route is not None:
+        guard_reason = _ROUTING_HOLD_REASONS.get(route.source)
     return guard_reason
+
+
+# RouteDecision.source -> guard reason for routes that hold the card (no
+# failure counted; one ``routing_held`` event per hold streak).
+_ROUTING_HOLD_REASONS = {"exhausted": "tier_exhausted", "quota_held": "quota_hold"}
 
 
 def _record_route(conn: sqlite3.Connection, task: "Task", route: "_kbr.RouteDecision") -> None:
@@ -2066,7 +2077,10 @@ def _record_route(conn: sqlite3.Connection, task: "Task", route: "_kbr.RouteDeci
         _kb._log.debug("kanban routing: could not record route for %s", task.id, exc_info=True)
 
 
-def _record_routing_hold(conn: sqlite3.Connection, task_id: str, route: Optional["_kbr.RouteDecision"]) -> None:
+def _record_routing_hold(
+    conn: sqlite3.Connection, task_id: str, route: Optional["_kbr.RouteDecision"],
+    reason: str = "tier_exhausted",
+) -> None:
     """``routing_held`` event, once per hold streak (not every 60 s tick)."""
     try:
         last = conn.execute(
@@ -2074,10 +2088,10 @@ def _record_routing_hold(conn: sqlite3.Connection, task_id: str, route: Optional
         ).fetchone()
         if last is not None and last["kind"] == "routing_held":
             return
-        payload: dict[str, Any] = {"reason": "tier_exhausted"}
+        payload: dict[str, Any] = {"reason": reason}
         if route is not None:
             payload.update({k: v for k, v in route.event_payload().items()
-                            if k in ("lane", "requested_tier", "skipped")})
+                            if k in ("lane", "requested_tier", "skipped", "note")})
             if route.retry_at:
                 payload["retry_at"] = int(route.retry_at)
         with _kb.write_txn(conn):
@@ -2128,6 +2142,8 @@ def _dispatch_lane_task(
     guard_reason = _routed_guard(conn, task_id, lane, route)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
+        if guard_reason == "quota_hold" and route is not None:
+            result.quota_held.append((task_id, route.note or "", int(route.retry_at) if route.retry_at else None))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
         # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
         # operator-configured fallback exists, persist the assignment and proceed. This removes the
@@ -2136,8 +2152,8 @@ def _dispatch_lane_task(
         # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
-            if guard_reason == "tier_exhausted":
-                _record_routing_hold(conn, task_id, route)
+            if guard_reason in _ROUTING_HOLD_REASONS.values():
+                _record_routing_hold(conn, task_id, route, guard_reason)
             else:
                 with _kb.write_txn(conn):
                     _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
