@@ -396,11 +396,71 @@ def _normalize_for_quote_match(text: str) -> str:
     return " ".join(text.split()).lower()
 
 
-def _collapse_repeated_reply_quote(user_content: str, assistant_texts: List[str]) -> str:
-    """Shorten a leading reply quote to its first ~160 chars + `` …`` when it repeats an assistant
-    message in *assistant_texts* (normalized). Quotes of anything else (cron briefs, digests, other
-    chats) stay whole: they are the only copy of what the user is answering."""
-    if not assistant_texts or not isinstance(user_content, str):
+def _lookup_session_assistant_texts(hermes_home: Any, session_id: str) -> List[str]:
+    """Last assistant messages for *session_id*, normalized; empty on any miss/error."""
+    if not hermes_home or not session_id:
+        return []
+    try:
+        import sqlite3
+        db_path = Path(hermes_home) / "state.db"
+        if not db_path.is_file():
+            return []
+        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True, timeout=1.0)
+        try:
+            rows = conn.execute(
+                "SELECT content FROM messages WHERE session_id = ? AND role = 'assistant' "
+                "AND length(content) > 0 ORDER BY id DESC LIMIT ?",
+                (session_id, _SESSION_ASSISTANT_TEXTS_MAX),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [_normalize_for_quote_match(row[0]) for row in reversed(rows) if row[0]]
+    except Exception:
+        logger.debug("Hindsight reply quote: session assistant lookup failed", exc_info=True)
+        return []
+
+
+def _lookup_recent_assistant_quote(hermes_home: Any, quote: str) -> bool:
+    """Whether a recent assistant message in state.db contains this normalized quote."""
+    quote_head = quote[:40]
+    needle = _normalize_for_quote_match(quote)[:_REPLY_QUOTE_MATCH_CHARS]
+    if not hermes_home or len(quote_head) < 3 or not needle:
+        return False
+    try:
+        import sqlite3
+        db_path = Path(hermes_home) / "state.db"
+        if not db_path.is_file():
+            return False
+        # FTS5 phrase syntax: double embedded quotes inside the quoted literal.
+        fts_phrase = '"' + quote_head.replace('"', '""') + '"'
+        cutoff = time.time() - 30 * 24 * 60 * 60
+        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True, timeout=1.0)
+        try:
+            rows = conn.execute(
+                "SELECT m.content FROM messages_fts_trigram "
+                "JOIN messages m ON m.id = messages_fts_trigram.rowid "
+                "WHERE messages_fts_trigram MATCH ? AND m.role = 'assistant' "
+                "AND m.timestamp >= ? AND length(m.content) > 0",
+                (fts_phrase, cutoff),
+            )
+            return any(needle in _normalize_for_quote_match(row[0] or "") for row in rows)
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("Hindsight reply quote: recent assistant lookup failed", exc_info=True)
+        return False
+
+
+def _collapse_repeated_reply_quote(
+    user_content: str, assistant_texts: List[str], hermes_home: Any = None
+) -> str:
+    """Shorten a leading quote known to repeat Hermes assistant output.
+
+    Session-local assistant texts are checked first. If none match, the state.db trigram index
+    can identify a recent assistant message from another session (for example a cron digest).
+    Quotes without a Hermes origin stay whole because they are the only copy of what is answered.
+    """
+    if not isinstance(user_content, str):
         return user_content
     match = _REPLY_QUOTE_RE.match(user_content)
     if not match:
@@ -414,7 +474,8 @@ def _collapse_repeated_reply_quote(user_content: str, assistant_texts: List[str]
     needle = _normalize_for_quote_match(quote)[:_REPLY_QUOTE_MATCH_CHARS]
     if len(quote) <= _REPLY_QUOTE_KEEP_CHARS or not needle:
         return user_content
-    if not any(needle in text for text in assistant_texts):
+    session_match = any(needle in text for text in assistant_texts)
+    if not session_match and not _lookup_recent_assistant_quote(hermes_home, quote):
         return user_content
     short = quote[:_REPLY_QUOTE_KEEP_CHARS].rstrip() + " …"
     return user_content[:match.end()] + short + user_content[end:]
@@ -845,8 +906,10 @@ class HindsightMemoryProvider(MemoryProvider):
             setattr(self, f"_{name}", str(kwargs.get(name) or "").strip())
         self._turn_index = self._last_retained_turn_count = 0
         self._session_turns = []
-        self._session_assistant_texts = []
         self._handed_hermes_home = str(kwargs.get("hermes_home") or "").strip()
+        self._session_assistant_texts = _lookup_session_assistant_texts(
+            self._handed_hermes_home, self._session_id
+        )
         self._first_user_line = self._last_turn_at = ""
         self._mode = cfg.get("mode", "cloud")
         self._timeout = self._int_setting("timeout", "HINDSIGHT_TIMEOUT", _DEFAULT_TIMEOUT)
@@ -1228,7 +1291,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._last_turn_at = now
         if not self._first_user_line:
             self._first_user_line = _first_line(user_content)
-        user_content = _collapse_repeated_reply_quote(user_content, self._session_assistant_texts)
+        user_content = _collapse_repeated_reply_quote(
+            user_content, self._session_assistant_texts, self._handed_hermes_home
+        )
         # Kept across append-mode retains (which clear _session_turns) so a reply to any earlier
         # turn of this session is recognised; reset on session switch.
         self._session_assistant_texts.append(_normalize_for_quote_match(str(assistant_content or "")))
@@ -1497,7 +1562,9 @@ class HindsightMemoryProvider(MemoryProvider):
             self._parent_session_id = str(parent_session_id).strip()
         self._session_id, self._document_id = new_id, _mint_document_id(new_id)
         self._session_turns = []
-        self._session_assistant_texts = []
+        self._session_assistant_texts = _lookup_session_assistant_texts(
+            self._handed_hermes_home, self._session_id
+        )
         self._first_user_line = self._last_turn_at = ""
         self._turn_counter = self._turn_index = self._last_retained_turn_count = 0
         logger.debug("Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",

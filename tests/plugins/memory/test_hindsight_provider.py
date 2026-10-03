@@ -1375,6 +1375,17 @@ _ASSISTANT_PLAN = (
 )
 
 
+def _state_db_with_assistant(home, session_id: str, content: str, *, timestamp=None) -> None:
+    """Persist an assistant row in a real SessionDB, including the trigram FTS index."""
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=Path(home) / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+        db.append_message(session_id, "assistant", content, timestamp=timestamp)
+    finally:
+        db.close()
+
+
 class TestReplyQuoteCollapse:
     def test_quote_of_in_session_assistant_message_is_collapsed(self, tmp_path, monkeypatch):
         _write_config(tmp_path, monkeypatch)
@@ -1394,6 +1405,64 @@ class TestReplyQuoteCollapse:
         assert ' …"]\n\n1. do you have metal mesh?' in collapsed
         assert "Negative pressure" not in collapsed
         assert len(collapsed) < len(rendered)
+
+    def test_fresh_provider_seeds_assistant_texts_from_state_db(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch)
+        _state_db_with_assistant(tmp_path, "sess-1", _ASSISTANT_PLAN)
+        p = _init_provider(tmp_path, platform="telegram")
+
+        rendered = _ASSISTANT_PLAN.replace("**", "").replace("`", "").replace(
+            "[the plan](https://example.com/plan)", "the plan")
+        p.sync_turn(f'[Replying to: "{rendered}"]\n\nIs that still the plan?', "Yes.")
+        collapsed = _retained_user_texts(p)[0]
+
+        assert ' …"]\n\nIs that still the plan?' in collapsed
+        assert "Negative pressure" not in collapsed
+
+    @pytest.mark.parametrize("other_session_row", [False, True])
+    def test_quote_with_no_matching_state_db_assistant_stays_whole(
+        self, tmp_path, monkeypatch, other_session_row
+    ):
+        _write_config(tmp_path, monkeypatch)
+        if other_session_row:
+            _state_db_with_assistant(tmp_path, "other-session", "Unrelated assistant response.")
+        p = _init_provider(tmp_path, platform="telegram")
+
+        p.sync_turn(f'[Replying to: "{_ASSISTANT_PLAN}"]\n\nQuestion?', "Answer.")
+        user = _retained_user_texts(p)[0]
+
+        assert _ASSISTANT_PLAN in user
+        assert ' …"]' not in user
+
+    def test_cron_digest_quote_collapses_via_recent_trigram_lookup(self, tmp_path, monkeypatch):
+        digest = (
+            "Daily greenhouse status: the pressure plan is unchanged; exhaust remains high on "
+            "the opposite wall, passive intake stays low, and the negative-pressure boundary "
+            "prevents spores from escaping toward the hallway. The harness uses a separate "
+            "12V relay board with the common ground kept isolated from the sensor rail."
+        )
+        _write_config(tmp_path, monkeypatch)
+        _state_db_with_assistant(tmp_path, "cron-session", digest)
+        p = _init_provider(tmp_path, platform="telegram")
+
+        p.sync_turn(f'[Replying to: "{digest}"]\n\nThanks, got it.', "Noted.")
+        user = _retained_user_texts(p)[0]
+
+        assert ' …"]\n\nThanks, got it.' in user
+        assert "spores from escaping" not in user
+
+    def test_session_switch_seeds_new_session_assistant_texts(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch)
+        _state_db_with_assistant(tmp_path, "sess-2", _ASSISTANT_PLAN)
+        p = _init_provider(tmp_path, platform="telegram")
+        monkeypatch.setattr("plugins.memory.hindsight._lookup_recent_assistant_quote", lambda *args: False)
+
+        p.on_session_switch("sess-2")
+        p.sync_turn(f'[Replying to: "{_ASSISTANT_PLAN}"]\n\nStill valid?', "Yes.")
+        user = _retained_user_texts(p)[-1]
+
+        assert ' …"]\n\nStill valid?' in user
+        assert "Negative pressure" not in user
 
     def test_quote_not_in_session_kept_even_after_assistant_turns(self, tmp_path, monkeypatch):
         _write_config(tmp_path, monkeypatch)
