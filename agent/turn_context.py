@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from agent.conversation_compression import recover_rotated_compression_session
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
-from agent.memory_provider import is_synthetic_prompt, is_trivial_prompt
+from agent.memory_provider import is_low_signal_prompt, is_synthetic_prompt, is_trivial_prompt
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
@@ -883,6 +883,9 @@ def _memory_turn_start_and_prefetch(
             logger.info("Memory prefetch skipped: synthetic turn (query_len=%d)", len(_query))
         elif is_trivial_prompt(_query):
             logger.info("Memory prefetch skipped: trivial prompt (query_len=%d)", len(_query))
+        elif is_low_signal_prompt(_query):
+            # Reply turns never land here: their query carries the quote (memory_query override).
+            logger.info("Memory prefetch skipped: low-signal prompt (query_len=%d)", len(_query))
         else:
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
     # Deterministic recall indicator via _emit_status so the model can't silently

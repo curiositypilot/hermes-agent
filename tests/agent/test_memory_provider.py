@@ -1444,6 +1444,26 @@ class TestTrivialPromptClassifier:
             assert not is_trivial_prompt(t), f"expected non-trivial: {t!r}"
 
 
+class TestLowSignalPromptClassifier:
+    """is_low_signal_prompt — short non-trivial prompts skip auto-recall."""
+
+    def test_short_prompts_match(self):
+        from agent.memory_provider import is_low_signal_prompt
+
+        for t in ("card", "good", "1", "garmin?", "  the card ", "option 2", "#3"):
+            assert is_low_signal_prompt(t), f"expected low-signal: {t!r}"
+
+    def test_trivial_long_and_unspaced_scripts_do_not_match(self):
+        from agent.memory_provider import is_low_signal_prompt, is_trivial_prompt
+
+        for t in ("", None, "ok", "thanks!", "/help"):
+            assert is_trivial_prompt(t) and not is_low_signal_prompt(t), t
+        for t in ("what about garmin", "check the realista digest",
+                  "https://example.com/some/listing", "~/.hermes/hindsight/config.json",
+                  "我的垃圾邮件"):
+            assert not is_low_signal_prompt(t), f"expected substantive: {t!r}"
+
+
 class TestSyntheticPromptClassifier:
     """is_synthetic_prompt — runtime-injected notices never key a memory prefetch."""
 

@@ -81,6 +81,30 @@ def is_trivial_prompt(text: Optional[str]) -> bool:
     return bool(TRIVIAL_PROMPT_RE.match(stripped))
 
 
+# Below this many words a prompt carries too little topic for semantic recall: "card", "good",
+# "1" (a reply to a numbered list) pulled 20-40 off-topic memories each, because BM25 + embedding
+# + reranker all score generic facts high against a single common word. Reply turns are unaffected:
+# their recall query carries the quoted message (gateway ``reply_memory_query``), so it is long.
+LOW_SIGNAL_MAX_WORDS = 2
+LOW_SIGNAL_MAX_CHARS = 24
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+# Scripts written without spaces: word counting says nothing about their signal.
+_UNSPACED_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\u0e00-\u0e7f]")
+
+
+def is_low_signal_prompt(text: Optional[str]) -> bool:
+    """True for a short prompt (at most ``LOW_SIGNAL_MAX_WORDS`` words and
+    ``LOW_SIGNAL_MAX_CHARS`` characters) that ``is_trivial_prompt`` does not already cover.
+    Auto-recall skips it; explicit recall tools still work. A pasted URL, path or long token
+    exceeds the character cap and keeps recall."""
+    stripped = (text or "").strip()
+    if not stripped or is_trivial_prompt(stripped):
+        return False
+    if len(stripped) > LOW_SIGNAL_MAX_CHARS or _UNSPACED_SCRIPT_RE.search(stripped):
+        return False
+    return len(_WORD_RE.findall(stripped)) <= LOW_SIGNAL_MAX_WORDS
+
+
 # Machine-authored user turns (background-process completion, async delegation, background
 # subagent notices). One source for the prefetch gate and the session-timeline prompt index.
 SYNTHETIC_PROMPT_RE = re.compile(
