@@ -183,15 +183,33 @@ class TestExplicitProviderRespected:
             assert _get_provider({"provider": "local"}) == "groq"
 
     def test_explicit_local_uses_local_command_fallback(self, monkeypatch):
-        """Local-to-local_command fallback is fine — both are local."""
+        """Local-to-local_command fallback is fine — both are local — once
+        faster-whisper can't be restored."""
         monkeypatch.setenv(
             "HERMES_LOCAL_STT_COMMAND",
             "whisper {input_path} --output_dir {output_dir} --language {language}",
         )
-        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False):
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
+             patch("tools.transcription_tools._try_lazy_install_stt", return_value=False), \
+             patch("tools.tool_backend_helpers.read_selection", return_value="local"):
             from tools.transcription_tools import _get_provider
             result = _get_provider({"provider": "local"})
             assert result == "local_command"
+
+    def test_explicit_local_restores_faster_whisper_before_cli(self, monkeypatch):
+        """An explicit provider=local whose venv lost faster-whisper (runtime rebuild)
+        lazy-restores it instead of pinning the much slower whisper CLI, which timed
+        out on long voice notes."""
+        monkeypatch.setenv(
+            "HERMES_LOCAL_STT_COMMAND",
+            "whisper {input_path} --output_dir {output_dir} --language {language}",
+        )
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
+             patch("tools.transcription_tools._try_lazy_install_stt", return_value=True) as lazy, \
+             patch("tools.tool_backend_helpers.read_selection", return_value="local"):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "local"}) == "local"
+            lazy.assert_called_once()
 
 
     def test_auto_detect_prefers_groq_over_openai(self, monkeypatch):
@@ -465,6 +483,17 @@ class TestLocalModelLoading:
             assert _create_whisper_model("base", device="cpu", compute_type="int8") is downloaded_model
 
         assert [c.kwargs["local_files_only"] for c in model_cls.call_args_list] == [True, False]
+
+    @pytest.mark.parametrize("configured, expected", [(12, 12), ("8", 8), (0, None), ("junk", None)])
+    def test_stt_local_cpu_threads_reaches_whisper_model(self, configured, expected):
+        """stt.local.cpu_threads flows from config to WhisperModel; 0/invalid keeps the library default."""
+        import tools.transcription_tools as tt
+
+        with patch("faster_whisper.WhisperModel", return_value=object()) as model_cls, \
+             patch.object(tt, "_local_model", None), patch.object(tt, "_local_model_name", None):
+            tt._get_or_load_local_model("base", {"device": "cpu", "compute_type": "int8", "cpu_threads": configured})
+
+        assert model_cls.call_args.kwargs.get("cpu_threads") == expected
 
 
 @pytest.mark.skipif(
@@ -1236,7 +1265,7 @@ class TestLocalModelLock:
         load_count = 0
         load_started = threading.Event()
 
-        def slow_load(model_name, device="auto", compute_type="auto"):
+        def slow_load(model_name, device="auto", compute_type="auto", cpu_threads=0):
             nonlocal load_count
             load_count += 1
             load_started.set()
