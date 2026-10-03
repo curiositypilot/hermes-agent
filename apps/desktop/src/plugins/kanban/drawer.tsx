@@ -69,12 +69,14 @@ import {
   isLockedTarget,
   type KanbanText,
   lockedReason,
+  scheduledWake,
   ScrollFade,
   Section,
   shortId,
   StatusMenu,
   useDefaultAssignee,
-  useKanban
+  useKanban,
+  wakeFull
 } from './ui'
 
 /**
@@ -153,9 +155,14 @@ function eventText(event: KanbanEvent, k: KanbanText): { detail?: string; label:
 
     case 'promoted':
       return { label: k.evtPromoted }
+    case 'scheduled': {
+      // Dated schedules carry `until` (epoch s) + `then`; undated ones don't.
+      const until = typeof p.until === 'number' && p.until > 0 ? p.until : null
+      const then = str('then') === 'start' ? 'start' : 'ask'
+      const wake = until ? `${k.metaWakes} ${wakeFull(new Date(until * 1000))} → ${k.scheduleOutcome[then]}` : null
 
-    case 'scheduled':
-      return { label: k.evtScheduled, detail: str('reason') ?? undefined }
+      return { label: k.evtScheduled, detail: [wake, str('reason')].filter(Boolean).join(' · ') || undefined }
+    }
 
     case 'archived':
       return { label: k.evtArchived }
@@ -568,6 +575,7 @@ export function TaskDrawer({
 
   const task = detail?.task
   const running = task?.status === 'running'
+  const wake = task ? scheduledWake(task) : null
   const defaultAssignee = useDefaultAssignee()
 
   const { data: log } = useQuery({
@@ -790,6 +798,11 @@ export function TaskDrawer({
               {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
               {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
               {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
+              {wake && (
+                <MetaRow label={k.metaWakes}>
+                  {wakeFull(wake.at)} → {k.scheduleOutcome[wake.then]}
+                </MetaRow>
+              )}
             </div>
 
             {task.status === 'ready' && !task.assignee && !defaultAssignee && (

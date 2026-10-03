@@ -23,6 +23,11 @@ export interface KanbanTask {
   started_at?: null | number
   worker_pid?: null | number
   last_heartbeat_at?: null | number
+  /** Dated schedule (epoch seconds): the dispatcher wakes a `scheduled` card
+   *  then. Null = undated (the backend still rechecks it; no date to show). */
+  scheduled_until?: null | number
+  /** What the wake does: `start` → ready/todo, `ask` → blocked for a human. */
+  scheduled_then?: 'ask' | 'start' | null
 }
 
 export interface KanbanColumn {

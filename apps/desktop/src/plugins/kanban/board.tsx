@@ -99,10 +99,13 @@ import {
   isLockedTarget,
   lockedReason,
   RunClock,
+  scheduledWake,
   shortId,
   useDefaultAssignee,
   useKanban,
-  useOrchestration
+  useOrchestration,
+  wakeFull,
+  wakeShort
 } from './ui'
 
 // ── optimistic board edits (reconciled by the follow-up refresh) ─────────────
@@ -164,6 +167,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
   const attached = task.assignee || (task.status === 'ready' ? fallback : task.status === 'triage' ? orchestrator : '')
 
   const meta = columnMeta(task.status)
+  const wake = scheduledWake(task)
 
   return (
     <div className="flex items-center gap-2 whitespace-nowrap text-[0.625rem] text-(--ui-text-tertiary)">
@@ -209,6 +213,17 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
           <span className="inline-flex shrink-0 cursor-help items-center gap-1 text-amber-500">
             <Codicon name="debug-disconnect" size="0.7rem" />
             {k.wontRun}
+          </span>
+        </Tip>
+      )}
+      {wake && (
+        <Tip label={`${k.metaWakes} ${wakeFull(wake.at)} → ${k.scheduleOutcome[wake.then]}`}>
+          <span
+            className="inline-flex shrink-0 cursor-help items-center gap-1 font-medium"
+            style={{ color: meta.tone }}
+          >
+            <Codicon name={meta.codicon} size="0.7rem" />
+            {wakeShort(wake.at)} · {k.scheduleThen[wake.then]}
           </span>
         </Tip>
       )}

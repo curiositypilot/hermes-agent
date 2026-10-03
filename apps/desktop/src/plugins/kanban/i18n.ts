@@ -123,6 +123,10 @@ type KanbanMessages = {
   metaCreatedBy: string
   metaCreated: string
   metaWorkerPid: string
+  // dated schedule (card chip + drawer row)
+  metaWakes: string
+  scheduleThen: Record<'ask' | 'start', string>
+  scheduleOutcome: Record<'ask' | 'start', string>
   readyUnassignedTitle: string
   readyUnassignedBody: string
   diagnosticsN: (n: number) => string
@@ -341,6 +345,9 @@ export const en: KanbanMessages = {
   metaCreatedBy: 'Created by',
   metaCreated: 'Created',
   metaWorkerPid: 'Worker pid',
+  metaWakes: 'Wakes',
+  scheduleThen: { start: 'start', ask: 'ask' },
+  scheduleOutcome: { start: 'starts work', ask: 'asks you' },
   readyUnassignedTitle: 'Ready, but unassigned — this card will never run.',
   readyUnassignedBody:
     'The dispatcher only claims Ready cards that have an assignee. Pick a profile in the Assignee field above (or set a default assignee in the orchestration settings) and it runs within a minute.',
@@ -554,6 +561,9 @@ const ja: KanbanMessages = {
   metaCreatedBy: '作成者',
   metaCreated: '作成',
   metaWorkerPid: 'ワーカー PID',
+  metaWakes: '起動',
+  scheduleThen: { start: '開始', ask: '確認' },
+  scheduleOutcome: { start: '作業を開始', ask: 'あなたに確認' },
   readyUnassignedTitle: 'Ready ですが未割り当て — このカードは実行されません。',
   readyUnassignedBody:
     'ディスパッチャは担当のある Ready カードのみ取得します。上の担当フィールドでプロフィールを選ぶ（またはオーケストレーション設定でデフォルトの担当を設定する）と、1分以内に実行されます。',
@@ -766,6 +776,9 @@ const zh: KanbanMessages = {
   metaCreatedBy: '创建者',
   metaCreated: '创建于',
   metaWorkerPid: '工作单元 PID',
+  metaWakes: '唤醒',
+  scheduleThen: { start: '开始', ask: '询问' },
+  scheduleOutcome: { start: '开始工作', ask: '询问你' },
   readyUnassignedTitle: '就绪但未分配 — 这张卡片永远不会运行。',
   readyUnassignedBody:
     '调度器只领取有负责人的就绪卡片。在上面的负责人字段选择一个配置档（或在编排设置中设置默认负责人），它会在一分钟内运行。',
@@ -976,6 +989,9 @@ const zhHant: KanbanMessages = {
   metaCreatedBy: '建立者',
   metaCreated: '建立於',
   metaWorkerPid: '工作單元 PID',
+  metaWakes: '喚醒',
+  scheduleThen: { start: '開始', ask: '詢問' },
+  scheduleOutcome: { start: '開始工作', ask: '詢問你' },
   readyUnassignedTitle: '就緒但未指派 — 這張卡片永遠不會執行。',
   readyUnassignedBody:
     '排程器只領取有負責人的就緒卡片。在上方的負責人欄位選擇一個設定檔（或在編排設定中設定預設負責人），它會在一分鐘內執行。',

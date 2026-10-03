@@ -10,6 +10,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
   FadeScroll,
+  fmtDateTime,
   profileColor,
   profileColorSoft,
   relativeTime,
@@ -77,6 +78,33 @@ export function errText(err: unknown): string {
 export const ago = (seconds?: null | number): null | string => (seconds ? relativeTime(seconds * 1000) : null)
 
 const ELAPSED_SUFFIX = { day: 'd', hour: 'h', minute: 'm', second: 's' } as const
+
+// ── dated schedule ───────────────────────────────────────────────────────────
+
+const fmtWakeDay = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short' })
+const fmtWakeClock = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' })
+
+/** The wake time of a dated `scheduled` card, or null when undated / not
+ *  scheduled. The backend owns the semantics (incl. undated rechecks and the
+ *  legacy "until YYYY-MM-DD" reason); the renderer only formats the column. */
+export function scheduledWake(task: KanbanTask): null | { at: Date; then: 'ask' | 'start' } {
+  if (task.status !== 'scheduled' || !task.scheduled_until) {
+    return null
+  }
+
+  return { at: new Date(task.scheduled_until * 1000), then: task.scheduled_then === 'start' ? 'start' : 'ask' }
+}
+
+/** Compact local wake label for the card chip ("Oct 7", "Oct 7 09:30") —
+ *  the clock only when the wake isn't local midnight. */
+export function wakeShort(at: Date): string {
+  const midnight = at.getHours() === 0 && at.getMinutes() === 0
+
+  return midnight ? fmtWakeDay.format(at) : `${fmtWakeDay.format(at)} ${fmtWakeClock.format(at)}`
+}
+
+/** Full local wake date + time for the drawer and the chip tooltip. */
+export const wakeFull = (at: Date): string => fmtDateTime.format(at)
 
 /** Compact run duration ("42s", "3m") off the canonical elapsed bucketing. */
 export function duration(start?: null | number, end?: null | number): null | string {
