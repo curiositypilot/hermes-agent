@@ -400,8 +400,10 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "Defaults to HERMES_TENANT env if set."
         )),
         "priority": _prop("integer", (
-                "Dispatcher tiebreaker: higher is picked sooner among "
-                "ready tasks sharing an assignee."
+                "Priority on the 0–3 scale; higher is picked sooner among "
+                "ready tasks sharing an assignee. Omit to inherit the maximum "
+                "parent priority, or one below the creator task for a worker "
+                "follow-up without parents (floor 0); otherwise defaults to 0."
         )),
         "workspace_kind": {
             "type": "string",

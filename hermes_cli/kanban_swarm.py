@@ -34,7 +34,7 @@ class SwarmWorkerSpec:
     title: str
     body: str
     skills: list[str] = field(default_factory=list)
-    priority: int = 0
+    priority: Optional[int] = None
     max_runtime_seconds: Optional[int] = None
 
 
@@ -117,7 +117,7 @@ def create_swarm(
     created_by: str = "swarm-orchestrator",
     workspace_kind: Optional[str] = None,
     workspace_path: Optional[str] = None,
-    priority: int = 0,
+    priority: Optional[int] = None,
     idempotency_key: Optional[str] = None,
 ) -> SwarmCreated:
     """Atomically create a durable, immediately dispatchable Kanban swarm."""
@@ -166,7 +166,7 @@ def _create_swarm_uncommitted(
     conn: sqlite3.Connection, *, goal: str, workers: Iterable[SwarmWorkerSpec],
     verifier_assignee: str, synthesizer_assignee: str, root_title: Optional[str],
     verifier_title: str, synthesizer_title: str, tenant: Optional[str], created_by: str,
-    workspace_kind: Optional[str], workspace_path: Optional[str], priority: int, idempotency_key: Optional[str],
+    workspace_kind: Optional[str], workspace_path: Optional[str], priority: Optional[int], idempotency_key: Optional[str],
 ) -> SwarmCreated:
     """Create the swarm graph inside the caller's transaction: planning root
     (``blocked`` until the caller activates it), parallel workers, a verifier
@@ -216,7 +216,7 @@ def _create_swarm_uncommitted(
             body=(spec.body or "") + context_suffix,
             assignee=spec.profile,
             parents=[root],
-            priority=spec.priority or priority,
+            priority=spec.priority if spec.priority is not None else priority,
             skills=spec.skills or None,
             max_runtime_seconds=spec.max_runtime_seconds,
             **common,

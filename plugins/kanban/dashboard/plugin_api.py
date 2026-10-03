@@ -380,7 +380,7 @@ class CreateTaskBody(BaseModel):
     body: Optional[str] = None
     assignee: Optional[str] = None
     tenant: Optional[str] = None
-    priority: int = 0
+    priority: Optional[int] = None
     workspace_kind: Optional[str] = None  # None = scratch, or the board project's worktree when scoped
     workspace_path: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
