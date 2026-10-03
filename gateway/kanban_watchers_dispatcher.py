@@ -353,6 +353,8 @@ def _log_spawn_results(results: Optional[list]) -> bool:
     """Log per-board spawn summaries; returns whether any board spawned."""
     any_spawned = False
     for slug, res in (results or []):
+        for tid, status in getattr(res, "woke_scheduled", None) or ():
+            logger.info("kanban dispatcher [%s]: %s woke from scheduled -> %s", slug, tid, status)
         if res is not None and getattr(res, "spawned", None):
             any_spawned = True
             # Quiet by default: an idle gateway stays silent.

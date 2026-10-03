@@ -839,6 +839,9 @@ _LATER_TASK_COLUMNS = (
     ("worker_started_at", "worker_started_at INTEGER"),
     # S|M|L label for kanban.routing tier selection; NULL = unlabeled.
     ("complexity", "complexity TEXT"),
+    # Dated ``scheduled`` cards (kanban_db_schedule): wake time (epoch) + mode start|ask.
+    ("scheduled_until", "scheduled_until INTEGER"),
+    ("scheduled_then", "scheduled_then TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

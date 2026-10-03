@@ -1944,6 +1944,10 @@ DEFAULT_CONFIG = {
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,
+        # A `scheduled` card with no date (no --until, no "until YYYY-MM-DD" in its reason) wakes
+        # as a sticky `blocked` ("ask") this many days after it was parked. Dated cards wake on
+        # their date into ready (--then start) or blocked (--then ask). 0 = undated cards never wake.
+        "schedule_recheck_days": 7,
         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.

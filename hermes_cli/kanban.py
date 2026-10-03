@@ -363,6 +363,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
         return _err(f"kanban: --max-runtime: {exc}", 2)
+    if getattr(args, "until", None) or getattr(args, "then", None):
+        from hermes_cli.kanban_db_schedule import parse_until
+        if not getattr(args, "until", None):
+            return _err("kanban: --then needs --until YYYY-MM-DD[THH:MM]", 2)
+        if getattr(args, "initial_status", "running") == "blocked" or getattr(args, "triage", False):
+            return _err("kanban: --until cannot be combined with --initial-status blocked or --triage", 2)
+        try:
+            parse_until(args.until)
+        except ValueError as exc:
+            return _err(f"kanban: --until: {exc}", 2)
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
@@ -385,6 +395,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
+            scheduled_until=getattr(args, "until", None),
+            scheduled_then=getattr(args, "then", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -436,6 +448,8 @@ def _cmd_list(args: argparse.Namespace) -> int:
             include_archived=args.archived, order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
         )
+        from hermes_cli.kanban_db_schedule import schedule_label
+        when = {t.id: schedule_label(conn, t) for t in tasks if t.status == "scheduled"}
     if _json_out(args, [_task_to_dict(t) for t in tasks]):
         return 0
     # Passive discoverability: only multi-board users see which board this is.
@@ -451,7 +465,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
         print("(no matching tasks)")
         return 0
     for t in tasks:
-        print(_fmt_task_line(t))
+        print(_fmt_task_line(t, when.get(t.id, "")))
     return 0
 
 
@@ -496,12 +510,17 @@ def _cmd_show(args: argparse.Namespace) -> int:
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        schedule = None
+        if task.status == "scheduled":
+            from hermes_cli.kanban_db_schedule import schedule_label
+            schedule = schedule_label(conn, task)
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
 
     if want_json:
         _print_json({
-            "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
+            "task": _task_to_dict(task), "latest_summary": latest_summary, "schedule": schedule,
+            "parents": parents, "children": children,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
@@ -512,7 +531,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  {label + ':':<11}{value}")
 
     print(f"Task {task.id}: {task.title}")
-    field("status", task.status)
+    field("status", f"{task.status}  {schedule}" if schedule else task.status)
     field("assignee", task.assignee or "-")
     if task.tenant:
         field("tenant", task.tenant)
@@ -1112,14 +1131,30 @@ def _cmd_block(args: argparse.Namespace) -> int:
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
-    reason = _joined_words(args.reason)
+    from hermes_cli.kanban_db_schedule import format_until, resolve_schedule
+
+    words = list(args.reason or [])
+    until = then = None
+    if getattr(args, "until", None):
+        until, *rest = args.until
+        words += rest
+    if getattr(args, "then", None):
+        then, *rest = args.then
+        words += rest
+    reason = _joined_words(words)
     author = _profile_author()
     ids = _bulk_ids(args)
+    try:
+        until_ts, mode = resolve_schedule(reason, until, then)
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
+    when = f" (⏱ → {format_until(until_ts)} {mode})" if until_ts else ""
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
         op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
+            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid), until=until, then=then))
+        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{when}{suffix}",
+                           lambda tid: f"cannot schedule {tid}")
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
@@ -1460,7 +1495,7 @@ Common subcommands:
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
-  `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+  `block <id> [reason]` Mark blocked; `schedule <id> [--until DATE --then start|ask] [reason]` parks time-delay work (dispatcher wakes it on DATE); `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts

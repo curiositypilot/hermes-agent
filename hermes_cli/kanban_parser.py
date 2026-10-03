@@ -221,6 +221,12 @@ _SPECS = [
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
                   "to skip the brief running-to-blocked transition."),
+        _arg("--until", metavar="YYYY-MM-DD[THH:MM]",
+             help="Create the card already Scheduled; the dispatcher wakes it on this date "
+                  "(local time; a bare date wakes at midnight)."),
+        _arg("--then", choices=["start", "ask"],
+             help="With --until: 'start' -> ready/todo and runs; 'ask' (default) -> sticky "
+                  "blocked for a human."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [
@@ -338,6 +344,17 @@ _SPECS = [
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
+        # nargs="+": words after the flag value are the note, so both
+        # `schedule ID "note" --until D` and `schedule ID --until D --then start note`
+        # parse (argparse cannot fill a nargs="*" positional after an option on 3.11).
+        _arg("--until", nargs="+", metavar="YYYY-MM-DD[THH:MM]",
+             help="Wake date (local time; a bare date wakes at midnight). Without it, "
+                  "'until YYYY-MM-DD' in the reason is the date; an undated card wakes "
+                  "as 'ask' after kanban.schedule_recheck_days."),
+        _arg("--then", nargs="+", metavar="start|ask",
+             help="On the wake date: 'start' -> ready (todo while parents are open) and the "
+                  "dispatcher runs it; 'ask' (default) -> sticky blocked for a human. "
+                  "Re-running schedule on a scheduled card moves its date."),
         _bulk_ids("schedule"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [

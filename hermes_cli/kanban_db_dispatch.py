@@ -151,6 +151,10 @@ class DispatchResult:
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
+    woke_scheduled: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, new_status)`` for dated ``scheduled`` cards woken this tick
+    (``kanban_db_schedule``): ``ready``/``todo`` for then=start, ``blocked`` for
+    then=ask. On a dry run: what WOULD wake (nothing written)."""
     memory_pressure: Optional[str] = None
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
@@ -2250,8 +2254,11 @@ def _run_reclaim_phase(
     failure_limit: int,
     reconcile_orphans: bool,
     board: Optional[str] = None,
+    dry_run: bool = False,
 ) -> None:
-    """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
+    """Reclaim stale/orphaned/crashed/timed-out running tasks, wake due
+    ``scheduled`` cards, then promote (so a woken start-mode card whose parents
+    finished can spawn this same tick)."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
@@ -2264,7 +2271,19 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
+    result.woke_scheduled = _wake_scheduled(conn, dry_run=dry_run)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+
+
+def _wake_scheduled(conn: sqlite3.Connection, *, dry_run: bool) -> list[tuple[str, str]]:
+    """Dated-schedule wake pass; a failure is logged, never costs the tick."""
+    try:
+        from hermes_cli.kanban_db_schedule import wake_due_scheduled
+        return wake_due_scheduled(conn, dry_run=dry_run)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("kanban dispatcher: scheduled wake pass failed")
+        return []
 
 
 def _tick_spawn_budget(
@@ -2424,6 +2443,7 @@ def _dispatch_once_locked(
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+        dry_run=dry_run,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,

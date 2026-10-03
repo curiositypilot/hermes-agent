@@ -21,6 +21,7 @@ _TASK_DICT_FIELDS = (
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_runtime_seconds", "max_retries", "model_override", "provider_override", "complexity",
     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
+    "scheduled_until", "scheduled_then",
 )
 _SHOW_RUN_FIELDS = (
     "id", "profile", "step_key", "status", "outcome", "summary", "error",
@@ -71,12 +72,14 @@ def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
     return 1 if failed else 0
 
 
-def _fmt_task_line(t: kb.Task) -> str:
+def _fmt_task_line(t: kb.Task, schedule: str = "") -> str:
+    """One ``list`` row; ``schedule`` is the wake label of a scheduled card."""
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
     size = f" ({t.complexity})" if getattr(t, "complexity", None) else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}{size}  {t.title}"
+    when = f"  {schedule}" if schedule else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}{size}  {t.title}{when}"
 
 
 def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:

@@ -750,6 +750,9 @@ class Task:
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
     complexity: Optional[str] = None         # VALID_COMPLEXITIES; NULL = unlabeled (kanban.routing)
+    # Dated ``scheduled`` cards (kanban_db_schedule): epoch wake time + start|ask; NULL = undated.
+    scheduled_until: Optional[int] = None
+    scheduled_then: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -779,12 +782,12 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "scheduled_until",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
-    "complexity",
+    "complexity", "scheduled_then",
 )
 
 
@@ -990,7 +993,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- has no model_override, the dispatcher picks the worker model from the
     -- label's tier list, skipping providers that are currently rate-limited.
     -- NULL = unlabeled (``kanban.routing.unlabeled`` decides).
-    complexity           TEXT
+    complexity           TEXT,
+    -- Dated ``scheduled`` cards (hermes_cli/kanban_db_schedule.py): the
+    -- dispatcher wakes the card at ``scheduled_until`` (epoch) into
+    -- ``ready``/``todo`` (then='start') or a sticky ``blocked`` (then='ask').
+    -- NULL = undated (legacy reason date, else recheck after N days).
+    scheduled_until      INTEGER,
+    scheduled_then       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1285,6 +1294,7 @@ def create_task(
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
     complexity: Optional[str] = None,
+    scheduled_until=None, scheduled_then: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1295,6 +1305,8 @@ def create_task(
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
     worker model (provider requires model); ``reasoning_effort`` is independent.
     ``complexity`` (S|M|L) selects the ``kanban.routing`` tier when no model is pinned.
+    ``scheduled_until`` (``YYYY-MM-DD[THH:MM]`` or epoch) + ``scheduled_then``
+    (start|ask) create the card already ``scheduled`` (see ``schedule_task``).
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
@@ -1314,6 +1326,15 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
+    schedule_until_ts: Optional[int] = None
+    schedule_mode: Optional[str] = None
+    if scheduled_until not in (None, "") or scheduled_then:
+        from hermes_cli.kanban_db_schedule import resolve_schedule
+        if initial_status == "blocked" or triage:
+            raise ValueError("a scheduled card cannot also be created blocked or in triage")
+        schedule_until_ts, schedule_mode = resolve_schedule(None, scheduled_until, scheduled_then)
+        if schedule_until_ts is None:
+            raise ValueError("scheduled_then needs scheduled_until (YYYY-MM-DD[THH:MM])")
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
@@ -1430,6 +1451,16 @@ def create_task(
                         "blocked",
                         {"reason": "initial_status", "status": "blocked", "actor": created_by or "user"},
                     )
+                if schedule_until_ts is not None:
+                    # Born dated: park before the txn commits so no tick can claim it.
+                    conn.execute(
+                        "UPDATE tasks SET status = 'scheduled', scheduled_until = ?, scheduled_then = ? "
+                        "WHERE id = ?", (schedule_until_ts, schedule_mode, task_id),
+                    )
+                    _append_event(conn, task_id, "scheduled", {
+                        "reason": "created scheduled", "until": schedule_until_ts, "then": schedule_mode,
+                    })
+                    task_status = "scheduled"
                 if task_status == "todo":
                     # Parked behind an open parent: record why, exactly as
                     # link_tasks does, so the board never shows an unexplained todo.
@@ -3710,7 +3741,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # is a fresh start for the retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "scheduled_until = NULL, scheduled_then = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -3992,18 +4024,42 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
+    expected_run_id: Optional[int] = None, until=None, then: Optional[str] = None,
 ) -> bool:
-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable).
+
+    ``until`` (``YYYY-MM-DD[THH:MM]`` local, or epoch) + ``then`` (``start`` |
+    ``ask``) make the dispatcher wake it on that date (``kanban_db_schedule``);
+    without ``until`` an ``until YYYY-MM-DD`` in ``reason`` is the date. An
+    already ``scheduled`` card is re-dated in place (no unblock round-trip that
+    the dispatcher could claim in between). ``unblock_task`` still releases early.
+    Raises ``ValueError`` on a malformed date/mode.
+    """
+    from hermes_cli.kanban_db_schedule import resolve_schedule
+
+    until_ts, mode = resolve_schedule(reason, until, then)
     with write_txn(conn):
-        params: list[Any] = [task_id]
+        if _task_status(conn, task_id) == "scheduled":
+            if expected_run_id is not None:
+                return False
+            conn.execute(
+                "UPDATE tasks SET scheduled_until = ?, scheduled_then = ? WHERE id = ? AND status = 'scheduled'",
+                (until_ts, mode, task_id),
+            )
+            payload: dict[str, Any] = {"reason": reason, "rescheduled": True}
+            if until_ts is not None:
+                payload.update(until=until_ts, then=mode)
+            _append_event(conn, task_id, "scheduled", payload)
+            return True
+        params: list[Any] = [until_ts, mode, task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   scheduled_until = ?,
+                   scheduled_then  = ?
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
@@ -4015,7 +4071,10 @@ def schedule_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        payload = {"reason": reason}
+        if until_ts is not None:
+            payload.update(until=until_ts, then=mode)
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
 
 

@@ -112,6 +112,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "rate_limited": res.rate_limited,
             "routed": [{"task_id": tid, "route": label} for (tid, label) in res.routed],
+            "woke_scheduled": [{"task_id": tid, "status": st} for (tid, st) in res.woke_scheduled],
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
         }, ascii=True)
@@ -128,9 +129,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"{label} {len(items)}")
         if items:
             print(f"  {', '.join(items)}")
+    tag = " (dry)" if args.dry_run else ""
+    if res.woke_scheduled:
+        verb = "Would wake" if args.dry_run else "Woke"
+        print(f"{verb} scheduled: " + ", ".join(f"{tid} -> {st}" for tid, st in res.woke_scheduled))
     print(f"Promoted:     {res.promoted}")
     print(f"Spawned:      {len(res.spawned)}")
-    tag = " (dry)" if args.dry_run else ""
     for tid, who, ws in res.spawned:
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
     for tid, label in res.routed:
