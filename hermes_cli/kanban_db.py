@@ -1283,7 +1283,7 @@ def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
     workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
-    branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
+    branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: Optional[int] = None,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
@@ -1390,6 +1390,32 @@ def create_task(
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
+                resolved_priority = priority
+                if resolved_priority is None:
+                    if parents:
+                        placeholders = ",".join("?" for _ in parents)
+                        priority_row = conn.execute(
+                            f"SELECT COALESCE(MAX(priority), 0) AS priority FROM tasks "
+                            f"WHERE id IN ({placeholders})",
+                            parents,
+                        ).fetchone()
+                        resolved_priority = int(priority_row["priority"] or 0)
+                        priority_source = "parents"
+                    elif creator_task_id:
+                        creator = conn.execute(
+                            "SELECT priority FROM tasks WHERE id = ?", (creator_task_id,),
+                        ).fetchone()
+                        if creator is not None:
+                            resolved_priority = max(int(creator["priority"] or 0) - 1, 0)
+                            priority_source = "creator"
+                        else:
+                            resolved_priority = 0
+                            priority_source = "default"
+                    else:
+                        resolved_priority = 0
+                        priority_source = "default"
+                else:
+                    priority_source = "explicit"
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -1411,7 +1437,7 @@ def create_task(
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        task_id, title.strip(), body, assignee, task_status, priority,
+                        task_id, title.strip(), body, assignee, task_status, resolved_priority,
                         created_by, now, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
@@ -1432,6 +1458,8 @@ def create_task(
                         "status": task_status,
                         "parents": list(parents),
                         "creator_task_id": creator_task_id,
+                        "priority": resolved_priority,
+                        "priority_source": priority_source,
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
