@@ -1150,6 +1150,7 @@ DEFAULT_CONFIG = {
             "no_speech_prob_threshold": 0.6,
             "logprob_threshold": -1.0,
             "unload_after_idle_seconds": 0,  # 0 = never; e.g. 300 frees the model after 5min
+            "cpu_threads": 0,  # CPU decode threads; 0 = faster-whisper default (4)
         },
         "groq": {
             # whisper-large-v3, whisper-large-v3-turbo, distil-whisper-large-v3-en

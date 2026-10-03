@@ -133,11 +133,14 @@ def _hub_cache_miss_error() -> type:
     return LocalEntryNotFoundError
 
 
-def _create_whisper_model(model_name: str, *, device: str, compute_type: str):
-    """Use a cached model without contacting the Hub, downloading only on a cache miss."""
+def _create_whisper_model(model_name: str, *, device: str, compute_type: str, cpu_threads: int = 0):
+    """Use a cached model without contacting the Hub, downloading only on a cache miss.
+    ``cpu_threads`` > 0 pins CTranslate2's CPU thread count (its default is 4)."""
     from faster_whisper import WhisperModel
 
-    kwargs = {"device": device, "compute_type": compute_type}
+    kwargs: dict = {"device": device, "compute_type": compute_type}
+    if cpu_threads > 0:
+        kwargs["cpu_threads"] = cpu_threads
     try:
         return WhisperModel(model_name, local_files_only=True, **kwargs)
     except (_hub_cache_miss_error(), RuntimeError) as exc:
@@ -160,7 +163,8 @@ def _create_whisper_model(model_name: str, *, device: str, compute_type: str):
         ) from exc
 
 
-def _load_local_whisper_model(model_name: str, device: str = "auto", compute_type: str = "auto"):
+def _load_local_whisper_model(model_name: str, device: str = "auto", compute_type: str = "auto",
+                              cpu_threads: int = 0):
     """Load faster-whisper with graceful CUDA → CPU fallback. ``device="auto"`` picks CUDA
     whenever the ctranslate2 wheel ships CUDA libs, even on hosts without the NVIDIA runtime (WSL2,
     headless servers): try the requested config first; on a CUDA library load failure fall back to
@@ -177,15 +181,15 @@ def _load_local_whisper_model(model_name: str, device: str = "auto", compute_typ
     if force_cpu:
         logger.info("Apple Silicon/Rosetta detected — loading faster-whisper on CPU "
                     "(int8) to avoid native device autodetection crashes")
-        return _create_whisper_model(model_name, device="cpu", compute_type="int8")
+        return _create_whisper_model(model_name, device="cpu", compute_type="int8", cpu_threads=cpu_threads)
     try:
-        return _create_whisper_model(model_name, device=device, compute_type=compute_type)
+        return _create_whisper_model(model_name, device=device, compute_type=compute_type, cpu_threads=cpu_threads)
     except Exception as exc:
         if not _looks_like_cuda_lib_error(exc):
             raise
         logger.warning("faster-whisper CUDA load failed (%s) — falling back to CPU (int8). "
                        "Install the NVIDIA CUDA runtime (libcublas/libcudnn) to use GPU.", exc)
-        return _create_whisper_model(model_name, device="cpu", compute_type="int8")
+        return _create_whisper_model(model_name, device="cpu", compute_type="int8", cpu_threads=cpu_threads)
 
 
 # Silence-hallucination hardening for local faster-whisper (whisper decodes junk like

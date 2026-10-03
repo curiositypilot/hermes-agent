@@ -165,11 +165,18 @@ def _detect_local_backend() -> Optional[str]:
 
 
 def _resolve_explicit_local() -> str:
-    backend = _detect_local_backend()
-    if not backend:
-        logger.warning("STT provider 'local' configured but unavailable "
-                       "(install faster-whisper or set HERMES_LOCAL_STT_COMMAND)")
-    return backend or "none"
+    """An explicit ``provider: local`` asks for faster-whisper: restore it (lazy install) before
+    settling for the whisper CLI, which is several times slower on CPU and can hit its timeout on
+    long voice notes. A venv rebuild that dropped faster-whisper must not silently pin the CLI."""
+    if _HAS_FASTER_WHISPER or _try_lazy_install_stt():
+        return "local"
+    if _has_local_command():
+        logger.warning("STT provider 'local' configured but faster-whisper is unavailable; "
+                       "falling back to the local whisper command")
+        return "local_command"
+    logger.warning("STT provider 'local' configured but unavailable "
+                   "(install faster-whisper or set HERMES_LOCAL_STT_COMMAND)")
+    return "none"
 
 
 def _resolve_explicit_local_command() -> str:
@@ -308,6 +315,15 @@ def _touch_transcription_time() -> None:
     _last_transcription_time = time.monotonic()
 
 
+def _local_cpu_threads(local_cfg: Dict[str, Any]) -> int:
+    """``stt.local.cpu_threads`` as a non-negative int; 0 (or junk) keeps the library default."""
+    try:
+        return max(0, int(local_cfg.get("cpu_threads") or 0))
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid stt.local.cpu_threads=%r", local_cfg.get("cpu_threads"))
+        return 0
+
+
 def _get_or_load_local_model(model_name: str, local_cfg: Dict[str, Any]):
     """Cached faster-whisper model, (re)loaded under a double-checked lock when needed. The returned
     strong reference stays valid even if the idle watcher nulls the global mid-transcription."""
@@ -321,18 +337,20 @@ def _get_or_load_local_model(model_name: str, local_cfg: Dict[str, Any]):
         with _local_model_lock:
             if _local_model is None or _local_model_name != model_name:
                 logger.info("Loading faster-whisper model '%s' (first load downloads the model)...", model_name)
-                # stt.local.device / compute_type pin a configuration where ``auto`` mis-detects.
+                # stt.local.device / compute_type pin a configuration where ``auto`` mis-detects;
+                # stt.local.cpu_threads overrides CTranslate2's 4-thread CPU default.
                 _local_model = _load_local_whisper_model(model_name, device=local_cfg.get("device", "auto"),
-                                                         compute_type=local_cfg.get("compute_type", "auto"))
+                                                         compute_type=local_cfg.get("compute_type", "auto"),
+                                                         cpu_threads=_local_cpu_threads(local_cfg))
                 _local_model_name = model_name
             model = _local_model
     return model
 
 
-def _replace_cached_model_on_cpu(model_name: str):
+def _replace_cached_model_on_cpu(model_name: str, cpu_threads: int = 0):
     """Load *model_name* on CPU/int8 and make it the cached singleton."""
     global _local_model, _local_model_name
-    model = _load_local_whisper_model(model_name, device="cpu", compute_type="int8")
+    model = _load_local_whisper_model(model_name, device="cpu", compute_type="int8", cpu_threads=cpu_threads)
     with _local_model_lock:
         _local_model, _local_model_name = model, model_name
     return model
@@ -371,7 +389,7 @@ def _transcribe_local(
                 raise
             logger.warning("faster-whisper CUDA runtime failed mid-transcribe (%s) — "
                            "evicting cached model and retrying on CPU (int8).", exc)
-            model = _replace_cached_model_on_cpu(model_name)
+            model = _replace_cached_model_on_cpu(model_name, _local_cpu_threads(local_cfg))
             segments, info = model.transcribe(file_path, **transcribe_kwargs)
             segments = list(segments)
         transcript = _join_confident_segments(segments, local_cfg)
