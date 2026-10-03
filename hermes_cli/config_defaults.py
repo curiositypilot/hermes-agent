@@ -1940,6 +1940,30 @@ DEFAULT_CONFIG = {
             # cards each tick (one aux call per card, up to auto_label_per_tick).
             "auto_label": False,
             "auto_label_per_tick": 3,
+            # Quota gate: hold low-priority cards off a provider whose live headroom is low. Reads
+            # the quota-snapshot file each tick (no network). For provider p with headroom h, the
+            # card needs priority >= max(min_priority of p's bands with h < below), else that
+            # candidate is skipped and the walk moves on; if nothing is left the card waits as
+            # quota_hold (no failure counted; on_exhausted: profile does not override it). Unknown
+            # headroom (missing/stale/unreadable file, provider absent, ok: false) = gate open.
+            "quota_gate": {
+                "enabled": False,
+                # "" = <HERMES_HOME>/data/quota/headroom.json
+                "headroom_file": "",
+                # Older file = headroom unknown = gate open.
+                "max_age_seconds": 1800,
+                # Pay-as-you-go providers a card may NOT fall through to once a gate skip happened
+                # in its walk (a plain rate-limit fallthrough still reaches them).
+                "payg_providers": ["openrouter"],
+                # Per provider name as written in the headroom file; "default" covers the rest.
+                "bands": {
+                    "default": [
+                        {"below": 0.25, "min_priority": 1},
+                        {"below": 0.10, "min_priority": 2},
+                        {"below": 0.03, "min_priority": 3},
+                    ],
+                },
+            },
         },
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.

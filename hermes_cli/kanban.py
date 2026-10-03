@@ -656,6 +656,48 @@ def _cmd_set_complexity(args: argparse.Namespace) -> int:
     return 0
 
 
+def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
+    """``kanban.routing.quota_gate`` state for ``route``: file age and, per
+    provider in the headroom file, headroom and the priority it requires."""
+    from hermes_cli import kanban_routing as kr
+
+    gate = cfg.quota_gate
+    snap = ctx.quota()
+    providers = []
+    for name, (headroom, resets_at) in sorted(snap.providers.items()):
+        required, below = kr.required_priority(gate.bands_for(name), headroom)
+        providers.append({"provider": name, "headroom": headroom, "required_priority": required,
+                          "band_below": below, "resets_at": int(resets_at) if resets_at else None})
+    for name, why in sorted(snap.unknown.items()):
+        providers.append({"provider": name, "headroom": None, "required_priority": 0,
+                          "band_below": None, "resets_at": None, "unknown": why})
+    return {
+        "enabled": gate.enabled, "file": snap.path, "status": snap.status,
+        "age_seconds": int(snap.age_seconds) if snap.age_seconds is not None else None,
+        "max_age_seconds": gate.max_age_seconds, "payg_providers": list(gate.payg_providers),
+        "card_priority": kr._task_priority(task) if task is not None else None,
+        "providers": providers,
+    }
+
+
+def _print_quota_gate(q: dict) -> None:
+    if not q["enabled"]:
+        print("\nQuota gate: disabled (kanban.routing.quota_gate.enabled: false)")
+        return
+    age = f", age {q['age_seconds']}s" if q["age_seconds"] is not None else ""
+    open_note = "" if q["status"] == "ok" else " — headroom unknown, gate OPEN"
+    print(f"\nQuota gate: {q['file']} ({q['status']}{age}, max {q['max_age_seconds']}s){open_note}")
+    if q["payg_providers"]:
+        print(f"  no paid fallthrough after a gate skip: {', '.join(q['payg_providers'])}")
+    for p in q["providers"]:
+        if p["headroom"] is None:
+            print(f"  ?  {p['provider']}: unknown ({p.get('unknown')}) -> gate open")
+            continue
+        band = f" (< {p['band_below'] * 100:.0f}%)" if p["band_below"] is not None else ""
+        mark = "ok " if q["card_priority"] is None or q["card_priority"] >= p["required_priority"] else "-- "
+        print(f"  {mark}{p['provider']}: headroom {p['headroom'] * 100:.0f}%{band} -> needs P{p['required_priority']}")
+
+
 def _cmd_route(args: argparse.Namespace) -> int:
     """Routing preview: tier table with live availability, plus one task's decision."""
     from hermes_cli import kanban_routing as kr
@@ -682,11 +724,12 @@ def _cmd_route(args: argparse.Namespace) -> int:
                            "until": int(avail.until) if avail.until else None})
         lane = "review" if task is not None and task.status == "review" else "ready"
         decision = ctx.decide_for_lane(task, lane, home) if task is not None else None
+        quota = _quota_gate_view(ctx, cfg, task)
     if getattr(args, "json", False):
         _print_json({
             "enabled": cfg.enabled, "unlabeled": cfg.unlabeled, "escalate": cfg.escalate,
             "on_exhausted": cfg.on_exhausted, "cooldown_seconds": cfg.cooldown_seconds,
-            "auto_label": cfg.auto_label, "tiers": tiers, "review": review,
+            "auto_label": cfg.auto_label, "tiers": tiers, "review": review, "quota_gate": quota,
             "task": None if task is None else {
                 "id": task.id, "complexity": task.complexity, "lane": lane,
                 **({"decision": decision.label(), **decision.event_payload()} if decision is not None
@@ -710,12 +753,15 @@ def _cmd_route(args: argparse.Namespace) -> int:
     for t in tiers:
         _rows(f"Tier {t['tier']}", t["candidates"], "no candidates")
     _rows("Review lane", review, "not set: reviewers use the card pin / profile model")
+    _print_quota_gate(quota)
     if task is not None:
         print(f"\nTask {task.id} (lane={lane}, complexity={task.complexity or '-'}, assignee={task.assignee or '-'}):")
         if decision is None:
             print("  -> pinned / profile model (no kanban.routing.review)")
             return 0
         print(f"  -> {decision.label()}")
+        if decision.source == "quota_held" and decision.retry_at:
+            print(f"     retry ~{_fmt_ts(int(decision.retry_at))}")
         for s in decision.skipped:
             where = f"{s['tier']} " if s.get("tier") else ""
             print(f"     skipped {where}{s.get('provider') or ''}:{s['model']} ({s['reason']})")

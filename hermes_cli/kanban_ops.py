@@ -111,6 +111,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, reason) in res.respawn_guarded
             ],
             "rate_limited": res.rate_limited,
+            "quota_held": [
+                {"task_id": tid, "reason": why, "retry_at": retry}
+                for (tid, why, retry) in res.quota_held
+            ],
             "routed": [{"task_id": tid, "route": label} for (tid, label) in res.routed],
             "woke_scheduled": [{"task_id": tid, "status": st} for (tid, st) in res.woke_scheduled],
             "skipped_locked": res.skipped_locked,
@@ -153,7 +157,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    held = {tid for tid, _why, _retry in res.quota_held}
+    for tid, why, retry in res.quota_held:
+        when = f", retry ~{_fmt_ts(retry)}" if retry else ""
+        print(f"Held (quota_hold): {tid} — {why}{when}")
     for tid, reason in res.respawn_guarded:
+        if reason == "quota_hold" and tid in held:
+            continue
         print(f"Guarded ({reason}): {tid}")
     if res.rate_limited:
         print(f"Rate-limited (released to ready, no failure counted): {', '.join(res.rate_limited)}")
