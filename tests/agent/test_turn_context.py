@@ -315,6 +315,25 @@ def test_blank_memory_query_keeps_the_message_text():
     mm.prefetch_all.assert_called_once_with(query, session_id=agent.session_id)
 
 
+@pytest.mark.parametrize("prompt", ["card", "good", "1", "garmin?"])
+def test_prefetch_skipped_for_low_signal_prompt_and_logged(prompt, caplog):
+    agent, mm = _agent_with_memory_manager()
+    with caplog.at_level("INFO", logger="agent.turn_context"):
+        ctx = _build(agent, user_message=prompt)
+    mm.prefetch_all.assert_not_called()
+    mm.on_turn_start.assert_called_once()
+    assert ctx.ext_prefetch_cache == ""
+    assert any("prefetch skipped: low-signal" in r.getMessage() for r in caplog.records)
+
+
+def test_low_signal_reply_recalls_on_the_quote():
+    # A one-word reply to a quoted message keeps recall: the gateway's memory_query carries the quote.
+    agent, mm = _agent_with_memory_manager()
+    query = "1\n\nJob-fit brief: 1. Osavul analyst role 2. Lisbon fintech"
+    _build(agent, user_message='[Replying to: "Job-fit brief ..."]\n\n1', memory_query=query)
+    mm.prefetch_all.assert_called_once_with(query, session_id=agent.session_id)
+
+
 @pytest.mark.parametrize("notice", [
     "[IMPORTANT: Background process proc_1 completed (exit code 0).\nOutput: done",
     "[ASYNC DELEGATION COMPLETE — d_1]\nA background subagent you dispatched earlier has finished.",
