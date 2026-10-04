@@ -3363,10 +3363,15 @@ def block_task(
         if kind == "dependency" and _parents_satisfied(conn, task_id):
             kind = "needs_input"
             rekind_reason = "no_open_parent"
+        prev_recurrences = int(_row_get(cur_row, "block_recurrences") or 0)
+        answered_by = _previous_block_answered_by(conn, task_id) if prev_recurrences else None
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
-            prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            prev_recurrences=0 if answered_by else prev_recurrences,
+            implementation_complete=_implementation_complete(conn, task_id, source_status),
         )
+        if answered_by:
+            payload["loop_reset"] = answered_by
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
@@ -3399,9 +3404,84 @@ def block_task(
     return True
 
 
+def _previous_block_answered_by(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Why the previous block no longer counts toward the loop breaker, or None.
+
+    The breaker exists for the blind loop: a cron unblocks, the worker re-blocks
+    for the same cause, nobody answered anything. A block someone DID answer is
+    a new question, not a recurrence. "Answered" between the previous block
+    event and this one means either:
+
+    * ``comment`` -- a comment posted while the card was parked, i.e. after the
+      block and before the next ``claimed``. No worker of this card runs in that
+      window, so the author is a human or an orchestrator (an ``unblock
+      --reason`` lands here too). Worker comments on their own run precede the
+      block or follow the claim and do not count; author names cannot separate
+      them because orchestrator and worker often share a profile.
+    * ``parent_completed`` -- a parent completed after the block.
+
+    A bare ``unblocked`` event is deliberately NOT an answer: every re-block
+    follows one (block_task only fires from running/ready), so counting it
+    would disable the breaker for exactly the cron loop it guards.
+    """
+    last_block = conn.execute(
+        "SELECT MAX(id) FROM task_events WHERE task_id = ? "
+        "AND kind IN ('blocked', 'block_loop_detected')", (task_id,),
+    ).fetchone()[0]
+    if last_block is None:
+        return None
+    next_claim = conn.execute(
+        "SELECT MIN(id) FROM task_events WHERE task_id = ? AND kind = 'claimed' AND id > ?",
+        (task_id, last_block),
+    ).fetchone()[0]
+    comment = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'commented' "
+        "AND id > ? AND id < ? LIMIT 1",
+        (task_id, last_block, next_claim if next_claim is not None else 1 << 62),
+    ).fetchone()
+    if comment:
+        return "comment"
+    parent_done = conn.execute(
+        "SELECT 1 FROM task_events e JOIN task_links l ON l.parent_id = e.task_id "
+        "WHERE l.child_id = ? AND e.kind = 'completed' AND e.id > ? LIMIT 1",
+        (task_id, last_block),
+    ).fetchone()
+    return "parent_completed" if parent_done else None
+
+
+def _implementation_complete(conn: sqlite3.Connection, task_id: str, source_status: str) -> bool:
+    """True when the card's implementation already finished: it blocks from a
+    review run, or its latest implementation verdict is ``review_requested`` /
+    ``completed`` and no implementation run was claimed after it (a later
+    ``changes_requested`` or a reopen re-opens the work). Such a card is
+    waiting on a human sign-off, so triage/auto-decompose would only re-plan
+    finished work into duplicate children."""
+    if source_status == "review":
+        return True
+    verdict = conn.execute(
+        "SELECT id, outcome FROM task_runs WHERE task_id = ? "
+        "AND outcome IN ('review_requested', 'completed', 'changes_requested') "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if not verdict or verdict["outcome"] not in ("review_requested", "completed"):
+        return False
+    for ev in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'claimed' AND run_id > ?",
+        (task_id, verdict["id"]),
+    ):
+        if _json_dict(ev["payload"]).get("source_status") != "review":
+            return False
+    return True
+
+
+def implementation_complete(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Public read of :func:`_implementation_complete` for a parked card (no live run)."""
+    return _implementation_complete(conn, task_id, "ready")
+
+
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int,
+    prev_kind: Optional[str], prev_recurrences: int, implementation_complete: bool = False,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3414,7 +3494,9 @@ def _route_block(
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
     (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human,
+    unless *implementation_complete* (it then stays ``blocked``). Answered
+    blocks reset the count before this runs (:func:`_previous_block_answered_by`).
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
@@ -3424,6 +3506,11 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
+        if implementation_complete:
+            # A finished card waiting on a sign-off: triage would hand it to the
+            # auto-decomposer, which re-plans done work into duplicate children.
+            payload["loop_suppressed"] = "implementation_complete"
+            return "blocked", "blocked", set_sql, (kind, recurrences), payload
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 

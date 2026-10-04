@@ -336,11 +336,16 @@ def decompose_task(
     return _apply_fanout(task_id, parsed, routing, audit_author)
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+def list_triage_ids(*, tenant: Optional[str] = None, exclude_finished: bool = False) -> list[str]:
+    """Return task ids currently in the triage column.
+
+    ``exclude_finished`` drops cards whose implementation already completed
+    (see :func:`kanban_db.implementation_complete`): the auto-decomposer must
+    never re-plan finished work into duplicate children."""
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+        return [row.id for row in rows
+                if not (exclude_finished and kb.implementation_complete(conn, row.id))]
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
