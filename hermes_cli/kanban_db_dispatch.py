@@ -3027,6 +3027,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # kanban_comment reads HERMES_PROFILE for its default author; `-p` alone
     # doesn't set the env var.
     env["HERMES_PROFILE"] = profile_arg
+    # Belt-and-braces default: prevent test runner from spawning 2*cores jobs
+    # inside memory-capped (e.g. 4G) worker scopes and OOM-killing the run.
+    # An explicit HERMES_TEST_WORKERS in the environment always wins.
+    env.setdefault("HERMES_TEST_WORKERS", "4")
     # This is the grant boundary: the dispatcher assigned this new worker's task.
     from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
     env.pop(DELEGATED_CHILD_ENV_MARKER, None)

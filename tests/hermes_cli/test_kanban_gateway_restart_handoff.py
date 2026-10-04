@@ -87,6 +87,7 @@ def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
     assert captured_cwd == str(workspace)
     assert captured_env["HERMES_KANBAN_TASK"] == task.id
     assert captured_env["HERMES_KANBAN_RUN_ID"] == "23"
+    assert captured_env["HERMES_TEST_WORKERS"] == "4"
     assert "ANTHROPIC_API_KEY" not in captured_env
 
 
