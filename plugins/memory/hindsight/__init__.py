@@ -647,6 +647,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
+            {"key": "recall_kanban_workers", "description": "Auto-recall in Kanban worker processes (HERMES_KANBAN_TASK set). False skips automatic prefetch only; explicit recall/reflect tools remain available", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
             {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
             {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
@@ -1034,6 +1035,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_tags = cfg.get("recall_tags") or None
         self._recall_tags_match = cfg.get("recall_tags_match", "any")
         self._auto_recall = cfg.get("auto_recall", True)
+        self._recall_kanban_workers = _parse_bool_setting(cfg.get("recall_kanban_workers"), True)
         self._recall_sync = bool(cfg.get("recall_sync", False))
         self._recall_max_tokens = int(cfg.get("recall_max_tokens", 4096))
         self._recall_max_input_chars = int(cfg.get("recall_max_input_chars", 800))
@@ -1168,6 +1170,8 @@ class HindsightMemoryProvider(MemoryProvider):
     def _recall_disabled(self) -> bool:
         """Guards shared by the async and synchronous recall paths."""
         why = ("tools-only mode" if self._memory_mode == "tools" else "auto_recall disabled" if not self._auto_recall
+               else "Kanban worker auto-recall disabled"
+               if not self._recall_kanban_workers and os.environ.get(_KANBAN_TASK_ENV, "").strip()
                else "shutting down" if self._shutting_down.is_set() else None)
         if why:
             logger.debug("Prefetch: skipped (%s)", why)
@@ -1248,6 +1252,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_thread.join(timeout=timeout)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        if self._recall_disabled():
+            return self._finish_prefetch("", 0)
         # Opt-in: recall synchronously against the *current* message so the
         # injected memories match this turn's query, not the previous turn's.
         # See NousResearch/hermes-agent#5820.
