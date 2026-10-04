@@ -41,6 +41,19 @@ least one gate skip) the card is held as ``quota_held`` — no failure counted,
 ``on_exhausted: profile`` does not override it, and pay-as-you-go providers
 are not used as a fallthrough for it. Unknown headroom (no/stale/unreadable
 file, provider missing, ``ok: false``) leaves the gate open.
+
+Pace bands: a band entry may carry ``below`` (level headroom), ``pace_below``
+(``pace.pace_headroom`` from headroom.json schema 2, minus
+``quota_gate.reserve[provider]``) or both; the card needs the max
+``min_priority`` over every matched band of either kind. A provider without
+pace data (schema 1, null pace) is gated on level bands only.
+
+Pace order (``kanban.routing.pace_order``): each tier's candidates are
+stable-sorted by ``pace_headroom - reserve`` descending (unknown = 0.0), so the
+provider furthest ahead of its budget line is tried first and the configured
+order breaks ties. Pay-as-you-go providers stay behind every quota provider.
+Tiers keep their escalation order; the review lane and pinned/profile routes
+are not re-ordered.
 """
 
 from __future__ import annotations
@@ -94,12 +107,27 @@ class QuotaGateConfig:
     payg_providers: tuple[str, ...] = ("openrouter",)
     bands: dict[str, tuple[tuple[float, int], ...]] = field(
         default_factory=lambda: dict(DEFAULT_QUOTA_BANDS))
-    """provider (or ``default``) -> ``((below, min_priority), ...)``."""
+    """provider (or ``default``) -> level bands ``((below, min_priority), ...)``."""
+    pace_bands: dict[str, tuple[tuple[float, int], ...]] = field(default_factory=dict)
+    """provider (or ``default``) -> pace bands ``((pace_below, min_priority), ...)``,
+    from the same ``bands`` entries (a band may carry ``below`` and/or ``pace_below``)."""
+    reserve: dict[str, float] = field(default_factory=dict)
+    """provider (or ``default``) -> fraction subtracted from ``pace_headroom``."""
+
+    def _for(self, table: dict, provider: str) -> tuple[tuple[float, int], ...]:
+        # A provider listed in ``bands`` owns its whole policy (both kinds);
+        # ``default`` covers providers that are not listed.
+        key = provider if provider in self.bands or provider in self.pace_bands else "default"
+        return table.get(key) or ()
 
     def bands_for(self, provider: str) -> tuple[tuple[float, int], ...]:
-        if provider in self.bands:
-            return self.bands[provider]
-        return self.bands.get("default") or ()
+        return self._for(self.bands, provider)
+
+    def pace_bands_for(self, provider: str) -> tuple[tuple[float, int], ...]:
+        return self._for(self.pace_bands, provider)
+
+    def reserve_for(self, provider: str) -> float:
+        return self.reserve.get(provider, self.reserve.get("default", 0.0))
 
 
 @dataclass
@@ -114,23 +142,58 @@ class RoutingConfig:
     auto_label: bool = False
     auto_label_per_tick: int = 3
     quota_gate: QuotaGateConfig = field(default_factory=QuotaGateConfig)
+    pace_order: bool = False
+    """Within each tier, try providers furthest ahead of their budget line first
+    (``pace_headroom - reserve`` descending, unknown = 0.0; static order breaks ties)."""
 
 
-def _parse_bands(raw: Any) -> dict[str, tuple[tuple[float, int], ...]]:
+def _parse_bands(raw: Any) -> tuple[dict[str, tuple[tuple[float, int], ...]],
+                                     dict[str, tuple[tuple[float, int], ...]]]:
+    """``(level bands, pace bands)``, keyed by the same providers. One entry may
+    carry ``below`` (level), ``pace_below`` (pace) or both; each kind present
+    becomes one band with the entry's ``min_priority``."""
     if raw is None:
-        return dict(DEFAULT_QUOTA_BANDS)
+        return dict(DEFAULT_QUOTA_BANDS), {}
     if not isinstance(raw, dict):
         logger.warning("kanban.routing.quota_gate.bands: expected a mapping, got %r", raw)
-        return dict(DEFAULT_QUOTA_BANDS)
-    out: dict[str, tuple[tuple[float, int], ...]] = {}
+        return dict(DEFAULT_QUOTA_BANDS), {}
+    level: dict[str, tuple[tuple[float, int], ...]] = {}
+    pace: dict[str, tuple[tuple[float, int], ...]] = {}
     for provider, entries in raw.items():
-        parsed: list[tuple[float, int]] = []
+        lv: list[tuple[float, int]] = []
+        pc: list[tuple[float, int]] = []
         for entry in (entries if isinstance(entries, list) else [entries]):
             try:
-                parsed.append((float(entry["below"]), int(entry["min_priority"])))
+                if not isinstance(entry, dict) or ("below" not in entry and "pace_below" not in entry):
+                    raise KeyError("below")
+                prio = int(entry["min_priority"])
+                below = float(entry["below"]) if entry.get("below") is not None else None
+                pace_below = float(entry["pace_below"]) if entry.get("pace_below") is not None else None
             except (TypeError, KeyError, ValueError):
                 logger.warning("kanban.routing.quota_gate.bands.%s: ignoring bad band %r", provider, entry)
-        out[str(provider).strip().lower()] = tuple(parsed)
+                continue
+            if below is not None:
+                lv.append((below, prio))
+            if pace_below is not None:
+                pc.append((pace_below, prio))
+        key = str(provider).strip().lower()
+        level[key] = tuple(lv)
+        pace[key] = tuple(pc)
+    return level, pace
+
+
+def _parse_reserve(raw: Any) -> dict[str, float]:
+    if raw in (None, ""):
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("kanban.routing.quota_gate.reserve: expected a mapping, got %r", raw)
+        return {}
+    out: dict[str, float] = {}
+    for provider, value in raw.items():
+        try:
+            out[str(provider).strip().lower()] = float(value)
+        except (TypeError, ValueError):
+            logger.warning("kanban.routing.quota_gate.reserve.%s: ignoring non-number %r", provider, value)
     return out
 
 
@@ -143,12 +206,15 @@ def _parse_quota_gate(raw: Any) -> QuotaGateConfig:
         max_age = DEFAULT_QUOTA_MAX_AGE_SECONDS
     payg = raw.get("payg_providers", ["openrouter"])
     payg_list = payg if isinstance(payg, list) else [payg] if payg else []
+    level, pace = _parse_bands(raw.get("bands"))
     return QuotaGateConfig(
         enabled=bool(raw.get("enabled", False)),
         headroom_file=str(raw.get("headroom_file") or "").strip(),
         max_age_seconds=max_age if max_age > 0 else DEFAULT_QUOTA_MAX_AGE_SECONDS,
         payg_providers=tuple(str(p).strip().lower() for p in payg_list if str(p).strip()),
-        bands=_parse_bands(raw.get("bands")),
+        bands=level,
+        pace_bands={k: v for k, v in pace.items() if v},
+        reserve=_parse_reserve(raw.get("reserve")),
     )
 
 
@@ -226,6 +292,7 @@ def load_routing_config(kanban_cfg: Optional[dict] = None) -> RoutingConfig:
         auto_label=bool(raw.get("auto_label", False)),
         auto_label_per_tick=_int("auto_label_per_tick", 3, 1),
         quota_gate=_parse_quota_gate(raw.get("quota_gate")),
+        pace_order=bool(raw.get("pace_order", False)),
     )
 
 
@@ -440,6 +507,10 @@ class QuotaSnapshot:
     age_seconds: Optional[float] = None
     providers: dict[str, tuple[float, Optional[float]]] = field(default_factory=dict)
     """provider -> ``(headroom 0..1, resets_at epoch or None)``."""
+    pace: dict[str, float] = field(default_factory=dict)
+    """provider -> ``pace.pace_headroom`` (schema 2; no reserve subtracted). Only
+    providers with a known level headroom AND a non-null pace appear; the rest
+    fall back to level bands and sort as pace 0.0."""
     unknown: dict[str, str] = field(default_factory=dict)
 
 
@@ -486,11 +557,21 @@ def read_headroom(gate: QuotaGateConfig, *, now: Optional[float] = None) -> Quot
             snap.unknown[name] = "no binding window"
             continue
         snap.providers[name.strip().lower()] = (headroom, _parse_iso_epoch(binding.get("resets_at")))
+        pace = entry.get("pace")
+        if isinstance(pace, dict) and pace.get("pace_headroom") is not None:
+            try:
+                value = float(pace["pace_headroom"])
+            except (TypeError, ValueError):
+                continue
+            if value == value:  # NaN = unknown
+                snap.pace[name.strip().lower()] = value
     return snap
 
 
 def required_priority(bands: tuple[tuple[float, int], ...], headroom: float) -> tuple[int, Optional[float]]:
-    """``(min priority, the band threshold that set it)``; ``(0, None)`` when no band matches."""
+    """``(min priority, the band threshold that set it)``; ``(0, None)`` when no band matches.
+    Same math for level bands (``below`` vs headroom) and pace bands
+    (``pace_below`` vs ``pace_headroom - reserve``)."""
     matched = [(below, prio) for below, prio in bands if headroom < below]
     if not matched:
         return 0, None
@@ -500,15 +581,69 @@ def required_priority(bands: tuple[tuple[float, int], ...], headroom: float) -> 
 
 @dataclass
 class QuotaVerdict:
-    """One provider refused by the gate for one card."""
+    """One provider refused by the gate for one card. ``kind`` names the band
+    that set the requirement: ``level`` (``headroom`` = binding-window headroom,
+    ``below`` = band) or ``pace`` (``headroom`` = ``pace_headroom - reserve``,
+    ``below`` = ``pace_below``)."""
     provider: str
     headroom: float
     below: float
     required: int
     resets_at: Optional[float] = None
+    kind: str = "level"
 
     def describe(self) -> str:
+        if self.kind == "pace":
+            return f"{self.provider} pace {self.headroom:+.2f} < {self.below:+.2f} needs P{self.required}"
         return f"{self.provider} headroom {_pct(self.headroom)} < {_pct(self.below)} needs P{self.required}"
+
+
+@dataclass
+class GateRequirement:
+    """Both band kinds evaluated for one provider (route printer + verdict)."""
+    provider: str
+    headroom: float
+    resets_at: Optional[float]
+    level_required: int
+    level_below: Optional[float]
+    pace_raw: Optional[float]
+    reserve: float
+    pace_required: int
+    pace_below: Optional[float]
+
+    @property
+    def pace_effective(self) -> Optional[float]:
+        return None if self.pace_raw is None else self.pace_raw - self.reserve
+
+    @property
+    def required(self) -> int:
+        return max(self.level_required, self.pace_required)
+
+    def verdict(self, priority: int) -> Optional[QuotaVerdict]:
+        if priority >= self.required or self.required <= 0:
+            return None
+        # Name the band that set the requirement; on a tie the pace band (the
+        # time-aware signal) is the one reported.
+        if self.pace_below is not None and self.pace_raw is not None and self.pace_required >= self.level_required:
+            return QuotaVerdict(self.provider, self.pace_raw - self.reserve, self.pace_below, self.pace_required,
+                                self.resets_at, kind="pace")
+        below = self.level_below if self.level_below is not None else 0.0
+        return QuotaVerdict(self.provider, self.headroom, below, self.level_required, self.resets_at)
+
+
+def gate_requirement(gate: QuotaGateConfig, snap: QuotaSnapshot, provider: str) -> Optional[GateRequirement]:
+    """Level + pace requirement for ``provider``, or None when its headroom is unknown."""
+    key = provider.strip().lower()
+    known = snap.providers.get(key)
+    if known is None:
+        return None
+    headroom, resets_at = known
+    level_req, level_below = required_priority(gate.bands_for(key), headroom)
+    pace_raw = snap.pace.get(key)
+    reserve = gate.reserve_for(key)
+    pace_req, pace_below = (0, None) if pace_raw is None else required_priority(
+        gate.pace_bands_for(key), pace_raw - reserve)
+    return GateRequirement(key, headroom, resets_at, level_req, level_below, pace_raw, reserve, pace_req, pace_below)
 
 
 @dataclass
@@ -545,29 +680,52 @@ class RoutingContext:
 
     def quota_verdict(self, provider: Optional[str], priority: int) -> Optional[QuotaVerdict]:
         """The gate's refusal of ``provider`` for a card of ``priority``, or None
-        (gate off, headroom unknown, or the card's priority meets the band)."""
+        (gate off, headroom unknown, or the card's priority meets every matched
+        band). Level and pace bands both apply; the required priority is the max
+        over all matched bands. A provider with no pace data uses level bands only."""
         gate = self.cfg.quota_gate
         if not gate.enabled or not provider:
             return None
         snap = self.quota()
         if snap.status != "ok":
             return None
+        req = gate_requirement(gate, snap, provider)
+        return None if req is None else req.verdict(priority)
+
+    def pace_key(self, provider: Optional[str]) -> float:
+        """Sort key for ``pace_order``: ``pace_headroom - reserve``; unknown = 0.0."""
+        if not provider:
+            return 0.0
+        snap = self.quota()
+        if snap.status != "ok":
+            return 0.0
         key = provider.strip().lower()
-        known = snap.providers.get(key)
-        if known is None:
-            return None
-        headroom, resets_at = known
-        required, below = required_priority(gate.bands_for(key), headroom)
-        if below is None or priority >= required:
-            return None
-        return QuotaVerdict(key, headroom, below, required, resets_at)
+        raw = snap.pace.get(key)
+        return 0.0 if raw is None else raw - self.cfg.quota_gate.reserve_for(key)
+
+    def order_tier(self, cands: "tuple[TierCandidate, ...] | list[TierCandidate]") -> list[TierCandidate]:
+        """One tier's candidates in walk order: static order, or (``pace_order``)
+        stable-sorted by ``pace_key`` descending so static order breaks ties.
+        Pay-as-you-go providers have no quota line to be ahead of, so they stay
+        behind every quota provider (in static order): pace ordering must never
+        turn a paid fallthrough into a paid first choice."""
+        cands = list(cands)
+        if not self.cfg.pace_order:
+            return cands
+        return sorted(cands, key=lambda c: (self._is_payg(c.provider), -self.pace_key(c.provider)))
 
     def _is_payg(self, provider: Optional[str]) -> bool:
         return bool(provider) and provider.strip().lower() in self.cfg.quota_gate.payg_providers
 
+    def _tier_entries(self, tiers: tuple[str, ...]) -> list[tuple[Optional[str], TierCandidate]]:
+        """``(tier, candidate)`` walk entries; tiers stay in escalation order and
+        only candidates within one tier are re-ordered by pace."""
+        return [(t, c) for t in tiers for c in self.order_tier(self.cfg.tiers.get(t, ()))]
+
     def _walk(self, entries: list[tuple[Optional[str], TierCandidate]], task: Any,
               profile_home: Optional[str]) -> _Walk:
-        """First usable candidate of ``(tier, candidate)`` entries in order. A
+        """First usable candidate of ``(tier, candidate)`` entries in the given
+        order (pace ordering, when on, is applied by ``_tier_entries``). A
         quota-gated candidate is skipped like an unavailable one; after the
         first gate skip, pay-as-you-go providers are skipped too."""
         walk = _Walk()
@@ -677,7 +835,7 @@ class RoutingContext:
             return self._gate_fixed(task, RouteDecision(
                 "profile", requested_tier=requested, candidate=_profile_model(profile_home),
                 note=f"no candidates configured for tier {requested}"))
-        walk = self._walk([(t, c) for t in tiers for c in self.cfg.tiers.get(t, ())], task, profile_home)
+        walk = self._walk(self._tier_entries(tiers), task, profile_home)
         if walk.chosen is not None:
             tier, cand = walk.chosen
             return RouteDecision("tier", requested_tier=requested, tier=tier, candidate=cand, skipped=walk.skipped)

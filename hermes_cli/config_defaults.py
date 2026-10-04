@@ -1957,6 +1957,10 @@ DEFAULT_CONFIG = {
                 # in its walk (a plain rate-limit fallthrough still reaches them).
                 "payg_providers": ["openrouter"],
                 # Per provider name as written in the headroom file; "default" covers the rest.
+                # A band may carry "below" (level headroom) and/or "pace_below" (the file's
+                # pace.pace_headroom minus reserve[provider]; negative = behind the budget line);
+                # the card needs the max min_priority over every matched band of either kind.
+                # Providers without pace data are gated on "below" bands only.
                 "bands": {
                     "default": [
                         {"below": 0.25, "min_priority": 1},
@@ -1964,7 +1968,16 @@ DEFAULT_CONFIG = {
                         {"below": 0.03, "min_priority": 3},
                     ],
                 },
+                # Per provider (or "default") fraction held back from pace_headroom before pace
+                # bands and pace_order compare it, e.g. {anthropic: 0.20} keeps 20% for chat.
+                "reserve": {},
             },
+            # Within each tier, try the candidate whose provider is furthest ahead of its budget
+            # line first (pace_headroom - reserve, descending; unknown pace = 0.0). The configured
+            # order breaks ties; payg_providers always stay last. Tier escalation order, the review
+            # lane and pinned cards unchanged.
+            # Reads the quota_gate headroom file, so it is a no-op while quota_gate is disabled.
+            "pace_order": False,
         },
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
