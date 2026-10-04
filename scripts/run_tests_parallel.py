@@ -56,7 +56,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 def _sweep_killed_run_roots(root: str) -> None:
     """Remove per-file temp roots older runs left behind. Each attempt deletes its own root
@@ -962,6 +962,96 @@ def _pytest_flag_error(tokens: List[str]) -> Optional[str]:
     return f"unrecognized arguments: {' '.join(unknown)}" if unknown else None
 
 
+def _detect_cgroup_v2_memory_limit(
+    cgroup_file: Path = Path("/proc/self/cgroup"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> Optional[int]:
+    """Read the cgroup v2 memory limit in bytes, or None if unconstrained.
+
+    Walks from this process's cgroup path up to ``cgroup_root`` inspecting
+    ``memory.max`` at each level; ``max`` means unlimited.
+    """
+    if not cgroup_file.exists():
+        return None
+    try:
+        content = cgroup_file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    rel_path: Optional[str] = None
+    for line in content.splitlines():
+        if line.startswith("0::"):
+            rel_path = line.partition("::")[2].strip("/")
+            break
+    if rel_path is None:
+        return None
+
+    curr = cgroup_root / rel_path
+    limits: List[int] = []
+    while True:
+        mem_max_file = curr / "memory.max"
+        if mem_max_file.exists():
+            try:
+                val = mem_max_file.read_text(encoding="utf-8").strip()
+                if val != "max" and val.isdigit():
+                    num = int(val)
+                    if num > 0:
+                        limits.append(num)
+            except OSError:
+                pass
+        try:
+            if curr == cgroup_root or curr == curr.parent or not curr.is_relative_to(cgroup_root):
+                break
+        except (ValueError, AttributeError):
+            break
+        curr = curr.parent
+
+    return min(limits) if limits else None
+
+
+# Per-job memory allowance when sizing concurrency against cgroup memory limits.
+# Measured per-job RSS: across a sample of test files in tests/, individual
+# pytest worker subprocesses exhibit a median RSS of ~100 MiB and a p95 RSS of
+# ~120-150 MiB (up to ~180-215 MiB for large files like test_kanban_db).
+# Accounting for parallel test collection, heavy imports, Python runtime
+# overhead, and ambient processes (like the parent agent or test runner) within
+# the same cgroup scope, we budget ~900 MiB per worker slot so that a 4 GiB scope
+# (MemoryMax=4G = 4,294,967,296 bytes) defaults to 4 parallel jobs.
+_BYTES_PER_WORKER = 900 * 1024 * 1024
+
+
+_MEM_LIMIT_SENTINEL = object()
+
+
+def _default_worker_jobs(
+    env_workers: Optional[str] = None,
+    cpu_count: Optional[int] = None,
+    mem_limit: Any = _MEM_LIMIT_SENTINEL,
+) -> int:
+    """Determine the default parallel worker count.
+
+    Honours $HERMES_TEST_WORKERS if set. Otherwise, caps at
+    min(cpu_count * 2, cgroup_mem_limit // _BYTES_PER_WORKER).
+    """
+    if env_workers is not None:
+        val = env_workers.strip()
+        if val:
+            try:
+                return int(val)
+            except ValueError:
+                pass
+
+    cpus = (cpu_count if cpu_count is not None else os.cpu_count()) or 4
+    cpu_jobs = cpus * 2
+
+    limit = _detect_cgroup_v2_memory_limit() if mem_limit is _MEM_LIMIT_SENTINEL else mem_limit
+    if limit is not None and limit > 0:
+        mem_jobs = max(1, limit // _BYTES_PER_WORKER)
+        return min(cpu_jobs, mem_jobs)
+
+    return cpu_jobs
+
+
 def main() -> int:
     _make_stdio_glyph_safe()
     parser = argparse.ArgumentParser(
@@ -972,8 +1062,8 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
+        default=_default_worker_jobs(os.environ.get("HERMES_TEST_WORKERS")),
+        help="Parallel worker count (default: $HERMES_TEST_WORKERS or min(cpu_count*2, cgroup_mem_limit // ~800MB))",
     )
     parser.add_argument(
         "--paths",
