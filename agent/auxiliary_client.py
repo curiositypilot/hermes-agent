@@ -127,6 +127,10 @@ from agent.auxiliary_health import (
 from agent.auxiliary_unavailable import (
     AuxiliaryClientUnavailable, clear_nous_credential_failure, missing_provider_credentials_message,
     nous_credential_failure_detail, record_nous_credential_failure)
+from agent.provider_policy import (
+    AUXILIARY_SAME_PROVIDER, ProviderDenied, allowed_providers, assert_provider_allowed, assert_same_provider,
+    auxiliary_permits, auxiliary_policy, auxiliary_restricted, current_data_class, same_provider_or_fail,
+)
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key
 from utils import base_url_host_matches, base_url_hostname, base_url_origin, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
@@ -3075,6 +3079,103 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     return normalized
 
 
+class _AuxPolicy(NamedTuple):
+    """The active data class and the main provider it pins auxiliary routes to."""
+    data_class: str
+    main_provider: str
+
+
+def _policy_provider_label(provider: Optional[str]) -> str:
+    """Canonical provider label for policy checks. Aliases resolve (``codex`` → ``openai-codex``) so a
+    spelling never bypasses the allowlist; ``custom:<name>`` keeps its prefix so a custom endpoint named
+    like an allowlisted provider does not inherit that provider's trust."""
+    raw = str(provider or "").strip().lower()
+    if not raw or raw.startswith("custom:"):
+        return raw
+    return _normalize_aux_provider(raw)
+
+
+def _aux_policy_context(main_runtime: Optional[Dict[str, Any]] = None) -> Optional[_AuxPolicy]:
+    """The data-class policy for auxiliary routing, or None when the class leaves it unrestricted.
+
+    Fails closed: an unresolvable class or an invalid policy raises ``ProviderDenied``. The main provider
+    is the live runtime's (``set_runtime_main`` / ``main_runtime``), else the configured one."""
+    data_class = current_data_class()
+    if not auxiliary_restricted(data_class):
+        return None
+    runtime = _normalize_main_runtime(main_runtime)
+    return _AuxPolicy(data_class, _policy_provider_label(runtime.get("provider") or _read_main_provider()))
+
+
+def _assert_aux_route(provider: Optional[str], policy: _AuxPolicy, *, phase: str = "auxiliary") -> None:
+    """Raise ``ProviderDenied`` (and record a ``provider_denied`` card event) unless ``provider`` is
+    on the class allowlist and, for ``same_provider_or_fail``, is the main provider."""
+    label = _policy_provider_label(provider)
+    assert_provider_allowed(label, policy.data_class, phase=phase)
+    assert_same_provider(label, policy.main_provider, policy.data_class, phase=phase)
+
+
+_aux_denials_seen: set = set()
+
+
+def _record_aux_denial_once(provider: str, policy: _AuxPolicy, phase: str) -> None:
+    """Log + persist one ``provider_denied`` card event per (card, class, provider, phase) per process: an
+    auxiliary call that walks a denied chain on every approval/title/compression must not flood the card."""
+    key = (os.environ.get("HERMES_KANBAN_TASK") or "", policy.data_class, provider, phase)
+    if key in _aux_denials_seen:
+        return
+    _aux_denials_seen.add(key)
+    with contextlib.suppress(ProviderDenied):
+        _assert_aux_route(provider, policy, phase=phase)
+
+
+def _aux_route_denied(provider: Optional[str], policy: Optional[_AuxPolicy], *, phase: str = "auxiliary") -> bool:
+    """True when ``policy`` forbids ``provider``. For candidate selection: a denied candidate is skipped
+    (refusal recorded once on the card) instead of aborting the walk. ``auto`` is never denied here —
+    the auto route gates every candidate it picks."""
+    label = _policy_provider_label(provider)
+    if policy is None or label == "auto" or auxiliary_permits(label, policy.data_class, policy.main_provider):
+        return False
+    _record_aux_denial_once(label, policy, phase)
+    return True
+
+
+def _assert_provider_in_data_class(provider: Optional[str], *, phase: str = "auxiliary") -> None:
+    """Allowlist-only backstop for ``resolve_provider_client``. It also serves the main agent's own
+    clients, so it cannot pin to the main provider (the live runtime may not be published yet)."""
+    if str(provider or "").strip().lower() == "auto":
+        return
+    data_class = current_data_class()
+    if allowed_providers(data_class) != "any":
+        assert_provider_allowed(_policy_provider_label(provider), data_class, phase=phase)
+
+
+def _enforce_data_class_on_task_route(
+    route: Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]], *,
+    caller_chose_route: bool,
+) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Apply the data class to a resolved ``(provider, model, base_url, api_key, api_mode)`` route.
+
+    ``auto`` passes: ``_resolve_auto_route`` starts at the main provider and gates every candidate behind
+    it. A *configured* provider (``auxiliary.<task>.provider``) outside the policy is replaced by the main
+    provider — validated by ``same_provider_or_fail`` — and its model, endpoint, key and transport are
+    dropped, since they belong to the replaced provider. That rewrite is the ``same_provider_or_fail``
+    contract only: a provider the *caller* named, or any denial under ``auxiliary: any``, raises
+    ``ProviderDenied`` rather than being rerouted, as does an unusable main provider (empty/``auto``).
+    """
+    policy = _aux_policy_context()
+    label = _policy_provider_label(route[0])
+    if policy is None or label == "auto" or auxiliary_permits(label, policy.data_class, policy.main_provider):
+        return route
+    if caller_chose_route or auxiliary_policy(policy.data_class) != AUXILIARY_SAME_PROVIDER:
+        _assert_aux_route(label, policy)  # records the provider_denied event and raises
+    pinned = same_provider_or_fail(policy.main_provider, policy.data_class, phase="auxiliary")
+    _record_aux_denial_once(label, policy, "auxiliary_reroute")
+    logger.debug("Auxiliary route %s is outside data class %s; using main provider %s instead",
+                 label or "(none)", policy.data_class, pinned)
+    return pinned, None, None, None, None
+
+
 def _get_provider_chain() -> List[tuple]:
     """Ordered provider detection chain, built at call time so ``_try_*`` patches are picked up.
 
@@ -4230,6 +4331,8 @@ def _try_main_agent_model_fallback(
         main_provider, main_model = _agg_provider, _agg_model
     if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
         return None, None, ""
+    if _aux_route_denied(main_provider, _aux_policy_context(), phase="auxiliary_fallback"):
+        return None, None, ""
     if task == "vision" and (
             main_provider in _PROVIDERS_WITHOUT_VISION or not _main_model_supports_vision(main_provider, main_model)):
         # Same capability gate as the auto-route (_vision_main_provider_client): handing an image to a
@@ -4323,6 +4426,7 @@ def _try_configured_fallback_chain(
         return None, None, ""
     skip = _failed_backend_skip(
         failed_provider, failed_model, failed_base_url=failed_base_url, failure_scope=failure_scope)
+    policy = _aux_policy_context()
     tried = []
     min_ctx = _task_minimum_context_length(task)
     for i, entry in enumerate(chain):
@@ -4330,6 +4434,9 @@ def _try_configured_fallback_chain(
             continue
         fb_provider = str(entry.get("provider", "")).strip()
         if not fb_provider:
+            continue
+        if _aux_route_denied(fb_provider, policy, phase="auxiliary_fallback"):
+            tried.append(f"fallback_chain[{i}]({fb_provider}) (data class)")
             continue
         fb_model_raw = str(entry.get("model", "")).strip()
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
@@ -4413,6 +4520,7 @@ def _try_main_fallback_chain(
         return None, None, ""
     skip = _failed_backend_skip(
         failed_provider, failed_model, failed_base_url=failed_base_url, failure_scope=failure_scope)
+    policy = _aux_policy_context()
     tried: List[str] = []
     min_ctx = _task_minimum_context_length(task)
     for i, entry in enumerate(chain):
@@ -4424,6 +4532,9 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
+        if _aux_route_denied(fb_provider, policy, phase="auxiliary_fallback"):
+            tried.append(f"{label} (data class)")
+            continue
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
         if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url):
             tried.append(f"{label} (skipped)")
@@ -4551,7 +4662,12 @@ def _discovery_chain_allowed(main_provider: str, task: Optional[str] = None) -> 
     Once the user picked one, every auxiliary route must be a provider they configured (main,
     ``auxiliary.<task>``, ``fallback_providers``); guessing "whatever else is logged in" bills an
     account they never pointed this session at (xAI OAuth session with a dead token → every
-    compression silently charged to a Nous Portal balance)."""
+    compression silently charged to a Nous Portal balance). A data class that restricts auxiliary routing
+    closes it entirely: the chain's labels (``api-key``, ``local/custom``) hide the vendor, so no candidate
+    can be proven inside the policy."""
+    if _aux_policy_context() is not None:
+        logger.warning("Auxiliary %s: discovery chain disabled by the active data class", task or "call")
+        return False
     if (main_provider or "").strip().lower() in {"", "auto"}:
         return True
     logger.warning(
@@ -4598,6 +4714,9 @@ def _resolve_auto_route(
     runtime = _normalize_main_runtime(main_runtime)
     _warn_stale_openai_base_url(runtime.get("provider", ""))
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
+    policy = _aux_policy_context(runtime)
+    if policy is not None:
+        _assert_aux_route(main_provider, policy)  # unusable or disallowed main provider: fail closed
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
         return routed
@@ -5372,6 +5491,9 @@ def resolve_provider_client(
             if explicit_base_url and str(explicit_base_url).lower().startswith("moa://"):
                 explicit_base_url = None
                 explicit_api_key = None
+    # Data-class backstop: whatever path reached the router, a provider outside the class allowlist
+    # never yields a client (``auto`` gates its own candidates).
+    _assert_provider_in_data_class(original_provider or provider)
     # Model for concrete providers: caller ``model`` → catalog default (empty for OAuth-gated providers whose
     # lists drift) → configured main model (MoA → aggregator), keeping OAuth aux tasks off the Step-2 fallback.
     # Excluded: ``auto`` (a stale main slug could pair with any picked provider) and Nous + vision (the
@@ -5426,9 +5548,18 @@ def resolve_provider_client(
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
+def _resolve_task_provider_model_for(task: Optional[str], main_runtime: Optional[Dict[str, Any]]):
+    """``_resolve_task_provider_model(task)`` under the caller's live main runtime, so the data-class
+    pin compares against the provider the agent is really on (not a stale config default)."""
+    if main_runtime:
+        with scoped_runtime_main(main_runtime):
+            return _resolve_task_provider_model(task or None)
+    return _resolve_task_provider_model(task or None)
+
+
 def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, default_model_slug) for text-only aux tasks; ``task`` selects auxiliary.<task> overrides."""
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
+    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model_for(task, main_runtime)
     return resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
         api_mode=api_mode, main_runtime=main_runtime,
@@ -5480,6 +5611,8 @@ _STRICT_VISION_BACKENDS: Dict[str, Callable[[Optional[str]], Tuple[Optional[Any]
 
 
 def _resolve_strict_vision_backend(provider: str, model: Optional[str] = None) -> Tuple[Optional[Any], Optional[str]]:
+    if _aux_route_denied(provider, _aux_policy_context(), phase="auxiliary_vision"):
+        return None, None
     backend = _STRICT_VISION_BACKENDS.get(_normalize_vision_provider(provider))
     return backend(model) if backend is not None else (None, None)
 
@@ -6013,7 +6146,21 @@ def _resolve_task_provider_model(
     task: str = None, provider: str = None, model: str = None, base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Determine (provider, model, base_url, api_key, api_mode) for a call.
+    """Determine (provider, model, base_url, api_key, api_mode) for a call, under the data-class policy.
+
+    A route the caller named explicitly that the policy forbids raises ``ProviderDenied``; a route that
+    came from ``auxiliary.<task>`` config is rewritten onto the main provider (see
+    ``_enforce_data_class_on_task_route``). Unclassified and ``internal`` sessions are unaffected.
+    """
+    route = _resolve_task_route(task, provider, model, base_url, api_key)
+    return _enforce_data_class_on_task_route(route, caller_chose_route=bool(provider or base_url))
+
+
+def _resolve_task_route(
+    task: str = None, provider: str = None, model: str = None, base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Policy-blind (provider, model, base_url, api_key, api_mode) resolution.
 
     Priority: explicit args > config auxiliary.{task}.* > "auto". A bare base_url means custom,
     but a first-class provider + base_url keeps the provider identity so its auth/transport
@@ -8176,7 +8323,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     (AsyncCodexAuxiliaryClient, model) which wraps the Responses API.
     Returns (None, None) when no provider is available.
     """
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
+    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model_for(task, main_runtime)
     return resolve_provider_client(
         provider,
         model=model,
