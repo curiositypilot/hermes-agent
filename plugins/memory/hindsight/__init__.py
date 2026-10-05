@@ -41,6 +41,7 @@ from .embedded import (
     _export_port_health_grace_timeout, _load_simple_env, _local_runtime_hint, _materialize_embedded_profile_env,
     _may_rewrite_profile_env,
 )
+from .recall_log import log_recalled
 from .settings import (
     _DEFAULT_API_URL, _DEFAULT_IDLE_TIMEOUT, _DEFAULT_LOCAL_URL, _DEFAULT_RETAIN_SOURCE,
     _DEFAULT_TIMEOUT, _HINDSIGHT_GLYPH, _MIN_CLIENT_VERSION, _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
@@ -1199,7 +1200,10 @@ class HindsightMemoryProvider(MemoryProvider):
         if auto and self._recall_min_reranker is not None:
             kwargs["min_scores"] = {"reranker": self._recall_min_reranker}
         resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
-        return resp.results or []
+        results = resp.results or []
+        # Fail-open append of the surfaced ids; the nightly dream's age review reads them (recall_log.py).
+        log_recalled(results, query)
+        return results
 
     def _reflect(self, query: str, overrides: dict | None = None) -> str | None:
         resp = self._run_hindsight_operation(
