@@ -380,19 +380,19 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 
 
 _TASK_FIELDS = tuple(
-    "id title body assignee status tenant priority workspace_kind workspace_path created_by "
+    "id title body assignee status tenant data_class priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
     "provider_override complexity completion_contract last_failure_error "
     "scheduled_until scheduled_then".split())
 _TASK_SUMMARY_FIELDS = tuple(
-    "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
+    "id title assignee status priority tenant data_class workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override complexity".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
 _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
-_CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id")
+_CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id", "data_class")
 
 
 def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
@@ -606,8 +606,11 @@ def _handle_show(args: dict, **kw) -> str:
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
+        from agent.provider_policy import resolve_data_class
+        task_fields = _fields(task, _TASK_FIELDS)
+        task_fields["data_class_resolved"] = resolve_data_class(task)
         return json.dumps({
-            "task": _fields(task, _TASK_FIELDS),
+            "task": task_fields,
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
             # gate is not holding it and kanban_complete will refuse.
@@ -1039,6 +1042,7 @@ def _handle_create(args: dict, **kw) -> str:
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority")),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
+            data_class=args.get("data_class"),
             # Board-project inheritance must read the board this call opened, not the
             # session's current board.
             board=args.get("board"),

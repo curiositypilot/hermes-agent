@@ -81,8 +81,19 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "task" in d
     assert d["task"]["id"] == worker_env
     assert d["task"]["status"] == "running"
+    assert d["task"]["data_class_resolved"] == "internal"
     assert "worker_context" in d
     assert "runs" in d
+
+
+def test_create_accepts_data_class_tool_argument(worker_env):
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "child inherits policy", "assignee": "test-worker", "data_class": "internal",
+    }))
+    assert result["ok"] is True
+    assert result["data_class"] == "internal"
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):

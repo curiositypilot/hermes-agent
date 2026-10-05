@@ -399,6 +399,9 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "Optional namespace for multi-project isolation. "
                 "Defaults to HERMES_TENANT env if set."
         )),
+        "data_class": _prop("string", (
+            "Data policy class for this task. Omit to resolve from the tenant default, then kanban.data_policies.default."
+        )),
         "priority": _prop("integer", (
                 "Priority on the 0–3 scale; higher is picked sooner among "
                 "ready tasks sharing an assignee. Omit to inherit the maximum "

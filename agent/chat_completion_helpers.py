@@ -2007,9 +2007,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    from agent.provider_policy import (
+        ProviderDenied, assert_fallback_allowed, assert_provider_allowed, current_data_class,
+    )
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
+    data_class = getattr(agent, "_data_class", None) or current_data_class()
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
             return _fallback_chain_exhausted(agent, reason)
@@ -2021,6 +2025,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
         unavailable = agent._unavailable_fallback_keys
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
+        try:
+            assert_provider_allowed(fb_provider, data_class, phase="fallback")
+            assert_fallback_allowed(fb_provider, data_class)
+        except ProviderDenied:
+            continue
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
 
