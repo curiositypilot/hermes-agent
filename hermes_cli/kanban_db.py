@@ -4227,6 +4227,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)
+    _ctx_principles(lines, task)
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -4420,6 +4421,39 @@ def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
         lines.append(f"comment from worker `{safe_author}` at {_ctx_stamp(c.created_at, now)}:")
         lines.append(_ctx_cap(c.body, _CTX_MAX_COMMENT_BYTES))
         lines.append("")
+
+
+def _ctx_principles(lines: list[str], task: Task) -> None:
+    """Last section: the Hindsight directives for the card's tags (``principles: <tag>``
+    body line, else title prefix), capped by ``fetch_directives`` (~3k chars). The tag
+    rules and the fetch live in ``hermes_cli.principles`` (one owner, shared with
+    ``~/.hermes/scripts/principles.py``). A card with no tags gets no block; Hindsight
+    down gives one ``principles: unavailable (<error>)`` line, never a failed spawn."""
+    from hermes_cli import principles
+
+    tags = principles.resolve_tags(task.title, task.body)
+    if not tags:
+        return
+    lines.append("## Principles")
+    try:
+        directives = principles.fetch_directives(tags)
+    except principles.DirectivesUnavailable as exc:
+        lines.append(f"principles: unavailable ({_first_line(str(exc), 200) or type(exc).__name__})")
+        lines.append("")
+        return
+    if not directives:
+        lines.append(f"principles: no active directives for {' '.join(tags)}")
+        lines.append("")
+        return
+    lines.append(f"_Operating directives for {' '.join(tags)}, highest priority first; follow them._")
+    lines.extend(principles.render_directive(d) for d in directives)
+    omitted = getattr(directives, "omitted", 0)
+    if omitted:
+        lines.append(
+            f"_({omitted} lower-priority directive{'s' if omitted != 1 else ''} omitted by the "
+            f"size cap; run `python ~/.hermes/scripts/principles.py {' '.join(tags)}` for all)_"
+        )
+    lines.append("")
 
 
 # --- Stats + SLA helpers ---
