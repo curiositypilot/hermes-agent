@@ -721,6 +721,7 @@ class Task:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
+    data_class: Optional[str] = None  # Explicit provider-policy class; NULL resolves by tenant/default.
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
@@ -787,7 +788,7 @@ _TASK_OPTIONAL_COLUMNS = (
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
-    "complexity", "scheduled_then",
+    "complexity", "data_class", "scheduled_then",
 )
 
 
@@ -999,7 +1000,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``ready``/``todo`` (then='start') or a sticky ``blocked`` (then='ask').
     -- NULL = undated (legacy reason date, else recheck after N days).
     scheduled_until      INTEGER,
-    scheduled_then       TEXT
+    scheduled_then       TEXT,
+    data_class           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1283,7 +1285,8 @@ def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
     workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
-    branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: Optional[int] = None,
+    branch_name: Optional[str] = None, tenant: Optional[str] = None,
+    data_class: Optional[str] = None, priority: Optional[int] = None,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
@@ -1321,6 +1324,8 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     complexity = normalize_complexity(complexity)
+    data_class = str(data_class).strip().lower() if data_class is not None else None
+    data_class = data_class or None
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -1390,6 +1395,14 @@ def create_task(
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
+                from agent.provider_policy import inherit_data_class
+
+                inheritance_sources = tuple(parents) or ((creator_task_id,) if creator_task_id else ())
+                data_class = inherit_data_class(
+                    {"id": task_id, "data_class": data_class, "tenant": tenant},
+                    [parent for parent_id in inheritance_sources
+                     if (parent := get_task(conn, parent_id)) is not None],
+                )
                 resolved_priority = priority
                 if resolved_priority is None:
                     if parents:
@@ -1433,8 +1446,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract, complexity
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract, complexity,
+                        data_class
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, resolved_priority,
@@ -1444,7 +1458,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
-                        complexity,
+                        complexity, data_class,
                     ),
                 )
                 for pid in parents:
@@ -1470,6 +1484,7 @@ def create_task(
                         "model_override": model_override,
                         "provider_override": provider_override,
                         "complexity": complexity,
+                        "data_class": data_class,
                     },
                 )
                 if task_status == "blocked":

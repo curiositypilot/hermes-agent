@@ -1850,6 +1850,20 @@ DEFAULT_CONFIG = {
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
     "kanban": {
+        # Default data handling and main-model provider boundaries for Kanban workers. Unknown
+        # classes fail closed; tenant defaults are applied only when a task has no explicit class.
+        "data_policies": {
+            "default": "internal",
+            "tenant_defaults": {"work": "confidential"},
+            "classes": {
+                "internal": {"providers": "any", "fallback": True, "auxiliary": "any"},
+                "confidential": {
+                    "providers": ["anthropic", "openai-codex"],
+                    "fallback": False,
+                    "auxiliary": "same_provider_or_fail",
+                },
+            },
+        },
         # Auto-subscribe the originating gateway/TUI session to completion + block events when
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
