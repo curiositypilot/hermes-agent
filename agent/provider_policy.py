@@ -144,6 +144,71 @@ def assert_provider_allowed(provider: str, data_class: str, *, phase: str = "mai
         _deny(candidate, data_class, reason="provider is not in the class allowlist", phase=phase)
 
 
+AUXILIARY_ANY = "any"
+AUXILIARY_SAME_PROVIDER = "same_provider_or_fail"
+
+
+def auxiliary_policy(data_class: str) -> str:
+    """Return how the class routes auxiliary (side-LLM) calls: ``any`` or ``same_provider_or_fail``.
+
+    ``any`` still honours the class provider allowlist; ``same_provider_or_fail`` additionally pins
+    every auxiliary route to the main model's provider. A missing key means ``any``; any other value
+    fails closed.
+    """
+    raw = _class_policy(data_class).get("auxiliary", AUXILIARY_ANY)
+    label = str(raw).strip().lower() if isinstance(raw, str) else ""
+    if label not in (AUXILIARY_ANY, AUXILIARY_SAME_PROVIDER):
+        raise ProviderDenied(f"invalid auxiliary policy {raw!r} for data class {data_class!r}")
+    return label
+
+
+def auxiliary_restricted(data_class: str) -> bool:
+    """Whether auxiliary routing is narrowed for the class (allowlist or same-provider pin)."""
+    return allowed_providers(data_class) != "any" or auxiliary_policy(data_class) != AUXILIARY_ANY
+
+
+def same_provider_or_fail(main_provider: str, data_class: str, *, phase: str = "auxiliary") -> str:
+    """Return the provider an auxiliary route must use: the main model's provider, else raise.
+
+    Raises ``ProviderDenied`` (recorded as a ``provider_denied`` card event) when the main provider is
+    unknown (empty or ``auto``) or is itself outside the class allowlist.
+    """
+    provider = str(main_provider or "").strip().lower()
+    if provider in ("", "auto"):
+        _deny(provider or "(none)", data_class, reason="no main provider to pin the auxiliary route to", phase=phase)
+    assert_provider_allowed(provider, data_class, phase=phase)
+    return provider
+
+
+def assert_same_provider(provider: str, main_provider: str, data_class: str, *, phase: str = "auxiliary") -> None:
+    """For a ``same_provider_or_fail`` class, raise unless ``provider`` is the main model's provider.
+
+    A no-op for ``auxiliary: any`` (the allowlist check stays with ``assert_provider_allowed``).
+    """
+    if auxiliary_policy(data_class) != AUXILIARY_SAME_PROVIDER:
+        return
+    pinned = same_provider_or_fail(main_provider, data_class, phase=phase)
+    candidate = str(provider or "").strip().lower()
+    if candidate != pinned:
+        _deny(candidate, data_class, reason=f"auxiliary calls are pinned to the main provider {pinned!r}", phase=phase)
+
+
+def auxiliary_permits(provider: str, data_class: str, main_provider: str = "") -> bool:
+    """Side-effect-free twin of ``assert_provider_allowed`` + ``assert_same_provider``.
+
+    For callers that pick between routes (rewrite or skip a candidate) and must not log or write a
+    ``provider_denied`` event for a route they are about to replace.
+    """
+    candidate = str(provider or "").strip().lower()
+    allowed = allowed_providers(data_class)
+    if allowed != "any" and candidate not in allowed:
+        return False
+    if auxiliary_policy(data_class) == AUXILIARY_SAME_PROVIDER:
+        pinned = str(main_provider or "").strip().lower()
+        return bool(pinned) and pinned != "auto" and candidate == pinned
+    return True
+
+
 def resolve_data_class(task_row: Any) -> str:
     """Resolve explicit task class, then tenant default, then policy default.
 
