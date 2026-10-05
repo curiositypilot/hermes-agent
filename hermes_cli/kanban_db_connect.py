@@ -842,6 +842,8 @@ _LATER_TASK_COLUMNS = (
     # Dated ``scheduled`` cards (kanban_db_schedule): wake time (epoch) + mode start|ask.
     ("scheduled_until", "scheduled_until INTEGER"),
     ("scheduled_then", "scheduled_then TEXT"),
+    # Explicit data-class selection; NULL resolves from tenant/default at dispatch.
+    ("data_class", "data_class TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

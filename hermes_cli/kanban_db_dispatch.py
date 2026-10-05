@@ -2951,6 +2951,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         # HERMES_PROFILE (set below) instead.
         profile_home = None
 
+    # Resolve against the assignee's profile config, not the dispatcher's launch profile.
+    from agent.provider_policy import resolve_data_class
+    if profile_home:
+        with _worker_profile_scope(profile_home):
+            data_class = resolve_data_class(task)
+    else:
+        data_class = resolve_data_class(task)
+
     # Scrub for a ROUTED home, not only under multiplex: the authority test is "does this worker act
     # for another profile", exactly as served_profile_child_env decides it (tools/environments/local.py).
     # Gating on the gateway-wide flag left B's worker inheriting the dispatcher's own OPENAI_API_KEY and
@@ -2983,6 +2991,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    env["HERMES_DATA_CLASS"] = data_class
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the session `kanban` so session-browsing surfaces filter it out by
     # source instead of rendering one sidebar row per attempt.

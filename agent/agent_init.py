@@ -1040,10 +1040,25 @@ def _init_fallback_chain(agent, fallback_model):
     # Stable pool-entry identity: OAuth refreshes can replace the token before a failed
     # request is recovered, so the key value alone can't attribute the failure.
     from agent.agent_runtime_helpers import sync_credential_pool_entry_id
+    from agent.provider_policy import (
+        ProviderDenied, assert_fallback_allowed, assert_provider_allowed, current_data_class,
+    )
+
     sync_credential_pool_entry_id(agent)
+    data_class = current_data_class()
+    agent._data_class = data_class
+    assert_provider_allowed(agent.provider, data_class, phase="main")
 
     # Ordered backups tried when the primary is exhausted (legacy single-dict or list).
-    agent._fallback_chain = _fallback_entries(fallback_model)
+    chain = []
+    for fallback in _fallback_entries(fallback_model):
+        try:
+            assert_provider_allowed(fallback["provider"], data_class, phase="fallback")
+            assert_fallback_allowed(fallback["provider"], data_class)
+        except ProviderDenied:
+            continue
+        chain.append(fallback)
+    agent._fallback_chain = chain
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     # Legacy attribute kept for backward compat (tests, external callers)

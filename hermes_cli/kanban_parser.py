@@ -175,6 +175,8 @@ _SPECS = [
                   "worktree under the project's primary repo with a "
                   "deterministic branch. See `hermes project list`."),
         _TENANT,
+        _arg("--data-class", dest="data_class",
+             help="Data policy class for this task (defaults to the tenant policy, then kanban.data_policies.default)."),
         _PRIORITY,
         _arg("--triage", action="store_true",
              help="Park in triage — a specifier will flesh out the spec and promote to todo"),

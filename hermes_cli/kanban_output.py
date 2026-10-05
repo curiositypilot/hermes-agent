@@ -21,7 +21,7 @@ _TASK_DICT_FIELDS = (
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_runtime_seconds", "max_retries", "model_override", "provider_override", "complexity",
     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
-    "scheduled_until", "scheduled_then",
+    "scheduled_until", "scheduled_then", "data_class",
 )
 _SHOW_RUN_FIELDS = (
     "id", "profile", "step_key", "status", "outcome", "summary", "error",
@@ -88,5 +88,7 @@ def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     d = _obj_dict(t, _TASK_DICT_FIELDS)
+    from agent.provider_policy import resolve_data_class
+    d["data_class_resolved"] = resolve_data_class(t)
     d["skills"] = list(t.skills) if t.skills else []
     return d
