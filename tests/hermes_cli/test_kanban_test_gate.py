@@ -121,6 +121,17 @@ def test_kanban_complete_tool_surfaces_the_refusal_tail(board, monkeypatch):
     assert kb.get_task(conn, tid).status == "running"
 
 
+@pytest.mark.linux_only
+def test_timed_out_command_is_killed_and_refused(tmp_path, monkeypatch):
+    from hermes_cli import kanban_test_gate
+
+    monkeypatch.setattr(kanban_test_gate, "TIMEOUT_SECONDS", 1)
+    receipt = kanban_test_gate.run_test_contract("test:echo started; sleep 30", str(tmp_path))
+    assert receipt["ok"] is False and receipt["exit_code"] is None
+    assert receipt["duration_s"] < 15
+    assert "started" in receipt["tail"] and "timed out" in receipt["tail"]
+
+
 def test_resolve_test_command_order(tmp_path):
     assert resolve_test_command(tmp_path) is None
     (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": 'echo "Error: no test specified" && exit 1'}}))

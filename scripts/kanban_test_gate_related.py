@@ -17,8 +17,8 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _git(*args: str) -> list[str]:
-    out = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True,
-                         stdin=subprocess.DEVNULL, check=True).stdout
+    out = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", stdin=subprocess.DEVNULL, check=True).stdout
     return [line for line in out.splitlines() if line.strip()]
 
 

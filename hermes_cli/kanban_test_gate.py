@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import signal
 import subprocess
 import time
 from pathlib import Path
@@ -104,11 +103,15 @@ def run_test_contract(contract: str, workspace: Optional[str]) -> dict:
     if wp is None or not wp.is_dir():
         receipt["tail"] = f"workspace {workspace or '(none)'} does not exist; the test gate needs the worker's checkout"
         return receipt
+    from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
+
+    # Own process group (POSIX) so a timeout kills the whole test tree, never ours.
+    group_kw: dict = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {"process_group": 0}
     started = time.monotonic()
     try:
         proc = subprocess.Popen(
             command, shell=True, cwd=str(wp), stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **group_kw,
         )
     except OSError as exc:
         receipt["tail"] = f"could not start test command: {exc}"
@@ -127,10 +130,9 @@ def run_test_contract(contract: str, workspace: Optional[str]) -> dict:
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (OSError, AttributeError):
-        proc.kill()
+    from hermes_cli._subprocess_compat import kill_process_tree
+
+    kill_process_tree(proc)
 
 
 def _tail(output: bytes) -> str:
