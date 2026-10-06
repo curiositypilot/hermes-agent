@@ -487,6 +487,132 @@ def test_unrouted_rate_limit_is_escaped_by_routing(conn, monkeypatch, all_assign
     assert seen == [(tid, "mid-1", "prov-b", None)]
 
 
+# ---------------------------------------------------------------------------
+# In-process fallbacks arm the cooldown (provider_fallback events)
+# ---------------------------------------------------------------------------
+
+
+def _seed_fallback_run(conn, *, model, provider, fb, at, routed_at=None, outcome="completed", title="fb"):
+    """A run routed ``provider:model`` that fell back in-process (event ``fb`` at ``at``)
+    and then ended ``outcome`` — the shape the outcome query cannot see."""
+    tid = kb.create_task(conn, title=title, assignee="w", complexity="M")
+    kb.claim_task(conn, tid)
+    run_id = kb.get_task(conn, tid).current_run_id
+    with kb.write_txn(conn):
+        kb._append_event(conn, tid, "routed", {"source": "tier", "model": model, "provider": provider},
+                         run_id=run_id)
+        kb._append_event(conn, tid, "provider_fallback", fb, run_id=run_id)
+    conn.execute("UPDATE task_events SET created_at=? WHERE run_id=? AND kind='routed'",
+                 (routed_at if routed_at is not None else at, run_id))
+    conn.execute("UPDATE task_events SET created_at=? WHERE run_id=? AND kind='provider_fallback'", (at, run_id))
+    conn.execute("UPDATE task_runs SET outcome=?, status=?, ended_at=? WHERE id=?", (outcome, outcome, at + 60, run_id))
+    conn.execute("UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?", (tid,))
+    conn.commit()
+    return tid
+
+
+def _fb(from_model, reason="rate_limit", from_provider="custom", to_model="mid-1", to_provider="prov-b"):
+    return {"from_provider": from_provider, "from_model": from_model,
+            "to_provider": to_provider, "to_model": to_model, "reason": reason}
+
+
+FB_TIERS = {"M": [{"model": "g", "provider": "antigravity"}, {"model": "mid-1", "provider": "prov-b"}]}
+
+
+def test_fallback_event_arms_cooldown(conn, monkeypatch):
+    _pool(monkeypatch)
+    now = time.time()
+    at = int(now) - 60
+    _seed_fallback_run(conn, model="g", provider="antigravity", fb=_fb("g"), at=at)
+    ctx = kr.RoutingContext(conn, _cfg(tiers=FB_TIERS, cooldown_seconds=900), now=now)
+    avail = ctx.availability(kr.TierCandidate("g", "antigravity"), None)
+    assert avail.available is False
+    assert avail.until == at + 900
+    assert avail.reason == "rate_limited on this board (fallback)"
+    assert ctx.decide(_task(complexity="M")).candidate.model == "mid-1"
+
+
+def test_fallback_overloaded_ignored(conn, monkeypatch):
+    _pool(monkeypatch)
+    now = time.time()
+    for reason in ("overloaded", "timeout", "server_error", ""):
+        _seed_fallback_run(conn, model="g", provider="antigravity", fb=_fb("g", reason=reason), at=int(now) - 60)
+    ctx = kr.RoutingContext(conn, _cfg(tiers=FB_TIERS, cooldown_seconds=900), now=now)
+    assert ctx.availability(kr.TierCandidate("g", "antigravity"), None).available is True
+
+
+def test_second_hop_not_counted(conn, monkeypatch):
+    """A later hop (mid-1 -> other) on a run routed to ``g`` benches neither model."""
+    _pool(monkeypatch)
+    now = time.time()
+    _seed_fallback_run(conn, model="g", provider="antigravity",
+                       fb=_fb("mid-1", from_provider="prov-b", to_model="x", to_provider="prov-x"),
+                       at=int(now) - 60)
+    ctx = kr.RoutingContext(conn, _cfg(tiers=FB_TIERS, cooldown_seconds=900), now=now)
+    assert ctx.recently_rate_limited() == {}
+    assert ctx.availability(kr.TierCandidate("g", "antigravity"), None).available is True
+    assert ctx.availability(kr.TierCandidate("mid-1", "prov-b"), None).available is True
+
+
+def test_fallback_outside_window_ignored(conn, monkeypatch):
+    _pool(monkeypatch)
+    now = time.time()
+    _seed_fallback_run(conn, model="g", provider="antigravity", fb=_fb("g"), at=int(now) - 901)
+    ctx = kr.RoutingContext(conn, _cfg(tiers=FB_TIERS, cooldown_seconds=900), now=now)
+    assert ctx.availability(kr.TierCandidate("g", "antigravity"), None).available is True
+
+
+def test_fallback_and_outcome_merge_by_max(conn, monkeypatch):
+    """The newer of an outcome row and a fallback event sets ``until``; the reason names the source."""
+    _pool(monkeypatch)
+    now = time.time()
+    first = kb.create_task(conn, title="limited", assignee="w", complexity="M")
+    _seed_rate_limited_run(conn, first, model="g", provider="antigravity", ended_at=int(now) - 300)
+    _seed_fallback_run(conn, model="g", provider="antigravity", fb=_fb("g"), at=int(now) - 100)
+    ctx = kr.RoutingContext(conn, _cfg(tiers=FB_TIERS, cooldown_seconds=900), now=now)
+    avail = ctx.availability(kr.TierCandidate("g", "antigravity"), None)
+    assert avail.until == int(now) - 100 + 900 and avail.reason.endswith("(fallback)")
+
+    later = kr.RoutingContext(conn, _cfg(tiers=FB_TIERS, cooldown_seconds=900), now=now)
+    second = kb.create_task(conn, title="limited-2", assignee="w", complexity="M")
+    _seed_rate_limited_run(conn, second, model="g", provider="antigravity", ended_at=int(now) - 10)
+    avail = later.availability(kr.TierCandidate("g", "antigravity"), None)
+    assert avail.until == int(now) - 10 + 900 and avail.reason == "rate_limited on this board"
+
+
+# Incident 2026-10-06 (UTC): run 681 (t_18b37fe4) routed antigravity at 09:28:59, fell back
+# to anthropic on a 429 (log has no timestamp; approximated at 09:29:30, inside the run's
+# 09:28:59-09:35:08 window) and ended completed. The dispatcher kept routing antigravity.
+_INCIDENT_ROUTED = 1791278939  # 2026-10-06T09:28:59Z
+_INCIDENT_FALLBACK = 1791278970  # 2026-10-06T09:29:30Z
+_INCIDENT_TICKS = {"09:30:00": 1791279000, "09:40:02": 1791279602, "09:45:05": 1791279905}
+_INCIDENT_TIERS = {"M": [{"model": "gemini-3.8-flash-tiered", "provider": "antigravity"},
+                         {"model": "claude-sonnet-5-5", "provider": "anthropic"}]}
+
+
+def _incident_picks(conn) -> dict[str, str]:
+    cfg = _cfg(tiers=_INCIDENT_TIERS, cooldown_seconds=900)
+    return {label: kr.RoutingContext(conn, cfg, now=ts).decide(_task(complexity="M")).candidate.provider
+            for label, ts in _INCIDENT_TICKS.items()}
+
+
+def test_incident_681_replay(conn, monkeypatch):
+    _pool(monkeypatch)
+    _seed_fallback_run(
+        conn, model="gemini-3.8-flash-tiered", provider="antigravity",
+        fb=_fb("gemini-3.8-flash-tiered", to_model="claude-sonnet-5-5", to_provider="anthropic"),
+        at=_INCIDENT_FALLBACK, routed_at=_INCIDENT_ROUTED, title="t_18b37fe4")
+
+    picks = _incident_picks(conn)
+    assert picks["09:30:00"] == "anthropic"
+    assert picks["09:40:02"] == "anthropic"
+    assert picks["09:45:05"] == "antigravity"  # 09:29:30 + 900 s has passed
+
+    # On the old (outcome-only) query the cooldown never arms: all three pick antigravity.
+    monkeypatch.setattr(kr.RoutingContext, "_fallback_hits", lambda self, since: [])
+    assert set(_incident_picks(conn).values()) == {"antigravity"}
+
+
 def _to_review(conn, tid):
     conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
     conn.commit()

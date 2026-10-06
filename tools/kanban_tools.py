@@ -287,6 +287,37 @@ def _board(board: Optional[str], *, quiet_close: bool = False):
                 raise
 
 
+def record_fallback_from_env(from_provider: Optional[str], from_model: Optional[str],
+                             to_provider: Optional[str], to_model: Optional[str],
+                             reason: Optional[str]) -> bool:
+    """Record an in-process provider fallback on this worker's run as a
+    ``provider_fallback`` event, so the dispatcher's rate-limit cooldown sees a
+    429 that the worker survived (``kanban_routing.recently_rate_limited``).
+    Best-effort and never raises: False without a dispatcher-owned
+    ``HERMES_KANBAN_TASK``, in a delegated child, without a run id, or on any error."""
+    try:
+        if _is_delegated_child_context() or _delegation_ctx("is_delegated_child_process_context", False):
+            return False
+        tid = _default_task_id(None)
+        if not tid:
+            return False
+        run_id = _worker_run_id(tid)
+        if run_id is None:
+            return False
+        from hermes_cli import kanban_db as kb
+        if not kb.kanban_db_path().exists():
+            return False  # never create a board as a side effect of a fallback
+        payload = {"from_provider": from_provider or "", "from_model": from_model or "",
+                   "to_provider": to_provider or "", "to_model": to_model or "",
+                   "reason": reason or ""}
+        from hermes_cli import kanban_db_dispatch as kbd
+        with _board(None, quiet_close=True) as (_kb, conn):
+            return bool(kbd.record_provider_fallback(conn, tid, run_id=run_id, payload=payload))
+    except Exception as e:
+        logger.debug("record_fallback_from_env failed: %s", e)
+        return False
+
+
 def _existing_task(kb, conn, tid: str):
     task = kb.get_task(conn, tid)
     _check(task is not None, f"task {tid} not found")

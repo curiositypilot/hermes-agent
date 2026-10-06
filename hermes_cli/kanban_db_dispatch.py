@@ -657,6 +657,34 @@ def heartbeat_worker(
     return True
 
 
+def record_provider_fallback(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    payload: dict,
+) -> bool:
+    """Append a run-scoped ``provider_fallback`` event while ``run_id`` is still
+    ``task_id``'s current run. The router's cooldown reads it
+    (``kanban_routing.RoutingContext.recently_rate_limited``): an in-process
+    fallback ends the run as a success, so the run outcome never shows the 429.
+
+    False when the run is no longer current or the board is write-fenced for
+    this process (a delegate_task child: ``write_txn`` raises PermissionError).
+    """
+    try:
+        with _kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ? AND current_run_id = ?", (task_id, int(run_id)),
+            ).fetchone()
+            if row is None:
+                return False
+            _kb._append_event(conn, task_id, "provider_fallback", payload, run_id=int(run_id))
+    except PermissionError:
+        return False
+    return True
+
+
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
