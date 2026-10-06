@@ -311,8 +311,8 @@ def _healthy_import_probe(cmd, **kwargs):
 
 
 def test_missing_declared_dep_marks_venv_unhealthy(tmp_path):
-    """Replays 2026-10-01: version equal, core imports fine, one base pin absent. The old probe
-    reported healthy and ``hermes update`` printed "Already up to date!" over the gap."""
+    """Shape of 2026-10-01: core imports succeed, one declared base pin is absent; the probe must
+    now report unhealthy and name the pin (the old probe reported healthy)."""
     from hermes_cli import main_install_repair, update_cmd_deps
 
     venv_python = _fake_venv_python(tmp_path)
@@ -333,8 +333,9 @@ def test_missing_declared_dep_marks_venv_unhealthy(tmp_path):
 
 
 def test_current_checkout_with_missing_declared_dep_runs_the_repair(monkeypatch, tmp_path, capsys):
-    """End to end through the commit_count == 0 path with the real health probe: the missing pin
-    now reaches the repair instead of ``✓ Already up to date!``."""
+    """``_repair_current_checkout`` (the repair step the commit_count == 0 path runs) with the
+    health probe's dependency check stubbed to report snowballstemmer missing: the missing pin
+    reaches the venv repair instead of ``✓ Already up to date!``."""
     from hermes_cli import main as hm, main_install_repair, update_cmd_deps
 
     _fake_venv_python(tmp_path)
