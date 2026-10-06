@@ -1,0 +1,2 @@
+# Kanban completion gate command (hermes_cli/kanban_test_gate.py): first non-comment line.
+python3 scripts/kanban_test_gate_related.py

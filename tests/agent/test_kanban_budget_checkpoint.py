@@ -23,6 +23,9 @@ def test_checkpoint_requires_opt_in_or_dispatcher_completion_scope(
 
     if scope != "ordinary":
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_checkpoint")
+        # The dispatcher stamps every worker's data class (kanban_db_dispatch); without it the
+        # provider policy looks the fake task up on the board and fails closed.
+        monkeypatch.setenv("HERMES_DATA_CLASS", "internal")
     contexts = {"non-owner": non_dispatcher_owned_context, "child": delegated_child_context}
     with contexts.get(scope, nullcontext)():
         agent = _agent(tmp_path, monkeypatch, ratio)

@@ -210,7 +210,10 @@ _SPECS = [
                   "With kanban.routing enabled and no --model pin, the dispatcher picks the "
                   "worker model from this tier's list, skipping rate-limited providers."),
         _arg("--completion-contract", metavar="CONTRACT",
-             help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
+             help="local-only, test:<command> (command must exit 0 in the card's workspace before "
+                  "done/review), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done. "
+                  "Default: local-only, or test:<repo test command> for a dir:/worktree: workspace whose "
+                  "command resolves (.hermes-test, Makefile test, pyproject pytest, package.json test)."),
         _arg("--goal", action="store_true", dest="goal_mode",
              help="Run the worker in a goal loop: after each turn a judge checks the "
                   "response against the card title/body and, if not done, the worker "

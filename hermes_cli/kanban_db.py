@@ -1320,6 +1320,7 @@ def create_task(
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
+    contract_declared = completion_contract is not None
     completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -1387,6 +1388,13 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # Repo workspace with no declared contract: gate completion on the repo's
+    # own test command when one resolves (kanban_test_gate.resolve_test_command).
+    if not contract_declared:
+        from hermes_cli.kanban_test_gate import default_contract
+
+        completion_contract = default_contract(
+            workspace_kind, project_repo or workspace_path) or completion_contract
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -2862,16 +2870,19 @@ def complete_task(
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
-    from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
+    from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance, with_test_receipt
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    # PR contracts collect CI evidence; ``test:`` contracts run the command in
+    # the card's workspace. Both refuse the transition on a non-success.
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
+    metadata = with_test_receipt(metadata, acceptance)
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
@@ -3577,6 +3588,12 @@ def request_review(
     # must be durable BEFORE anything can clean the scratch workspace up: for a
     # review-bound card the reviewer's completion is the cleanup trigger.
     metadata = _merge_completion_prose_artifacts(conn, task_id, metadata, summary=summary, result=None)
+    # ``test:`` contracts run their command before the handoff (outside the txn).
+    from hermes_cli.kanban_pr_acceptance_store import prepare_test_gate, record_acceptance, with_test_receipt
+    test_gate = prepare_test_gate(conn, task_id, expected_run_id)
+    if test_gate is False:
+        return _ret(False, "task is not in running/ready (or expected_run_id did not match the current run)")
+    metadata = with_test_receipt(metadata, test_gate)
     now = int(time.time())
     # Staged copies live outside the txn: a rollback after staging must not
     # leave orphans that make the retry stage ``name_1.ext`` beside them.
@@ -3585,6 +3602,13 @@ def request_review(
         with write_txn(conn):
             if not _parents_satisfied(conn, task_id):
                 return _ret(False, "parent dependencies are not satisfied")
+            if test_gate is not None and not record_acceptance(conn, task_id, test_gate):
+                from hermes_cli.kanban_test_gate import refusal_detail
+
+                receipt = test_gate[1]
+                if receipt["ok"]:
+                    return _ret(False, "task changed while the test gate ran; retry")
+                return _ret(False, refusal_detail(receipt))
             trow = conn.execute(
                 "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
                 "worker_started_at FROM tasks WHERE id = ?", (task_id,),
