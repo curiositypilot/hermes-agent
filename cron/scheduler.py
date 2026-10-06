@@ -40,7 +40,7 @@ from cron.env_settings import cron_env_setting
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
     load_config, load_config_readonly)
-from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.fallback_config import get_fallback_chain, same_provider_only_chain
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
@@ -99,10 +99,11 @@ def _set_cron_session_title(session_db, session_id, base_title):
         return deduped
 
 
-def _fallback_chain_phrase() -> str:
+def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
     """Backup-provider clause for a provider-failure notice: "the backups failed too" vs "none
-    configured" (most installs). Fails open to the former if config can't be read — never crash
-    delivery.
+    configured" (most installs) vs "every backup is on the provider that just failed" (the chain
+    never leaves the dead pool). Primary = ``job["provider"]`` > ``cron.model_provider`` >
+    ``model.provider``. Fails open to "failed too" if config can't be read — never crash delivery.
     """
     try:
         cfg = load_config() or {}
@@ -110,11 +111,38 @@ def _fallback_chain_phrase() -> str:
     except Exception:
         return "No backup provider succeeded either."
     if chain:
+        primary = _cron_primary_provider(job, cfg)
+        try:
+            same_only = same_provider_only_chain(chain, primary)
+        except Exception:
+            same_only = False
+        if same_only:
+            return (
+                f"Every backup provider is on `{primary}`, the provider that just failed, so none "
+                "could take over. Add one from a different provider with `hermes fallback add`, "
+                f"or repoint this job with `hermes cron edit {(job or {}).get('id') or '<id>'} "
+                "--provider <name>`."
+            )
         return "No backup provider succeeded either."
     return (
         "No backup provider is configured — add one with `hermes fallback add`, "
         "or set a cron-wide default via `cron.model` + `cron.model_provider` in config.yaml."
     )
+
+
+def _cron_primary_provider(job: Optional[dict], cfg: Any) -> str:
+    """Provider a cron job runs on: the job's pin, else ``cron.model_provider``, else
+    ``model.provider``; "" when none is known."""
+    if not isinstance(cfg, dict):
+        cfg = {}
+    cron_cfg = cfg.get("cron") or {}
+    model_cfg = cfg.get("model") or {}
+    cron_provider = cron_cfg.get("model_provider") if isinstance(cron_cfg, dict) else None
+    model_provider = model_cfg.get("provider") if isinstance(model_cfg, dict) else None
+    for value in ((job or {}).get("provider"), cron_provider, model_provider):
+        if text := str(value or "").strip():
+            return text
+    return ""
 
 
 def _failure_streak_nudge(job: dict) -> str:
@@ -294,7 +322,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     if not job.get("no_agent"):
         notice = provider_failure_notice(
             job_name, job_id, classify_cron_failure_reason(text),
-            backup_provider_phrase=_fallback_chain_phrase(), provider=job.get("provider"))
+            backup_provider_phrase=_fallback_chain_phrase(job), provider=job.get("provider"))
         if notice is not None:
             return notice
 

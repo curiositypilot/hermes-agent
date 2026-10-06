@@ -1693,6 +1693,41 @@ class TestDoctorDeprecatedConfigAndEnv:
         assert "⚠" in out or "Deprecated" in out
 
 
+class TestDoctorFallbackChain:
+    """Doctor warns when every fallback shares the primary provider (#133454 item 3).
+    Real load_config against a temp HERMES_HOME, not a mocked config."""
+
+    def _run(self, monkeypatch, tmp_path, capsys, config_yaml):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(config_yaml, encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        finding = doctor_config._check_fallback_chain(False)
+        return finding, capsys.readouterr().out
+
+    def test_codex_only_chain_warns_with_one_manual_issue(self, monkeypatch, tmp_path, capsys):
+        finding, out = self._run(monkeypatch, tmp_path, capsys,
+            "model:\n  provider: openai-codex\n  default: gpt-x\n"
+            "fallback_providers:\n"
+            "  - {provider: openai-codex, model: a}\n  - {provider: openai-codex, model: b}\n")
+        assert "openai-codex" in out
+        assert len(finding.manual_issues) == 1
+        assert "hermes fallback add" in finding.manual_issues[0]
+
+    def test_mixed_chain_is_ok(self, monkeypatch, tmp_path, capsys):
+        finding, out = self._run(monkeypatch, tmp_path, capsys,
+            "model:\n  provider: openai-codex\n  default: gpt-x\n"
+            "fallback_providers:\n"
+            "  - {provider: openai-codex, model: a}\n  - {provider: anthropic, model: c}\n")
+        assert finding.manual_issues == [] and finding.issues == []
+        assert "leaves the primary" in out
+
+    def test_empty_chain_adds_no_issue(self, monkeypatch, tmp_path, capsys):
+        finding, _ = self._run(monkeypatch, tmp_path, capsys,
+            "model:\n  provider: openai-codex\n  default: gpt-x\n")
+        assert finding.manual_issues == [] and finding.issues == []
+
+
 class TestMacOSTCCGrants:
     """macOS TCC grant persistence check (issue #86385)."""
 
