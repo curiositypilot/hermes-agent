@@ -370,6 +370,25 @@ class TestBuildSkillsSystemPrompt:
         full = build_skills_system_prompt()
         assert "Write threads" in full
 
+    def test_skills_block_loads_by_trigger_not_by_default(self, monkeypatch, tmp_path):
+        """Progressive disclosure: the interactive block tells the model to load a skill when its
+        description names the task and to open references only on demand — not to load anything
+        "even partially relevant" (982 loads/7d, 2.9 per system session before this rule changed).
+        The offer-to-save and patch-it coaching stay, and the index is still the last thing listed."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+        d = tmp_path / "skills" / "tools" / "demo-skill"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text("---\nname: demo-skill\ndescription: Demo skill.\n---\n")
+        result = build_skills_system_prompt(available_tools={"skill_view", "skill_manage"})
+        head = result.split("<available_skills>", 1)[0]
+        assert "demo-skill" in result and "skill_view(name)" in head
+        assert "skill_view(name, file_path)" in head  # references are a second, on-demand call
+        assert "one skill per task class" in head.lower()
+        for coercion in ("MUST load", "even partially relevant", "Err on the side of", "Only proceed without loading"):
+            assert coercion not in result
+        assert "skill_manage(action='patch')" in head and "offer to save as a skill" in head
+
 
 
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):

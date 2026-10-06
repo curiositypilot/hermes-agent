@@ -1107,6 +1107,58 @@ class TestSameRootDuplicationResolves:
         assert len(result["matches"]) == 2
 
 
+class TestSkillViewRefusesExcludedDirs:
+    """``skill_view`` must not serve skills under ``EXCLUDED_SKILL_DIRS`` (``.archive`` …).
+
+    The index scan prunes those dirs, but the direct-path and legacy flat ``<name>.md`` lookup
+    strategies in ``_collect_skill_candidates`` do not: an archived skill (``i-have-adhd`` under
+    ``.archive/soul-merge-2026-09-30/``) kept loading ~10x/day by path or leftover memory."""
+
+    def _view(self, tmp_path, name):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            return json.loads(skill_view(name))
+
+    def test_archived_skill_by_path_is_refused_naming_the_archive_dir(self, tmp_path):
+        _make_skill(tmp_path / ".archive" / "soul-merge", "i-have-adhd")
+        result = self._view(tmp_path, ".archive/soul-merge/i-have-adhd")
+        assert result["success"] is False
+        assert ".archive/soul-merge/i-have-adhd" in result["error"]
+        assert "archived" in result["error"] and "\n" not in result["error"]
+        assert "content" not in result
+
+    def test_archived_skill_by_bare_name_is_not_loadable(self, tmp_path):
+        _make_skill(tmp_path / ".archive" / "soul-merge", "i-have-adhd")
+        assert self._view(tmp_path, "i-have-adhd")["success"] is False
+
+    def test_archived_flat_markdown_is_refused(self, tmp_path):
+        archive = tmp_path / ".archive" / "old"
+        archive.mkdir(parents=True)
+        (archive / "legacy-skill.md").write_text("---\nname: legacy-skill\ndescription: d.\n---\nbody\n")
+        result = self._view(tmp_path, ".archive/old/legacy-skill")
+        assert result["success"] is False and "archived" in result["error"]
+
+    def test_symlink_into_archive_is_refused(self, tmp_path):
+        real = _make_skill(tmp_path / ".archive" / "old", "ghost")
+        try:
+            (tmp_path / "ghost").symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable in test environment: {exc}")
+        assert self._view(tmp_path, "ghost")["success"] is False
+
+    def test_live_skill_loads_when_an_archived_copy_shares_its_name(self, tmp_path):
+        """An archived copy shadows nothing: it must not trigger the ambiguous-name refusal."""
+        _make_skill(tmp_path, "twin", body="LIVE VERSION")
+        _make_skill(tmp_path / ".archive" / "old", "twin", body="ARCHIVED VERSION")
+        result = self._view(tmp_path, "twin")
+        assert result["success"] is True and "LIVE VERSION" in result["content"]
+
+    def test_skills_dir_under_an_excluded_named_ancestor_still_loads(self, tmp_path):
+        """Only components BELOW the skills root count: a profile that lives under ``venv/`` works."""
+        root = tmp_path / "venv" / "skills"
+        _make_skill(root, "normal")
+        assert self._view(root, "normal")["success"] is True
+
+
 class TestTrustWarningSymlinkAware:
     """The trust check is on the RESOLVED path: a symlink whose target lives under a registered
     search dir is quiet, a SKILL.md symlinked to a file outside every root still warns."""

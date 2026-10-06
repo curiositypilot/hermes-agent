@@ -500,6 +500,29 @@ def _provably_same_skill(candidates) -> bool:
         return False
 
 
+def _excluded_skill_location(skill_md: Path, all_dirs) -> Optional[Tuple[str, str]]:
+    """``(component, shown_path)`` when *skill_md* sits under an ``EXCLUDED_SKILL_DIRS`` dir
+    (``.archive``, ``.curator_backups``, ``node_modules`` …), else None. Components are taken
+    relative to the owning search root, lexically and after symlink resolution, so a skills
+    dir that itself lives under e.g. ``venv/`` is not misread and a symlink INTO an archive
+    is still refused."""
+    owner = _owning_search_dir(skill_md, all_dirs)
+    views = []
+    if owner is not None:
+        views.append(skill_md.relative_to(owner))
+    with suppress(Exception):
+        roots = [Path(d).resolve() for d in all_dirs]
+        resolved = skill_md.resolve()
+        rel = [resolved.relative_to(r) for r in roots if resolved.is_relative_to(r)]
+        if rel:
+            views.append(min(rel, key=lambda p: len(p.parts)))  # most specific root = shortest remainder
+    for rel in views:
+        for part in rel.parts[:-1]:  # the leaf is the file itself
+            if part in _EXCLUDED_SKILL_DIRS:
+                return part, "/".join(rel.parts[:-1])
+    return None
+
+
 def _locate_skill(name: str, local_category_name: Optional[str], project_dirs: list, all_dirs):
     """Unique on-disk skill for *name*: collision refusal, project-tier precedence, same-root
     precedence, quarantine gate, not-found listing. ``(error_json, skill_dir, skill_md)``;
@@ -508,6 +531,17 @@ def _locate_skill(name: str, local_category_name: Optional[str], project_dirs: l
         return _fail(
             "Skills directory does not exist yet. It will be created on first install."), None, None
     candidates = _collect_skill_candidates(name, local_category_name, all_dirs)
+    # Archived/excluded skills never load, and never count toward the collision refusal below
+    # (an archived copy shadows nothing). Direct-path and legacy flat ``<name>.md`` lookups can
+    # still reach ``.archive/`` — the index scan prunes it, those two strategies do not.
+    excluded = [(c, _excluded_skill_location(c[1], all_dirs)) for c in candidates]
+    if excluded_hits := [loc for _c, loc in excluded if loc is not None]:
+        candidates = [c for c, loc in excluded if loc is None]
+        if not candidates:
+            component, shown = excluded_hits[0]
+            kind = "archived" if component == ".archive" else f"under excluded dir '{component}'"
+            return _fail(f"Skill is {kind} and not loadable: {shown}",
+                         hint="Restore it first (e.g. `hermes curator restore`) if it is still needed."), None, None
     if len(candidates) > 1 and project_dirs:
         # A project skill intentionally overrides a same-named local/external skill;
         # ambiguity WITHIN the project tier (two different skills) still refuses.
