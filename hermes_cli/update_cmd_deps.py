@@ -760,6 +760,19 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
         return False, detail[0] if detail else "venv python failed to run"
     if missing:
         return False, "; ".join(missing[:4])
+    # Core imports are only a sample: a declared base pin that never landed (e.g. an editable
+    # reinstall with --no-deps, the 2026-10 snowballstemmer gap that silently disabled tool_search)
+    # passes the probe above and the version compare below. Check every declared base dep.
+    from hermes_cli.main_install_repair import DEP_PROBE_ERRORS, missing_core_dependencies
+    try:
+        absent = missing_core_dependencies(venv_python)
+    except DEP_PROBE_ERRORS as exc:
+        # The import probe above just ran in this interpreter, so this is rare; say so, keep going.
+        logger.warning("declared-deps probe failed: %s", exc)
+        absent = []
+    if absent:
+        shown = ", ".join(absent[:8]) + ("..." if len(absent) > 8 else "")
+        return False, f"declared deps missing: {shown}"
     return True, ""
 
 

@@ -1018,3 +1018,59 @@ class TestDeferredCallSchemaProbe:
         }, calls)
 
         assert validate_deferred_call_args(name, {"payload": {"anything": True}}) is None
+
+
+# ---------------------------------------------------------------------------
+# A broken install must be loud: missing module -> one ERROR per process (2026-10 snowballstemmer)
+# ---------------------------------------------------------------------------
+
+
+class TestAssemblyImportFailureIsLoud:
+    @staticmethod
+    def _fake_tool_search(monkeypatch, *, import_error=None, assemble_error=None):
+        import types
+
+        class _Mod(types.ModuleType):
+            def __getattr__(self, name):
+                if import_error is not None:
+                    raise import_error
+                raise AttributeError(name)
+
+        mod = _Mod("tools.tool_search")
+        if import_error is None:
+            mod.load_config = lambda: types.SimpleNamespace(enabled="on")
+
+            def _assemble(*a, **kw):
+                raise assemble_error
+            mod.assemble_tool_defs = _assemble
+        monkeypatch.setitem(sys.modules, "tools.tool_search", mod)
+        import tools
+        monkeypatch.setattr(tools, "tool_search", mod, raising=False)
+
+    def test_missing_module_logs_one_error_and_keeps_tools(self, monkeypatch, caplog):
+        import logging
+        import model_tools
+
+        monkeypatch.setattr(model_tools, "_tool_search_import_error_logged", False)
+        self._fake_tool_search(monkeypatch, import_error=ModuleNotFoundError(
+            "No module named 'snowballstemmer'", name="snowballstemmer"))
+        with caplog.at_level(logging.DEBUG, logger="model_tools"):
+            first = model_tools._compute_tool_definitions(enabled_toolsets=["file"], quiet_mode=True)
+            second = model_tools._compute_tool_definitions(enabled_toolsets=["file"], quiet_mode=True)
+        assert first and second, "tool loading must survive a missing tool_search dependency"
+        errors = [r for r in caplog.records if r.name == "model_tools" and r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        msg = errors[0].getMessage()
+        assert "snowballstemmer" in msg and "hermes doctor --fix" in msg
+
+    def test_other_failure_stays_a_warning(self, monkeypatch, caplog):
+        import logging
+        import model_tools
+
+        monkeypatch.setattr(model_tools, "_tool_search_import_error_logged", False)
+        self._fake_tool_search(monkeypatch, assemble_error=RuntimeError("boom"))
+        with caplog.at_level(logging.DEBUG, logger="model_tools"):
+            defs = model_tools._compute_tool_definitions(enabled_toolsets=["file"], quiet_mode=True)
+        assert defs
+        records = [r for r in caplog.records if r.name == "model_tools" and "boom" in r.getMessage()]
+        assert [r.levelno for r in records] == [logging.WARNING]
