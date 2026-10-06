@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import cron.incidents as incidents
+import cron.jobs as cron_jobs
 import cron.scheduler as sched
 from cron import quota_hold as qh
 from cron.jobs import (
@@ -19,6 +21,7 @@ from cron.jobs import (
     mark_job_run, pause_job, update_job,
 )
 from hermes_cli.auth import CODEX_RATE_LIMITED_CODE, AuthError
+from tests.cron.test_cron_incidents import _tick_failing
 
 QUOTA_MSG = "Codex provider quota exhausted (429); retry after 123518s. Credentials are still valid."
 
@@ -88,7 +91,7 @@ def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_r
     j = get_job(job_id)
     assert j["last_status"] == "error"
     # 123518s is over MAX_HOLD_SECONDS, so this alert takes the capped wording; it must still say
-    # the job is held (the one alert on entering a hold).
+    # the job is held (the alert on entering a hold).
     assert len(deliveries) == 1 and "This job is held" in deliveries[0], deliveries
     assert "provider credential missing" not in deliveries[0]
     parked = datetime.fromisoformat(j["next_run_at"])
@@ -165,7 +168,8 @@ def test_monthly_window_parks_one_day_and_notices_the_reprobe(tmp_cron_home, fro
 
 def test_reprobe_on_a_still_closed_window_parks_again_with_its_own_alert(tmp_cron_home, frozen_now):
     """Day 2: the capped hold ends, the job re-probes, the window is still closed. It parks
-    another cap and the alert fires again (one alert per hold, as the notice says)."""
+    another cap (the notice does not promise silence; the delivered day-2 alert is exercised
+    through the tick in ``test_day_two_reprobe_delivers_its_alert_through_the_tick``)."""
     job = _interval_job()
     assert qh.plan_hold(job, MONTHLY)
     first = job["next_run_at"]
@@ -433,3 +437,105 @@ def test_reanchoring_a_repointed_job_drops_a_stale_pending_slot(tmp_cron_home):
     assert get_job(held["id"]).get("pending_slot")
     update_job(held["id"], {"provider": "anthropic"})
     assert "pending_slot" not in get_job(held["id"])
+
+
+def test_no_hold_notice_when_the_last_repeat_retires_the_job(tmp_cron_home):
+    """``mark_job_run`` retires a repeat-exhausted job before ``plan_hold`` runs and leaves no
+    hold, so the alert (composed first) must not say the job is held."""
+    job = create_job("probe", "every 15m", deliver="local", repeat=1)
+    assert qh.hold_notice(job, MONTHLY) == ""
+    assert qh.hold_notice(job, 3600) == ""
+
+    assert mark_job_run(job["id"], False, QUOTA_MSG, quota_hold_seconds=MONTHLY)
+    after = get_job(job["id"])
+    assert after["state"] == "completed" and qh.STATE_KEY not in after
+
+
+def test_hold_notice_still_promises_the_hold_while_repeats_remain(tmp_cron_home):
+    job = create_job("probe", "every 15m", deliver="local", repeat=2)
+    assert "This job is held" in qh.hold_notice(job, MONTHLY)
+    assert mark_job_run(job["id"], False, QUOTA_MSG, quota_hold_seconds=MONTHLY)
+    assert qh.STATE_KEY in get_job(job["id"])
+
+
+def test_no_hold_notice_when_next_run_cannot_be_computed(tmp_cron_home):
+    """A recurring job whose next run cannot be computed (croniter missing) ends in
+    ``state=error`` with no park; the alert must not promise one."""
+    job = create_job("probe", "every 15m", deliver="local")
+    with patch("cron.jobs.compute_next_run", return_value=None):
+        assert qh.hold_notice(job, MONTHLY) == ""
+        assert mark_job_run(job["id"], False, QUOTA_MSG, quota_hold_seconds=MONTHLY)
+    after = get_job(job["id"])
+    assert after["state"] == "error" and qh.STATE_KEY not in after
+
+
+def test_terminal_after_run_leaves_the_stored_record_untouched(tmp_cron_home):
+    job = create_job("probe", "every 15m", deliver="local", repeat=1)
+    before = get_job(job["id"])
+    assert cron_jobs.terminal_after_run(before)
+    assert before == get_job(job["id"]) and before["repeat"]["completed"] == 0
+
+
+def _quota_hint_error(seconds: int) -> AuthError:
+    return AuthError(f"Codex provider quota exhausted (429); retry after {seconds}s. "
+                     "Credentials are still valid.",
+                     provider="openai-codex", code=CODEX_RATE_LIMITED_CODE)
+
+
+@pytest.fixture
+def day_clock(monkeypatch, tmp_path):
+    """Every clock the failure path reads (hold plan, job store, incident ledger and its
+    cooldown) follows one movable instant, and the incident ledger lives under *tmp_path*.
+    Jobs under test deliver to a real lane (not ``local``): only a ping that leaves the process
+    marks its incident ``alerted``, which is what arms the cooldown."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # The platform preflight would refuse the unconnected telegram lane before the agent runs.
+    (tmp_path / "config.yaml").write_text("cron:\n  preflight: false\n", encoding="utf-8")
+    monkeypatch.setattr(incidents, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    box = [datetime.now(timezone.utc)]
+    for module in (qh, cron_jobs, sched, incidents):
+        monkeypatch.setattr(module, "_hermes_now", lambda: box[0])
+    return box
+
+
+def test_day_two_reprobe_delivers_its_alert_through_the_tick(tmp_path, day_clock, monkeypatch):
+    """The re-probe's alert is delivered by the real scheduler path, not just composed: the
+    provider's remaining window shrinks, so the failure signature changes and a new incident
+    alerts. The job is parked again each time. The repeat-alert cooldown is pinned above the
+    24 h cap, so only the signature change can deliver the day-2 alert."""
+    monkeypatch.setattr(sched, "_failure_repeat_alert_hours", lambda: 48.0)
+    with cron_jobs.use_cron_store(tmp_path):
+        job = create_job("probe", "every 15m", deliver="telegram:123")
+        deliveries: list = []
+
+        _tick_failing(get_job(job["id"]), tmp_path, deliveries, _quota_hint_error(MONTHLY))
+        assert len(deliveries) == 1 and "This job is held" in deliveries[0], deliveries
+        first = get_job(job["id"])
+        assert first[qh.STATE_KEY] == first["next_run_at"]
+
+        day_clock[0] += CAP + SLACK  # the capped hold ends; the job re-probes
+        _tick_failing(get_job(job["id"]), tmp_path, deliveries,
+                      _quota_hint_error(MONTHLY - 86400))
+        assert len(deliveries) == 2 and "This job is held" in deliveries[1], deliveries
+        second = get_job(job["id"])
+        assert datetime.fromisoformat(second[qh.STATE_KEY]) == day_clock[0] + CAP + SLACK
+        assert second[qh.STATE_KEY] != first[qh.STATE_KEY]
+
+
+def test_day_two_reprobe_alert_is_withheld_inside_the_incident_cooldown(
+        tmp_path, day_clock, monkeypatch):
+    """A provider that repeats the same hint, with a cooldown longer than the hold, gets no day-2
+    alert (normal failure-incident rules) but the job is still parked again."""
+    monkeypatch.setattr(sched, "_failure_repeat_alert_hours", lambda: 48.0)
+    with cron_jobs.use_cron_store(tmp_path):
+        job = create_job("probe", "every 15m", deliver="telegram:123")
+        deliveries: list = []
+
+        _tick_failing(get_job(job["id"]), tmp_path, deliveries, _quota_hint_error(MONTHLY))
+        assert len(deliveries) == 1
+
+        day_clock[0] += CAP + SLACK
+        _tick_failing(get_job(job["id"]), tmp_path, deliveries, _quota_hint_error(MONTHLY))
+        assert len(deliveries) == 1, "same signature inside the cooldown: no second alert"
+        second = get_job(job["id"])
+        assert datetime.fromisoformat(second[qh.STATE_KEY]) == day_clock[0] + CAP + SLACK

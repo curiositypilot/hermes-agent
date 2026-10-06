@@ -97,6 +97,39 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+_NON_CHAT_PLATFORMS = frozenset({"cron", "subagent"})
+
+
+def is_background_context(platform: str | None = None) -> bool:
+    """True for unattended work: cron runs, delegated children, Kanban workers (and anything they spawn).
+
+    ``HERMES_KANBAN_TASK`` is inherited by a worker's subprocesses on purpose: a child of a worker is
+    still worker work. A chat surface (cli/desktop/telegram ...) with none of these markers is chat.
+    """
+    import os
+    from agent.delegation_context import is_delegated_child_process_context
+
+    return (
+        (platform or "").strip().lower() in _NON_CHAT_PLATFORMS
+        or bool((os.environ.get("HERMES_KANBAN_TASK") or "").strip())
+        or is_delegated_child_process_context()
+    )
+
+
+def drop_chat_only_entries(chain: list[dict[str, Any]] | None, *, platform: str | None = None,
+                           background: bool | None = None) -> list[dict[str, Any]]:
+    """Remove ``chat_only: true`` entries outside interactive chat.
+
+    A ``chat_only`` entry (e.g. a pay-per-use last resort) keeps chat alive when every subscription is
+    exhausted, while unattended work stops and waits for a subscription to come back instead of
+    burning metered credit. ``background`` overrides detection for callers that already know.
+    """
+    entries = list(chain or [])
+    if not (is_background_context(platform) if background is None else background):
+        return entries
+    return [e for e in entries if not (isinstance(e, dict) and e.get("chat_only") is True)]
+
+
 def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Return the effective fallback chain merged across old and new config keys.
 

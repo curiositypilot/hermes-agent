@@ -463,16 +463,18 @@ the hold. One-shot jobs are not held.
 A hold lasts about 24 hours, however long the provider says the window is
 (a monthly quota reports ~30 days). A cron expression then waits for its next
 scheduled time, so a daily 09:00 job can be held for about two days. After that
-the job probes once; if the window is still closed it is held again, with one
-alert per hold. Changing the job's provider, model or `base_url` (including a
-`pinned` change that moves it) clears the hold and puts the next run back on
-the job's schedule; other edits (name, prompt, delivery) leave an active hold
-alone. Two caveats: a paused job keeps its stored next run until it is resumed,
-and an edit made while a run is in flight can be overtaken, because that run
-parks the job again from the old provider's window (about a day, longer for a
-cron expression, then it re-probes on the new route). A model-only change on
-the same provider clears the hold, but the next run can hit the same window
-again when the provider's quota covers every model (Codex's does).
+the job probes once; if the window is still closed it is held again; whether
+that re-probe alerts follows the normal failure-incident rules below
+(`cron.failure_repeat_alert_hours`, acknowledged incidents). Changing the job's
+provider, model or `base_url` (including a `pinned` change that moves it)
+clears the hold and puts the next run back on the job's schedule; other edits
+(name, prompt, delivery) leave an active hold alone. Two caveats: a paused job
+keeps its stored next run until it is resumed, and an edit made while a run is
+in flight can be overtaken, because that run parks the job again from the old
+provider's window (about a day, longer for a cron expression, then it
+re-probes on the new route). A model-only change on the same provider clears
+the hold, but the next run can hit the same window again when the provider's
+quota covers every model (Codex's does).
 
 ### Failure incidents: alert once, remind on a cooldown, acknowledge
 

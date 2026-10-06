@@ -44,8 +44,9 @@ def _job(**overrides):
 
 def _tick_failing(job, tmp_path, deliveries, error="boom unrelated"):
     """Run one run_one_job tick whose agent raises ``error`` (the failure
-    path that composes the per-run failure ping). Mirrors the preflight alert-once
-    harness so the incident gating is exercised through the real scheduler."""
+    path that composes the per-run failure ping; a str becomes a RuntimeError, an exception is
+    raised as is). Mirrors the preflight alert-once harness so the incident gating is exercised
+    through the real scheduler."""
     fake_db = MagicMock()
 
     def fake_deliver(jb, content, adapters=None, loop=None, **kwargs):
@@ -69,7 +70,8 @@ def _tick_failing(job, tmp_path, deliveries, error="boom unrelated"):
          patch.object(sched, "_deliver_result", side_effect=fake_deliver), \
          patch("run_agent.AIAgent") as mock_agent_cls:
         mock_agent = MagicMock()
-        mock_agent.run_conversation.side_effect = RuntimeError(error)
+        mock_agent.run_conversation.side_effect = (
+            error if isinstance(error, BaseException) else RuntimeError(error))
         mock_agent_cls.return_value = mock_agent
         sched.run_one_job(dict(job))
     return mock_agent_cls.called

@@ -565,7 +565,8 @@ class GatewayConfigLoadersMixin:
         """
         if agent is None:
             return
-        new_chain = list(chain or [])
+        from hermes_cli.fallback_config import drop_chat_only_entries
+        new_chain = drop_chat_only_entries(chain, platform=getattr(agent, "platform", None))
         rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
         if getattr(agent, "_fallback_activated", False) and rate_limited_until > time.monotonic():
             return

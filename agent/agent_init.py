@@ -1050,8 +1050,11 @@ def _init_fallback_chain(agent, fallback_model):
     assert_provider_allowed(agent.provider, data_class, phase="main")
 
     # Ordered backups tried when the primary is exhausted (legacy single-dict or list).
+    from hermes_cli.fallback_config import drop_chat_only_entries
+
     chain = []
-    for fallback in _fallback_entries(fallback_model):
+    for fallback in drop_chat_only_entries(_fallback_entries(fallback_model),
+                                           platform=getattr(agent, "platform", None)):
         try:
             assert_provider_allowed(fallback["provider"], data_class, phase="fallback")
             assert_fallback_allowed(fallback["provider"], data_class)
