@@ -566,7 +566,8 @@ def _log_tool_search_import_error(exc: ImportError) -> None:
     _tool_search_import_error_logged = True
     module = getattr(exc, "name", None) or "a required module"
     logger.error(
-        "Tool search disabled: %s is not installed (%s). Every tool schema is sent on every call. "
+        "Tool search disabled: %s is not installed (%s). This is a broken install; when "
+        "tool_search is enabled, MCP/plugin tool schemas cannot be deferred. "
         "Fix: run `hermes doctor --fix`, or `uv pip install -e .` in the hermes-agent checkout "
         "(not --no-deps).", module, exc)
 
