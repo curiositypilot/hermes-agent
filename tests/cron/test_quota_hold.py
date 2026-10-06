@@ -421,3 +421,35 @@ def test_config_switch_while_the_fire_is_in_flight_does_not_park_it(tmp_cron_hom
     j = get_job(job["id"])
     assert j["last_status"] == "error"
     assert not qh.hold_active(j) and qh.ROUTE_KEY not in j
+
+
+def _stamp_daily(job_id, parked_at, route="openai-codex@"):
+    """Rewrite a job's stored hold to park it until ``parked_at`` on ``route``."""
+    jobs = load_jobs()
+    rec = next(j for j in jobs if j["id"] == job_id)
+    rec["next_run_at"] = rec[qh.STATE_KEY] = parked_at.isoformat()
+    rec[qh.ROUTE_KEY] = route
+    save_jobs(jobs)
+
+
+def test_expired_marker_with_a_stale_stamp_is_still_due_and_not_moved(tmp_cron_home):
+    """An expired marker is inert: the route release must not push a due job a cadence out."""
+    _write_config(tmp_cron_home, ANTHROPIC)
+    job = create_job("daily", "every 1d", deliver="local")
+    from cron.jobs import _hermes_now
+    _stamp_daily(job["id"], _hermes_now() - timedelta(minutes=5))
+    parked = get_job(job["id"])["next_run_at"]
+    assert job["id"] in [d["id"] for d in get_due_jobs()]
+    assert get_job(job["id"])["next_run_at"] == parked
+
+
+def test_releasing_a_near_end_hold_never_fires_later_than_the_hold(tmp_cron_home):
+    _write_config(tmp_cron_home, ANTHROPIC)
+    job = create_job("daily", "every 1d", deliver="local")
+    from cron.jobs import _hermes_now, _parse_aware
+    parked_at = _hermes_now() + timedelta(hours=1)
+    _stamp_daily(job["id"], parked_at)
+    get_due_jobs()
+    j = get_job(job["id"])
+    assert qh.STATE_KEY not in j and qh.ROUTE_KEY not in j, "the stale-route hold is released"
+    assert _parse_aware(j["next_run_at"]) <= parked_at

@@ -3250,11 +3250,15 @@ def _release_stale_quota_hold(job: Dict[str, Any], scan: _DueScan) -> None:
     (main ``model.provider`` or ``cron.model_provider`` changed in config; ``update_job`` only
     sees per-job edits). Runs before ``_evaluate_due_job`` so a parked, not-yet-due job is put
     back on its schedule. A hold without a route stamp (written before the stamp existed) is
-    kept; ``MAX_HOLD_SECONDS`` bounds it. A route that cannot be read keeps the hold."""
+    kept; ``MAX_HOLD_SECONDS`` bounds it. A route that cannot be read keeps the hold.
+
+    Only an ACTIVE hold is released: an expired marker is inert and its job is already due, so
+    it is left to the clear-on-run path. A release never moves ``next_run_at`` later than the
+    parked instant: it exists so the job runs sooner, never later."""
     from cron import quota_hold
 
     stamp = job.get(quota_hold.ROUTE_KEY)
-    if not job.get(quota_hold.STATE_KEY) or not stamp:
+    if not stamp or not quota_hold.hold_active(job, scan.now):
         return
     try:
         now_route = quota_hold.route_of(job)
@@ -3275,9 +3279,21 @@ def _release_stale_quota_hold(job: Dict[str, Any], scan: _DueScan) -> None:
     for rec in targets:
         quota_hold.clear_state(rec)
         rec.pop("pending_slot", None)
-        if next_run:
-            rec["next_run_at"] = next_run
+        rec_next = _earlier_instant(rec.get("next_run_at"), next_run)
+        if rec_next:
+            rec["next_run_at"] = rec_next
     scan.needs_save = True
+
+
+def _earlier_instant(current: Optional[str], candidate: Optional[str]) -> Optional[str]:
+    """The earlier of two ISO instants; an unparseable or missing side yields the other."""
+    cur, cand = (_parse_aware(current) if current else None,
+                 _parse_aware(candidate) if candidate else None)
+    if cur is None:
+        return candidate if cand is not None else current
+    if cand is None or cur <= cand:
+        return current
+    return candidate
 
 
 def _get_due_jobs_locked() -> List[Dict[str, Any]]:
