@@ -1727,7 +1727,8 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         logger.warning(
             "Job '%s': primary provider resolve failed (%s: %s), trying fallback",
             job_id, "auth" if is_auth else "transient network", resolve_exc)
-        for entry in get_fallback_chain(jc.cfg):
+        from hermes_cli.fallback_config import drop_chat_only_entries
+        for entry in drop_chat_only_entries(get_fallback_chain(jc.cfg), background=True):
             if not isinstance(entry, dict):
                 continue
             fb_provider = str(entry.get("provider") or "").strip()
@@ -2364,7 +2365,8 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     setup.reasoning_config = _resolve_job_reasoning_config(
         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
     )
-    setup.fallback_model = get_fallback_chain(_cfg) or None
+    from hermes_cli.fallback_config import drop_chat_only_entries
+    setup.fallback_model = drop_chat_only_entries(get_fallback_chain(_cfg), background=True) or None
     setup.credential_pool = _load_credential_pool(setup.runtime, job_id)
     # MCP servers must be registered before AIAgent is constructed.
     _init_cron_mcp_tools(job_id)
