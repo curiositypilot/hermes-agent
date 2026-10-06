@@ -474,6 +474,30 @@ def _check_config_drift(should_fix: bool, f: Finding) -> None:
             step(f, should_fix, config_path)
 
 
+@doctor_check("Fallback chain check skipped", "({e})")
+def _check_fallback_chain(should_fix: bool, f: Finding) -> None:
+    """Warn when every fallback entry is on the primary provider: a quota/auth/outage on that
+    provider takes the whole chain down with it (upstream #133454 item 3)."""
+    from hermes_cli.config import load_config
+    from hermes_cli.fallback_config import get_fallback_chain, same_provider_only_chain
+    cfg = load_config() or {}
+    chain = get_fallback_chain(cfg)
+    if not chain:
+        check_info("No fallback providers configured (add one with `hermes fallback add`)")
+        return
+    model_cfg = cfg.get("model") or {}
+    primary = str((model_cfg.get("provider") if isinstance(model_cfg, dict) else "") or "").strip()
+    primary_base_url = str((model_cfg.get("base_url") if isinstance(model_cfg, dict) else "") or "").strip()
+    if same_provider_only_chain(chain, primary, primary_base_url):
+        check_warn(f"Every fallback provider is on '{primary}' (the primary)",
+                   "(a quota/auth/outage there takes the whole chain down)")
+        f.manual_issues.append(
+            f"Add a fallback on a provider other than '{primary}' with `hermes fallback add` — "
+            f"every configured backup shares the primary's endpoint.")
+        return
+    check_ok(f"Fallback chain leaves the primary provider ({len(chain)} entr{'y' if len(chain) == 1 else 'ies'})")
+
+
 @doctor_check("xAI retirement check skipped", "({e})")
 def _check_xai_retirement(should_fix: bool, f: Finding) -> None:
     from hermes_cli.config import load_config

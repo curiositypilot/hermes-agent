@@ -130,6 +130,31 @@ def drop_chat_only_entries(chain: list[dict[str, Any]] | None, *, platform: str 
     return [e for e in entries if not (isinstance(e, dict) and e.get("chat_only") is True)]
 
 
+def same_provider_only_chain(
+    chain: list[dict[str, Any]] | None, primary_provider: Any, primary_base_url: Any = ""
+) -> bool:
+    """True when every fallback entry sits on the primary's own endpoint, so none can take over
+    when that provider fails (e.g. ``openai-codex -> openai-codex`` on one exhausted pool).
+
+    Sameness is :func:`agent.backend_identity.should_skip_candidate` at ``FailureScope.ENDPOINT``
+    (same label, or equal explicit base_urls). Empty chain or unknown primary -> False (fail open).
+    """
+    primary = str(primary_provider or "").strip()
+    entries = [entry for entry in chain or () if isinstance(entry, dict)]
+    if not entries or not primary:
+        return False
+    from agent.backend_identity import BackendIdentity, FailureScope, should_skip_candidate
+
+    failed = BackendIdentity.build(primary, None, _normalized_base_url(primary_base_url) or None)
+    return all(
+        should_skip_candidate(
+            BackendIdentity.build(entry.get("provider"), entry.get("model"), entry.get("base_url")),
+            failed, FailureScope.ENDPOINT,
+        )
+        for entry in entries
+    )
+
+
 def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Return the effective fallback chain merged across old and new config keys.
 

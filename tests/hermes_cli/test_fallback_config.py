@@ -1,7 +1,8 @@
 """Tests for hermes_cli/fallback_config.py — fallback entry API-key resolution."""
 
 from agent.secret_scope import reset_secret_scope, set_secret_scope
-from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
+from hermes_cli.fallback_config import (
+    effective_runtime_provider, resolve_entry_api_key, same_provider_only_chain)
 
 
 class TestResolveEntryApiKey:
@@ -65,3 +66,29 @@ class TestEffectiveRuntimeProvider:
 
     def test_none_inputs_are_safe(self):
         assert effective_runtime_provider(None, None) == ""
+
+
+class TestSameProviderOnlyChain:
+    """A chain that never leaves the primary's endpoint cannot take over when it fails (#133454)."""
+
+    CODEX_ONLY = [{"provider": "openai-codex", "model": "a"}, {"provider": "openai-codex", "model": "b"}]
+
+    def test_empty_chain_is_false(self):
+        assert same_provider_only_chain([], "openai-codex") is False
+
+    def test_unknown_primary_fails_open(self):
+        assert same_provider_only_chain(self.CODEX_ONLY, "") is False
+        assert same_provider_only_chain(self.CODEX_ONLY, None) is False
+
+    def test_same_label_any_case_is_true(self):
+        assert same_provider_only_chain(self.CODEX_ONLY, "OpenAI-Codex") is True
+
+    def test_mixed_chain_is_false(self):
+        chain = [self.CODEX_ONLY[0], {"provider": "anthropic", "model": "c"}]
+        assert same_provider_only_chain(chain, "openai-codex") is False
+
+    def test_same_label_on_two_distinct_explicit_base_urls_is_false(self):
+        chain = [{"provider": "custom", "model": "m", "base_url": "http://host-b:8000/v1"}]
+        assert same_provider_only_chain(chain, "custom", "http://host-a:8000/v1") is False
+        # ...and the same explicit URL is the same endpoint.
+        assert same_provider_only_chain(chain, "custom", "http://host-b:8000/v1") is True
