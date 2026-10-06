@@ -100,22 +100,24 @@ def _parked_at(
     if schedule.get("kind") == "interval":
         return window_end.isoformat()
     # First LEGAL cron occurrence after the window; parking at the boundary would fire at a time
-    # the expression excludes.
-    return compute_next_run(schedule, window_end.isoformat()) or window_end.isoformat()
+    # the expression excludes. ``compute_next_run`` returns None only when croniter is missing or
+    # the schedule has no ``expr`` (an impossible expression raises): the job has no computable
+    # occurrence to park at, so it is not parked and keeps its natural next run.
+    return compute_next_run(schedule, window_end.isoformat())
 
 
 def plan_hold(job: Dict[str, Any], hold_seconds: float) -> bool:
     """Called under the jobs lock AFTER ``_advance_after_run`` computed the schedule's natural
     ``next_run_at`` for a failed run. Parks a recurring job at its first occurrence after the
-    provider window (bounded by ``MAX_HOLD_SECONDS``) when that is later than the natural one.
-    Returns True when parked."""
+    provider window (``MAX_HOLD_SECONDS`` plus slack, and one cadence for cron) when that is later
+    than the natural one. Returns True when parked."""
     from cron.jobs import _parse_aware
 
     schedule = job.get("schedule") or {}
     parked = None
+    now = _hermes_now()
     if job.get("state") != "paused":
-        parked = _parked_at(
-            schedule, _parse_aware(job.get("next_run_at")), hold_seconds, _hermes_now())
+        parked = _parked_at(schedule, _parse_aware(job.get("next_run_at")), hold_seconds, now)
     if parked is None:
         clear_state(job)
         return False
@@ -125,7 +127,7 @@ def plan_hold(job: Dict[str, Any], hold_seconds: float) -> bool:
         "Job '%s': provider usage window closed for %.0fs (holding for %.0fs) — holding fires "
         "until %s instead of failing on every cadence tick",
         job.get("name", job.get("id", "?")), float(hold_seconds),
-        _effective_hold_seconds(hold_seconds), parked)
+        (datetime.fromisoformat(parked) - now).total_seconds(), parked)
     return True
 
 
@@ -161,5 +163,6 @@ def hold_notice(job: Dict[str, Any], hold_seconds: Optional[float]) -> str:
         "\nThe provider's usage window is closed for longer than this job waits at once. This "
         f"job is held for about {hours:.1f}h (through {parked_dt.strftime('%Y-%m-%d %H:%M %Z')}) "
         "and then re-probes; if the window is still closed it is held again, with one alert per "
-        "hold. Repoint the job to another provider or model to clear the hold."
+        "hold. Repoint the job to another provider to clear the hold (a model on the same "
+        "provider normally shares the quota)."
     )

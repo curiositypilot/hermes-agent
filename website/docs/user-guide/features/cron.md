@@ -460,12 +460,19 @@ scheduled occurrence after the window (`quota_hold_until` on the job record),
 and nothing fires or alerts until then. Any run that reaches the model clears
 the hold. One-shot jobs are not held.
 
-A hold lasts at most 24 hours, however long the provider says the window is
-(a monthly quota reports ~30 days). After that the job probes once; if the
-window is still closed it is held for another 24 hours, with one alert per
-hold. Changing the job's provider, model or `base_url` (including a `pinned`
-change that moves it) clears the hold and puts the next run back on the job's
-schedule; other edits (name, prompt, delivery) leave an active hold alone.
+A hold lasts about 24 hours, however long the provider says the window is
+(a monthly quota reports ~30 days). A cron expression then waits for its next
+scheduled time, so a daily 09:00 job can be held for about two days. After that
+the job probes once; if the window is still closed it is held again, with one
+alert per hold. Changing the job's provider, model or `base_url` (including a
+`pinned` change that moves it) clears the hold and puts the next run back on
+the job's schedule; other edits (name, prompt, delivery) leave an active hold
+alone. Two caveats: a paused job keeps its stored next run until it is resumed,
+and an edit made while a run is in flight can be overtaken, because that run
+parks the job again from the old provider's window (up to a day, then it
+re-probes on the new route). A model-only change on the same provider clears
+the hold but normally re-fires once into the same window, because the provider
+quota is shared across models.
 
 ### Failure incidents: alert once, remind on a cooldown, acknowledge
 

@@ -2053,7 +2053,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # pulled back to its schedule: an unheld job's next_run_at is a real cadence slot that
             # a model switch must not push out. A paused job has no fire to re-anchor. An edit
             # racing an in-flight run is not covered: that run's own mark_job_run parks it again
-            # from the old provider's window (bounded by MAX_HOLD_SECONDS).
+            # from the old provider's window (for up to MAX_HOLD_SECONDS plus slack, and one cron
+            # cadence).
             held = hold_active(job)
             _clear_quota_hold(updated)
             if held and updated.get("state") != "paused":
