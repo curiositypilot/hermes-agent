@@ -90,7 +90,7 @@ def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_r
     j = get_job(job_id)
     assert j["last_status"] == "error"
     # 123518s is over MAX_HOLD_SECONDS, so this alert takes the capped wording; it must still say
-    # the job is held (the one alert on entering a hold).
+    # the job is held (the alert on entering a hold).
     assert len(deliveries) == 1 and "This job is held" in deliveries[0], deliveries
     assert "provider credential missing" not in deliveries[0]
     parked = datetime.fromisoformat(j["next_run_at"])
@@ -467,10 +467,12 @@ def day_clock(monkeypatch, tmp_path):
     return box
 
 
-def test_day_two_reprobe_delivers_its_alert_through_the_tick(tmp_path, day_clock):
+def test_day_two_reprobe_delivers_its_alert_through_the_tick(tmp_path, day_clock, monkeypatch):
     """The re-probe's alert is delivered by the real scheduler path, not just composed: the
     provider's remaining window shrinks, so the failure signature changes and a new incident
-    alerts. The job is parked again each time."""
+    alerts. The job is parked again each time. The repeat-alert cooldown is pinned above the
+    24 h cap, so only the signature change can deliver the day-2 alert."""
+    monkeypatch.setattr(sched, "_failure_repeat_alert_hours", lambda: 48.0)
     with cron_jobs.use_cron_store(tmp_path):
         job = create_job("probe", "every 15m", deliver="telegram:123")
         deliveries: list = []

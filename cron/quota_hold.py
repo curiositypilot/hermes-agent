@@ -132,8 +132,8 @@ def plan_hold(job: Dict[str, Any], hold_seconds: float) -> bool:
 def hold_notice(job: Dict[str, Any], hold_seconds: Optional[float]) -> str:
     """Line appended to the failure alert delivered on entering the hold, else "" when the job
     will not be held: not recurring, paused, past the cap, or retired by this very run (repeat
-    limit reached, no next run computable). Same decision as ``plan_hold``, computed from the
-    delivery-time clock (``mark_job_run`` reads its own, later).
+    limit reached, no next run computable). Uses the same logic as ``plan_hold``, on the
+    delivery-time job and clock (``mark_job_run`` reads its own, later).
 
     Inside the cap the provider's window is quoted and no further alert is promised. Over the cap
     the job is held for ``MAX_HOLD_SECONDS`` only, then re-probes; a window that is still closed
