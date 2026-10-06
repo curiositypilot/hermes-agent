@@ -9,8 +9,9 @@ per-session token counters, so the run close copies them into
 Compression rotates the session id mid-run (``HERMES_SESSION_ID`` becomes the
 child id), so the usage sums the session and its ``kanban``-sourced ancestors.
 
-Everything here is best-effort and read-only: a missing profile, DB or row
-yields ``None`` and the run closes exactly as before.
+Read-only. Expected misses (unresolvable profile, no state.db, no session row,
+sqlite errors) are logged and yield ``None``; the run then closes without
+``usage``. Unexpected errors propagate.
 """
 
 from __future__ import annotations
@@ -30,11 +31,12 @@ _USAGE_COLUMNS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_w
 
 def profile_state_db(profile: Optional[str]) -> Optional[Path]:
     """``state.db`` of ``profile``'s home, or None when it cannot be resolved."""
-    try:
-        from hermes_cli.profiles import get_profile_dir
+    from hermes_cli.profiles import get_profile_dir
 
+    try:
         path = get_profile_dir(profile or "default") / "state.db"
-    except Exception:
+    except ValueError as exc:  # invalid profile id on the run row
+        _log.warning("kanban run usage: profile %r unresolvable: %s", profile, exc)
         return None
     return path if path.is_file() else None
 
@@ -48,7 +50,8 @@ def read_session_usage(db_path: Path, session_id: str) -> Optional[dict]:
     """
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        _log.warning("kanban run usage: cannot open %s: %s", db_path, exc)
         return None
     conn.row_factory = sqlite3.Row
     try:
@@ -74,7 +77,7 @@ def read_session_usage(db_path: Path, session_id: str) -> Optional[dict]:
             provider = provider or row["billing_provider"]
             sid = row["parent_session_id"]
     except sqlite3.Error as exc:
-        _log.debug("kanban run usage: read of %s failed (%s)", db_path, exc)
+        _log.warning("kanban run usage: read of %s failed: %s", db_path, exc)
         return None
     finally:
         conn.close()
@@ -109,13 +112,10 @@ def usage_for_run(profile: Optional[str], metadata: Optional[dict]) -> Optional[
 def with_run_usage(profile: Optional[str], metadata: Optional[dict]) -> Optional[dict]:
     """``metadata`` with ``usage`` added when the worker session is readable.
 
-    Never raises: run close must not fail on accounting.
+    Expected misses (no profile dir, no state.db, no session row, sqlite errors)
+    return ``metadata`` unchanged and are logged; anything else propagates.
     """
-    try:
-        if not isinstance(metadata, dict) or "usage" in metadata:
-            return metadata
-        usage = usage_for_run(profile, metadata)
-    except Exception as exc:  # pragma: no cover - defensive
-        _log.debug("kanban run usage: lookup failed (%s)", exc)
+    if not isinstance(metadata, dict) or "usage" in metadata:
         return metadata
+    usage = usage_for_run(profile, metadata)
     return {**metadata, "usage": usage} if usage else metadata
