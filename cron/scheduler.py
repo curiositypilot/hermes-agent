@@ -2491,8 +2491,9 @@ def run_job(
         try:
             from cron.quota_hold import route_of
             _dispatch_route = route_of(job, jc.cron_default_provider)
-        except Exception:
-            logger.debug("Job '%s': could not snapshot the dispatch route", job_id, exc_info=True)
+        except Exception as exc:  # the snapshot must never block the fire; a hold falls back unstamped
+            logger.warning("Job '%s': could not snapshot the dispatch route (%s: %s)",
+                           job_id, type(exc).__name__, exc, exc_info=True)
         setup = _resolve_cron_agent_setup(job, job_id, job_name, jc)
         if setup.blocked is not None:
             return setup.blocked

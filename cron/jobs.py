@@ -2389,9 +2389,9 @@ def _park_on_quota_window(
 
     try:
         now_route: Optional[str] = quota_hold.route_of(job)
-    except Exception:
-        logger.debug("Job '%s': could not read the current route; parking unstamped",
-                     job.get("id"), exc_info=True)
+    except Exception as exc:  # the run outcome must still be recorded (spec t_30440fb0, #12)
+        logger.warning("Job '%s': could not read the current route (%s: %s); parking unstamped",
+                       job.get("id"), type(exc).__name__, exc, exc_info=True)
         now_route = None
     run_route = run_route or now_route
     if now_route is not None and run_route != now_route:
@@ -3258,9 +3258,9 @@ def _release_stale_quota_hold(job: Dict[str, Any], scan: _DueScan) -> None:
         return
     try:
         now_route = quota_hold.route_of(job)
-    except Exception:
-        logger.debug("Job '%s': could not read the current route; keeping the quota hold",
-                     job.get("id"), exc_info=True)
+    except Exception as exc:  # one job's config read must not abort the due scan; keep the hold
+        logger.warning("Job '%s': could not read the current route (%s: %s); keeping the quota "
+                       "hold", job.get("id"), type(exc).__name__, exc, exc_info=True)
         return
     if now_route == stamp:
         return
