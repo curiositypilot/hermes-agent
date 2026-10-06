@@ -460,6 +460,13 @@ scheduled occurrence after the window (`quota_hold_until` on the job record),
 and nothing fires or alerts until then. Any run that reaches the model clears
 the hold. One-shot jobs are not held.
 
+A hold lasts at most 24 hours, however long the provider says the window is
+(a monthly quota reports ~30 days). After that the job probes once; if the
+window is still closed it is held for another 24 hours, with one alert per
+hold. Changing the job's provider, model or `base_url` (including a `pinned`
+change that moves it) clears the hold and puts the next run back on the job's
+schedule; other edits (name, prompt, delivery) leave an active hold alone.
+
 ### Failure incidents: alert once, remind on a cooldown, acknowledge
 
 A recurring job that keeps failing with the *same* error alerts you **once**,
