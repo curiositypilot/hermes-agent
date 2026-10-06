@@ -2506,6 +2506,7 @@ def run_job(
     _session_db = None
     _audit: Optional[_FireAudit] = None
     _worker_state: dict = {}
+    _dispatch_route: Optional[str] = None
     scope = _CronRunScope(job, job_id, execution_id)
     try:
         scope.enter()
@@ -2516,6 +2517,15 @@ def run_job(
         jc = _load_cron_job_config(job, job_id, job_name)
         _cfg = jc.cfg
         model = jc.model
+        # The route this fire's provider resolve is sent to, captured BEFORE the resolve: a quota
+        # hold is stamped with it, so a config switch while the run is in flight cannot make the
+        # stamp describe the new route (cron/quota_hold.py).
+        try:
+            from cron.quota_hold import route_of
+            _dispatch_route = route_of(job, jc.cron_default_provider)
+        except Exception as exc:  # the snapshot must never block the fire; a hold falls back unstamped
+            logger.warning("Job '%s': could not snapshot the dispatch route (%s: %s)",
+                           job_id, type(exc).__name__, exc, exc_info=True)
         setup = _resolve_cron_agent_setup(job, job_id, job_name, jc)
         if setup.blocked is not None:
             return setup.blocked
@@ -2560,6 +2570,8 @@ def run_job(
             _hold_s = hold_seconds_from_failure(e)
             if _hold_s:
                 job["_quota_hold_seconds"] = _hold_s
+                if _dispatch_route:
+                    job["_quota_hold_route"] = _dispatch_route
         except Exception:  # classification must never mask the real failure
             logger.debug("Job '%s': unreachable-failure classification failed", job_id)
         # No audit row when we failed before the agent existed; the audit write must never raise.
@@ -3060,9 +3072,12 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         # (cron/unreachable_retry.py) inside the same fenced store write.
         mark_kwargs["model_unreachable"] = True
     _hold_s = job.pop("_quota_hold_seconds", None)
+    _hold_route = job.pop("_quota_hold_route", None)
     if not d.success and _hold_s:
         # Provider window closed for a known duration: park past it (cron/quota_hold.py, #89376).
         mark_kwargs["quota_hold_seconds"] = _hold_s
+        if _hold_route:
+            mark_kwargs["quota_hold_route"] = _hold_route
     if d.success and not d.delivery_error and d.should_deliver and job.get("last_delivery_queued"):
         mark_kwargs["status"] = "delivery_queued"
     if fire_owner is not None:

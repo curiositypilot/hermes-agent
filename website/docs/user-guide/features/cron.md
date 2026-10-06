@@ -475,6 +475,9 @@ provider's window (about a day, longer for a cron expression, then it
 re-probes on the new route). A model-only change on the same provider clears
 the hold, but the next run can hit the same window again when the provider's
 quota covers every model (Codex's does).
+A hold is also released, and the job put back on its schedule, when the
+provider the job resolves to changes through config (the main `model.provider`
+or `cron.model_provider`), since the closed window belonged to the old provider.
 
 ### Failure incidents: alert once, remind on a cooldown, acknowledge
 
