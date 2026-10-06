@@ -347,6 +347,64 @@ def test_dispatch_holds_when_tier_exhausted(conn, monkeypatch, all_assignees_spa
     assert (tid, "tier_exhausted") in dry.respawn_guarded
 
 
+def _routing_holds(conn, tid):
+    return [e for e in kb.list_events(conn, tid) if e.kind == "routing_held"]
+
+
+def test_routing_hold_dedupe_survives_comment(conn, monkeypatch, all_assignees_spawnable):
+    """A comment between ticks must not restart the hold streak."""
+    _use_routing(monkeypatch)
+    _pool(monkeypatch, {"prov-a": "x", "prov-b": "x", "prov-c": "x"})
+    seen, spawn = _spawns(monkeypatch)
+    tid = kb.create_task(conn, title="s", assignee="w", complexity="S")
+
+    kbd.dispatch_once(conn, spawn_fn=spawn)
+    kb.add_comment(conn, tid, "w", "still waiting")
+    kbd.dispatch_once(conn, spawn_fn=spawn)
+
+    assert seen == []
+    holds = _routing_holds(conn, tid)
+    assert len(holds) == 1
+    assert holds[0].payload["reason"] == "tier_exhausted"
+
+
+def test_routing_hold_reemits_on_lifecycle_or_new_note(conn, monkeypatch, all_assignees_spawnable, tmp_path):
+    """A lifecycle event, or a changed reason/note, ends the streak."""
+    _use_routing(monkeypatch)
+    _pool(monkeypatch, {"prov-a": "x", "prov-b": "x", "prov-c": "x"})
+    _, spawn = _spawns(monkeypatch)
+    tid = kb.create_task(conn, title="s", assignee="w", complexity="S")
+
+    kbd.dispatch_once(conn, spawn_fn=spawn)
+    with kb.write_txn(conn):
+        kb._append_event(conn, tid, "claimed", {"lock": "test"})
+    kbd.dispatch_once(conn, spawn_fn=spawn)
+    holds = _routing_holds(conn, tid)
+    assert len(holds) == 2
+    assert [h.payload["reason"] for h in holds] == ["tier_exhausted", "tier_exhausted"]
+
+    path = tmp_path / "headroom.json"
+    path.write_text(json.dumps({
+        "schema": 1,
+        "written_at_epoch": time.time() - 60,
+        "providers": {
+            name: {"ok": True, "binding": {"name": "session", "headroom": 0.01,
+                                            "resets_at": "2026-11-04T00:00:00Z"}, "windows": []}
+            for name in ("prov-a", "prov-b", "prov-c")
+        },
+    }))
+    _use_routing(monkeypatch, quota_gate={
+        "enabled": True,
+        "headroom_file": str(path),
+        "bands": {"default": [{"below": 0.25, "min_priority": 1}]},
+    })
+    kbd.dispatch_once(conn, spawn_fn=spawn)
+    holds = _routing_holds(conn, tid)
+    assert len(holds) == 3
+    assert holds[-1].payload["reason"] == "quota_hold"
+    assert holds[-1].payload.get("note")
+
+
 def _seed_rate_limited_run(conn, tid, *, model=None, provider=None, ended_at=None):
     kb.claim_task(conn, tid)
     run_id = kb.get_task(conn, tid).current_run_id
