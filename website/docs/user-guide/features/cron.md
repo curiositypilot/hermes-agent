@@ -469,10 +469,10 @@ alert per hold. Changing the job's provider, model or `base_url` (including a
 the job's schedule; other edits (name, prompt, delivery) leave an active hold
 alone. Two caveats: a paused job keeps its stored next run until it is resumed,
 and an edit made while a run is in flight can be overtaken, because that run
-parks the job again from the old provider's window (up to a day, then it
-re-probes on the new route). A model-only change on the same provider clears
-the hold but normally re-fires once into the same window, because the provider
-quota is shared across models.
+parks the job again from the old provider's window (about a day, longer for a
+cron expression, then it re-probes on the new route). A model-only change on
+the same provider clears the hold, but the next run can hit the same window
+again when the provider's quota covers every model (Codex's does).
 
 ### Failure incidents: alert once, remind on a cooldown, acknowledge
 

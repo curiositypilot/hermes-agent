@@ -163,6 +163,6 @@ def hold_notice(job: Dict[str, Any], hold_seconds: Optional[float]) -> str:
         "\nThe provider's usage window is closed for longer than this job waits at once. This "
         f"job is held for about {hours:.1f}h (through {parked_dt.strftime('%Y-%m-%d %H:%M %Z')}) "
         "and then re-probes; if the window is still closed it is held again, with one alert per "
-        "hold. Repoint the job to another provider to clear the hold (a model on the same "
-        "provider normally shares the quota)."
+        "hold. Repoint the job to another provider or model to clear the hold (another model "
+        "on the same provider may share the same quota)."
     )
