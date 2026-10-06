@@ -211,14 +211,20 @@ def test_window_inside_the_cap_keeps_the_original_notice(tmp_cron_home, frozen_n
     assert "re-probes" not in notice
 
 
-def _held_job(**create_kw):
-    """A 15-minute job pinned to Codex, parked by a monthly 429 (real clock, loose bounds)."""
+def _held_job(provider="openai-codex", model="gpt-6.1-sol", **create_kw):
+    """A 15-minute job (pinned to Codex unless *provider*/*model* say otherwise; ``None`` = unpinned,
+    follows the main model) parked by a monthly 429 (real clock, loose bounds)."""
     job = create_job("probe", "every 15m", deliver="local",
-                     provider="openai-codex", model="gpt-6.1-sol", **create_kw)
+                     provider=provider, model=model, **create_kw)
     assert mark_job_run(job["id"], False, QUOTA_MSG, quota_hold_seconds=MONTHLY)
     held = get_job(job["id"])
     assert qh.STATE_KEY in held
     return held
+
+
+def _main_runs_on(monkeypatch, provider, model):
+    """What ``_main_model_pin`` (the main agent's provider+model) answers for this test."""
+    monkeypatch.setattr("cron.jobs._main_model_pin", lambda: (provider, model))
 
 
 def _minutes_out(job_id):
@@ -230,9 +236,8 @@ def _minutes_out(job_id):
     {"model": "claude-sonnet-5-5", "provider": "anthropic"},
     {"model": "gpt-6.2-sol"},
     {"provider": "anthropic"},
-    {"pinned": False},
     {"base_url": "https://llm.example.invalid/v1"},
-], ids=["model+provider", "model-only", "provider-only", "unpin", "base_url"])
+], ids=["model+provider", "model-only", "provider-only", "base_url"])
 def test_repointing_a_held_job_clears_the_hold_and_reanchors(tmp_cron_home, edit):
     held = _held_job()
     assert _minutes_out(held["id"]) > 23 * 60
@@ -241,17 +246,95 @@ def test_repointing_a_held_job_clears_the_hold_and_reanchors(tmp_cron_home, edit
     assert 0 < _minutes_out(held["id"]) < 16, "next_run_at follows the 15m schedule again"
 
 
-@pytest.mark.parametrize("edit", [
-    {"name": "renamed"},
-    {"prompt": "something else"},
-    {"model": "gpt-6.1-sol", "provider": "openai-codex"},   # restates the current route
-    {"pinned": True},                                       # already pinned: nothing changes
-], ids=["rename", "prompt", "restated-route", "pin-already-pinned"])
-def test_edits_that_do_not_change_the_route_keep_the_hold(tmp_cron_home, edit):
+def test_unpinning_a_job_pinned_off_the_main_route_clears_the_hold_and_reanchors(
+        tmp_cron_home, monkeypatch):
+    """Unpin means "follow the main model": a repoint only when the main model is somewhere else."""
     held = _held_job()
+    _main_runs_on(monkeypatch, "anthropic", "claude-sonnet-5-5")
+    from cron.jobs import _main_model_pin
+    assert _main_model_pin()[0] != held["provider"], "the effective provider really changes"
+    updated = update_job(held["id"], {"pinned": False})
+    assert qh.STATE_KEY not in updated
+    assert 0 < _minutes_out(held["id"]) < 16
+
+
+def test_unpinning_a_job_pinned_to_the_main_route_keeps_the_hold(tmp_cron_home, monkeypatch):
+    """Pinned to the model the main agent runs on, unpin changes the stored pin but not where the
+    job runs: it must not re-fire into the closed window."""
+    held = _held_job()
+    _main_runs_on(monkeypatch, "openai-codex", "gpt-6.1-sol")
+    updated = update_job(held["id"], {"pinned": False})
+    assert updated["provider"] is None and updated["model"] is None
+    assert updated[qh.STATE_KEY] == held[qh.STATE_KEY]
+    assert get_job(held["id"])["next_run_at"] == held["next_run_at"]
+
+
+@pytest.mark.parametrize("held_kw, main, edit", [
+    ({}, ("openai-codex", "gpt-6.1-sol"), {"name": "renamed"}),
+    ({}, ("openai-codex", "gpt-6.1-sol"), {"prompt": "something else"}),
+    ({}, ("openai-codex", "gpt-6.1-sol"),
+     {"model": "gpt-6.1-sol", "provider": "openai-codex"}),   # restates the current route
+    ({}, ("openai-codex", "gpt-6.1-sol"), {"pinned": True}),  # already pinned: nothing changes
+    ({"provider": None, "model": None}, ("openai-codex", "gpt-6.1-sol"),
+     {"pinned": True}),                                       # unpinned -> pin at the same route
+    ({"provider": None, "model": None}, ("openai-codex", "gpt-6.1-sol"),
+     {"provider": "openai-codex"}),                           # partial edit, same effective route
+], ids=["rename", "prompt", "restated-route", "pin-already-pinned", "pin-unpinned-at-main",
+        "provider-restated-on-unpinned"])
+def test_edits_that_do_not_change_the_route_keep_the_hold(tmp_cron_home, monkeypatch,
+                                                          held_kw, main, edit):
+    held = _held_job(**held_kw)
+    _main_runs_on(monkeypatch, *main)
     updated = update_job(held["id"], dict(edit))
     assert updated[qh.STATE_KEY] == held[qh.STATE_KEY]
     assert get_job(held["id"])["next_run_at"] == held["next_run_at"]
+
+
+def test_repointing_an_unpinned_held_job_off_the_main_route_clears_the_hold(
+        tmp_cron_home, monkeypatch):
+    held = _held_job(provider=None, model=None)
+    _main_runs_on(monkeypatch, "openai-codex", "gpt-6.1-sol")
+    updated = update_job(held["id"], {"model": "claude-sonnet-5-5", "provider": "anthropic"})
+    assert qh.STATE_KEY not in updated
+    assert 0 < _minutes_out(held["id"]) < 16
+
+
+def test_route_compare_falls_back_to_the_stored_pin_when_the_main_model_is_unreadable(
+        tmp_cron_home, monkeypatch):
+    """The main model cannot be read (config/OAuth hiccup): the stored comparison stands, which is
+    the pre-existing behaviour (a pin change is a repoint) and never fails the edit."""
+    held = _held_job()
+
+    def broken():
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr("cron.jobs._main_model_pin", broken)
+    updated = update_job(held["id"], {"pinned": False})
+    assert qh.STATE_KEY not in updated
+    assert 0 < _minutes_out(held["id"]) < 16
+
+
+def test_a_fully_explicit_route_edit_never_reads_the_main_model(tmp_cron_home, monkeypatch):
+    """Explicit provider+model on both sides decide on the stored keys; no config work runs under
+    the jobs lock."""
+    held = _held_job()
+
+    def forbidden():
+        raise AssertionError("main model read for a fully explicit edit")
+
+    monkeypatch.setattr("cron.jobs._main_model_pin", forbidden)
+    updated = update_job(held["id"], {"model": "claude-sonnet-5-5", "provider": "anthropic"})
+    assert qh.STATE_KEY not in updated
+
+
+def test_explicit_next_run_at_wins_over_the_repoint_reanchor(tmp_cron_home):
+    held = _held_job()
+    requested = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
+    updated = update_job(held["id"], {"provider": "anthropic", "next_run_at": requested})
+    assert qh.STATE_KEY not in updated
+    assert datetime.fromisoformat(updated["next_run_at"]) == datetime.fromisoformat(requested)
+    assert datetime.fromisoformat(get_job(held["id"])["next_run_at"]) == \
+        datetime.fromisoformat(requested)
 
 
 def test_repointing_a_paused_held_job_clears_the_marker_but_does_not_reanchor(tmp_cron_home):
