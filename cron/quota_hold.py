@@ -37,9 +37,9 @@ HOLD_SLACK_SECONDS = 60
 
 # Upper bound on how long ONE failed run parks a job, whatever window the provider reports. A
 # monthly quota would otherwise park an every-15-minute job for 30 days with no way to notice the
-# window reopened early or the job was repointed. Capped holds re-probe once per cap (one failed
-# run, one alert) while the window stays closed. A module constant, not a config key: nobody needs
-# to tune it yet (#133454).
+# window reopened early or the job was repointed. Capped holds re-probe once per cap while the
+# window stays closed; whether a re-probe alerts follows the normal failure-incident rules. A
+# module constant, not a config key: nobody needs to tune it yet (#133454).
 MAX_HOLD_SECONDS = 24 * 3600.0
 
 _RETRY_AFTER_RE = re.compile(r"retry after (\d+)s", re.IGNORECASE)
@@ -88,8 +88,8 @@ def _parked_at(
 ) -> Optional[str]:
     """Where a recurring job failing at *now* is parked, or None when no park applies (the
     schedule is not recurring, or its natural next run already lands past the effective window).
-    One owner for ``plan_hold`` and ``hold_notice`` so the alert never promises a park the store
-    will not make."""
+    One owner of the schedule/window arithmetic for ``plan_hold`` and ``hold_notice``; the
+    caller owns the terminal-state and paused gates."""
     from cron.jobs import compute_next_run
 
     if schedule.get("kind") not in {"cron", "interval"}:
@@ -130,17 +130,20 @@ def plan_hold(job: Dict[str, Any], hold_seconds: float) -> bool:
 
 
 def hold_notice(job: Dict[str, Any], hold_seconds: Optional[float]) -> str:
-    """Line appended to the ONE failure alert delivered on entering the hold, else "" (also when
-    ``plan_hold`` will not park this job, so the alert never promises a hold that is not made).
+    """Line appended to the failure alert delivered on entering the hold, else "" when the job
+    will not be held: not recurring, paused, past the cap, or retired by this very run (repeat
+    limit reached, no next run computable). Same decision as ``plan_hold``, computed from the
+    delivery-time clock (``mark_job_run`` reads its own, later).
 
     Inside the cap the provider's window is quoted and no further alert is promised. Over the cap
     the job is held for ``MAX_HOLD_SECONDS`` only, then re-probes; a window that is still closed
-    parks it again with a fresh alert, so the notice promises one alert per hold, not silence."""
-    from cron.jobs import _parse_aware, compute_next_run
+    parks it again. Whether that re-probe alerts follows the normal failure-incident rules, so
+    the notice does not promise it."""
+    from cron.jobs import _parse_aware, compute_next_run, terminal_after_run
 
     schedule = job.get("schedule") or {}
     if not hold_seconds or schedule.get("kind") not in {"cron", "interval"} \
-            or job.get("state") == "paused":
+            or job.get("state") == "paused" or terminal_after_run(job):
         return ""
     now = _hermes_now()
     natural_next = _parse_aware(compute_next_run(schedule, now.isoformat()))
@@ -160,6 +163,6 @@ def hold_notice(job: Dict[str, Any], hold_seconds: Optional[float]) -> str:
     return (
         "\nThe provider's usage window is closed for longer than this job waits at once. This "
         f"job is held for about {hours:.1f}h (through {parked_dt.strftime('%Y-%m-%d %H:%M %Z')}) "
-        "and then re-probes; if the window is still closed it is held again, with one alert per "
-        "hold. Repoint the job to another provider or model to clear the hold."
+        "and then re-probes; if the window is still closed it is held again. Repoint the job to "
+        "another provider or model to clear the hold."
     )
