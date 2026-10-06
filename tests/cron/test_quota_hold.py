@@ -77,10 +77,11 @@ def _tick(job, home, deliveries, resolve):
 
 def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_reach(tmp_cron_home):
     """A 30-minute job whose provider resolve raises the Codex quota AuthError ('retry after
-    123518s', over the 24h cap) is parked for the cap by the real scheduler tick: preflight lets the rate-limited AuthError
-    through (it is not a missing credential), the one delivered alert carries the hold notice,
-    and the job does not fire again inside the window (not even after the stale-error re-arm's
-    cadence+grace). The marker clears once a run reaches the model."""
+    123518s', over the 24h cap) is parked for the cap by the real scheduler tick: preflight lets
+    the rate-limited AuthError through (it is not a missing credential), the one delivered alert
+    carries the hold notice, and the job does not fire again inside the capped hold (not even
+    after the stale-error re-arm's cadence+grace). The marker clears once a run reaches the
+    model."""
     job = create_job("portfolio triage", "every 30m", deliver="local")
     job_id = job["id"]
     now = datetime.now(timezone.utc)
@@ -194,6 +195,36 @@ def test_cron_schedule_parks_at_first_legal_occurrence_after_the_cap(tmp_cron_ho
     assert parked == datetime.fromisoformat(compute_next_run(job["schedule"], window_end.isoformat()))
     assert window_end < parked <= window_end + timedelta(days=1)
     assert "re-probes" in qh.hold_notice(job, MONTHLY)
+
+
+def test_cron_with_no_computable_next_occurrence_is_not_parked(tmp_cron_home, frozen_now):
+    """``compute_next_run`` returns None (croniter missing, no ``expr``): there is no legal
+    occurrence to park at, and parking at the window boundary would fire at a time the
+    expression excludes. The job keeps its natural next run and no alert promises a hold."""
+    natural = (FROZEN + timedelta(hours=1)).isoformat()
+    job = {"id": "j4", "name": "daily", "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+           "next_run_at": natural, qh.STATE_KEY: "stale"}
+    with patch("cron.jobs.compute_next_run", return_value=None):
+        assert not qh.plan_hold(job, MONTHLY)
+        assert qh.hold_notice(job, MONTHLY) == ""
+    assert job["next_run_at"] == natural
+    assert qh.STATE_KEY not in job
+
+
+def test_hold_log_reports_the_real_park_delay(tmp_cron_home, frozen_now, caplog):
+    """The logged hold length is the actual delay to ``next_run_at`` (cap + slack + the cron
+    cadence to the next legal occurrence), not the bare cap, so it agrees with the ``until``
+    printed beside it."""
+    job = {"id": "j5", "name": "daily", "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+           "next_run_at": (FROZEN + timedelta(hours=1)).isoformat()}
+    with caplog.at_level("WARNING", logger="cron.scheduler"):
+        assert qh.plan_hold(job, MONTHLY)
+    parked = datetime.fromisoformat(job["next_run_at"])
+    delay = (parked - frozen_now).total_seconds()
+    assert delay > qh.MAX_HOLD_SECONDS + qh.HOLD_SLACK_SECONDS, "cron park is past cap + slack"
+    record = next(r for r in caplog.records if "usage window closed" in r.getMessage())
+    assert f"(holding for {delay:.0f}s)" in record.getMessage()
+    assert f"closed for {MONTHLY}s" in record.getMessage()
 
 
 def test_job_the_cap_does_not_park_gets_no_hold_notice(tmp_cron_home, frozen_now):
