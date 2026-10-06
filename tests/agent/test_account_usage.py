@@ -144,6 +144,16 @@ def test_codex_weekly_only_primary_window_is_labeled_weekly(monkeypatch):
     assert [(w.label, w.used_percent) for w in snapshot.windows] == [("Weekly", 1.0)]
 
 
+def test_codex_30_day_primary_window_is_labeled_monthly(monkeypatch):
+    """A lone 2592000s primary_window (free plan) is a 30-day limit, not the 5h session."""
+    payload = {"plan_type": "free", "rate_limit": {
+        "primary_window": {"used_percent": 100, "limit_window_seconds": 2592000},
+        "secondary_window": None,
+    }}
+    snapshot, _ = _explicit_creds_snapshot(monkeypatch, payload)
+    assert [(w.label, w.used_percent) for w in snapshot.windows] == [("Monthly", 100.0)]
+
+
 def test_codex_window_labels_follow_duration_with_positional_fallback(monkeypatch):
     # Swapped positions: labels must follow limit_window_seconds.
     payload = {"rate_limit": {
