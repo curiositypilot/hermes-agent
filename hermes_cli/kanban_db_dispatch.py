@@ -2063,7 +2063,15 @@ def _routed_guard(
 
 # RouteDecision.source -> guard reason for routes that hold the card (no
 # failure counted; one ``routing_held`` event per hold streak).
+# Streak ignores noise events; a changed reason, note or requested_tier writes a new hold.
 _ROUTING_HOLD_REASONS = {"exhausted": "tier_exhausted", "quota_held": "quota_hold"}
+
+# Kinds that do not end a hold streak. An unknown future kind is absent on
+# purpose: an allowlist fails safe (an extra row, never a missing hold).
+_HOLD_STREAK_NOISE = frozenset({
+    "commented", "heartbeat", "linked", "unlinked", "attached", "edited",
+    "terminal_worker_reaped",
+})
 
 
 def _record_route(conn: sqlite3.Connection, task: "Task", route: "_kbr.RouteDecision") -> None:
@@ -2081,19 +2089,28 @@ def _record_routing_hold(
     conn: sqlite3.Connection, task_id: str, route: Optional["_kbr.RouteDecision"],
     reason: str = "tier_exhausted",
 ) -> None:
-    """``routing_held`` event, once per hold streak (not every 60 s tick)."""
+    """``routing_held`` once per streak: same reason, note and tier; noise events ignored."""
     try:
-        last = conn.execute(
-            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
-        ).fetchone()
-        if last is not None and last["kind"] == "routing_held":
-            return
         payload: dict[str, Any] = {"reason": reason}
         if route is not None:
             payload.update({k: v for k, v in route.event_payload().items()
                             if k in ("lane", "requested_tier", "skipped", "note")})
             if route.retry_at:
                 payload["retry_at"] = int(route.retry_at)
+        noise = tuple(sorted(_HOLD_STREAK_NOISE))
+        last = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            f"WHERE task_id = ? AND kind NOT IN ({','.join('?' * len(noise))}) "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, *noise),
+        ).fetchone()
+        prev = _kb._json_dict(last["payload"]) if last is not None else {}
+        if (
+            last is not None
+            and last["kind"] == "routing_held"
+            and all(prev.get(k) == payload.get(k) for k in ("reason", "note", "requested_tier"))
+        ):
+            return
         with _kb.write_txn(conn):
             _kb._append_event(conn, task_id, "routing_held", payload)
     except Exception:
