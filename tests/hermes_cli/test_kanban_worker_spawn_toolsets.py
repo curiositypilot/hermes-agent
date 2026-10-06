@@ -136,6 +136,47 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     assert args.query == "work kanban task t_spawn_tools"
 
 
+def test_pinned_spawn_env(monkeypatch, tmp_path):
+    """A pinned route reaches the worker as ``HERMES_KANBAN_PINNED=1``; a tier route does
+    not, even when the dispatcher's own environment carries a stale value."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_PINNED", "1")
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_routing as kr
+
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    envs = []
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        envs.append(dict(kwargs.get("env") or {}))
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    pinned = _make_task(kb, assignee="elias")
+    pinned.model_override, pinned.provider_override = "gemini-x", "antigravity"
+    kr.apply_route(pinned, kr.RouteDecision("pinned", candidate=kr.TierCandidate("gemini-x", "antigravity")))
+    kbd._default_spawn(pinned, str(workspace))
+
+    tiered = _make_task(kb, assignee="elias")
+    kr.apply_route(tiered, kr.RouteDecision("tier", requested_tier="S", tier="S",
+                                            candidate=kr.TierCandidate("cheap-1", "prov-a")))
+    kbd._default_spawn(tiered, str(workspace))
+
+    assert envs[0].get("HERMES_KANBAN_PINNED") == "1"
+    assert "HERMES_KANBAN_PINNED" not in envs[1]
+
+
 def test_default_spawn_resolves_env_passthrough_under_multiplex(monkeypatch, tmp_path):
     """Under multiplex a worker spawn with ``terminal.env_passthrough`` configured must
     forward the ASSIGNEE profile's own value, never crash on an unscoped read or leak the

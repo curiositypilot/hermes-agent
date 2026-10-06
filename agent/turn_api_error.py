@@ -233,6 +233,31 @@ def _is_local_validation_error(api_error: Any) -> bool:
     return not (isinstance(api_error, TypeError) and "nonetype" in _text and "not iterable" in _text)
 
 
+_PINNED_SHORT_WAIT_S = 60.0
+
+
+def _pinned_kanban_rate_limit_fast_fail(agent: Any, api_error: Any, error_context: Any, retry_count: int) -> bool:
+    """A rate-limited pinned Kanban worker has nowhere to go: its fallback chain is empty by
+    design (``agent_init._init_fallback_chain``) and, unless its credential pool can rotate,
+    every retry hits the same quota. True when the turn should end now so the worker exits 75
+    and the dispatcher requeues the card. One in-process retry is kept for a short burst limit
+    (first attempt, provider wait unknown or <= 60 s); anything longer ends the run at once."""
+    if not getattr(agent, "_kanban_pinned_route", False) or agent._has_pending_fallback():
+        return False
+    from agent.conversation_loop import _ra
+    if _ra()._pool_may_recover_from_rate_limit(getattr(agent, "_credential_pool", None)):
+        return False
+    if retry_count >= 2:
+        return True
+    from agent.turn_recovery_autorecover import _retry_after_seconds
+    wait = _retry_after_seconds(api_error)
+    reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+    if reset_at:
+        from agent.fallback_cooldown import _provider_reset_delay
+        wait = max(wait or 0.0, _provider_reset_delay(reset_at) or 0.0)
+    return bool(wait and wait > _PINNED_SHORT_WAIT_S)
+
+
 @dataclass
 class UnrecoveredErrorVerdict:
     """``action``: ``"continue"`` (retry), ``"break"`` (fallback armed / redirect pending) or
@@ -345,6 +370,18 @@ def settle_unrecovered_error(
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
             base_url=_base, model=_model,
         ))
+
+    if (
+        is_rate_limited and retry_count < max_retries
+        and _pinned_kanban_rate_limit_fast_fail(agent, api_error, error_context, retry_count)
+    ):
+        # Pinned Kanban route, no fallback, no other credential: retrying in-process only holds
+        # the worker slot through the provider's reset window. End the turn now so the worker
+        # exits 75 and the dispatcher requeues the card (rate_limited, no failure counted).
+        agent._buffer_diagnostic_status(
+            "⏸️ Rate limited on a pinned Kanban route (no fallback) — ending the run so the card requeues"
+        )
+        retry_count = max_retries
 
     if retry_count >= max_retries:
         # Before fallback, rebuild the primary client once per API call block for

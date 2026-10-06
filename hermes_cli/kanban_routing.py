@@ -874,7 +874,17 @@ class RoutingContext:
 def apply_route(task: Any, decision: Optional[RouteDecision]) -> None:
     """Pin the routed model on the IN-MEMORY task used to build the worker argv.
     A task-level ``reasoning_effort`` still wins over a tier candidate's; a
-    review candidate replaces it (the card's effort was set for the implementer)."""
+    review candidate replaces it (the card's effort was set for the implementer).
+
+    Also sets ``task.route_pinned`` (``_default_spawn`` turns it into
+    ``HERMES_KANBAN_PINNED=1``, which drops the worker's fallback chain). It is set
+    BEFORE the applies-model guard because pinned decisions never pass it. With no
+    decision (routing off, no review candidates) the card's own pin drives ``-m``,
+    so that counts as pinned too."""
+    if decision is None:
+        task.route_pinned = bool(getattr(task, "model_override", None))
+    else:
+        task.route_pinned = decision.source == "pinned"
     if decision is None or not decision.applies_model or decision.candidate is None:
         return
     cand = decision.candidate
