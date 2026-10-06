@@ -400,8 +400,9 @@ def _usage_windows(
     return windows
 
 
-# Published Codex quota windows by ``limit_window_seconds``: 5h session and 7-day weekly.
-_CODEX_WINDOW_LABELS_BY_SECONDS = {18000: "Session", 604800: "Weekly"}
+# Published Codex quota windows by ``limit_window_seconds``: 5h session, 7-day weekly, and the
+# 30-day window free plans get as their only limit.
+_CODEX_WINDOW_LABELS_BY_SECONDS = {18000: "Session", 604800: "Weekly", 2592000: "Monthly"}
 _CODEX_WINDOW_POSITIONAL_LABELS = (("primary_window", "Session"), ("secondary_window", "Weekly"))
 
 
