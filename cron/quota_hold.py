@@ -11,7 +11,10 @@ re-arm (``cron.jobs._job_is_stale_error_recurring``) does not pull the job back 
 The park is bounded: a provider that reports a multi-week window (a Codex monthly 429 says
 ``retry after 2581776s``) parks a job for at most ``MAX_HOLD_SECONDS`` (plus, for a cron schedule,
 up to one cadence to the next legal occurrence), after which the job re-probes. Repointing a job to
-another provider/model clears the hold (``cron.jobs.update_job``).
+another provider/model clears the hold (``cron.jobs.update_job``). The hold is stamped with the
+route it was measured on (``ROUTE_KEY``); a due scan releases it once the job resolves to another
+route through config (main ``model.provider`` or ``cron.model_provider``), and a run that was
+repointed while in flight is not parked on the old route's window (``cron.jobs.mark_job_run``).
 
 Mirror of ``cron/unreachable_retry.py`` (which pulls ``next_run_at`` EARLIER); this one pushes
 it LATER. Any run that reaches the model clears the marker.
@@ -30,6 +33,11 @@ logger = logging.getLogger("cron.scheduler")
 
 # Persisted while a hold is active: ISO instant the job was parked at.
 STATE_KEY = "quota_hold_until"
+
+# Persisted beside STATE_KEY: the route (``route_of``) the window was measured on. A due scan
+# releases a hold whose job no longer resolves to this route (main-model or ``cron.model_provider``
+# switch); a hold without it (written before the stamp existed) is kept until it expires.
+ROUTE_KEY = "quota_hold_route"
 
 # The provider's remaining seconds were measured when the probe ran; by the time the run is
 # recorded a little wall clock has passed, so land clearly past the boundary.
@@ -76,6 +84,48 @@ def hold_active(job: Dict[str, Any], now: Optional[datetime] = None) -> bool:
 
 def clear_state(job: Dict[str, Any]) -> None:
     job.pop(STATE_KEY, None)
+    job.pop(ROUTE_KEY, None)
+
+
+_UNSET = object()
+
+
+def route_of(job: Dict[str, Any], cron_default_provider: Any = _UNSET) -> str:
+    """``"<provider>@<base_url>"`` the job's provider resolve is sent to — the identity a quota
+    window belongs to (the model is not part of it). Provider precedence mirrors the scheduler's
+    ``_resolve_job_runtime``: per-job provider > ``cron.model_provider`` > the main
+    ``model.provider`` (then ``HERMES_INFERENCE_PROVIDER``, else ``"auto"``). The scheduler passes
+    the ``cron.model_provider`` it dispatched with (``_CronJobConfig.cron_default_provider``) so
+    the stamp describes the fire, not config read later; otherwise it is read from config.
+
+    Config read only, no credential resolution (``cron.jobs._main_model_pin`` resolves credentials
+    and would swallow the very quota error). Known gap: an unset main provider reads ``"auto"``
+    on both sides of a switch, so such a hold is kept until it expires (``MAX_HOLD_SECONDS``).
+    This is the canonical identity for the hold's stamp; ``cron.jobs._route_key`` is
+    ``update_job``'s per-job edit detector and is not compared against it. May raise; callers
+    holding the jobs lock guard it."""
+    from cron.jobs import _normalize_base_url, _normalize_job_optional_text
+    from hermes_cli.runtime_provider import resolve_requested_provider
+
+    requested = _normalize_job_optional_text(job.get("provider"))
+    if not requested:
+        requested = (_cron_default_provider() if cron_default_provider is _UNSET
+                     else _normalize_job_optional_text(cron_default_provider))
+    provider = resolve_requested_provider(requested or None)
+    return f"{provider}@{_normalize_base_url(job.get('base_url')) or ''}"
+
+
+def _cron_default_provider() -> Optional[str]:
+    """``cron.model_provider``, read the way ``cron.scheduler._load_cron_job_config`` reads it."""
+    from hermes_cli.config_effective import load_user_config_effective
+    from hermes_constants import get_hermes_home
+
+    cfg_path = get_hermes_home() / "config.yaml"
+    cfg = load_user_config_effective(cfg_path) if cfg_path.exists() else {}
+    cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+    if not isinstance(cron_cfg, dict):
+        return None
+    return str(cron_cfg.get("model_provider") or "").strip() or None
 
 
 def _effective_hold_seconds(hold_seconds: float) -> float:
