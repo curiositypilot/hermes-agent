@@ -1036,6 +1036,13 @@ def _fallback_entries(fallback_model) -> List[Dict[str, Any]]:
     ]
 
 
+def _kanban_pinned_route() -> bool:
+    """True for the dispatcher-owned worker of a card whose route is pinned
+    (``HERMES_KANBAN_PINNED=1`` set by ``kanban_db_dispatch._default_spawn``)."""
+    from agent.delegation_context import owned_kanban_task
+    return bool(owned_kanban_task()) and os.environ.get("HERMES_KANBAN_PINNED") == "1"
+
+
 def _init_fallback_chain(agent, fallback_model):
     # Stable pool-entry identity: OAuth refreshes can replace the token before a failed
     # request is recovered, so the key value alone can't attribute the failure.
@@ -1061,6 +1068,14 @@ def _init_fallback_chain(agent, fallback_model):
         except ProviderDenied:
             continue
         chain.append(fallback)
+    # A pinned Kanban route is an explicit model choice: walking the global chain would
+    # silently answer on another vendor (a critic pinned away from the author's vendor).
+    # owned_kanban_task() is "" inside in-process delegate children, so their own chains
+    # (inherited or declared) are untouched; same-provider pool rotation is unaffected.
+    agent._kanban_pinned_route = _kanban_pinned_route()
+    if agent._kanban_pinned_route:
+        logger.info("kanban pinned route: fallback disabled (%d entries dropped)", len(chain))
+        chain = []
     agent._fallback_chain = chain
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)

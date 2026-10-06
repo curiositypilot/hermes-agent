@@ -2241,10 +2241,11 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    # Model choice lives only on the in-memory task and the run's ``routed``
+    # event — never on the card — so every retry routes afresh. Called with
+    # ``route=None`` too: it still marks a card pin as ``route_pinned``.
+    _kbr.apply_route(claimed, route)
     if route is not None:
-        # Model choice lives only on the in-memory task and the run's ``routed``
-        # event — never on the card — so every retry routes afresh.
-        _kbr.apply_route(claimed, route)
         _record_route(conn, claimed, route)
         result.routed.append((claimed.id, route.label()))
     try:
@@ -3036,6 +3037,12 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    # A pinned route is an explicit model choice: the worker must not walk the
+    # global fallback chain onto another vendor (agent_init._init_fallback_chain).
+    if getattr(task, "route_pinned", False):
+        env["HERMES_KANBAN_PINNED"] = "1"
+    else:
+        env.pop("HERMES_KANBAN_PINNED", None)
     env["HERMES_DATA_CLASS"] = data_class
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the session `kanban` so session-browsing surfaces filter it out by

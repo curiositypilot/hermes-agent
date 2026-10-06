@@ -313,6 +313,49 @@ def test_apply_route_keeps_task_reasoning():
     assert t2.reasoning_effort == "high"
 
 
+def test_apply_route_marks_pinned():
+    """Only a pinned route (or, with no route, a card pin) marks ``route_pinned``; the
+    mark lands even though apply_route's applies-model guard returns early for pins."""
+    pin = kr.RouteDecision("pinned", candidate=kr.TierCandidate("mine", "prov-z"))
+    tier = kr.RouteDecision("tier", requested_tier="S", tier="S", candidate=kr.TierCandidate("c", "prov-a"))
+    review = kr.RouteDecision("review", lane="review", candidate=kr.TierCandidate("r", "prov-r"))
+    profile = kr.RouteDecision("profile", candidate=kr.TierCandidate("p", "prov-p"))
+
+    t = _task(model_override="mine", provider_override="prov-z")
+    kr.apply_route(t, pin)
+    assert t.route_pinned is True and (t.model_override, t.provider_override) == ("mine", "prov-z")
+    for decision in (tier, review, profile):
+        t = _task()
+        kr.apply_route(t, decision)
+        assert t.route_pinned is False
+    # A review run of a pinned card runs on the reviewer model, not the pin.
+    t = _task(model_override="mine", provider_override="prov-z")
+    kr.apply_route(t, review)
+    assert t.route_pinned is False and t.model_override == "r"
+    # No decision (routing off / no review candidates): the card pin drives -m, so it counts.
+    t = _task(model_override="mine", provider_override="prov-z")
+    kr.apply_route(t, None)
+    assert t.route_pinned is True
+    t = _task()
+    kr.apply_route(t, None)
+    assert t.route_pinned is False
+
+
+def test_dispatch_marks_pinned_card_with_routing_off(conn, monkeypatch, all_assignees_spawnable):
+    """Routing disabled: apply_route still runs, so a card pin still reaches the spawn as pinned."""
+    _use_routing(monkeypatch, enabled=False)
+    seen = []
+
+    def spawn(task, workspace, board=None):
+        seen.append((task.id, getattr(task, "route_pinned", None)))
+        return 4242
+
+    pinned = kb.create_task(conn, title="p", assignee="w", model_override="mine", provider_override="prov-z")
+    plain = kb.create_task(conn, title="u", assignee="w")
+    kbd.dispatch_once(conn, spawn_fn=spawn)
+    assert dict(seen) == {pinned: True, plain: False}
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher integration
 # ---------------------------------------------------------------------------
