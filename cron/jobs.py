@@ -2376,6 +2376,37 @@ def _advance_after_run(job: Dict[str, Any], now: str) -> None:
         _complete_job_record(job)  # one-shot: terminal completion
 
 
+def _park_on_quota_window(
+    job: Dict[str, Any], hold_seconds: float, run_route: Optional[str],
+) -> None:
+    """``mark_job_run``'s park branch: park *job* (the stored record, under the jobs lock) past the
+    provider window only while it still resolves to the route the failing fire ran on, and stamp
+    that route on the hold. A mismatch means the job was repointed while the run was in flight:
+    the window belongs to the old route, so the hold is dropped and the job keeps its natural
+    cadence. When the current route cannot be read, park as before, without a stamp (a stampless
+    hold is never released early; ``MAX_HOLD_SECONDS`` bounds it)."""
+    from cron import quota_hold
+
+    try:
+        now_route: Optional[str] = quota_hold.route_of(job)
+    except Exception:
+        logger.debug("Job '%s': could not read the current route; parking unstamped",
+                     job.get("id"), exc_info=True)
+        now_route = None
+    run_route = run_route or now_route
+    if now_route is not None and run_route != now_route:
+        logger.info(
+            "Job '%s': provider window was measured on %s but the job now runs on %s; not holding",
+            job.get("name", job.get("id", "?")), run_route, now_route)
+        quota_hold.clear_state(job)
+        return
+    if quota_hold.plan_hold(job, hold_seconds):
+        if now_route is not None:
+            job[quota_hold.ROUTE_KEY] = now_route
+        else:
+            job.pop(quota_hold.ROUTE_KEY, None)
+
+
 def mark_job_run(
     job_id: str,
     success: bool,
@@ -2386,6 +2417,7 @@ def mark_job_run(
     expected_fire_owner: Optional[str] = None,
     model_unreachable: bool = False,
     quota_hold_seconds: Optional[float] = None,
+    quota_hold_route: Optional[str] = None,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached.
@@ -2403,6 +2435,11 @@ def mark_job_run(
     ``quota_hold_seconds``: the provider said it stays closed for this long (a quota 429 with
     ``retry after <N>s``). Recurring jobs are parked at their first occurrence after the window
     instead of re-firing into it on every tick (cron/quota_hold.py, #89376).
+
+    ``quota_hold_route``: the route (``quota_hold.route_of``) the failing fire was dispatched on.
+    The park only happens while the stored record still resolves to that route; a job repointed
+    while the run was in flight is not parked on the old route's window. ``None`` (callers that do
+    not know it) means the record's current route.
     """
     def apply(jobs, _i, job):
         if expected_fire_owner is not None:
@@ -2424,8 +2461,9 @@ def mark_job_run(
             # Any run that reached the model (either outcome) resets the re-run ladder.
             clear_state(job)
         if not success and quota_hold_seconds and not is_terminal_job(job):
-            quota_hold.plan_hold(job, quota_hold_seconds)
+            _park_on_quota_window(job, quota_hold_seconds, quota_hold_route)
         else:
+            # Unchanged and never route-gated: any run that reached the model clears the hold.
             quota_hold.clear_state(job)
         save_jobs(jobs)
         return True
@@ -3207,6 +3245,41 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     return True
 
 
+def _release_stale_quota_hold(job: Dict[str, Any], scan: _DueScan) -> None:
+    """Release a quota hold whose job no longer resolves to the route the window was measured on
+    (main ``model.provider`` or ``cron.model_provider`` changed in config; ``update_job`` only
+    sees per-job edits). Runs before ``_evaluate_due_job`` so a parked, not-yet-due job is put
+    back on its schedule. A hold without a route stamp (written before the stamp existed) is
+    kept; ``MAX_HOLD_SECONDS`` bounds it. A route that cannot be read keeps the hold."""
+    from cron import quota_hold
+
+    stamp = job.get(quota_hold.ROUTE_KEY)
+    if not job.get(quota_hold.STATE_KEY) or not stamp:
+        return
+    try:
+        now_route = quota_hold.route_of(job)
+    except Exception:
+        logger.debug("Job '%s': could not read the current route; keeping the quota hold",
+                     job.get("id"), exc_info=True)
+        return
+    if now_route == stamp:
+        return
+    next_run = compute_next_run(job.get("schedule") or {}, scan.now.isoformat())
+    logger.info(
+        "Job '%s': quota hold was measured on %s but the job now runs on %s; releasing it "
+        "(next run %s)", job.get("name", job.get("id", "?")), stamp, now_route, next_run)
+    targets = [job]
+    rj = scan.find(job.get("id"))
+    if rj is not None:
+        targets.append(rj)
+    for rec in targets:
+        quota_hold.clear_state(rec)
+        rec.pop("pending_slot", None)
+        if next_run:
+            rec["next_run_at"] = next_run
+    scan.needs_save = True
+
+
 def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
     raw_jobs = load_jobs()
@@ -3234,6 +3307,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             if _has_pause_marker(job):
                 _self_disable_half_paused(job, scan)
                 continue
+            _release_stale_quota_hold(job, scan)
             if _evaluate_due_job(job, scan, run_claim_ttl):
                 due.append(job)
         except Exception:

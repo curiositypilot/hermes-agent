@@ -95,6 +95,10 @@ def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_r
         "next_run_at lands one capped hold out, not at the provider's full window"
     assert j[qh.STATE_KEY] == j["next_run_at"]
     assert "_quota_hold_seconds" not in j
+    # The hold is stamped with the route the fire was dispatched on (the fixture writes no config,
+    # so the provider is whatever the unconfigured resolve reports).
+    assert j[qh.ROUTE_KEY] == qh.route_of(j) and j[qh.ROUTE_KEY].endswith("@")
+    assert "_quota_hold_route" not in j
 
     # Two hours later the job looks like a wedged stale-error record (#62002) — the hold says
     # it is parked on purpose, so it is neither re-armed nor due.
@@ -277,3 +281,143 @@ def test_reanchoring_a_repointed_job_drops_a_stale_pending_slot(tmp_cron_home):
     assert get_job(held["id"]).get("pending_slot")
     update_job(held["id"], {"provider": "anthropic"})
     assert "pending_slot" not in get_job(held["id"])
+
+
+# --- The hold is keyed to the route it was measured on (t_30440fb0) ---------------------------
+
+import yaml  # noqa: E402
+
+from cron.jobs import load_jobs, save_jobs  # noqa: E402
+
+CODEX = {"default": "gpt-6.1-sol", "provider": "openai-codex"}
+ANTHROPIC = {"default": "claude-opus-5-5", "provider": "anthropic"}
+
+
+def _write_config(home, model, cron=None):
+    cfg = {"model": dict(model)}
+    if cron is not None:
+        cfg["cron"] = dict(cron)
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+
+
+def _held_unpinned(**create_kw):
+    """A 15-minute job that follows the configured route, parked by a monthly 429 on it."""
+    job = create_job("probe", "every 15m", deliver="local", **create_kw)
+    assert mark_job_run(job["id"], False, QUOTA_MSG, quota_hold_seconds=MONTHLY)
+    held = get_job(job["id"])
+    assert qh.hold_active(held) and held[qh.ROUTE_KEY] == qh.route_of(held)
+    return held
+
+
+def _assert_released(job_id):
+    j = get_job(job_id)
+    assert qh.STATE_KEY not in j and qh.ROUTE_KEY not in j
+    assert not qh.hold_active(j)
+    assert 0 < _minutes_out(job_id) < 16, "next_run_at is back within one cadence"
+
+
+def _assert_kept(held):
+    j = get_job(held["id"])
+    assert j[qh.STATE_KEY] == held[qh.STATE_KEY] and qh.hold_active(j)
+    assert j["next_run_at"] == held["next_run_at"]
+
+
+def test_main_provider_switch_releases_the_hold_on_the_next_scan(tmp_cron_home):
+    _write_config(tmp_cron_home, CODEX)
+    held = _held_unpinned()
+    assert held[qh.ROUTE_KEY] == "openai-codex@"
+    _write_config(tmp_cron_home, ANTHROPIC)
+    assert all(d["id"] != held["id"] for d in get_due_jobs())
+    _assert_released(held["id"])
+
+
+def test_same_provider_main_model_change_keeps_the_hold(tmp_cron_home):
+    _write_config(tmp_cron_home, CODEX)
+    held = _held_unpinned()
+    _write_config(tmp_cron_home, {"default": "gpt-6.2-sol-mini", "provider": "openai-codex"})
+    get_due_jobs()
+    _assert_kept(held)
+
+
+def test_unchanged_route_keeps_the_hold(tmp_cron_home):
+    _write_config(tmp_cron_home, CODEX)
+    held = _held_unpinned()
+    get_due_jobs()
+    get_due_jobs()
+    _assert_kept(held)
+
+
+def test_job_pinned_provider_ignores_main_switch(tmp_cron_home):
+    _write_config(tmp_cron_home, ANTHROPIC)
+    held = _held_unpinned(provider="openai-codex", model="gpt-6.1-sol")
+    assert held[qh.ROUTE_KEY] == "openai-codex@"
+    _write_config(tmp_cron_home, {"default": "glm-5", "provider": "zai"})
+    get_due_jobs()
+    _assert_kept(held)
+
+
+def test_cron_model_provider_change_releases_the_hold(tmp_cron_home):
+    _write_config(tmp_cron_home, ANTHROPIC, cron={"model_provider": "openai-codex"})
+    held = _held_unpinned()
+    assert held[qh.ROUTE_KEY] == "openai-codex@"
+    _write_config(tmp_cron_home, ANTHROPIC, cron={"model_provider": "anthropic"})
+    get_due_jobs()
+    _assert_released(held["id"])
+
+
+def test_stampless_legacy_hold_is_kept(tmp_cron_home):
+    """A hold written before the route stamp existed is never released on its absence."""
+    _write_config(tmp_cron_home, CODEX)
+    held = _held_unpinned()
+    jobs = load_jobs()
+    for j in jobs:
+        j.pop(qh.ROUTE_KEY, None)
+    save_jobs(jobs)
+    _write_config(tmp_cron_home, ANTHROPIC)
+    get_due_jobs()
+    _assert_kept(held)
+
+
+def test_inflight_repoint_is_not_parked_on_the_old_window(tmp_cron_home):
+    _write_config(tmp_cron_home, ANTHROPIC)
+    job = create_job("race", "every 15m", deliver="local", provider="openai-codex", model="gpt-6.1-sol")
+    dispatched_on = qh.route_of(get_job(job["id"]))
+    update_job(job["id"], {"provider": "anthropic", "model": "claude-opus-5-5"})
+    assert mark_job_run(job["id"], False, QUOTA_MSG, quota_hold_seconds=MONTHLY,
+                        quota_hold_route=dispatched_on)
+    j = get_job(job["id"])
+    assert not qh.hold_active(j) and qh.STATE_KEY not in j and qh.ROUTE_KEY not in j
+    assert j["last_status"] == "error", "the run outcome is still recorded"
+    assert 0 < _minutes_out(job["id"]) < 16
+
+
+def test_route_read_failure_parks_unstamped_and_keeps_the_outcome(tmp_cron_home, monkeypatch):
+    _write_config(tmp_cron_home, CODEX)
+    job = create_job("probe", "every 15m", deliver="local")
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr(qh, "route_of", boom)
+    assert mark_job_run(job["id"], False, QUOTA_MSG, quota_hold_seconds=MONTHLY,
+                        quota_hold_route="openai-codex@")
+    j = get_job(job["id"])
+    assert j["last_status"] == "error" and qh.hold_active(j) and qh.ROUTE_KEY not in j
+    get_due_jobs()  # a scan that cannot read the route keeps the hold
+    assert qh.hold_active(get_job(job["id"]))
+
+
+def test_config_switch_while_the_fire_is_in_flight_does_not_park_it(tmp_cron_home):
+    """The real tick snapshots the route BEFORE the provider resolve; a main-model switch that
+    lands while the codex fire is failing must not park the job on codex's window."""
+    _write_config(tmp_cron_home, CODEX)
+    job = create_job("portfolio triage", "every 30m", deliver="local")
+
+    def switch_then_raise(**_kw):
+        _write_config(tmp_cron_home, ANTHROPIC)
+        raise _quota_error()
+
+    _tick(get_job(job["id"]), tmp_cron_home, [], switch_then_raise)
+    j = get_job(job["id"])
+    assert j["last_status"] == "error"
+    assert not qh.hold_active(j) and qh.ROUTE_KEY not in j

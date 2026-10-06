@@ -466,6 +466,9 @@ window is still closed it is held for another 24 hours, with one alert per
 hold. Changing the job's provider, model or `base_url` (including a `pinned`
 change that moves it) clears the hold and puts the next run back on the job's
 schedule; other edits (name, prompt, delivery) leave an active hold alone.
+A hold is also released, and the job put back on its schedule, when the
+provider the job resolves to changes through config (the main `model.provider`
+or `cron.model_provider`), since the closed window belonged to the old provider.
 
 ### Failure incidents: alert once, remind on a cooldown, acknowledge
 
