@@ -168,7 +168,11 @@ _SPECS = [
         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
         _arg("--workspace",
              help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
-                  "an explicit 'scratch' also opts out of a project-scoped board's project)"),
+                  "an explicit 'scratch' also opts out of a project-scoped board's project; "
+                  "dir:<git repo> becomes a worktree unless --allow-shared)"),
+        _arg("--allow-shared", dest="allow_shared", action="store_true",
+             help="Keep a dir:<git repo> workspace as a shared checkout instead of "
+                  "isolating it in a worktree (parallel workers may collide)"),
         _arg("--branch", help="Branch name for worktree tasks, e.g. wt/t6-wire"),
         _arg("--project",
              help="Link to a project (id or slug). Anchors the task's "

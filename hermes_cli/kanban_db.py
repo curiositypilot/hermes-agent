@@ -1155,6 +1155,16 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _is_repo_path(path: Optional[str]) -> bool:
+    """True when ``path`` is a git checkout root (``.git`` dir or worktree file)."""
+    if not path:
+        return False
+    try:
+        return (Path(os.path.expanduser(str(path))) / ".git").exists()
+    except OSError:
+        return False
+
+
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
     workspace_kind: str, workspace_path: Optional[str],
@@ -1298,8 +1308,13 @@ def create_task(
     completion_contract: Optional[str] = None,
     complexity: Optional[str] = None,
     scheduled_until=None, scheduled_then: Optional[str] = None,
+    allow_shared: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
+
+    ``workspace_kind="dir"`` on a git repo (the path, or the project's primary
+    repo, contains ``.git``) becomes ``worktree`` so parallel workers never
+    share a checkout; ``allow_shared=True`` keeps the shared ``dir``.
 
     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
@@ -1386,6 +1401,18 @@ def create_task(
         board_default = _board_meta_for(board).get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+
+    # A ``dir`` workspace on a git repo is a shared checkout: parallel workers
+    # collide in it. Default it to worktree isolation unless the caller opted
+    # into sharing explicitly (``--allow-shared``).
+    if workspace_kind == "dir" and not allow_shared:
+        repo_path = workspace_path or (
+            str(project_obj.primary_path) if project_obj is not None and project_obj.primary_path else None
+        )
+        if _is_repo_path(repo_path):
+            workspace_kind = "worktree"
+            if project_obj is not None and workspace_path is None:
+                project_repo = repo_path
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):

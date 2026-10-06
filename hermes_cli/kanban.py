@@ -398,6 +398,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                              if is_dispatcher_owned_worker_context() else None),
             scheduled_until=getattr(args, "until", None),
             scheduled_then=getattr(args, "then", None),
+            allow_shared=bool(getattr(args, "allow_shared", False)),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
