@@ -15,7 +15,8 @@ import pytest
 import cron.scheduler as sched
 from cron import quota_hold as qh
 from cron.jobs import (
-    _job_is_stale_error_recurring, create_job, get_due_jobs, get_job, mark_job_run, update_job,
+    _job_is_stale_error_recurring, compute_next_run, create_job, get_due_jobs, get_job,
+    mark_job_run, pause_job, update_job,
 )
 from hermes_cli.auth import CODEX_RATE_LIMITED_CODE, AuthError
 
@@ -73,7 +74,7 @@ def _tick(job, home, deliveries, resolve):
 
 def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_reach(tmp_cron_home):
     """A 30-minute job whose provider resolve raises the Codex quota AuthError ('retry after
-    123518s') is parked by the real scheduler tick: preflight lets the rate-limited AuthError
+    123518s', over the 24h cap) is parked for the cap by the real scheduler tick: preflight lets the rate-limited AuthError
     through (it is not a missing credential), the one delivered alert carries the hold notice,
     and the job does not fire again inside the window (not even after the stale-error re-arm's
     cadence+grace). The marker clears once a run reaches the model."""
@@ -85,10 +86,13 @@ def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_r
     _tick(get_job(job_id), tmp_cron_home, deliveries, _raise_quota)
     j = get_job(job_id)
     assert j["last_status"] == "error"
+    # 123518s is over MAX_HOLD_SECONDS, so this alert takes the capped wording; it must still say
+    # the job is held (the one alert on entering a hold).
     assert len(deliveries) == 1 and "This job is held" in deliveries[0], deliveries
     assert "provider credential missing" not in deliveries[0]
     parked = datetime.fromisoformat(j["next_run_at"])
-    assert parked - now >= timedelta(seconds=123518), "next_run_at must land past the window"
+    assert timedelta(seconds=qh.MAX_HOLD_SECONDS) <= parked - now < timedelta(seconds=123518), \
+        "next_run_at lands one capped hold out, not at the provider's full window"
     assert j[qh.STATE_KEY] == j["next_run_at"]
     assert "_quota_hold_seconds" not in j
 
@@ -113,3 +117,163 @@ def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_r
     j = update_job(job_id, {"schedule": "every 15m"})
     assert qh.STATE_KEY not in j
     assert datetime.fromisoformat(j["next_run_at"]) - now < timedelta(hours=1)
+
+
+MONTHLY = 2581776  # Codex monthly 429: "retry after 2581776s" (~29.9 days)
+FROZEN = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
+CAP = timedelta(seconds=qh.MAX_HOLD_SECONDS)
+SLACK = timedelta(seconds=qh.HOLD_SLACK_SECONDS)
+
+
+@pytest.fixture
+def frozen_now(monkeypatch):
+    """Pin the hold module's clock (plan_hold/hold_notice read ``qh._hermes_now``) so equality
+    assertions do not race the wall clock."""
+    monkeypatch.setattr(qh, "_hermes_now", lambda: FROZEN)
+    return FROZEN
+
+
+def _interval_job(minutes=15):
+    return {"id": "j1", "name": "probe", "schedule": {"kind": "interval", "minutes": minutes},
+            "next_run_at": (FROZEN + timedelta(minutes=minutes)).isoformat()}
+
+
+def test_monthly_window_parks_one_day_and_notices_the_reprobe(tmp_cron_home, frozen_now):
+    """The provider says closed for ~30 days; the job is parked for the cap, not the window, and
+    the alert says it re-probes instead of quoting the provider's 717h."""
+    job = _interval_job()
+    assert qh.plan_hold(job, MONTHLY)
+    parked = datetime.fromisoformat(job["next_run_at"])
+    assert parked == frozen_now + CAP + SLACK
+    assert job[qh.STATE_KEY] == job["next_run_at"]
+
+    notice = qh.hold_notice(job, MONTHLY)
+    assert "This job is held" in notice and "re-probes" in notice
+    assert f"{(qh.MAX_HOLD_SECONDS + qh.HOLD_SLACK_SECONDS) / 3600:.1f}h" in notice
+    assert f"{MONTHLY / 3600:.1f}h" not in notice
+    assert "no further alerts" not in notice.lower()  # day 2 alerts again; do not promise silence
+
+    # Stale-error re-arm (#62002) leaves the parked job alone up to the instant it becomes due,
+    # and the marker stops shielding it exactly then.
+    held = dict(job, last_status="error", last_run_at=(FROZEN - timedelta(hours=3)).isoformat())
+    just_before = parked - timedelta(seconds=1)
+    assert qh.hold_active(held, just_before)
+    assert not _job_is_stale_error_recurring(held, held["schedule"], just_before)
+    assert not qh.hold_active(held, parked + timedelta(seconds=1))
+
+
+def test_reprobe_on_a_still_closed_window_parks_again_with_its_own_alert(tmp_cron_home, frozen_now):
+    """Day 2: the capped hold ends, the job re-probes, the window is still closed. It parks
+    another cap and the alert fires again (one alert per hold, as the notice says)."""
+    job = _interval_job()
+    assert qh.plan_hold(job, MONTHLY)
+    first = job["next_run_at"]
+
+    day2 = FROZEN + CAP + SLACK
+    qh_now = lambda: day2  # noqa: E731
+    with patch.object(qh, "_hermes_now", qh_now):
+        job["next_run_at"] = (day2 + timedelta(minutes=15)).isoformat()  # _advance_after_run
+        assert qh.plan_hold(job, MONTHLY - qh.MAX_HOLD_SECONDS)
+        assert datetime.fromisoformat(job["next_run_at"]) == day2 + CAP + SLACK
+        assert job["next_run_at"] != first and job[qh.STATE_KEY] == job["next_run_at"]
+        assert "re-probes" in qh.hold_notice(job, MONTHLY - qh.MAX_HOLD_SECONDS)
+
+
+def test_cron_schedule_parks_at_first_legal_occurrence_after_the_cap(tmp_cron_home, frozen_now):
+    """For a cron expression the park is the first LEGAL occurrence after the capped window: up
+    to one cadence past the cap, never before it."""
+    job = {"id": "j2", "name": "daily", "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+           "next_run_at": (FROZEN + timedelta(hours=1)).isoformat()}
+    window_end = frozen_now + CAP + SLACK
+    assert qh.plan_hold(job, MONTHLY)
+    parked = datetime.fromisoformat(job["next_run_at"])
+    assert parked == datetime.fromisoformat(compute_next_run(job["schedule"], window_end.isoformat()))
+    assert window_end < parked <= window_end + timedelta(days=1)
+    assert "re-probes" in qh.hold_notice(job, MONTHLY)
+
+
+def test_job_the_cap_does_not_park_gets_no_hold_notice(tmp_cron_home, frozen_now):
+    """A sparse cron job whose natural next run is past the window is not parked, so the alert
+    must not claim a hold."""
+    job = {"id": "j3", "name": "yearly", "schedule": {"kind": "cron", "expr": "0 9 1 1 *"},
+           "next_run_at": "2099-01-01T09:00:00+00:00", qh.STATE_KEY: "stale"}
+    assert not qh.plan_hold(job, MONTHLY)
+    assert qh.STATE_KEY not in job
+    assert qh.hold_notice(job, MONTHLY) == ""
+
+
+def test_window_inside_the_cap_keeps_the_original_notice(tmp_cron_home, frozen_now):
+    job = _interval_job()
+    assert qh.plan_hold(job, 3600)
+    assert datetime.fromisoformat(job["next_run_at"]) == frozen_now + timedelta(seconds=3600) + SLACK
+    notice = qh.hold_notice(job, 3600)
+    assert "closed for about 1.0h" in notice and "no further alerts until then" in notice
+    assert "re-probes" not in notice
+
+
+def _held_job(**create_kw):
+    """A 15-minute job pinned to Codex, parked by a monthly 429 (real clock, loose bounds)."""
+    job = create_job("probe", "every 15m", deliver="local",
+                     provider="openai-codex", model="gpt-6.1-sol", **create_kw)
+    assert mark_job_run(job["id"], False, QUOTA_MSG, quota_hold_seconds=MONTHLY)
+    held = get_job(job["id"])
+    assert qh.STATE_KEY in held
+    return held
+
+
+def _minutes_out(job_id):
+    return (datetime.fromisoformat(get_job(job_id)["next_run_at"]) - datetime.now(timezone.utc)
+            ).total_seconds() / 60
+
+
+@pytest.mark.parametrize("edit", [
+    {"model": "claude-sonnet-5-5", "provider": "anthropic"},
+    {"model": "gpt-6.2-sol"},
+    {"provider": "anthropic"},
+    {"pinned": False},
+    {"base_url": "https://llm.example.invalid/v1"},
+], ids=["model+provider", "model-only", "provider-only", "unpin", "base_url"])
+def test_repointing_a_held_job_clears_the_hold_and_reanchors(tmp_cron_home, edit):
+    held = _held_job()
+    assert _minutes_out(held["id"]) > 23 * 60
+    updated = update_job(held["id"], dict(edit))
+    assert qh.STATE_KEY not in updated
+    assert 0 < _minutes_out(held["id"]) < 16, "next_run_at follows the 15m schedule again"
+
+
+@pytest.mark.parametrize("edit", [
+    {"name": "renamed"},
+    {"prompt": "something else"},
+    {"model": "gpt-6.1-sol", "provider": "openai-codex"},   # restates the current route
+    {"pinned": True},                                       # already pinned: nothing changes
+], ids=["rename", "prompt", "restated-route", "pin-already-pinned"])
+def test_edits_that_do_not_change_the_route_keep_the_hold(tmp_cron_home, edit):
+    held = _held_job()
+    updated = update_job(held["id"], dict(edit))
+    assert updated[qh.STATE_KEY] == held[qh.STATE_KEY]
+    assert get_job(held["id"])["next_run_at"] == held["next_run_at"]
+
+
+def test_repointing_a_paused_held_job_clears_the_marker_but_does_not_reanchor(tmp_cron_home):
+    held = _held_job()
+    pause_job(held["id"])
+    updated = update_job(held["id"], {"model": "claude-sonnet-5-5", "provider": "anthropic"})
+    assert qh.STATE_KEY not in updated
+    assert updated["state"] == "paused"
+    assert updated["next_run_at"] == held["next_run_at"]
+
+
+def test_repointing_an_unheld_job_keeps_its_next_run(tmp_cron_home):
+    job = create_job("probe", "every 15m", deliver="local",
+                     provider="openai-codex", model="gpt-6.1-sol")
+    before = get_job(job["id"])["next_run_at"]
+    update_job(job["id"], {"model": "claude-sonnet-5-5", "provider": "anthropic"})
+    assert get_job(job["id"])["next_run_at"] == before
+
+
+def test_reanchoring_a_repointed_job_drops_a_stale_pending_slot(tmp_cron_home):
+    held = _held_job()
+    update_job(held["id"], {"pending_slot": {"instant": held["next_run_at"]}})
+    assert get_job(held["id"]).get("pending_slot")
+    update_job(held["id"], {"provider": "anthropic"})
+    assert "pending_slot" not in get_job(held["id"])

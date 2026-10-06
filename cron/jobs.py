@@ -1974,8 +1974,25 @@ def _apply_schedule_update(updated: Dict[str, Any], updates: Dict[str, Any], job
     updated["schedule_display"] = updates.get(
         "schedule_display", updated_schedule.get("display", updated.get("schedule_display")))
     if updated.get("state") != "paused":
-        updated["next_run_at"] = _next_run_or_reject_past_oneshot(
-            updated_schedule, updated.get("name", job_id), updated_schedule, "update ")
+        _reanchor_next_run(updated, job_id)
+
+
+def _reanchor_next_run(updated: Dict[str, Any], job_id: str) -> None:
+    """Recompute ``next_run_at`` of the (already schedule-normalized) record from its schedule."""
+    schedule = updated["schedule"]
+    updated["next_run_at"] = _next_run_or_reject_past_oneshot(
+        schedule, updated.get("name", job_id), schedule, "update ")
+
+
+def _route_key(job: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """What a job's run is sent to: ``(provider, model, base_url)``, normalized, ``None`` = unset.
+    A provider quota window (``cron/quota_hold.py``) was measured against this route."""
+    provider = _normalize_job_optional_text(job.get("provider"))
+    return (
+        provider.lower() if provider else None,
+        _normalize_job_optional_text(job.get("model")),
+        _normalize_base_url(job.get("base_url")),
+    )
 
 
 def _fill_missing_next_run(updated: Dict[str, Any]) -> None:
@@ -2018,14 +2035,31 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 _normalize_job_optional_text(updated.get("script")))
         if any(k in updates for k in _PAYLOAD_FIELDS) and job_payload_is_empty(updated):
             raise ValueError(EMPTY_PAYLOAD_ERROR)
+        from cron.quota_hold import clear_state as _clear_quota_hold, hold_active
+        # A provider quota hold was measured against the route the job ran on. Sending the job to
+        # another provider/model/endpoint (including ``pinned`` flips, which rewrite provider+model)
+        # invalidates it: compare the stored route, not the update keys, so a no-op edit that
+        # restates the current model keeps the hold (#133454).
+        repointed = _route_key(job) != _route_key(updated)
+        reanchored = False
         if "schedule" in updates:
             _apply_schedule_update(updated, updates, job_id)
             # next_run_at now follows the new schedule; a stale quota_hold_until would only shield
             # the record from the stale-error re-arm while no longer describing where it is
             # parked. The next fire re-parks (with a fresh notice) if the window is still closed.
-            from cron.quota_hold import clear_state as _clear_quota_hold
             _clear_quota_hold(updated)
-        if {"schedule", "next_run_at", "enabled", "state"}.intersection(updates):
+        elif repointed:
+            # Same invalidation without a schedule edit. Only a job that was actually parked is
+            # pulled back to its schedule: an unheld job's next_run_at is a real cadence slot that
+            # a model switch must not push out. A paused job has no fire to re-anchor. An edit
+            # racing an in-flight run is not covered: that run's own mark_job_run parks it again
+            # from the old provider's window (bounded by MAX_HOLD_SECONDS).
+            held = hold_active(job)
+            _clear_quota_hold(updated)
+            if held and updated.get("state") != "paused":
+                _reanchor_next_run(updated, job_id)
+                reanchored = True
+        if reanchored or {"schedule", "next_run_at", "enabled", "state"}.intersection(updates):
             # An explicit schedule/lifecycle rewrite supersedes any occurrence the dispatcher
             # left unclaimed — pause/resume/edit must not resurrect a slot from before the edit.
             updated.pop("pending_slot", None)
