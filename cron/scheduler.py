@@ -2831,7 +2831,7 @@ def _compose_run_delivery(
             from cron.quota_hold import hold_notice
             deliver_content = (
                 _summarize_cron_failure_for_delivery(job, error) + _failure_streak_nudge(job)
-                # The one alert on entering a provider-window hold says so (#89376).
+                # The failure alert on entering a provider-window hold says so (#89376).
                 + hold_notice(job, job.get("_quota_hold_seconds"))
             )
     return deliver_content, blocked_config, blocked_config_silent, incident_acked, failure_incident_id

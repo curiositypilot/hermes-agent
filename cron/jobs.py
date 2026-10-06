@@ -2428,6 +2428,17 @@ def _advance_after_run(job: Dict[str, Any], now: str) -> None:
         _complete_job_record(job)  # one-shot: terminal completion
 
 
+def terminal_after_run(job: Dict[str, Any]) -> bool:
+    """Whether recording one more run retires *job* (repeat limit reached, or no next run could be
+    computed). Runs the real ``_advance_after_run`` on a copy, so it uses the same logic as
+    ``mark_job_run`` (on a delivery-time copy and clock; ``mark_job_run`` re-reads the stored
+    record later); the stored record is untouched. Lets the failure alert avoid
+    promising a hold ``mark_job_run`` will not make (``cron.quota_hold.hold_notice``)."""
+    probe = copy.deepcopy(job)
+    _advance_after_run(probe, _hermes_now().isoformat())
+    return is_terminal_job(probe)
+
+
 def mark_job_run(
     job_id: str,
     success: bool,
