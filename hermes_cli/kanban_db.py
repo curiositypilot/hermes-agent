@@ -2076,6 +2076,11 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
+    if metadata and metadata.get("worker_session_id"):
+        # Per-run cost: copy the worker session's token usage onto the run.
+        from hermes_cli.kanban_run_usage import with_run_usage
+        prow = conn.execute("SELECT profile FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        metadata = with_run_usage(prow["profile"] if prow else None, metadata)
     conn.execute(
         """
         UPDATE task_runs
