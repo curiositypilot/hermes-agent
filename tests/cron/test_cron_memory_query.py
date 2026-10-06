@@ -113,6 +113,22 @@ def test_per_fire_extra_prompt_joins_the_query(cron_env, monkeypatch):
     assert seen["kwargs"]["memory_query"] == f"{_JOB_PROMPT}\n\nfocus on the Revolut account"
 
 
+def test_job_memory_query_overrides_prompt(cron_env, monkeypatch):
+    home, scheduler = cron_env
+    rule_query = "MB decided who makes technical decisions"
+    job = {"id": "j4", "name": "orchestrator", "prompt": _JOB_PROMPT, "memory_query": rule_query}
+    seen = _run_capturing(monkeypatch, scheduler, home, job)
+    assert seen["kwargs"]["memory_query"] == rule_query
+    assert seen["prompt"].rstrip().endswith(_JOB_PROMPT)
+
+    from cron.scheduler_prompt import _cron_memory_query
+
+    assert _cron_memory_query(job, "focus on blocked cards") == \
+        f"{rule_query}\n\nfocus on blocked cards"
+    for blank in ("", "   \n", None):
+        assert _cron_memory_query({**job, "memory_query": blank}) == _JOB_PROMPT
+
+
 def test_skill_only_job_falls_back_to_name_and_skills():
     from cron.scheduler_prompt import _cron_memory_query
 
