@@ -56,8 +56,16 @@ def _cron_memory_query(job: dict, extra_prompt: Optional[str] = None) -> str:
     memory providers truncate their query (Hindsight: ``recall_max_input_chars``), so a
     no-skill job used to recall against the hint alone. Script output, monitor data,
     ``context_from`` and the notepad are runtime data, not the topic, and stay out.
-    A job with no prompt (skill-only) falls back to its name + skill names."""
-    query = str(job.get("prompt") or "").strip()
+    A job with no prompt (skill-only) falls back to its name + skill names.
+
+    A non-blank string ``memory_query`` on the job replaces the prompt as the base query
+    (``extra_prompt`` is still appended): a job whose prompt is a fixed procedure, not a
+    topic, would otherwise recall on its own procedure text every run."""
+    override = job.get("memory_query")
+    if isinstance(override, str) and override.strip():
+        query = override.strip()
+    else:
+        query = str(job.get("prompt") or "").strip()
     if extra_prompt and str(extra_prompt).strip():
         query = f"{query}\n\n{str(extra_prompt).strip()}".strip()
     if query:
