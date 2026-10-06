@@ -56,6 +56,18 @@ After publishing, pass `metadata.published_pr` to completion. The first matching
 URL binds the card permanently; retries cannot substitute a green sibling PR.
 CLI `show --json` and `kanban_show` expose the persisted contract.
 
+## Test completion contracts
+
+`--completion-contract "test:<command>"` gates `done` and `review` on a local
+command: on `kanban_complete` / `kanban_request_review` (and the CLI twins) the
+command runs in the task's workspace, and a non-zero exit refuses the
+transition, keeps the task in flight and returns the last 40 output lines. The
+receipt (command, cwd, exit code, tail) lands in run metadata `tests` and a
+`test_gate` event. A `dir:`/`worktree:` task created without a contract gets
+`test:<cmd>` from its repo when one resolves, in order: first line of
+`.hermes-test`, a Makefile `test` target, pytest config in `pyproject.toml`, a
+`package.json` `test` script. Otherwise it stays `local-only`.
+
 The shared `complete_task` boundary covers worker tools, CLI, review approval and
 dashboard completion. It reads classic branch protection and active ruleset
 required contexts, paginates exact-head check runs and legacy statuses, then

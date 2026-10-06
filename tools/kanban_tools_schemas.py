@@ -466,7 +466,9 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "cards one shot rarely finishes. Default false."
         )),
         "completion_contract": _prop("string", (
-            "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
+            "Declare at creation: local-only, test:<command> (the command must exit 0 in the task workspace "
+            "before complete/review; a dir/worktree workspace defaults to the repo's own test command when one "
+            "resolves), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
         )),
         "goal_max_turns": _prop("integer", (

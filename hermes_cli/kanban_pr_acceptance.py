@@ -17,8 +17,14 @@ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([
 def validate_contract(value: str | None) -> str:
     if value is None or value == "local-only":
         return "local-only"
+    if isinstance(value, str) and value.startswith("test:"):
+        command = value[len("test:"):].strip()
+        if not command or "\n" in command or "\x00" in command:
+            raise ValueError("completion_contract test:<command> needs a non-empty single-line command")
+        return "test:" + command
     if not isinstance(value, str) or not (_REPO.fullmatch(value) or _PR.fullmatch(value)):
-        raise ValueError("completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
+        raise ValueError("completion_contract must be local-only, test:<command>, OWNER/REPO, "
+                         "or an exact GitHub PR URL")
     return value
 
 
