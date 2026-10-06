@@ -1140,6 +1140,81 @@ _MISSING_DEPS_SCRIPT = (
     "    except md.PackageNotFoundError: missing.append(name)\n"
     "print('\\n'.join(missing))\n")
 
+_DEP_VERSIONS_SCRIPT = (
+    "import importlib.metadata as md, sys\n"
+    "for name in sys.argv[1:]:\n"
+    "    try: print(name + '\\t' + md.version(name))\n"
+    "    except md.PackageNotFoundError: pass\n")
+
+
+def _declared_base_dependencies() -> tuple[list[str], list[str]] | None:
+    """``(raw specs, marker-applicable names)`` of pyproject's base deps; ``None`` when unreadable."""
+    project = _pyproject_project("dep verification: failed to read pyproject.toml: %s")
+    if project is None:
+        return None
+    raw_deps = project.get("dependencies", []) or []
+    return raw_deps, _applicable_dependency_names(raw_deps)
+
+
+# A probe that could not run: interpreter missing/unlaunchable, or the script exited non-zero.
+DEP_PROBE_ERRORS = (OSError, subprocess.SubprocessError)
+
+
+def _run_dep_probe(venv_python: Path, script: str, names: list[str], env: dict[str, str] | None) -> list[str]:
+    """Run *script* over *names* in *venv_python*; non-blank stdout lines. Raises a
+    ``DEP_PROBE_ERRORS`` member (``CalledProcessError`` carries the probe's stderr) when it cannot answer."""
+    result = _venv_probe(venv_python, script, *names, env=env)
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, [str(venv_python), "-c", "<dep probe>"], result.stdout, result.stderr)
+    return _nonblank_lines(result.stdout or "")
+
+
+def missing_core_dependencies(venv_python: Path, *, env: dict[str, str] | None = None) -> list[str]:
+    """Declared pyproject base deps (markers applied) with no installed distribution in
+    *venv_python*'s environment; ``[]`` when there is no readable pyproject. A probe that cannot
+    run raises a ``DEP_PROBE_ERRORS`` member: an unknown state is not reported as healthy."""
+    declared = _declared_base_dependencies()
+    if declared is None or not declared[1]:
+        return []
+    return _run_dep_probe(venv_python, _MISSING_DEPS_SCRIPT, declared[1], env)
+
+
+def drifted_core_dependencies(
+    venv_python: Path, *, env: dict[str, str] | None = None) -> list[tuple[str, str, str]]:
+    """``(name, installed version, declared spec)`` for installed base deps whose version falls
+    outside the pyproject specifier. Missing deps are not listed (see :func:`missing_core_dependencies`).
+    Raises like :func:`missing_core_dependencies` when the probe cannot run."""
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.version import InvalidVersion, Version
+    declared = _declared_base_dependencies()
+    if declared is None or not declared[1]:
+        return []
+    raw_deps, applicable = declared
+    installed: dict[str, str] = {}
+    for line in _run_dep_probe(venv_python, _DEP_VERSIONS_SCRIPT, applicable, env):
+        name, _, version = line.partition("\t")
+        if version:
+            installed[name] = version
+    drifted: list[tuple[str, str, str]] = []
+    for spec in raw_deps:
+        try:
+            req = Requirement(spec)
+        except InvalidRequirement as e:
+            logger.warning("dep drift: unparseable pyproject requirement %r: %s", spec, e)
+            continue
+        version = installed.get(req.name)
+        if version is None or not req.specifier:
+            continue
+        try:
+            ok = req.specifier.contains(Version(version), prereleases=True)
+        except InvalidVersion as e:
+            logger.warning("dep drift: %s has unparseable installed version %r: %s", req.name, version, e)
+            continue
+        if not ok:
+            drifted.append((req.name, version, spec.split(";", 1)[0].strip()))
+    return drifted
+
 
 def _verify_core_dependencies_installed(
     install_cmd_prefix: list[str], *, env: dict[str, str] | None = None, group: str = "all"
@@ -1152,11 +1227,10 @@ def _verify_core_dependencies_installed(
     install. The final state is a warning, not a hard failure, so one broken-on-PyPI dep can't
     block an otherwise-successful update — but the partial install is visible where it happened.
     """
-    project = _pyproject_project("dep verification: failed to read pyproject.toml: %s")
-    if project is None:
+    declared = _declared_base_dependencies()
+    if declared is None:
         return
-    raw_deps = project.get("dependencies", []) or []
-    applicable = _applicable_dependency_names(raw_deps)
+    raw_deps, applicable = declared
     if not applicable:
         return
     # Probe inside the venv Python — sys.executable may be the outer Python that drove
@@ -1167,11 +1241,10 @@ def _verify_core_dependencies_installed(
 
     def _missing_deps() -> list[str]:
         try:
-            result = _venv_probe(venv_python, _MISSING_DEPS_SCRIPT, *applicable, env=env)
-        except Exception as e:
-            logger.debug("dep verification: subprocess failed: %s", e)
+            return _run_dep_probe(venv_python, _MISSING_DEPS_SCRIPT, applicable, env)
+        except DEP_PROBE_ERRORS as e:
+            logger.warning("dep verification: probe failed, skipping: %s", e)
             return []
-        return _nonblank_lines(result.stdout)
 
     missing = _missing_deps()
     if not missing:

@@ -508,6 +508,48 @@ def _check_required_packages(should_fix: bool, f: Finding) -> None:
                 _fail_and_issue(name, "(missing)", f"Install {name}: {_python_install_cmd()} {module}", f.issues)
 
 
+def _doctor_venv_python() -> Path:
+    """Interpreter whose environment Hermes runs in: the project venv when present, else this one."""
+    from hermes_cli.doctor import PROJECT_ROOT
+    from hermes_constants import project_venv_dir, venv_python_path
+    venv_dir = project_venv_dir(PROJECT_ROOT)
+    if venv_dir is not None:
+        candidate = venv_python_path(venv_dir, windows=sys.platform == "win32")
+        if candidate.exists():
+            return candidate
+    return Path(sys.executable)
+
+
+@doctor_check("Declared core dependencies", "(could not check: {e})")
+def _check_declared_dependencies(should_fix: bool, f: Finding) -> None:
+    """Every pyproject base dep is installed (issue) and within its specifier (warning).
+
+    The import sample in ``_check_required_packages`` misses a pin that never landed — an editable
+    reinstall with ``--no-deps`` left ``snowballstemmer`` out and tool_search silently off for weeks."""
+    from hermes_cli.doctor import PROJECT_ROOT
+    from hermes_cli.main_install_repair import drifted_core_dependencies, missing_core_dependencies
+    venv_python = _doctor_venv_python()
+    missing = missing_core_dependencies(venv_python)
+    if missing and should_fix:
+        from hermes_cli.main_install_repair import _default_venv_install_target, _verify_core_dependencies_installed
+        prefix, env = _default_venv_install_target()
+        _verify_core_dependencies_installed(prefix, env=env)
+        still = missing_core_dependencies(venv_python)
+        if len(still) < len(missing):
+            f.fixed += 1
+        missing = still
+    install_cmd = (f"{_python_install_cmd()} -e '{PROJECT_ROOT}'" if _is_termux()
+                   else f"cd {PROJECT_ROOT} && uv pip install --python {venv_python} -e .")
+    if missing:
+        _fail_and_issue("Declared core dependencies", f"(missing: {', '.join(missing)})",
+                        f"Install missing core deps ({', '.join(missing)}): {install_cmd}", f.issues)
+    drifted = drifted_core_dependencies(venv_python)
+    for name, installed, spec in drifted:
+        check_warn(f"{name} {installed}", f"(pyproject wants {spec}; fix: {install_cmd})")
+    if not missing and not drifted:
+        check_ok("Declared core dependencies", "(all installed)")
+
+
 @doctor_check()
 def _check_gateway_supervision(should_fix: bool, f: Finding) -> None:
     _check_gateway_service_linger(f.issues)

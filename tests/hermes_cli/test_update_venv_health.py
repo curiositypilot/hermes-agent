@@ -299,3 +299,97 @@ def test_current_checkout_with_stale_dependency_set_runs_the_sync(monkeypatch, c
     assert "never synced after the last pull" in capsys.readouterr().out
     assert run((False, "")) is True
     assert calls == ["sync", "✓ Already up to date!"]
+
+
+# ---------------------------------------------------------------------------
+# A declared base pin that never landed (2026-10 snowballstemmer / tool_search incident)
+# ---------------------------------------------------------------------------
+
+
+def _healthy_import_probe(cmd, **kwargs):
+    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+def test_missing_declared_dep_marks_venv_unhealthy(tmp_path):
+    """Replays 2026-10-01: version equal, core imports fine, one base pin absent. The old probe
+    reported healthy and ``hermes update`` printed "Already up to date!" over the gap."""
+    from hermes_cli import main_install_repair, update_cmd_deps
+
+    venv_python = _fake_venv_python(tmp_path)
+    asked = []
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(cli_main, "_is_windows", return_value=False), \
+            patch.object(update_cmd_deps.subprocess, "run", _healthy_import_probe), \
+            patch.object(main_install_repair, "missing_core_dependencies",
+                         lambda py, **kw: asked.append(py) or ["snowballstemmer"]):
+        healthy, detail = update_cmd._venv_core_imports_healthy()
+    assert healthy is False
+    assert "snowballstemmer" in detail
+    assert asked == [venv_python]  # probed in the venv's own interpreter
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(cli_main, "_is_windows", return_value=False), \
+            patch.object(update_cmd_deps.subprocess, "run", _healthy_import_probe), \
+            patch.object(main_install_repair, "missing_core_dependencies", lambda py, **kw: []):
+        assert update_cmd._venv_core_imports_healthy() == (True, "")
+
+
+def test_current_checkout_with_missing_declared_dep_runs_the_repair(monkeypatch, tmp_path, capsys):
+    """End to end through the commit_count == 0 path with the real health probe: the missing pin
+    now reaches the repair instead of ``✓ Already up to date!``."""
+    from hermes_cli import main as hm, main_install_repair, update_cmd_deps
+
+    _fake_venv_python(tmp_path)
+    calls = []
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_is_windows", lambda: False)
+    monkeypatch.delenv(hm._UPDATE_REEXEC_ENV, raising=False)
+    monkeypatch.setattr(update_cmd_deps.subprocess, "run", _healthy_import_probe)
+    monkeypatch.setattr(main_install_repair, "missing_core_dependencies", lambda py, **kw: ["snowballstemmer"])
+    monkeypatch.setattr(update_cmd, "_venv_dependency_set_stale", lambda: (False, ""))
+    monkeypatch.setattr("hermes_cli.managed_uv.update_managed_uv", lambda **kwargs: None)
+    monkeypatch.setattr("hermes_cli.managed_uv.ensure_uv", lambda **kwargs: "uv")
+    monkeypatch.setattr(update_cmd, "_repair_venv_on_current_checkout",
+                        lambda **kwargs: calls.append("repair") or True)
+    monkeypatch.setattr(update_cmd, "_repair_node_deps_on_current_checkout",
+                        lambda *a, **kwargs: calls.append(kwargs["completion_message"]) or True)
+    assert update_cmd._repair_current_checkout(
+        assume_yes=True, gateway_mode=False, pre_update_snapshot_id=None,
+        had_desktop_app_before_update=False, active_lazy_features=[], active_tool_dependencies=[],
+        upstream_checked=True, _windows_gateway_resume=None) is True
+    assert calls == ["repair"]
+    out = capsys.readouterr().out
+    assert "venv is unhealthy" in out and "snowballstemmer" in out
+
+
+def test_declared_dep_helpers_probe_the_real_interpreter(tmp_path, monkeypatch):
+    """Real subprocess probe against this interpreter: an absent pin is missing, an installed
+    dep outside its specifier is drift, a marker that does not apply here is ignored."""
+    from hermes_cli import main_install_repair
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "fake"\nversion = "0"\ndependencies = [\n'
+        '  "hermes-definitely-absent-pkg==1.0",\n'
+        '  "pytest<1",\n'
+        '  "packaging>=1",\n'
+        '  "other-absent-pkg==2; sys_platform == \'never\'",\n]\n', encoding="utf-8")
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", tmp_path)
+    py = __import__("pathlib").Path(sys.executable)
+    assert main_install_repair.missing_core_dependencies(py) == ["hermes-definitely-absent-pkg"]
+    drift = main_install_repair.drifted_core_dependencies(py)
+    assert [(name, spec) for name, _, spec in drift] == [("pytest", "pytest<1")]
+
+
+def test_declared_dep_probe_failure_is_raised_not_reported_healthy(tmp_path, monkeypatch):
+    """An interpreter that cannot answer is an unknown state: the helper raises a
+    ``DEP_PROBE_ERRORS`` member instead of returning "nothing missing"."""
+    from hermes_cli import main_install_repair
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "fake"\nversion = "0"\ndependencies = ["packaging>=1"]\n', encoding="utf-8")
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", tmp_path)
+    with pytest.raises(main_install_repair.DEP_PROBE_ERRORS):
+        main_install_repair.missing_core_dependencies(tmp_path / "no-such-python")
+    failing = SimpleNamespace(returncode=1, stdout="", stderr="Traceback: boom")
+    monkeypatch.setattr(main_install_repair, "_venv_probe", lambda *a, **kw: failing)
+    with pytest.raises(subprocess.CalledProcessError) as exc:
+        main_install_repair.drifted_core_dependencies(__import__("pathlib").Path(sys.executable))
+    assert exc.value.stderr == "Traceback: boom"

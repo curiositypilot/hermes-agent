@@ -545,10 +545,30 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
                       f"tool_search/describe/call — "
                       f"{_TOOL_SEARCH_LISTING_FORMS.get(assembly.listing_form, assembly.listing_form)}.")
             filtered_tools = assembly.tool_defs
+    except ImportError as e:  # never break tool loading, but a missing module is a broken install
+        _log_tool_search_import_error(e)
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 
     return filtered_tools
+
+
+_tool_search_import_error_logged = False
+
+
+def _log_tool_search_import_error(exc: ImportError) -> None:
+    """ERROR once per process: a missing module disables tool_search on every call, and a
+    per-call WARNING went unnoticed for weeks (snowballstemmer, 2026-09/10)."""
+    global _tool_search_import_error_logged
+    if _tool_search_import_error_logged:
+        logger.debug("Tool search assembly skipped (import error, already reported): %s", exc)
+        return
+    _tool_search_import_error_logged = True
+    module = getattr(exc, "name", None) or "a required module"
+    logger.error(
+        "Tool search disabled: %s is not installed (%s). Every tool schema is sent on every call. "
+        "Fix: run `hermes doctor --fix`, or `uv pip install -e .` in the hermes-agent checkout "
+        "(not --no-deps).", module, exc)
 
 
 def _active_model_config() -> Tuple[str, Dict[str, Any]]:
