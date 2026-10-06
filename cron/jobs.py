@@ -1584,6 +1584,28 @@ def _main_model_pin() -> Tuple[Optional[str], Optional[str]]:
     return (provider.lower() if provider else None), model
 
 
+def _cron_default_route() -> Tuple[Optional[str], Optional[str]]:
+    """``(provider, model)`` an UNPINNED job fires on, as the scheduler resolves it
+    (``cron/scheduler.py::_load_cron_job_config``): the main model (``_main_model_pin``), with
+    ``cron.model`` / ``cron.model_provider`` replacing the model / provider when set. Used by the
+    quota-hold route compare; ``pinned=True`` keeps ``_main_model_pin`` (a pin locks the main
+    agent model by contract)."""
+    from hermes_cli.config_effective import load_user_config_effective
+
+    provider, model = _main_model_pin()
+    cfg_path = get_hermes_home() / "config.yaml"
+    cfg = load_user_config_effective(cfg_path) if cfg_path.exists() else {}
+    cron_cfg = cfg.get("cron") or {}
+    if isinstance(cron_cfg, dict):
+        cron_model = _normalize_job_optional_text(cron_cfg.get("model"))
+        cron_provider = _normalize_job_optional_text(cron_cfg.get("model_provider"))
+        if cron_model:
+            model = cron_model
+        if cron_provider:
+            provider = cron_provider.lower()
+    return provider, model
+
+
 def _normalize_job_optional_text(
     value: Any, *, strip_trailing_slash: bool = False
 ) -> Optional[str]:
@@ -1989,9 +2011,9 @@ def _route_key(
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """The effective route a job's run is sent to: ``(provider, model, base_url)``, normalized.
     A provider quota window (``cron/quota_hold.py``) was measured against this route. An unset
-    provider/model means "follow the main model at fire time", so when *main* (``_main_model_pin()``)
-    is given they resolve to it; without it they stay ``None`` (the stored pin). ``base_url`` is
-    always as stored."""
+    provider/model means "the cron default route at fire time" (see ``_cron_default_route``), so
+    when *main* (that route) is given they resolve to it; without it they stay ``None`` (the stored
+    pin). ``base_url`` is always as stored."""
     provider = _normalize_job_optional_text(job.get("provider"))
     model = _normalize_job_optional_text(job.get("model"))
     if main is not None:
@@ -2015,9 +2037,10 @@ def _job_repointed(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
     if None not in stored_before[:2] + stored_after[:2]:
         return True
     try:
-        main = _main_model_pin()
+        main = _cron_default_route()
     except Exception:
-        logger.debug("cron route compare: main model unavailable, using stored pin", exc_info=True)
+        logger.debug("cron route compare: cron default route unavailable, using stored pin",
+                     exc_info=True)
         return True
     return _route_key(before, main) != _route_key(after, main)
 

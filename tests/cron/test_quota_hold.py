@@ -251,11 +251,53 @@ def test_unpinning_a_job_pinned_off_the_main_route_clears_the_hold_and_reanchors
     """Unpin means "follow the main model": a repoint only when the main model is somewhere else."""
     held = _held_job()
     _main_runs_on(monkeypatch, "anthropic", "claude-sonnet-5-5")
-    from cron.jobs import _main_model_pin
-    assert _main_model_pin()[0] != held["provider"], "the effective provider really changes"
     updated = update_job(held["id"], {"pinned": False})
     assert qh.STATE_KEY not in updated
     assert 0 < _minutes_out(held["id"]) < 16
+
+
+def _write_cron_model_config(home, *, cron_model=True):
+    """config.yaml whose main model IS the held job's pin (gpt-6.1-sol) while ``cron.model`` /
+    ``cron.model_provider`` send unpinned jobs elsewhere (when *cron_model*)."""
+    import yaml
+
+    cfg = {"model": {"default": "gpt-6.1-sol"}}
+    if cron_model:
+        cfg["cron"] = {"model": "other-model", "model_provider": "other"}
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+
+
+def _resolve_to_codex(**_kw):
+    return {"provider": "openai-codex"}
+
+
+def test_unpin_under_cron_model_default_clears_the_hold(tmp_cron_home, monkeypatch):
+    """Pinned to the main model, but ``cron.model`` sends unpinned jobs elsewhere: unpin IS a
+    repoint (the scheduler fires on cron.model), so the hold clears and the job re-anchors."""
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    _write_cron_model_config(tmp_cron_home)
+    held = _held_job()
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=_resolve_to_codex):
+        updated = update_job(held["id"], {"pinned": False})
+    assert updated["provider"] is None and updated["model"] is None
+    assert qh.STATE_KEY not in updated
+    assert 0 < _minutes_out(held["id"]) < 16
+
+
+def test_cron_default_route_matches_scheduler_model(tmp_cron_home, monkeypatch):
+    """The route compare resolves an unpinned job to the model the scheduler will really run."""
+    from cron.jobs import _cron_default_route
+
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=_resolve_to_codex):
+        _write_cron_model_config(tmp_cron_home)
+        provider, model = _cron_default_route()
+        assert model == sched._load_cron_job_config({}, "j", "j").model == "other-model"
+        assert provider == sched._load_cron_job_config({}, "j", "j").cron_default_provider
+
+        _write_cron_model_config(tmp_cron_home, cron_model=False)
+        assert _cron_default_route()[1] == sched._load_cron_job_config({}, "j", "j").model \
+            == "gpt-6.1-sol"
 
 
 def test_unpinning_a_job_pinned_to_the_main_route_keeps_the_hold(tmp_cron_home, monkeypatch):
