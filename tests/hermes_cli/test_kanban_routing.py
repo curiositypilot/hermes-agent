@@ -251,6 +251,34 @@ def test_decide_precedence_and_walk(conn, monkeypatch):
     assert unl.source == "profile" and unl.note == "unlabeled"
 
 
+def test_pinned_unavailable_holds(conn, monkeypatch):
+    _pool(monkeypatch, {"p": "credential pool exhausted"})
+    for cfg in (_cfg(), _cfg(on_exhausted="profile")):
+        d = kr.RoutingContext(conn, cfg).decide(_task(model_override="x", provider_override="p", complexity="S"))
+        assert d.source == "exhausted" and d.retry_at and not d.applies_model
+        assert d.skipped == [{"model": "x", "provider": "p", "reason": "credential pool exhausted"}]
+        assert d.label() == "pinned p:x: unavailable (credential pool exhausted)"
+    ok = kr.RoutingContext(conn, _cfg()).decide(_task(model_override="x", provider_override="q"))
+    assert ok.source == "pinned" and ok.label() == "pinned -> q:x"
+
+
+def test_dispatch_holds_pinned_on_unavailable_provider(conn, monkeypatch, all_assignees_spawnable):
+    _use_routing(monkeypatch)
+    _pool(monkeypatch, {"prov-z": "credential pool exhausted"})
+    seen, spawn = _spawns(monkeypatch)
+    tid = kb.create_task(conn, title="p", assignee="w", model_override="mine", provider_override="prov-z")
+
+    for _ in range(2):
+        res = kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert (tid, "tier_exhausted") in res.respawn_guarded
+
+    assert seen == []
+    task = kb.get_task(conn, tid)
+    assert task.status == "ready" and task.consecutive_failures == 0
+    holds = [e for e in kb.list_events(conn, tid) if e.kind == "routing_held"]
+    assert len(holds) == 1 and holds[0].payload["retry_at"]
+
+
 def test_decide_escalates_then_waits_or_falls_back(conn, monkeypatch):
     _pool(monkeypatch, {"prov-a": "x", "prov-b": "x"})
     d = kr.RoutingContext(conn, _cfg()).decide(_task(complexity="S"))

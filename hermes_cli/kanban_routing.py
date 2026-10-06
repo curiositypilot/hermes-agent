@@ -73,6 +73,7 @@ TIER_ORDER = ("S", "M", "L")
 DEFAULT_COOLDOWN_SECONDS = 900
 VALID_UNLABELED = ("profile", *TIER_ORDER)
 VALID_ON_EXHAUSTED = ("wait", "profile")
+PINNED_UNAVAILABLE_NOTE = "pinned candidate unavailable"
 
 
 # --- Config ---------------------------------------------------------------
@@ -447,6 +448,9 @@ class RouteDecision:
         if self.source == "tier" and self.candidate:
             esc = f" (escalated from {self.requested_tier})" if self.tier != self.requested_tier else ""
             return f"tier {self.tier}{esc} -> {self.candidate.label}"
+        if self.source == "exhausted" and self.note == PINNED_UNAVAILABLE_NOTE and self.candidate:
+            reason = self.skipped[-1].get("reason") if self.skipped else None
+            return f"pinned {self.candidate.label}: unavailable ({reason or 'unknown'})"
         if self.source == "exhausted":
             return f"tier {self.requested_tier}: no candidate available"
         if self.source == "pinned":
@@ -824,8 +828,17 @@ class RoutingContext:
 
     def decide(self, task: Any, profile_home: Optional[str] = None) -> RouteDecision:
         if getattr(task, "model_override", None):
-            return self._gate_fixed(task, RouteDecision(
-                "pinned", candidate=TierCandidate(task.model_override, getattr(task, "provider_override", None))))
+            cand = TierCandidate(task.model_override, getattr(task, "provider_override", None))
+            gated = self._gate_fixed(task, RouteDecision("pinned", candidate=cand))
+            if gated.source != "pinned":
+                return gated
+            # A pin is an explicit choice: never walk tiers or fall to the profile
+            # (its fallback_providers would run the card elsewhere) — hold it.
+            avail = self.availability(cand, profile_home)
+            if avail.available:
+                return gated
+            return RouteDecision("exhausted", candidate=cand, retry_at=avail.until, note=PINNED_UNAVAILABLE_NOTE,
+                                 skipped=[{"model": cand.model, "provider": cand.provider, "reason": avail.reason}])
         requested = self.requested_tier(task)
         if requested is None:
             return self._gate_fixed(task, RouteDecision("profile", candidate=_profile_model(profile_home),
