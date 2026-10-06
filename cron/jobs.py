@@ -1984,15 +1984,42 @@ def _reanchor_next_run(updated: Dict[str, Any], job_id: str) -> None:
         schedule, updated.get("name", job_id), schedule, "update ")
 
 
-def _route_key(job: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """What a job's run is sent to: ``(provider, model, base_url)``, normalized, ``None`` = unset.
-    A provider quota window (``cron/quota_hold.py``) was measured against this route."""
+def _route_key(
+    job: Dict[str, Any], main: Optional[Tuple[Optional[str], Optional[str]]] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """The effective route a job's run is sent to: ``(provider, model, base_url)``, normalized.
+    A provider quota window (``cron/quota_hold.py``) was measured against this route. An unset
+    provider/model means "follow the main model at fire time", so when *main* (``_main_model_pin()``)
+    is given they resolve to it; without it they stay ``None`` (the stored pin). ``base_url`` is
+    always as stored."""
     provider = _normalize_job_optional_text(job.get("provider"))
+    model = _normalize_job_optional_text(job.get("model"))
+    if main is not None:
+        provider = provider or _normalize_job_optional_text(main[0])
+        model = model or _normalize_job_optional_text(main[1])
     return (
         provider.lower() if provider else None,
-        _normalize_job_optional_text(job.get("model")),
+        model,
         _normalize_base_url(job.get("base_url")),
     )
+
+
+def _job_repointed(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
+    """Whether an edit sends the job to a different effective route (see ``_route_key``). The main
+    model is read only when the stored keys differ and an unset provider/model is on either side
+    (pin/unpin, partial edits), so an explicit provider/model edit never does config work under the
+    jobs lock; if that read fails the stored comparison stands (a repoint: the old behaviour)."""
+    stored_before, stored_after = _route_key(before), _route_key(after)
+    if stored_before == stored_after:
+        return False
+    if None not in stored_before[:2] + stored_after[:2]:
+        return True
+    try:
+        main = _main_model_pin()
+    except Exception:
+        logger.debug("cron route compare: main model unavailable, using stored pin", exc_info=True)
+        return True
+    return _route_key(before, main) != _route_key(after, main)
 
 
 def _fill_missing_next_run(updated: Dict[str, Any]) -> None:
@@ -2037,10 +2064,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             raise ValueError(EMPTY_PAYLOAD_ERROR)
         from cron.quota_hold import clear_state as _clear_quota_hold, hold_active
         # A provider quota hold was measured against the route the job ran on. Sending the job to
-        # another provider/model/endpoint (including ``pinned`` flips, which rewrite provider+model)
-        # invalidates it: compare the stored route, not the update keys, so a no-op edit that
-        # restates the current model keeps the hold (#133454).
-        repointed = _route_key(job) != _route_key(updated)
+        # another effective route (provider/model/endpoint; ``pinned`` flips rewrite provider+model,
+        # and an unset provider/model is the main model, see ``_route_key``) invalidates it. A
+        # no-op edit that restates the current route keeps the hold (#133454).
+        repointed = _job_repointed(job, updated)
         reanchored = False
         if "schedule" in updates:
             _apply_schedule_update(updated, updates, job_id)
@@ -2056,7 +2083,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # from the old provider's window (bounded by MAX_HOLD_SECONDS).
             held = hold_active(job)
             _clear_quota_hold(updated)
-            if held and updated.get("state") != "paused":
+            # A caller-supplied next_run_at is an explicit lifecycle rewrite and wins (it also
+            # drops pending_slot below); the hold marker is cleared either way.
+            if held and updated.get("state") != "paused" and "next_run_at" not in updates:
                 _reanchor_next_run(updated, job_id)
                 reanchored = True
         if reanchored or {"schedule", "next_run_at", "enabled", "state"}.intersection(updates):
