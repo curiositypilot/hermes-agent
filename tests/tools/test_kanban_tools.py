@@ -527,6 +527,123 @@ def test_heartbeat_extends_claim_expires(worker_env):
     )
 
 
+# ---------------------------------------------------------------------------
+# record_fallback_from_env: in-process fallback -> provider_fallback event
+# ---------------------------------------------------------------------------
+
+_FB_ARGS = ("custom", "gemini-3.8-flash-tiered", "anthropic", "claude-sonnet-5-5", "rate_limit")
+
+
+def _fallback_events(tid):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect_closing() as conn:
+        return [e for e in kb.list_events(conn, tid) if e.kind == "provider_fallback"]
+
+
+def test_record_fallback_writes_one_run_scoped_event(worker_env):
+    from tools import kanban_tools as kt
+    assert kt.record_fallback_from_env(*_FB_ARGS) is True
+    events = _fallback_events(worker_env)
+    assert len(events) == 1
+    assert events[0].run_id == int(os.environ["HERMES_KANBAN_RUN_ID"])
+    assert events[0].payload == {"from_provider": "custom", "from_model": "gemini-3.8-flash-tiered",
+                                 "to_provider": "anthropic", "to_model": "claude-sonnet-5-5",
+                                 "reason": "rate_limit"}
+
+
+def test_record_fallback_noop_without_env(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    assert kt.record_fallback_from_env(*_FB_ARGS) is False
+    monkeypatch.setenv("HERMES_KANBAN_TASK", worker_env)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    assert kt.record_fallback_from_env(*_FB_ARGS) is False
+    assert _fallback_events(worker_env) == []
+
+
+def test_record_fallback_noop_in_delegated_child(worker_env):
+    from agent.delegation_context import delegated_child_context
+    from tools import kanban_tools as kt
+    with delegated_child_context("child-session"):
+        assert kt.record_fallback_from_env(*_FB_ARGS) is False
+    assert _fallback_events(worker_env) == []
+
+
+def test_record_fallback_wrapper_survives_write_fence(worker_env):
+    """The public wrapper itself returns False (no PermissionError) when write_txn is fenced."""
+    from agent.delegation_context import delegated_child_context
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    conn = kbc.connect()
+    try:
+        with delegated_child_context("child-session"):
+            assert kbd.record_provider_fallback(
+                conn, worker_env, run_id=int(os.environ["HERMES_KANBAN_RUN_ID"]),
+                payload={"reason": "rate_limit"}) is False
+    finally:
+        conn.close()
+    assert _fallback_events(worker_env) == []
+
+
+def test_record_fallback_skips_stale_run(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(int(os.environ["HERMES_KANBAN_RUN_ID"]) + 999))
+    assert kt.record_fallback_from_env(*_FB_ARGS) is False
+    assert _fallback_events(worker_env) == []
+
+
+def test_record_fallback_never_raises_on_missing_db(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "nope" / "kanban.db"))
+    assert kt.record_fallback_from_env(*_FB_ARGS) is False
+    assert not (tmp_path / "nope").exists()
+    # A broken board path must not raise either.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path))
+    assert kt.record_fallback_from_env(*_FB_ARGS) is False
+
+
+def _activate_fallback(reason):
+    """Drive the real AIAgent._try_activate_fallback (zai glm-5.1 -> glm-4.7)."""
+    from unittest.mock import MagicMock, patch
+    from tests.agent.test_fallback_429_after_timeout import _make_agent_with_fallback
+    agent = _make_agent_with_fallback(
+        [{"provider": "zai", "model": "glm-4.7", "base_url": "https://open.bigmodel.cn/api/coding/paas/v4"}])
+    fb_client = MagicMock()
+    fb_client.api_key = "primary-key-abcdef12"
+    fb_client.base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+    fb_client._custom_headers = None
+    fb_client.default_headers = None
+    with (
+        patch("agent.auxiliary_client.resolve_provider_client", return_value=(fb_client, "glm-4.7")),
+        patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
+    ):
+        assert agent._try_activate_fallback(reason) is True
+
+
+@pytest.mark.parametrize("reason,recorded", [(None, ""), ("rate_limit", "rate_limit")])
+def test_try_activate_fallback_records_event(worker_env, reason, recorded):
+    """The real fallback switch writes the event, including the reason=None call sites
+    (turn_empty_response / turn_truncation / turn_response_check)."""
+    from agent.error_classifier import FailoverReason
+    _activate_fallback(FailoverReason(reason) if reason else None)
+    events = _fallback_events(worker_env)
+    assert len(events) == 1
+    p = events[0].payload
+    assert (p["from_model"], p["to_model"], p["reason"]) == ("glm-5.1", "glm-4.7", recorded)
+
+
+def test_try_activate_fallback_without_kanban_env_writes_nothing(worker_env, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    _activate_fallback(None)
+    assert _fallback_events(worker_env) == []
+
+
 def test_comment_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_comment({

@@ -646,6 +646,11 @@ def gate_requirement(gate: QuotaGateConfig, snap: QuotaSnapshot, provider: str) 
     return GateRequirement(key, headroom, resets_at, level_req, level_below, pace_raw, reserve, pace_req, pace_below)
 
 
+# ``provider_fallback`` reasons that arm the board cooldown: quota walls only.
+# overloaded / timeout / server_error are transient; cooldown_seconds is sized for walls.
+_COOLDOWN_FALLBACK_REASONS = frozenset({"rate_limit", "upstream_rate_limit", "billing"})
+
+
 @dataclass
 class _Walk:
     chosen: Optional[tuple[Optional[str], TierCandidate]] = None
@@ -668,7 +673,7 @@ class RoutingContext:
         self.conn = conn
         self.cfg = cfg
         self.now = time.time() if now is None else now
-        self._recent: Optional[dict[tuple[str, str], int]] = None
+        self._recent: Optional[dict[tuple[str, str], tuple[int, str]]] = None
         self._memo: dict[tuple[Optional[str], Optional[str], str], Availability] = {}
         self._quota: Optional[QuotaSnapshot] = None
 
@@ -773,43 +778,95 @@ class RoutingContext:
         return self._quota_held(task, [verdict], lane=decision.lane, requested_tier=decision.requested_tier,
                                 skipped=skipped, candidate=cand)
 
-    def recently_rate_limited(self) -> dict[tuple[str, str], int]:
-        """``(provider, model) -> latest ended_at`` of routed runs that exited
-        ``rate_limited`` within ``cooldown_seconds`` (whole board)."""
+    def recently_rate_limited(self) -> dict[tuple[str, str], tuple[int, str]]:
+        """``(provider, model) -> (latest hit time, source)`` within ``cooldown_seconds``
+        (whole board), keyed on the run's routed ``(provider, model)``. Two sources,
+        merged by max time (``outcome`` wins a tie):
+
+        - ``outcome``: routed runs that exited ``rate_limited`` (time = ``ended_at``).
+        - ``fallback``: ``provider_fallback`` events (written by the worker from
+          ``try_activate_fallback``) with reason in ``_COOLDOWN_FALLBACK_REASONS``
+          whose ``from_model`` is the run's newest routed model (time = the event's
+          ``created_at``). Such a run survives the 429 and ends as a success, so the
+          outcome source never sees it; a later hop (sonnet -> codex) does not match
+          the routed model and never benches the first route."""
         if self._recent is not None:
             return self._recent
-        recent: dict[tuple[str, str], int] = {}
+        recent: dict[tuple[str, str], tuple[int, str]] = {}
+
+        def merge(payload_text: Any, at: Any, source: str) -> None:
+            try:
+                payload = json.loads(payload_text or "{}")
+            except (TypeError, ValueError):
+                return
+            if not isinstance(payload, dict):
+                return
+            model = str(payload.get("model") or "")
+            if not model:
+                return
+            k = (str(payload.get("provider") or ""), model)
+            t = int(at or 0)
+            if k not in recent or t > recent[k][0]:
+                recent[k] = (t, source)
+
         if self.cfg.cooldown_seconds > 0:
+            since = int(self.now) - self.cfg.cooldown_seconds
             try:
                 rows = self.conn.execute(
                     "SELECT e.payload AS payload, r.ended_at AS ended_at FROM task_runs r "
                     "JOIN task_events e ON e.run_id = r.id AND e.kind = 'routed' "
                     "WHERE r.outcome = 'rate_limited' AND r.ended_at >= ?",
-                    (int(self.now) - self.cfg.cooldown_seconds,),
+                    (since,),
                 ).fetchall()
             except sqlite3.Error:
                 rows = []
             for row in rows:
-                try:
-                    payload = json.loads(row["payload"] or "{}")
-                except (TypeError, ValueError):
-                    continue
-                model = str(payload.get("model") or "")
-                if not model:
-                    continue
-                k = (str(payload.get("provider") or ""), model)
-                recent[k] = max(recent.get(k, 0), int(row["ended_at"] or 0))
+                merge(row["payload"], row["ended_at"], "outcome")
+            for routed, at in self._fallback_hits(since):
+                merge(routed, at, "fallback")
         self._recent = recent
         return recent
+
+    def _fallback_hits(self, since: int) -> list[tuple[str, int]]:
+        """``(routed payload, created_at)`` of quota-wall ``provider_fallback`` events
+        since ``since`` whose ``from_model`` equals the run's newest routed model."""
+        try:
+            rows = self.conn.execute(
+                "SELECT f.payload AS payload, f.created_at AS created_at, "
+                "(SELECT r.payload FROM task_events r WHERE r.run_id = f.run_id AND r.kind = 'routed' "
+                " ORDER BY r.id DESC LIMIT 1) AS routed "
+                "FROM task_events f WHERE f.kind = 'provider_fallback' AND f.run_id IS NOT NULL "
+                "AND f.created_at >= ?",
+                (since,),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        hits: list[tuple[str, int]] = []
+        for row in rows:
+            try:
+                fb = json.loads(row["payload"] or "{}")
+                routed = json.loads(row["routed"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(fb, dict) or not isinstance(routed, dict):
+                continue
+            if str(fb.get("reason") or "") not in _COOLDOWN_FALLBACK_REASONS:
+                continue
+            if not routed.get("model") or str(fb.get("from_model") or "") != str(routed["model"]):
+                continue
+            hits.append((row["routed"], int(row["created_at"] or 0)))
+        return hits
 
     def availability(self, cand: TierCandidate, profile_home: Optional[str]) -> Availability:
         memo_key = (cand.provider, cand.model, str(profile_home or ""))
         cached = self._memo.get(memo_key)
         if cached is not None:
             return cached
-        ended = self.recently_rate_limited().get((cand.provider or "", cand.model))
-        if ended is not None:
-            result = Availability(False, "rate_limited on this board", until=ended + self.cfg.cooldown_seconds)
+        hit = self.recently_rate_limited().get((cand.provider or "", cand.model))
+        if hit is not None:
+            at, source = hit
+            reason = "rate_limited on this board" + (" (fallback)" if source == "fallback" else "")
+            result = Availability(False, reason, until=at + self.cfg.cooldown_seconds)
         else:
             with _home_scope(profile_home):
                 result = pool_availability(cand.provider, cand.model, now=self.now)

@@ -2121,6 +2121,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             agent._provider_fallback_active = True
             agent._provider_fallback_route = (str(fb_model), str(fb_provider))
             _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider)
+            if os.environ.get("HERMES_KANBAN_TASK"):
+                # Tell the dispatcher's rate-limit cooldown: this run survives the 429 and ends
+                # as a success, so the run outcome never shows it. reason may be None.
+                with contextlib.suppress(Exception):
+                    from tools.kanban_tools import record_fallback_from_env
+                    record_fallback_from_env(old_provider, old_model, fb_provider, fb_model,
+                                             getattr(reason, "value", None))
             # The stale-call streak measured the OLD provider; carrying it over would
             # short-circuit the fresh fallback before its first stream attempt.
             _reset_stale_streak(agent)
