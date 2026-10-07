@@ -1503,7 +1503,7 @@ class HindsightMemoryProvider(MemoryProvider):
         """Whether the client's *method* takes *kwarg* (explicitly or via ``**kwargs``)."""
         try:
             params = inspect.signature(getattr(self._get_client(), method)).parameters
-        except Exception:
+        except (AttributeError, TypeError, ValueError):  # no such method / not introspectable
             return False
         return kwarg in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
@@ -1514,6 +1514,8 @@ class HindsightMemoryProvider(MemoryProvider):
         cached = self._project_slugs_cache
         if cached is not None and time.monotonic() - cached[0] < _PROJECT_SLUGS_TTL:
             return cached[1]
+        import aiohttp  # hindsight_client's transport; its errors are the fail-open set
+
         slugs = None
         try:
             resp = self._run_hindsight_operation(lambda client: client.aget_bank_config(self._bank_id))
@@ -1523,8 +1525,10 @@ class HindsightMemoryProvider(MemoryProvider):
                     values = [v.get("value") if isinstance(v, dict) else v for v in label.get("values") or []]
                     slugs = frozenset(str(v).strip() for v in values if str(v or "").strip()) or None
                     break
-        except Exception as exc:
-            logger.debug("Hindsight bank config fetch failed; project slugs unchecked: %s", exc)
+        except (aiohttp.ClientError, OSError, TimeoutError, RuntimeError, ValueError) as exc:
+            # Fail open by design (spec): the slug check is advisory. Logged once per TTL window.
+            logger.warning("Hindsight bank config fetch failed; project slugs unchecked for %ds: %s: %s",
+                           _PROJECT_SLUGS_TTL, type(exc).__name__, exc)
         self._project_slugs_cache = (time.monotonic(), slugs)
         return slugs
 

@@ -195,8 +195,8 @@ def _normalize_project_aliases(value: Any) -> dict:
     if isinstance(value, str) and value.strip().startswith("{"):
         try:
             value = json.loads(value)
-        except Exception:
-            logger.warning("Invalid recall_project_aliases %r; ignoring", value)
+        except json.JSONDecodeError as exc:
+            logger.warning("Invalid recall_project_aliases %r; ignoring: %s", value, exc)
             return {}
     if not isinstance(value, dict):
         return {}
