@@ -1048,6 +1048,7 @@ def _handle_create(args: dict, **kw) -> str:
     triage, skills, goal_mode = (
         _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
         _parse_bool_arg(args, "goal_mode"))
+    allow_shared = _parse_bool_arg(args, "allow_shared")
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
@@ -1073,7 +1074,7 @@ def _handle_create(args: dict, **kw) -> str:
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority")),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
-            data_class=args.get("data_class"),
+            allow_shared=allow_shared, data_class=args.get("data_class"),
             # Board-project inheritance must read the board this call opened, not the
             # session's current board.
             board=args.get("board"),
