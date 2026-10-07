@@ -221,6 +221,12 @@ class MemoryProvider(ABC):
     def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
         """PARENT-side observation of a completed delegation (the subagent has no provider session)."""
 
+    def delegation_context(self, query: str) -> str:
+        """PARENT-side, read-only recall for a delegated child's ``query`` (its goal), formatted
+        for the child's system prompt ("" = nothing). Children run with no provider, so this is
+        their only cross-session context; it must not touch per-turn prefetch or indicator state."""
+        return ""
+
     def get_config_schema(self) -> List[Dict[str, Any]]:
         """Setup fields for ``hermes memory setup`` ([] if none): ``key``, ``description``,
         optional ``secret`` (goes to .env), ``required``, ``default``, ``choices``, ``type``

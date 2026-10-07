@@ -178,6 +178,8 @@ def _build_child_agent(
     routing_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    # Parent-side memory recall on this goal (``_delegation_memory_contexts``); "" = none.
+    memory_context: str = "",
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -202,7 +204,7 @@ def _build_child_agent(
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
     child_prompt = _build_child_system_prompt(
         goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
-        max_spawn_depth=max_spawn, child_depth=child_depth,
+        max_spawn_depth=max_spawn, child_depth=child_depth, memory_context=memory_context,
     )
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -362,6 +364,50 @@ def _run_single_child(
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
+def _delegation_memory_contexts(parent_agent, goals: List[Any]) -> List[str]:
+    """Parent-side memory recall for each child goal, run concurrently under ONE shared deadline (the
+    manager's external prefetch timeout) so N children cost one recall latency. Children keep
+    ``skip_memory=True``; this block is their only cross-session context. A missing manager, a
+    timeout or an error yields "" for that task — spawning never waits on, or fails because of, memory."""
+    out = [""] * len(goals)
+    manager = getattr(parent_agent, "_memory_manager", None) if parent_agent is not None else None
+    fn = getattr(manager, "delegation_context", None) if manager is not None else None
+    if not callable(fn) or not goals:
+        return out
+    from agent.memory_provider import spawn_context_thread
+    deadline_s = getattr(manager, "_external_prefetch_timeout", None)
+    if not isinstance(deadline_s, (int, float)) or isinstance(deadline_s, bool) or deadline_s <= 0:
+        deadline_s = 8.0
+
+    def _run(index: int, goal: str) -> None:
+        try:
+            value = fn(goal, timeout=deadline_s)
+        except Exception as exc:
+            # Fail-open by contract (spawning never fails because of memory), but loud: exact error + traceback.
+            logging.warning("delegation memory recall failed for task %d; child gets no block: %r",
+                            index, exc, exc_info=True)
+            return
+        if isinstance(value, str):
+            out[index] = value
+
+    threads = []
+    for i, goal in enumerate(goals):
+        if not isinstance(goal, str) or not goal.strip():
+            continue
+        thread = spawn_context_thread(lambda i=i, g=goal: _run(i, g), name=f"delegate-memory-{i}")
+        thread.start()
+        threads.append((i, thread))
+    deadline = time.monotonic() + float(deadline_s)
+    for i, thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    # Snapshot: a straggler that lands after the deadline must not reach a child.
+    result = list(out)
+    for i, thread in threads:
+        if thread.is_alive():
+            result[i] = ""
+    return result
+
+
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
@@ -380,6 +426,7 @@ def _build_children(
         "routing_cfg": routing_cfg,
     }
     children = []
+    memory_contexts = _delegation_memory_contexts(parent_agent, [t.get("goal") for t in task_list])
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
@@ -390,7 +437,8 @@ def _build_children(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
+                memory_context=memory_contexts[i], **overrides,
             )
         except ValueError as exc:
             return [], str(exc)
