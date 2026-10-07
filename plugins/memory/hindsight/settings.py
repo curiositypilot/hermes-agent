@@ -188,6 +188,60 @@ def _normalize_observation_scopes(value: Any) -> Any:
     return [s for s in scopes if s] or None
 
 
+def _normalize_project_aliases(value: Any) -> dict:
+    """``recall_project_aliases`` (dict or JSON-encoded dict, old slug -> new slug) -> a clean
+    ``{old: new}``; anything unrecognized -> ``{}``. A ``project:`` prefix on either side is
+    dropped, so both ``{"a": "b"}`` and ``{"project:a": "project:b"}`` work."""
+    if isinstance(value, str) and value.strip().startswith("{"):
+        try:
+            value = json.loads(value)
+        except Exception:
+            logger.warning("Invalid recall_project_aliases %r; ignoring", value)
+            return {}
+    if not isinstance(value, dict):
+        return {}
+
+    def _slug(raw: Any) -> str:
+        text = str(raw or "").strip()
+        return text[len("project:"):].strip() if text.startswith("project:") else text
+
+    return {old: new for old, new in ((_slug(k), _slug(v)) for k, v in value.items()) if old and new and old != new}
+
+
+def _apply_project_aliases(tags: List[str], aliases: dict) -> List[str]:
+    """Rewrite each ``project:<old>`` tag to ``project:<new>`` (deduped, order kept)."""
+    out: list[str] = []
+    for tag in tags:
+        if tag.startswith("project:") and (new := aliases.get(tag[len("project:"):])):
+            tag = f"project:{new}"
+        if tag not in out:
+            out.append(tag)
+    return out
+
+
+def _observation_scope_tag_groups(tags: List[str], match: str, scopes: Any) -> list | None:
+    """``tag_groups`` that keep a project filter from hiding consolidated observations, or None.
+
+    Observations carry ONLY their consolidation-scope tags (``observation_scopes``), so a
+    ``project:<slug>`` filter excludes all of them. Adding the scope tag to an ``any`` filter is
+    no fix: every personal fact of every project carries it too. Instead: (the project filter,
+    without scope tags, in the caller's mode) OR (exactly one scope's tag set), which admits the
+    observations and nothing from other projects. Only for ``any``/``any_strict`` with a
+    ``project:`` tag and a list-form scope config; keyword scopes ('combined', ...) -> None."""
+    if match not in ("any", "any_strict") or not any(t.startswith("project:") for t in tags):
+        return None
+    if not isinstance(scopes, list) or not all(isinstance(s, list) and s for s in scopes):
+        return None
+    scope_tags = {t for scope in scopes for t in scope}
+    project_leaf = [t for t in tags if t not in scope_tags]
+    groups: list = [{"tags": project_leaf, "match": match}]
+    for scope in scopes:
+        leaf = {"tags": list(dict.fromkeys(scope)), "match": "exact"}
+        if leaf not in groups:
+            groups.append(leaf)
+    return [{"or": groups}]
+
+
 def _sanitize_bank_segment(value: str) -> str:
     """URL/filesystem-safe bank_id placeholder: runs outside ``[A-Za-z0-9_-]`` (per
     ``str.isalnum``) become one dash; leading/trailing ``-``/``_`` are stripped."""
