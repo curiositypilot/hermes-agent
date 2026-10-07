@@ -415,6 +415,24 @@ DANGEROUS_PATTERNS = [
     (r'\bgit\s+push\b.*--forc[a-z]*\b', "git force push (rewrites remote history)"),
     (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
+    # Worktree-overwriting forms that throw away uncommitted edits like reset --hard does. Each is
+    # bounded to one command segment. `git checkout <branch>` / `-b` stay ungated (git refuses to
+    # switch over conflicting local edits); `--` / `-f` / a bare `.` pathspec overwrite them.
+    (r'\bgit\s+checkout\b[^;|&\n]*?(?:\s--(?=\s|$)|\s(?:-f\b|--force\b)|\s\.(?=\s|$))',
+     "git checkout over paths/force (discards uncommitted changes)"),
+    # `restore` rewrites the worktree unless the only requested mode is --staged/-S.
+    # Short flags are case-sensitive here (-S = --staged, -s = --source, -W = --worktree).
+    (r'\bgit\s+restore\b(?![^;|&\n]*\s(?:--staged\b|(?-i:-[a-zA-Z]*S[a-zA-Z]*)\b))',
+     "git restore (discards uncommitted changes)"),
+    (r'\bgit\s+restore\b(?=[^;|&\n]*\s(?:--worktree\b|(?-i:-[a-zA-Z]*W[a-zA-Z]*)\b))',
+     "git restore --worktree (discards uncommitted changes)"),
+    # Bare `git stash` (= push, incl. `-u`/`-m msg`) or push/save/drop/clear. pop/apply restore
+    # work instead of destroying it (git aborts rather than overwrite local edits), and
+    # list/show/create/store/branch only read or record, so those stay ungated.
+    (r'\bgit\s+stash\b(?!\s+(?:list|show|create|store|pop|apply|branch)\b)',
+     "git stash push/drop/clear (removes uncommitted or stashed work)"),
+    (r'\bgit\s+switch\b[^;|&\n]*?\s(?:-f\b|--force\b|--discard-changes\b)',
+     "git switch --force/--discard-changes (discards uncommitted changes)"),
     # `-D` = `-d --force`: only the capital short flag is force-delete, so the group opts out of
     # the module-wide re.IGNORECASE and relies on _lower_preserving_flags keeping dash-prefixed
     # tokens' case in the detection input (every other pattern matches case-insensitively and is

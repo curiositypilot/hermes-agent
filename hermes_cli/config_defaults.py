@@ -1669,6 +1669,12 @@ DEFAULT_CONFIG = {
         # / mode=off. Quote in YAML when starting with * or containing {}/!/: e.g. "git push
         # --force*".
         "deny": [],
+        # Git checkouts that hold other agents' uncommitted work. git commands that overwrite or
+        # discard it there (checkout/restore/stash/reset --hard/clean/... and stash drop|clear) are
+        # refused before approvals, so mode=off and --yolo do not bypass it; nested repos and
+        # worktrees under a root stay free. None (unset) = HERMES_HOME when it is a git checkout;
+        # a list of paths (~ expanded) replaces that; [] turns the guard off.
+        "protected_checkouts": None,
         # /reload-mcp confirms before rebuilding the MCP tool set (it invalidates the prompt cache,
         # so the next message re-sends full input). "Always Approve" → false.
         "mcp_reload_confirm": True,
