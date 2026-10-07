@@ -686,13 +686,13 @@ def _create_project(home: Path, name: str, folder: Path, *, use: bool = False) -
         reset_hermes_home_override(token)
 
 
-def _create_session(home: Path, session_id: str, cwd: Path) -> None:
+def _create_session(home: Path, session_id: str, cwd: Path, source: str = "cli") -> None:
     """Seed one message-bearing session in ``home``'s state.db."""
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=home / "state.db")
     try:
-        db.create_session(session_id, "cli", cwd=str(cwd))
+        db.create_session(session_id, source, cwd=str(cwd))
         db.append_message(session_id, "user", f"hello from {session_id}")
     finally:
         db.close()
@@ -891,5 +891,28 @@ def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_pat
     assert _cached_repo_labels(launch_home) == ["only"]
     assert not (coder_home / "projects.db").exists()
     assert not (Path(os.environ["HERMES_HOME"]) / "projects.db").exists()
+
+
+def test_projects_tree_excludes_tool_and_subagent_sources(monkeypatch, tmp_path):
+    """projects.tree must exclude tool and subagent sessions alongside cron/kanban/oneshot."""
+    home = _profile_dir(tmp_path, "launch")
+    repo = tmp_path / "repos" / "test-repo"
+    repo.mkdir(parents=True)
+    _bind_profiles(monkeypatch, tmp_path, {"default": home})
+
+    _create_project(home, "Main Project", repo, use=True)
+    _create_session(home, "user-session", repo, source="cli")
+    _create_session(home, "tool-session", repo, source="tool")
+    _create_session(home, "subagent-session", repo, source="subagent")
+    _create_session(home, "cron-session", repo, source="cron")
+
+    with _serving_launch_profile(home):
+        tree = _call("projects.tree")
+
+    assert tree["scoped_session_ids"] == ["user-session"]
+    proj = tree["projects"][0]
+    assert proj["sessionCount"] == 1
+    assert [s["id"] for s in proj["previewSessions"]] == ["user-session"]
+
 
 
