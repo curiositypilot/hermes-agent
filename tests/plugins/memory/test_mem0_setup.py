@@ -259,7 +259,13 @@ def test_discovery_loaded_setup_module_exposes_post_setup(monkeypatch):
     """`hermes memory setup mem0` reaches the wizard when the package is first imported by plugin
     discovery, which execs sibling modules before ``__init__`` (#103078). The invariant is on the
     module the loader actually cached, not on a normal top-level import."""
+    import plugins.memory as _parent
     from plugins.memory import load_memory_provider
+
+    if hasattr(_parent, "mem0"):
+        monkeypatch.setattr(_parent, "mem0", getattr(_parent, "mem0"), raising=False)
+    else:
+        monkeypatch.delattr(_parent, "mem0", raising=False)
 
     saved = {k: sys.modules.pop(k) for k in list(sys.modules) if k.startswith("plugins.memory.mem0")}
     try:
