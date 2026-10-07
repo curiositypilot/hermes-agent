@@ -421,6 +421,11 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "Absolute path for 'dir' or 'worktree'; relative paths "
                 "are rejected at dispatch."
         )),
+        "allow_shared": _prop("boolean", (
+                "Keep a 'dir' workspace on a git repo as a shared checkout "
+                "instead of converting it to a git worktree (the default). "
+                "Only when the task must run in that checkout itself."
+        )),
         "project": _prop("string", (
                 "Optional project id or slug. The task then becomes a git "
                 "worktree under the project's primary repo on a "
