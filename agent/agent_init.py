@@ -1253,12 +1253,22 @@ def _apply_display_config(agent, _agent_cfg, platform):
 
 def _external_prefetch_timeout(mem_config: Any) -> Optional[float]:
     """``memory.external_prefetch_timeout_seconds`` as a positive float, or None for the
-    MemoryManager default (8 s). Invalid/zero/negative values fall back rather than raise."""
-    try:
-        value = float((mem_config or {}).get("external_prefetch_timeout_seconds") or 0)
-    except (TypeError, ValueError):
-        return None
-    return value if value > 0 else None
+    MemoryManager default (8 s). Invalid/zero/negative values fall back rather than raise.
+    In a Kanban worker (``HERMES_KANBAN_TASK`` set) a positive
+    ``memory.kanban_external_prefetch_timeout_seconds`` replaces it: the worker's first-turn
+    recall may wait for a host-wide slot (Hindsight ``recall_kanban_first_turn``)."""
+    def _positive(key: str) -> Optional[float]:
+        try:
+            value = float((mem_config or {}).get(key) or 0)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    if os.environ.get("HERMES_KANBAN_TASK", "").strip():
+        kanban = _positive("kanban_external_prefetch_timeout_seconds")
+        if kanban is not None:
+            return kanban
+    return _positive("external_prefetch_timeout_seconds")
 
 
 def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:

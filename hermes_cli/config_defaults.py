@@ -1301,6 +1301,9 @@ DEFAULT_CONFIG = {
         # A slow backend still runs to completion off-thread but is skipped on later turns until it
         # returns. Raising this makes every turn wait longer, so prefer speeding up the backend.
         "external_prefetch_timeout_seconds": 8.0,
+        # Replaces the value above in Kanban worker processes when > 0 (0 = same as everyone).
+        # Hindsight's recall_kanban_first_turn waits for a host-wide slot, so it needs ~30.
+        "kanban_external_prefetch_timeout_seconds": 0,
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
