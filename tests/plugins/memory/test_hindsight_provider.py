@@ -48,7 +48,7 @@ def _clean_env(tmp_path, monkeypatch):
     """Ensure no stale env vars or Windows home state leak between tests."""
     for key in (
         "HINDSIGHT_API_KEY", "HINDSIGHT_API_URL", "HINDSIGHT_BANK_ID",
-        "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT",
+        "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT", "HINDSIGHT_REFLECT_TIMEOUT",
         "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_OBSERVATION_SCOPES",
         "HINDSIGHT_RETAIN_SOURCE",
@@ -212,7 +212,8 @@ def provider(tmp_path, monkeypatch):
 
     p = HindsightMemoryProvider()
     p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
-    p._client = _make_mock_client()
+    # One mock serves both clients (reflect gets its own client when reflect_timeout != timeout).
+    p._client = p._reflect_client = _make_mock_client()
     return p
 
 
@@ -239,7 +240,7 @@ def provider_with_config(tmp_path, monkeypatch):
 
         p = HindsightMemoryProvider()
         p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
-        p._client = _make_mock_client()
+        p._client = p._reflect_client = _make_mock_client()
         return p
     return _make
 
@@ -550,6 +551,113 @@ class TestToolHandlers:
             "hindsight_unknown", {}
         ))
         assert "error" in result
+
+    def test_tool_error_names_timeout(self, provider):
+        """Replay of the recorded failures: the client budget expired and
+        ``str(concurrent.futures.TimeoutError())`` is empty, which used to yield
+        the bare 'Failed to reflect: '."""
+        import concurrent.futures
+        provider._client.areflect.side_effect = concurrent.futures.TimeoutError()
+        error = json.loads(provider.handle_tool_call(
+            "hindsight_reflect", {"query": "what is MB's plan"}
+        ))["error"]
+        assert "timed out" in error
+        assert str(provider._reflect_timeout) in error
+        assert not error.rstrip().endswith("Failed to reflect:")
+
+    @pytest.mark.parametrize("tool,arg", [
+        ("hindsight_recall", "query"), ("hindsight_retain", "content"),
+    ])
+    def test_tool_error_names_timeout_on_every_tool(self, provider, tool, arg):
+        provider._client.arecall.side_effect = TimeoutError()
+        provider._client.aretain_batch.side_effect = TimeoutError()
+        error = json.loads(provider.handle_tool_call(tool, {arg: "x"}))["error"]
+        assert "timed out" in error and str(provider._timeout) in error
+
+    def test_tool_error_with_empty_message_shows_type_name(self, provider):
+        class EmptyServerError(Exception):
+            pass
+        provider._client.areflect.side_effect = EmptyServerError()
+        error = json.loads(provider.handle_tool_call(
+            "hindsight_reflect", {"query": "q"}
+        ))["error"]
+        assert error.endswith("Failed to reflect: EmptyServerError")
+
+    def test_tool_error_keeps_a_non_empty_message_unchanged(self, provider):
+        provider._client.areflect.side_effect = RuntimeError("LLM failover exhausted")
+        error = json.loads(provider.handle_tool_call(
+            "hindsight_reflect", {"query": "q"}
+        ))["error"]
+        assert error.endswith("Failed to reflect: LLM failover exhausted")
+
+    def test_reflect_uses_reflect_timeout(self, provider, monkeypatch):
+        """reflect runs with reflect_timeout (HTTP client + future.result); recall keeps timeout."""
+        import plugins.memory.hindsight as hindsight_mod
+        provider._timeout, provider._reflect_timeout = 120, 300
+        provider._reflect_client = None  # built on first reflect
+        reflect_client = _make_mock_client()
+        built = []
+
+        def fake_new_cloud_client(timeout=None):
+            built.append(timeout)
+            return reflect_client
+        monkeypatch.setattr(provider, "_new_cloud_client", fake_new_cloud_client)
+        waits = []
+        real_run_sync = hindsight_mod._run_sync
+
+        def recording_run_sync(coro, timeout=hindsight_mod._DEFAULT_TIMEOUT):
+            waits.append(timeout)
+            return real_run_sync(coro, timeout=timeout)
+        monkeypatch.setattr(hindsight_mod, "_run_sync", recording_run_sync)
+
+        result = json.loads(provider.handle_tool_call("hindsight_reflect", {"query": "q"}))
+        assert result["result"] == "Synthesized answer"
+        assert built == [300]  # the reflect client's HTTP timeout
+        assert waits == [300]
+        reflect_client.areflect.assert_awaited_once()
+        provider._client.areflect.assert_not_called()  # the shared client is never retimed
+
+        waits.clear()
+        provider.handle_tool_call("hindsight_recall", {"query": "q"})
+        assert waits == [120]
+        provider._client.arecall.assert_awaited_once()
+        reflect_client.arecall.assert_not_called()
+
+        provider.shutdown()
+        reflect_client.aclose.assert_awaited_once()
+        assert provider._reflect_client is None
+
+    def test_reflect_timeout_reads_config_and_env(self, tmp_path, monkeypatch):
+        _write_config(tmp_path, monkeypatch, reflect_timeout=450)
+        assert _init_provider(tmp_path)._reflect_timeout == 450
+        _write_config(tmp_path, monkeypatch)
+        monkeypatch.setenv("HINDSIGHT_REFLECT_TIMEOUT", "222")
+        assert _init_provider(tmp_path)._reflect_timeout == 222
+        monkeypatch.delenv("HINDSIGHT_REFLECT_TIMEOUT")
+        from plugins.memory.hindsight.settings import _DEFAULT_REFLECT_TIMEOUT
+        assert _init_provider(tmp_path)._reflect_timeout == _DEFAULT_REFLECT_TIMEOUT
+
+    def test_local_embedded_reflect_reuses_main_client_with_reflect_budget(self, provider, monkeypatch):
+        import plugins.memory.hindsight as hindsight_mod
+        provider._mode = "local_embedded"
+        provider._timeout, provider._reflect_timeout = 120, 300
+        provider._reflect_client = None
+        first_client = _make_mock_client()
+        first_client.areflect.side_effect = RuntimeError("Cannot connect to host 127.0.0.1:8888")
+        second_client = _make_mock_client()
+        clients = iter([first_client, second_client])
+        provider._client = first_client
+        monkeypatch.setattr(provider, "_get_client", lambda: next(clients))
+        waits = []
+        real_run_sync = hindsight_mod._run_sync
+        monkeypatch.setattr(hindsight_mod, "_run_sync",
+                            lambda coro, timeout=120: (waits.append(timeout), real_run_sync(coro, timeout))[1])
+
+        result = json.loads(provider.handle_tool_call("hindsight_reflect", {"query": "q"}))
+        assert result["result"] == "Synthesized answer"
+        assert provider._client is second_client
+        assert provider._reflect_client is None
+        assert waits == [300, 300]
 
 
     def test_local_embedded_recall_reconnects_after_idle_shutdown(self, provider, monkeypatch):

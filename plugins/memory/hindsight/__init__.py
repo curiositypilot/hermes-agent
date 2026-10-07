@@ -43,7 +43,7 @@ from .embedded import (
 )
 from .recall_log import log_recalled
 from .settings import (
-    _DEFAULT_API_URL, _DEFAULT_IDLE_TIMEOUT, _DEFAULT_LOCAL_URL, _DEFAULT_RETAIN_SOURCE,
+    _DEFAULT_API_URL, _DEFAULT_IDLE_TIMEOUT, _DEFAULT_LOCAL_URL, _DEFAULT_REFLECT_TIMEOUT, _DEFAULT_RETAIN_SOURCE,
     _DEFAULT_TIMEOUT, _HINDSIGHT_GLYPH, _MIN_CLIENT_VERSION, _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
     _PROVIDER_DEFAULT_MODELS, _STREAM_ERROR_PREFIX, _VALID_BUDGETS, _daemon_llm_provider,
     _KANBAN_QUERY_BODY_CHARS, _kanban_recall_query, _kanban_recall_tags, _normalize_observation_scopes,
@@ -219,6 +219,25 @@ def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT):
     return future.result(timeout=timeout)
 
 
+def _is_timeout_error(exc: BaseException) -> bool:
+    """True for client-side timeouts: ``TimeoutError`` (concurrent.futures/asyncio alias it
+    on 3.11+, aiohttp's ServerTimeoutError subclasses it) or a library timeout class such as
+    urllib3's ``ReadTimeoutError`` that does not."""
+    return isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower()
+
+
+def _describe_tool_failure(exc: BaseException, budget: float) -> str:
+    """Tool-error cause for *exc*. ``str(TimeoutError())`` is empty, so a bare
+    ``f"{failure}: {exc}"`` told the agent nothing: name timeouts with their budget and
+    fall back to the exception type for any other empty message."""
+    detail = str(exc).strip()
+    name = type(exc).__name__
+    if _is_timeout_error(exc):
+        cause = f"{name}: {detail}" if detail else name
+        return f"timed out after {budget:g} s ({cause}); retry with a narrower query or tags"
+    return detail or name
+
+
 RETAIN_SCHEMA = {
     "name": "hindsight_retain",
     "description": (
@@ -328,6 +347,7 @@ def _load_config() -> dict:
         "mode": get_secret("HINDSIGHT_MODE", "") or "cloud",
         "apiKey": get_secret("HINDSIGHT_API_KEY", ""),
         "timeout": _parse_int_setting(os.environ.get("HINDSIGHT_TIMEOUT"), _DEFAULT_TIMEOUT),
+        "reflect_timeout": _parse_int_setting(os.environ.get("HINDSIGHT_REFLECT_TIMEOUT"), _DEFAULT_REFLECT_TIMEOUT),
         "idle_timeout": _parse_int_setting(os.environ.get("HINDSIGHT_IDLE_TIMEOUT"), _DEFAULT_IDLE_TIMEOUT),
         "retain_tags": get_secret("HINDSIGHT_RETAIN_TAGS", "") or "",
         "observation_scopes": get_secret("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", "") or "",
@@ -528,9 +548,10 @@ class HindsightMemoryProvider(MemoryProvider):
         return []
 
     def __init__(self):
-        self._config = self._api_key = self._client = None
+        self._config = self._api_key = self._client = self._reflect_client = None
         self._api_url, self._llm_base_url, self._mode = _DEFAULT_API_URL, "", "cloud"
         self._timeout, self._idle_timeout = _DEFAULT_TIMEOUT, _DEFAULT_IDLE_TIMEOUT
+        self._reflect_timeout = _DEFAULT_REFLECT_TIMEOUT
         self._bank_id, self._budget, self._bank_id_template = "hermes", "mid", ""
         self._bank_mission, self._bank_retain_mission = "", None
         self._memory_mode = "hybrid"  # "context", "tools", or "hybrid"
@@ -671,6 +692,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_kanban_tags_match", "description": "Tag matching mode for recall_kanban_tags ('any' also returns untagged memories)", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_prefer_observations", "description": "When recall_types mixes observation with raw world/experience facts, drop raw facts an included observation was consolidated from (applies to auto-recall and the hindsight_recall tool)", "default": False},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
+            {"key": "reflect_timeout", "description": "Timeout in seconds for reflect (hindsight_reflect tool and reflect prefetch), which runs an LLM loop server-side and needs longer than recall/retain", "default": _DEFAULT_REFLECT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
             {"key": "port_health_grace_timeout", "description": "Seconds to wait for a slow daemon /health before treating it as stale (raise on busy/low-resource hosts; blank uses the 30s default)", "default": "", "when": {"mode": "local_embedded"}},
         ]
@@ -703,10 +725,10 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["llm_base_url"] = self._llm_base_url
         return HindsightEmbedded(**kwargs)
 
-    def _new_cloud_client(self):
+    def _new_cloud_client(self, timeout: float | None = None):
         _ensure_client_dependency()
         from hindsight_client import Hindsight
-        kwargs = {"base_url": self._api_url, "timeout": float(self._timeout or _DEFAULT_TIMEOUT)}
+        kwargs = {"base_url": self._api_url, "timeout": float(timeout or self._timeout or _DEFAULT_TIMEOUT)}
         if self._api_key:
             kwargs["api_key"] = self._api_key
         logger.debug("Creating Hindsight cloud client (url=%s, has_key=%s, timeout=%s)",
@@ -719,23 +741,38 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = self._new_embedded_client() if self._mode == "local_embedded" else self._new_cloud_client()
         return self._client
 
-    def _run_sync(self, coro):
-        """Schedule *coro* on the shared loop using the configured timeout."""
-        return _run_sync(coro, timeout=self._timeout)
+    def _get_reflect_client(self):
+        """Client for reflect, whose HTTP timeout is ``reflect_timeout``. The cloud client reads
+        its timeout at call time, so a shared client is never retimed while recall/retain are in
+        flight: a second cached client carries the reflect budget. Embedded mode (the wrapper
+        owns its HTTP client) and an equal budget reuse the main client."""
+        if self._mode == "local_embedded" or self._reflect_timeout == self._timeout:
+            return self._get_client()
+        if self._reflect_client is None:
+            self._reflect_client = self._new_cloud_client(timeout=self._reflect_timeout)
+        return self._reflect_client
 
-    def _run_hindsight_operation(self, operation):
+    def _run_sync(self, coro, timeout: float | None = None):
+        """Schedule *coro* on the shared loop using *timeout* (default: the configured timeout)."""
+        return _run_sync(coro, timeout=timeout or self._timeout)
+
+    def _run_hindsight_operation(self, operation, *, reflect: bool = False):
         """Run an async client operation; for local_embedded, a stale-daemon
-        connection failure recreates the client and retries once."""
+        connection failure recreates the client and retries once. ``reflect`` runs it
+        on the reflect client with the ``reflect_timeout`` budget."""
+        get_client = self._get_reflect_client if reflect else self._get_client
+        timeout = self._reflect_timeout if reflect else self._timeout
         try:
-            return self._run_sync(operation(self._get_client()))
+            return self._run_sync(operation(get_client()), timeout=timeout)
         except Exception as exc:
             text = f"{type(exc).__name__}: {exc}".lower()
             if self._mode != "local_embedded" or not any(m in text for m in _RETRIABLE_CONNECTION_MARKERS):
                 raise
             logger.info("Hindsight embedded daemon appears unreachable; recreating client and retrying once: %s", exc)
+            # Embedded mode: the reflect client IS the main client, so both paths rebuild _client.
             self._client = None
-            self._client = client = self._get_client()
-            return self._run_sync(operation(client))
+            self._client = client = get_client()
+            return self._run_sync(operation(client), timeout=timeout)
 
     # -- retain writer thread + server-side visibility -------------------------
 
@@ -915,6 +952,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._first_user_line = self._last_turn_at = ""
         self._mode = cfg.get("mode", "cloud")
         self._timeout = self._int_setting("timeout", "HINDSIGHT_TIMEOUT", _DEFAULT_TIMEOUT)
+        self._reflect_timeout = self._int_setting("reflect_timeout", "HINDSIGHT_REFLECT_TIMEOUT",
+                                                  _DEFAULT_REFLECT_TIMEOUT)
         self._idle_timeout = self._int_setting("idle_timeout", "HINDSIGHT_IDLE_TIMEOUT", _DEFAULT_IDLE_TIMEOUT)
         if self._mode == "local":  # legacy alias
             self._mode = "local_embedded"
@@ -1208,7 +1247,8 @@ class HindsightMemoryProvider(MemoryProvider):
     def _reflect(self, query: str, overrides: dict | None = None) -> str | None:
         resp = self._run_hindsight_operation(
             lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget,
-                                           **(overrides or {}))
+                                           **(overrides or {})),
+            reflect=True,
         )
         return resp.text
 
@@ -1518,7 +1558,8 @@ class HindsightMemoryProvider(MemoryProvider):
             return json.dumps({"result": handler(self, args)})
         except Exception as e:
             logger.warning("%s failed: %s", tool_name, e, exc_info=True)
-            return tool_error(f"{failure}: {e}")
+            budget = self._reflect_timeout if tool_name == "hindsight_reflect" else self._timeout
+            return tool_error(f"{failure}: {_describe_tool_failure(e, budget)}")
 
     # -- session lifecycle -------------------------------------------------------
 
@@ -1608,6 +1649,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.warning("Hindsight writer did not stop within 10s; abandoning %d pending retain(s)",
                                self._retain_queue.qsize())
         self._join_prefetch(5.0)
+        if self._reflect_client is not None and self._reflect_client is not self._client:
+            with contextlib.suppress(Exception):
+                self._run_sync(self._reflect_client.aclose())
+            self._reflect_client = None
         if self._client is not None:
             with contextlib.suppress(Exception):
                 self._close_client()
