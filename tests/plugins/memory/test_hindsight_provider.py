@@ -786,6 +786,10 @@ class TestPrefetchServerRetainVisibility:
     queue, before recalling.
     """
 
+    @pytest.fixture(autouse=True)
+    def _warm_sdk(self):
+        pytest.importorskip("hindsight_client_api.exceptions")
+
     def _client_with_ops(self, statuses):
         """Mock client whose aretain_batch returns an async operation_id and
         whose operations.get_operation_status yields *statuses* in order
