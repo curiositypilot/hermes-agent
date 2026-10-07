@@ -553,8 +553,10 @@ class MemoryManager:
                             provider.name, limit)
                 continue
             if "error" in result_box:
-                logger.info("Memory provider '%s' delegation recall failed (non-fatal): %s",
-                            provider.name, result_box["error"])
+                # Fail-open by contract (a child spawn never fails on memory), but loud: exact error + traceback.
+                err = result_box["error"]
+                logger.warning("Memory provider '%s' delegation recall failed; child gets no block: %r",
+                               provider.name, err, exc_info=(type(err), err, err.__traceback__))
                 continue
             value = result_box.get("value", "")
             if isinstance(value, str) and value.strip():

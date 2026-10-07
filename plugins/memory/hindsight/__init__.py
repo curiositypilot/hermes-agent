@@ -1310,8 +1310,8 @@ class HindsightMemoryProvider(MemoryProvider):
         try:
             results = self._recall(query, auto=True)
         except Exception as e:
-            logger.info("Hindsight delegation recall failed: %s", e)
-            logger.debug("Hindsight delegation recall failure detail", exc_info=True)
+            # Fail-open by contract (memory never blocks a child spawn), but loud: exact error + traceback.
+            logger.warning("Hindsight delegation recall failed; child gets no block: %r", e, exc_info=True)
             return ""
         lines = [f"- {r.text}" for r in results if getattr(r, "text", None)][:self._recall_delegate_max_items]
         if not lines:

@@ -383,7 +383,9 @@ def _delegation_memory_contexts(parent_agent, goals: List[Any]) -> List[str]:
         try:
             value = fn(goal, timeout=deadline_s)
         except Exception as exc:
-            logging.info("delegation memory recall failed for task %d (non-fatal): %s", index, exc)
+            # Fail-open by contract (spawning never fails because of memory), but loud: exact error + traceback.
+            logging.warning("delegation memory recall failed for task %d; child gets no block: %r",
+                            index, exc, exc_info=True)
             return
         if isinstance(value, str):
             out[index] = value
