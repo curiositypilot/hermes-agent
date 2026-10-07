@@ -1226,6 +1226,124 @@ class TestToolTagFilter:
         provider._client.arecall.assert_not_called()
 
 
+_SCOPES = [["scope:personal"]]
+_SCOPE_GROUP = {"tags": ["scope:personal"], "match": "exact"}
+
+
+def _bank_config(*slugs):
+    return {"bank_id": "test-bank", "overrides": {}, "config": {"entity_labels": [
+        {"key": "topic", "values": [{"value": "x"}]},
+        {"key": "project", "values": [{"value": s, "description": ""} for s in slugs]}]}}
+
+
+def _tool_result(p, tool, args):
+    return json.loads(p.handle_tool_call(tool, {"query": "q", **args}))
+
+
+class TestToolProjectFilterHygiene:
+    """Project filters keep observations visible without leaking other projects; renamed
+    slugs are aliased; unknown slugs earn a note. Tool-call path only."""
+
+    def test_project_filter_admits_observation_scope_as_separate_group(self, provider_with_config):
+        p = provider_with_config(observation_scopes=_SCOPES)
+        out = _tool_result(p, "hindsight_recall", {"tags": ["project:x"], "tags_match": "any_strict"})
+        kw = p._client.arecall.await_args.kwargs
+        # (project filter) OR (exactly the observation scope): never a flat OR with scope:personal,
+        # which every personal fact of every project carries.
+        assert kw["tag_groups"] == [{"or": [{"tags": ["project:x"], "match": "any_strict"}, _SCOPE_GROUP]}]
+        assert "tags" not in kw and "tags_match" not in kw
+        assert out["result"].splitlines()[0].startswith("(tags used: ")
+        assert out["result"].splitlines()[1:] == ["1. Memory 1", "2. Memory 2"]
+
+    def test_scope_tag_given_by_the_model_moves_to_its_own_group(self, provider_with_config):
+        p = provider_with_config(observation_scopes=_SCOPES)
+        _tool_result(p, "hindsight_recall", {"tags": ["project:x", "scope:personal"], "tags_match": "any"})
+        groups = p._client.arecall.await_args.kwargs["tag_groups"][0]["or"]
+        assert groups == [{"tags": ["project:x"], "match": "any"}, _SCOPE_GROUP]
+
+    @pytest.mark.parametrize("args, scopes", [
+        ({"tags": ["project:x"], "tags_match": "all"}, _SCOPES),
+        ({"tags": ["project:x"], "tags_match": "exact"}, _SCOPES),
+        ({"tags": ["topic:x"], "tags_match": "any_strict"}, _SCOPES),
+        ({"tags": ["project:x"], "tags_match": "any_strict"}, None),
+        ({"tags": ["project:x"], "tags_match": "any_strict"}, "combined"),
+    ])
+    def test_filter_unchanged_outside_the_rewrite_case(self, provider_with_config, args, scopes):
+        p = provider_with_config(**({"observation_scopes": scopes} if scopes else {}))
+        out = _tool_result(p, "hindsight_recall", args)
+        kw = p._client.arecall.await_args.kwargs
+        assert kw["tags"] == args["tags"] and kw["tags_match"] == args["tags_match"]
+        assert "tag_groups" not in kw
+        assert out["result"] == "1. Memory 1\n2. Memory 2"
+
+    def test_reflect_gets_the_same_filter_and_clean_text(self, provider_with_config):
+        p = provider_with_config(observation_scopes=_SCOPES)
+        out = _tool_result(p, "hindsight_reflect", {"tags": ["project:x"]})
+        kw = p._client.areflect.await_args.kwargs
+        assert kw["tag_groups"] == [{"or": [{"tags": ["project:x"], "match": "any"}, _SCOPE_GROUP]}]
+        assert "(tags used" not in out["result"]
+
+    def test_tag_groups_override_replaces_configured_recall_tags(self, provider_with_config):
+        p = provider_with_config(observation_scopes=_SCOPES, recall_tags="default:tag")
+        _tool_result(p, "hindsight_recall", {"tags": ["project:x"]})
+        kw = p._client.arecall.await_args.kwargs
+        assert "tags" not in kw and "tag_groups" in kw
+
+    def test_empty_recall_still_says_no_memories(self, provider_with_config):
+        p = provider_with_config(observation_scopes=_SCOPES)
+        p._client.arecall.return_value = SimpleNamespace(results=[])
+        lines = _tool_result(p, "hindsight_recall", {"tags": ["project:x"]})["result"].splitlines()
+        assert lines[0].startswith("(tags used: ") and lines[-1] == "No relevant memories found."
+
+    def test_project_alias_rewrites(self, provider_with_config):
+        p = provider_with_config(recall_project_aliases={"aperture-robotics": "movis"})
+        out = _tool_result(p, "hindsight_recall", {"tags": ["project:aperture-robotics", "project:movis"],
+                                                   "tags_match": "any_strict"})
+        assert p._client.arecall.await_args.kwargs["tags"] == ["project:movis"]
+        assert '(tags used: ["project:movis"])' in out["result"]
+
+    def test_project_alias_accepts_json_string(self, provider_with_config):
+        p = provider_with_config(recall_project_aliases='{"project:old": "project:new"}')
+        _tool_result(p, "hindsight_recall", {"tags": ["project:old"], "tags_match": "all"})
+        assert p._client.arecall.await_args.kwargs["tags"] == ["project:new"]
+
+    def test_alias_applies_before_slug_check(self, provider_with_config):
+        p = provider_with_config(recall_project_aliases={"aperture-robotics": "movis"})
+        p._client.aget_bank_config = AsyncMock(return_value=_bank_config("movis", "car"))
+        out = _tool_result(p, "hindsight_recall", {"tags": ["project:aperture-robotics"]})
+        assert "not a project label" not in out["result"]
+        assert p._client.arecall.await_args.kwargs["tags"] == ["project:movis"]
+
+    def test_unknown_project_slug_gets_a_note_and_still_runs(self, provider_with_config):
+        p = provider_with_config()
+        p._client.aget_bank_config = AsyncMock(return_value=_bank_config("movis", "car"))
+        out = _tool_result(p, "hindsight_recall", {"tags": ["project:moviz"]})
+        assert "error" not in out
+        assert "project:moviz is not a project label" in out["result"] and "movis" in out["result"]
+        p._client.arecall.assert_awaited_once()
+        # Second tagged call within the TTL does not refetch the bank config.
+        _tool_result(p, "hindsight_recall", {"tags": ["project:car"]})
+        p._client.aget_bank_config.assert_awaited_once()
+
+    def test_bank_config_failure_fails_open_and_is_cached(self, provider_with_config):
+        p = provider_with_config()
+        p._client.aget_bank_config = AsyncMock(side_effect=RuntimeError("down"))
+        for _ in range(2):
+            out = _tool_result(p, "hindsight_recall", {"tags": ["project:anything"]})
+            assert out["result"] == "1. Memory 1\n2. Memory 2"
+        p._client.aget_bank_config.assert_awaited_once()
+
+    def test_untagged_call_never_fetches_bank_config(self, provider_with_config):
+        p = provider_with_config()
+        p._client.aget_bank_config = AsyncMock(return_value=_bank_config("movis"))
+        _tool_result(p, "hindsight_recall", {})
+        _tool_result(p, "hindsight_reflect", {})
+        p._client.aget_bank_config.assert_not_called()
+
+    def test_schema_lists_recall_project_aliases(self, provider):
+        assert "recall_project_aliases" in {f["key"] for f in provider.get_config_schema()}
+
+
 class TestRecallRelevanceFloor:
     def test_defaults_send_neither_kwarg(self, provider):
         # Default config keeps today's request shape exactly.

@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import difflib
+import inspect
 import json
 import logging
 import os
@@ -46,8 +48,9 @@ from .settings import (
     _DEFAULT_API_URL, _DEFAULT_IDLE_TIMEOUT, _DEFAULT_LOCAL_URL, _DEFAULT_REFLECT_TIMEOUT, _DEFAULT_RETAIN_SOURCE,
     _DEFAULT_TIMEOUT, _HINDSIGHT_GLYPH, _MIN_CLIENT_VERSION, _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
     _PROVIDER_DEFAULT_MODELS, _STREAM_ERROR_PREFIX, _VALID_BUDGETS, _daemon_llm_provider,
-    _KANBAN_QUERY_BODY_CHARS, _kanban_recall_query, _kanban_recall_tags, _normalize_observation_scopes,
-    _normalize_retain_contexts, _normalize_retain_tags, _parse_bool_setting, _parse_int_setting,
+    _KANBAN_QUERY_BODY_CHARS, _apply_project_aliases, _kanban_recall_query, _kanban_recall_tags,
+    _normalize_observation_scopes, _normalize_project_aliases, _normalize_retain_contexts,
+    _normalize_retain_tags, _observation_scope_tag_groups, _parse_bool_setting, _parse_int_setting,
     _parse_score_floor, _resolve_bank_id_template,
 )
 
@@ -278,12 +281,14 @@ RETAIN_SCHEMA = {
 
 _TAGS_MATCH_MODES = ("any", "all", "any_strict", "all_strict", "exact")
 _RECALL_FACT_TYPES = ("world", "experience", "observation")
+# How long the bank's project label list (tool-call slug check) is trusted before a refetch.
+_PROJECT_SLUGS_TTL = 3600.0
 
 _TAGS_PARAM = {"type": "array", "items": {"type": "string"}, "description": (
-    "Optional tag filter, e.g. [\"project:<slug>\", \"scope:personal\"] to scope to one project. "
-    "Always add \"scope:personal\" next to a project tag: consolidated observations carry ONLY "
-    "that tag, so project:<slug> alone hides them. Valid slugs are the 'project' entity-label "
-    "values in the bank config. Omit to use the configured default filter."
+    "Optional tag filter, e.g. [\"project:<slug>\"] to scope to one project. Consolidated "
+    "observations carry ONLY \"scope:personal\"; with 'any'/'any_strict' they are kept next to "
+    "the project's facts automatically. Valid slugs are the 'project' entity-label values in "
+    "the bank config. Omit to use the configured default filter."
 )}
 _TAGS_MATCH_PARAM = {"type": "string", "enum": list(_TAGS_MATCH_MODES), "description": (
     "How tags match (default 'any'). 'any'/'all' also return untagged memories; "
@@ -710,6 +715,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_kanban_card_query", "description": "In Kanban workers (HERMES_KANBAN_TASK set), auto-recall with the card's title + the start of its body instead of the dispatcher's topic-free 'work kanban task <id>' message", "default": False},
             {"key": "recall_kanban_body_chars", "description": "Card-body characters appended to the title for recall_kanban_card_query (0 = title only). Longer queries dilute the reranker score", "default": _KANBAN_QUERY_BODY_CHARS},
             {"key": "recall_kanban_tags", "description": "Auto-recall tag filter for Kanban workers, replacing recall_tags there (comma-separated or list; '{tenant}' expands to the card's tenant and the tag is dropped for untenanted cards), e.g. 'project:{tenant},scope:personal'. Blank keeps recall_tags", "default": ""},
+            {"key": "recall_project_aliases", "description": "Renamed project slugs for the recall/reflect tools: a JSON object old -> new (e.g. {\"aperture-robotics\": \"movis\"}); each project:<old> tag in a tool call is rewritten to project:<new>", "default": {}},
             {"key": "recall_kanban_tags_match", "description": "Tag matching mode for recall_kanban_tags ('any' also returns untagged memories)", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_prefer_observations", "description": "When recall_types mixes observation with raw world/experience facts, drop raw facts an included observation was consolidated from (applies to auto-recall and the hindsight_recall tool)", "default": False},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
@@ -1136,6 +1142,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_kanban_slot_wait_s = _parse_float_setting(cfg.get("recall_kanban_slot_wait_s"), 20.0)
         self._recall_kanban_recall_timeout_s = _parse_float_setting(
             cfg.get("recall_kanban_recall_timeout_s"), 10.0)
+        # Tool-call tag hygiene: renamed project slugs, and the bank's project label values
+        # (fetched lazily on the first tagged tool call, cached; None = unknown -> no check).
+        self._recall_project_aliases = _normalize_project_aliases(cfg.get("recall_project_aliases"))
+        self._project_slugs_cache: tuple[float, frozenset | None] | None = None
 
     def _kanban_first_turn_mode(self) -> bool:
         """True in a Kanban worker whose automatic recall is limited to its first turn."""
@@ -1343,7 +1353,11 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
         if self._recall_types:
             kwargs["types"] = self._recall_types
-        # Per-call tool overrides (tags + tags_match, types) replace the configured ones.
+        # Per-call tool overrides (tags + tags_match, types) replace the configured ones; a
+        # tag_groups override replaces the configured tags too (the server ANDs the two).
+        if overrides and "tag_groups" in overrides:
+            kwargs.pop("tags", None)
+            kwargs.pop("tags_match", None)
         kwargs.update(overrides or {})
         # Only sent when enabled, so default requests stay byte-identical (and older
         # clients without these kwargs keep working).
@@ -1643,19 +1657,87 @@ class HindsightMemoryProvider(MemoryProvider):
         logger.debug("Tool hindsight_retain: success")
         return "Memory stored successfully."
 
+    def _client_accepts(self, method: str, kwarg: str) -> bool:
+        """Whether the client's *method* takes *kwarg* (explicitly or via ``**kwargs``)."""
+        try:
+            params = inspect.signature(getattr(self._get_client(), method)).parameters
+        except (AttributeError, TypeError, ValueError):  # no such method / not introspectable
+            return False
+        return kwarg in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+    def _project_slugs(self) -> frozenset | None:
+        """The bank's ``project`` entity-label values, or None when unknown (fetch failed, no
+        such label). Cached on the provider for ``_PROJECT_SLUGS_TTL`` seconds, failures too, so
+        a down config endpoint costs one attempt per window, never one per call."""
+        cached = self._project_slugs_cache
+        if cached is not None and time.monotonic() - cached[0] < _PROJECT_SLUGS_TTL:
+            return cached[1]
+        import aiohttp  # hindsight_client's transport; its errors are the fail-open set
+
+        slugs = None
+        try:
+            resp = self._run_hindsight_operation(lambda client: client.aget_bank_config(self._bank_id))
+            labels = ((resp or {}).get("config") or {}).get("entity_labels") or []
+            for label in labels:
+                if isinstance(label, dict) and label.get("key") == "project":
+                    values = [v.get("value") if isinstance(v, dict) else v for v in label.get("values") or []]
+                    slugs = frozenset(str(v).strip() for v in values if str(v or "").strip()) or None
+                    break
+        except (aiohttp.ClientError, OSError, TimeoutError, RuntimeError, ValueError) as exc:
+            # Fail open by design (spec): the slug check is advisory. Logged once per TTL window.
+            logger.warning("Hindsight bank config fetch failed; project slugs unchecked for %ds: %s: %s",
+                           _PROJECT_SLUGS_TTL, type(exc).__name__, exc)
+        self._project_slugs_cache = (time.monotonic(), slugs)
+        return slugs
+
+    def _tool_overrides(self, args: dict, *, with_types: bool) -> tuple[dict, list[str]]:
+        """Client kwargs for a recall/reflect tool call plus notes for the model.
+
+        Order matters: aliases first (a renamed slug is valid after the rewrite), then the slug
+        check against the bank's project labels, which only warns: a slug missing from the
+        curated list (e.g. a fresh Kanban tenant) can still be a live tag. Then a project filter
+        in 'any'/'any_strict' mode becomes a tag group that also admits the observation scope."""
+        overrides = _tool_tag_filter(args, with_types=with_types)
+        tags, notes = overrides.get("tags"), []
+        if not tags:
+            return overrides, notes
+        rewritten = _apply_project_aliases(tags, self._recall_project_aliases)
+        projects = [t[len("project:"):] for t in rewritten if t.startswith("project:")]
+        if projects and (known := self._project_slugs()):
+            for slug in (p for p in projects if p not in known):
+                close = difflib.get_close_matches(slug, sorted(known), n=3, cutoff=0.5)
+                notes.append(f"(note: project:{slug} is not a project label in this bank"
+                             + (f"; closest: {', '.join(close)})" if close else ")"))
+        groups = _observation_scope_tag_groups(rewritten, overrides["tags_match"],
+                                               getattr(self, "_observation_scopes", None))
+        if groups is not None and not self._client_accepts("arecall" if with_types else "areflect", "tag_groups"):
+            groups = None  # client predates tag_groups (< 0.10): keep the flat filter
+        if groups is not None:
+            del overrides["tags"], overrides["tags_match"]
+            overrides["tag_groups"] = groups
+        else:
+            overrides["tags"] = rewritten
+        if rewritten != tags or groups is not None:
+            used = json.dumps(groups) if groups is not None else json.dumps(rewritten)
+            notes.insert(0, f"(tags used: {used})")
+        return overrides, notes
+
     def _tool_recall(self, args: dict) -> str:
         query = args["query"]
         logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                      self._bank_id, len(query), self._budget)
-        results = self._recall(query, overrides=_tool_tag_filter(args, with_types=True))
+        overrides, notes = self._tool_overrides(args, with_types=True)
+        results = self._recall(query, overrides=overrides)
         logger.debug("Tool hindsight_recall: %d results", len(results))
-        return "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
+        text = "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
+        return "\n".join([*notes, text])
 
     def _tool_reflect(self, args: dict) -> str:
         query = args["query"]
         logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
                      self._bank_id, len(query), self._budget)
-        text = self._reflect(query, _tool_tag_filter(args, with_types=False)) or ""
+        # Reflect returns synthesized prose: the filter rewrite applies, the notes do not.
+        text = self._reflect(query, self._tool_overrides(args, with_types=False)[0]) or ""
         logger.debug("Tool hindsight_reflect: response_len=%d", len(text))
         return text or "No relevant memories found."
 
