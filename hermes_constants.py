@@ -188,9 +188,11 @@ def get_default_hermes_root() -> Path:
         return memo[2]
     result = native_home
     if env_path is not None:
-        try:
-            env_path.resolve().relative_to(native_home.resolve())  # under ~/.hermes (normal or profile mode)
-        except ValueError:  # Docker/custom root: <root>/profiles/<name> -> <root>, else HERMES_HOME itself
+        # Native root only for ~/.hermes itself or ~/.hermes/profiles/<name>; any deeper path
+        # (e.g. a throwaway home under ~/.hermes/cache/scratch) is its own root (t_9983b9fe).
+        resolved, native = env_path.resolve(), native_home.resolve()
+        if resolved != native and not (resolved.parent.name == "profiles" and resolved.parent.parent == native):
+            # Docker/custom root: <root>/profiles/<name> -> <root>, else HERMES_HOME itself
             result = env_path.parent.parent if env_path.parent.name == "profiles" else env_path
     _default_hermes_root_memo = (*memo_key, result)
     return result

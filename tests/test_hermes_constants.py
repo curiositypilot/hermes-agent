@@ -135,8 +135,51 @@ class TestGetDefaultHermesRoot:
             "HERMES_HOME change must force a fresh resolution"
         )
 
+    # t_9983b9fe: only ~/.hermes and ~/.hermes/profiles/<name> map to the native root; any
+    # other path under ~/.hermes (scratch throwaway homes) is its own root.
+    def test_scratch_dir_under_native_is_custom_root(self, tmp_path, monkeypatch):
+        home = tmp_path / ".hermes" / "cache" / "scratch" / "demo_7414"
+        home.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        assert get_default_hermes_root() == home
 
+    def test_profile_under_native_returns_native(self, tmp_path, monkeypatch):
+        profile = tmp_path / ".hermes" / "profiles" / "coder"
+        profile.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        assert get_default_hermes_root() == tmp_path / ".hermes"
 
+    def test_native_itself_returns_native(self, tmp_path, monkeypatch):
+        native = tmp_path / ".hermes"
+        native.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(native))
+        assert get_default_hermes_root() == native
+
+    def test_profiles_dir_inside_scratch(self, tmp_path, monkeypatch):
+        scratch_home = tmp_path / ".hermes" / "cache" / "scratch" / "h"
+        profile = scratch_home / "profiles" / "p"
+        profile.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        assert get_default_hermes_root() == scratch_home
+
+    @pytest.mark.linux_only
+    def test_incident_t_9983b9fe_scratch_homes_isolate_kanban(self, tmp_path, monkeypatch):
+        """Replay: the 3 recorded smoke homes must not resolve to the live kanban.db."""
+        from hermes_cli import kanban_db as kb
+
+        for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        scratch = tmp_path / ".hermes" / "cache" / "scratch"
+        for name in ("demo_7414", "demo2_7414", "qa_ee3f.Ab12"):
+            home = scratch / name
+            home.mkdir(parents=True)
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            assert kb.kanban_db_path() == home / "kanban.db"
 
 
 class TestGetHermesHome:
