@@ -1265,6 +1265,57 @@ class TestGitDestructiveOps:
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, cmd
 
+    @pytest.mark.parametrize("cmd", [
+        "git checkout e72ff308 -- scripts/",
+        "git checkout HEAD -- scripts/",
+        "git checkout -- .",
+        "git checkout .",
+        "git checkout -f main",
+        "git checkout --force main",
+        "git restore scripts/",
+        "git restore --source=HEAD~1 x",
+        "git restore -s HEAD~1 x",
+        "git restore --staged --worktree x",
+        "git restore -SW x",
+        "git stash",
+        "git stash -u",
+        "git stash -m msg",
+        "git stash push",
+        "git stash save wip",
+        "git stash drop",
+        "git stash clear",
+        "git switch -f main",
+        "git switch --force main",
+        "git switch --discard-changes main",
+    ])
+    def test_worktree_overwriting_git_detected(self, cmd):
+        """Forms that discard uncommitted edits the way reset --hard does (t_2b84d05f)."""
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True, cmd
+        assert "uncommitted" in desc or "stashed" in desc, cmd
+
+    @pytest.mark.parametrize("cmd", [
+        "git checkout main",
+        "git checkout -b feat",
+        "git checkout -b feat origin/main",
+        "git stash list",
+        "git stash show -p",
+        "git stash create",
+        "git stash store abc",
+        "git stash pop",
+        "git stash apply",
+        "git restore --staged f",
+        "git restore -S f",
+        "git switch main",
+        "git switch -c new",
+        "git diff -- x",
+        "git log -- .",
+        "git checkout main; ls -- x",
+    ])
+    def test_non_destructive_git_not_flagged(self, cmd):
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False, cmd
+
     def test_branch_delete_flag_case_distinction(self):
         """git branch -d is the safe merged-only delete (git itself refuses unmerged
         branches); only the force spellings -D / delete+force belong behind the gate."""

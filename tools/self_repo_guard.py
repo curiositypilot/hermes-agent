@@ -21,6 +21,8 @@ _WORKTREE_MUTATIONS = frozenset({
     "bisect"})
 _WORKTREE_TARGET_ACTIONS = frozenset({"move", "remove"})
 _STASH_SAFE_ACTIONS = frozenset({"list", "show", "create", "store", "drop", "clear"})
+# A shared checkout's stash list holds other agents' parked work: drop/clear destroy it.
+_SHARED_STASH_SAFE_ACTIONS = frozenset({"list", "show", "create", "store"})
 _RESET_WORKTREE_MODES = frozenset({"--hard", "--merge", "--keep"})
 # `reset`/`stash`/`clean`/`restore` reach this set only in their SAFE forms (_mutates_worktree
 # runs first); listing them skips a pointless `git config --get alias.<sub>` subprocess.
@@ -51,6 +53,16 @@ _MAX_RECURSION = 4
 # git global options that consume the next argument (-C/--work-tree/-c are acted on).
 _GIT_GLOBAL_OPTIONS_WITH_ARG = frozenset(
     {"-C", "-c", "--work-tree", "--git-dir", "--namespace", "--exec-path"})
+
+
+@dataclass(frozen=True)
+class _Scope:
+    """What one guard protects. ``contains(target)``: a git command run against ``target`` acts
+    on a protected checkout. ``is_root(path)``: ``path`` names a protected checkout itself (the
+    `worktree remove|move` victim). ``mutates(subcommand, args)``: the git call rewrites it."""
+    contains: Callable[[Path], bool]
+    is_root: Callable[[Path], bool]
+    mutates: Callable[[str, list[str]], bool]
 
 
 @dataclass
@@ -431,13 +443,21 @@ def _mutates_worktree(subcommand: str, args: list[str]) -> bool:
     return check(args)
 
 
-def _inspect_git_worktree(args: list[str], cwd: Path, root: Path) -> str | None:
-    """Block `worktree remove|move` aimed at the running root, from any directory."""
+def _mutates_shared_checkout(subcommand: str, args: list[str]) -> bool:
+    """``_mutates_worktree`` plus `stash drop|clear` (they delete other agents' stashed work)."""
+    if subcommand == "stash":
+        return next((arg for arg in args if not arg.startswith("-")), "push") not in (
+            _SHARED_STASH_SAFE_ACTIONS)
+    return _mutates_worktree(subcommand, args)
+
+
+def _inspect_git_worktree(args: list[str], cwd: Path, scope: _Scope) -> str | None:
+    """Block `worktree remove|move` aimed at a protected root, from any directory."""
     action_index = _consume_options(args, 0)
     action = args[action_index].lower() if action_index < len(args) else None
     target_index = _consume_options(args, action_index + 1)
     if (action in _WORKTREE_TARGET_ACTIONS and target_index < len(args)
-            and _resolve(args[target_index], cwd) == root):
+            and scope.is_root(_resolve(args[target_index], cwd))):
         return f"git worktree {action}"
     return None
 
@@ -452,17 +472,18 @@ def _read_git_alias(executable: str, target: Path, alias: str) -> str | None:
 
 
 def _inspect_git(
-    executable: str, args: list[str], current_dir: Path, env: dict[str, str], root: Path, depth: int
+    executable: str, args: list[str], current_dir: Path, env: dict[str, str], scope: _Scope,
+    depth: int,
 ) -> str | None:
     target, subcommand, sub_args, inline_aliases = _git_target_and_subcommand(
         args, current_dir, env)
     if subcommand is None:
         return None
     if subcommand == "worktree":  # names its victim as an argument: the cwd check does not apply
-        return _inspect_git_worktree(sub_args, target, root)
-    if not _is_within(target, root):
+        return _inspect_git_worktree(sub_args, target, scope)
+    if not scope.contains(target):
         return None
-    if _mutates_worktree(subcommand, sub_args):
+    if scope.mutates(subcommand, sub_args):
         return f"git {subcommand}"
     if subcommand in _KNOWN_GIT_BUILTINS or depth >= _MAX_RECURSION:
         return None
@@ -471,18 +492,19 @@ def _inspect_git(
     if not alias:
         return None
     if alias.startswith("!"):  # shell alias: scan it as a command
-        return _find_mutation(alias[1:], target, root, depth + 1)
+        return _find_mutation(alias[1:], target, scope, depth + 1)
     try:
         alias_args = shlex.split(alias, posix=True)
     except ValueError:
         return None
-    return _inspect_git(executable, [*alias_args, *sub_args], target, {}, root, depth + 1)
+    return _inspect_git(executable, [*alias_args, *sub_args], target, {}, scope, depth + 1)
 
 
 def _inspect_github_cli(
-    executable: str, args: list[str], current_dir: Path, env: dict[str, str], root: Path, depth: int
+    executable: str, args: list[str], current_dir: Path, env: dict[str, str], scope: _Scope,
+    depth: int,
 ) -> str | None:
-    if not _is_within(current_dir, root):
+    if not scope.contains(current_dir):
         return None
     index = _consume_options(args, 0, frozenset({"-R", "--repo", "--hostname"}))
     is_checkout = args[index : index + 2] == ["pr", "checkout"]
@@ -490,20 +512,21 @@ def _inspect_github_cli(
 
 
 def _inspect_shell(
-    executable: str, args: list[str], current_dir: Path, env: dict[str, str], root: Path, depth: int
+    executable: str, args: list[str], current_dir: Path, env: dict[str, str], scope: _Scope,
+    depth: int,
 ) -> str | None:
     script = _shell_script_arg(args)
-    return _find_mutation(script, current_dir, root, depth + 1) if script else None
+    return _find_mutation(script, current_dir, scope, depth + 1) if script else None
 
 
-# executable name -> inspector(executable, args, current_dir, env, root, depth)
+# executable name -> inspector(executable, args, current_dir, env, scope, depth)
 _INSPECTORS: dict[str, Callable[..., str | None]] = {
     "git": _inspect_git, "gh": _inspect_github_cli, "hub": _inspect_github_cli,
     **{shell: _inspect_shell for shell in _SHELL_EXECUTABLES}}
 
 
-def _find_mutation(command: str, cwd: Path, root: Path, depth: int = 0) -> str | None:
-    """Name of the first command in ``command`` that would rewrite ``root``, else None."""
+def _find_mutation(command: str, cwd: Path, scope: _Scope, depth: int = 0) -> str | None:
+    """Name of the first command in ``command`` that would rewrite a checkout ``scope`` protects."""
     if depth > _MAX_RECURSION:
         return None
     masked_command, heredocs = _mask_heredocs(command)
@@ -512,25 +535,25 @@ def _find_mutation(command: str, cwd: Path, root: Path, depth: int = 0) -> str |
     # Bodies a bare shell reads (`bash <<EOF`, `cat <<EOF | bash`) are scripts: scan them.
     for heredoc in heredocs:
         if _shell_consumes_heredoc(masked_command, starts, scopes, heredoc.opener) and (
-                operation := _find_mutation("".join(heredoc.body), cwd, root, depth + 1)):
+                operation := _find_mutation("".join(heredoc.body), cwd, scope, depth + 1)):
             return operation
     # cwd per subshell scope; `cd` applies to the NEXT command only via `&&`, `;`, newline.
     cwd_by_scope: dict[tuple[int, ...], Path] = {(): cwd}
     pending_cd: dict[tuple[int, ...], Path] = {}
     for start in starts:
-        scope = scopes[start]
-        cwd_by_scope.setdefault(scope, cwd_by_scope.get(scope[:-1], cwd))
-        pending = pending_cd.pop(scope, None)
+        shell_scope = scopes[start]
+        cwd_by_scope.setdefault(shell_scope, cwd_by_scope.get(shell_scope[:-1], cwd))
+        pending = pending_cd.pop(shell_scope, None)
         if pending is not None and _operator_before(masked_command, start) in {"&&", ";", "\n"}:
-            cwd_by_scope[scope] = pending
+            cwd_by_scope[shell_scope] = pending
         env, executable, args = _command_parts(_shell_words_at(masked_command, start))
         if executable is None:
             continue
-        current_dir = cwd_by_scope[scope]
+        current_dir = cwd_by_scope[shell_scope]
         if (cd_target := _cd_target(executable, args, current_dir)) is not None:
-            pending_cd[scope] = cd_target
+            pending_cd[shell_scope] = cd_target
         elif (inspect := _INSPECTORS.get(_executable_name(executable))) and (
-                operation := inspect(executable, args, current_dir, env, root, depth)):
+                operation := inspect(executable, args, current_dir, env, scope, depth)):
             return operation
     return None
 
@@ -549,8 +572,62 @@ def detect_self_repo_git_mutation(
     if root is None or not command:
         return False, None
     root = _resolve(str(root), Path("/"))
-    operation = _find_mutation(command, _resolve(cwd or "/", Path("/")), root)
+    scope = _Scope(contains=lambda target: _is_within(target, root),
+                   is_root=lambda path: path == root, mutates=_mutates_worktree)
+    operation = _find_mutation(command, _resolve(cwd or "/", Path("/")), scope)
     return (True, _block_message(operation, root)) if operation is not None else (False, None)
+
+
+def _enclosing_toplevel(path: Path) -> Path | None:
+    """Nearest ancestor (``path`` included) holding a ``.git`` dir or file: the repo or worktree
+    a git command run there acts on. Filesystem only — no git subprocess on the hot path."""
+    for candidate in (path, *path.parents):
+        with contextlib.suppress(OSError):
+            if (candidate / ".git").exists():
+                return candidate
+    return None
+
+
+def protected_checkout_roots(configured: object, hermes_home: Path) -> list[Path]:
+    """``approvals.protected_checkouts`` -> resolved roots. Unset (None): ``[hermes_home]`` when it
+    is a git checkout, else ``[]``. An explicit list (``[]`` included) is used as given."""
+    if configured is None:
+        return [_resolve(str(hermes_home), Path("/"))] if (hermes_home / ".git").exists() else []
+    if isinstance(configured, str):
+        configured = [configured]
+    if not isinstance(configured, (list, tuple)):
+        return []
+    return [_resolve(str(item), Path("/")) for item in configured if str(item or "").strip()]
+
+
+def detect_shared_checkout_git_mutation(
+    command: str, cwd: str | None, protected_roots: list[Path]) -> tuple[bool, str | None]:
+    """-> (blocked, message): whether a command would rewrite (or drop the stashes of) a shared
+    checkout that holds other agents' uncommitted work. A target counts only when its nearest
+    enclosing repo toplevel IS a protected root, so nested repos and worktrees stay free."""
+    if not command or not protected_roots:
+        return False, None
+    current_dir = _resolve(cwd or "/", Path("/"))
+    for configured_root in protected_roots:
+        root = _resolve(str(configured_root), Path("/"))
+        scope = _Scope(contains=lambda target, root=root: _enclosing_toplevel(target) == root,
+                       is_root=lambda path, root=root: path == root,
+                       mutates=_mutates_shared_checkout)
+        operation = _find_mutation(command, current_dir, scope)
+        if operation is not None:
+            return True, _shared_block_message(operation, root)
+    return False, None
+
+
+def _shared_block_message(operation: str, root: Path) -> str:
+    return (
+        f"Blocked: `{operation}` would overwrite or discard uncommitted work in the shared checkout "
+        f"{root}. Other agents keep their uncommitted edits in this tree; git cannot bring them "
+        "back. Read or test without touching the worktree instead: `git show <rev>:<path>` to read "
+        "a file at a revision; a temporary index (`GIT_INDEX_FILE=<tmp>/idx git read-tree <rev>` "
+        "then `GIT_INDEX_FILE=<tmp>/idx git apply --cached --check <diff>`) to test a patch; or "
+        "`git worktree add --detach <dir> <rev>` for a full checkout elsewhere. If a human really "
+        "wants this, they run it themselves outside Hermes.")
 
 
 def _block_message(operation: str, root: Path) -> str:

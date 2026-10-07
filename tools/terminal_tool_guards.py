@@ -2,7 +2,8 @@
 
 Pure functions that decide whether a command may run at all: workdir
 validation, the foreground long-lived/background-operator guidance, the
-supervised-gateway lifecycle block, and the Windows self-repo git guard.
+supervised-gateway lifecycle block, the Windows self-repo git guard, and the
+shared-checkout git guard.
 Each ``*_block`` helper returns a finished JSON error string, or None when
 the command may proceed. Split out of tools/terminal_tool.py; the origin
 module re-imports every public helper so ``tools.terminal_tool.<name>``
@@ -286,4 +287,54 @@ def self_repo_block(
     if not hit:
         return None
     logger.warning("Blocked self-repo git mutation (command: %s)", _safe_command_preview(command))
+    return _blocked_json(msg, "blocked")
+
+
+def _protected_checkouts() -> list:
+    """``approvals.protected_checkouts`` resolved for the active profile (default: HERMES_HOME when
+    it is a git checkout). Fails closed to the default when config cannot be read."""
+    from hermes_constants import get_hermes_home
+    from tools.self_repo_guard import protected_checkout_roots
+
+    from hermes_cli.config import InvalidUserConfigError, load_config_readonly
+    from hermes_cli.config_home import HomeInitializationError
+
+    configured = None
+    try:
+        approvals = load_config_readonly().get("approvals")
+    except (InvalidUserConfigError, HomeInitializationError, OSError) as exc:
+        # Known "config unreadable" failures: fail closed to the default root, loudly.
+        logger.warning("protected_checkouts: config unreadable (%s: %s); guarding the default root",
+                       type(exc).__name__, exc)
+        approvals = None
+    if isinstance(approvals, dict):
+        configured = approvals.get("protected_checkouts")
+    return protected_checkout_roots(configured, get_hermes_home())
+
+
+def shared_checkout_block(
+    *,
+    command: str,
+    cwd: str,
+    workdir: Optional[str],
+    session_key: str,
+) -> Optional[str]:
+    """Refuse git commands that overwrite or discard uncommitted work in a shared checkout.
+
+    Every OS, local backend only. Runs before the approval chain, so
+    ``approvals.mode: off`` and yolo do not bypass it: the tree holds other
+    agents' uncommitted edits, which no approval can bring back. Returns the
+    JSON error string when blocked, else None.
+    """
+    from tools.self_repo_guard import detect_shared_checkout_git_mutation
+    from tools.terminal_tool import _resolve_command_cwd
+
+    roots = _protected_checkouts()
+    if not roots:
+        return None
+    guard_cwd = _resolve_command_cwd(workdir=workdir, default_cwd=cwd, session_key=session_key)
+    hit, msg = detect_shared_checkout_git_mutation(command, guard_cwd, roots)
+    if not hit:
+        return None
+    logger.warning("Blocked shared-checkout git mutation (command: %s)", _safe_command_preview(command))
     return _blocked_json(msg, "blocked")
