@@ -153,60 +153,33 @@ def test_manager_isolates_provider_failures():
 def _make_hindsight_provider():
     """Build a bare HindsightMemoryProvider that skips network setup.
 
-    We instantiate without importing optional deps at class-level by
-    bypassing __init__ and seeding the attributes on_session_switch
-    reads/writes. This keeps the test hermetic.
+    HindsightMemoryProvider.__init__ is pure config and sets up default
+    attributes without I/O or background threads. We instantiate normally
+    and override only the session state and stubs needed for testing
+    on_session_switch.
     """
-    import threading
     hindsight_mod = pytest.importorskip("plugins.memory.hindsight")
-    provider = object.__new__(hindsight_mod.HindsightMemoryProvider)
+    provider = hindsight_mod.HindsightMemoryProvider()
     provider._session_id = "old-sid"
     provider._parent_session_id = ""
     provider._document_id = "old-sid-20260101_000000_000000"
     provider._session_turns = ["turn-1", "turn-2"]
     provider._turn_counter = 2
     provider._turn_index = 2
-    # Attrs read by _build_metadata / _build_retain_kwargs when the
-    # buffer-flush path on session switch fires. Empty strings keep the
-    # metadata minimal but well-formed.
-    provider._retain_source = ""
-    provider._platform = ""
-    provider._user_id = ""
-    provider._user_name = ""
-    provider._chat_id = ""
-    provider._chat_name = ""
-    provider._chat_type = ""
-    provider._thread_id = ""
-    provider._agent_identity = ""
-    provider._agent_workspace = ""
-    provider._retain_tags = []
     provider._retain_context = "test-context"
     provider._retain_async = False
     provider._bank_id = "test-bank"
-    # Prefetch state the switch path drains/clears.
-    provider._prefetch_thread = None
-    provider._prefetch_lock = threading.Lock()
-    provider._prefetch_result = ""
-    # Sync thread tracking (legacy alias at the writer).
-    provider._sync_thread = None
     # Writer queue infra the flush-on-switch path enqueues onto. We stub
     # _ensure_writer / _register_atexit so no real thread is spawned;
     # tests exercising flush delivery live in
     # tests/plugins/memory/test_hindsight_provider.py where the full
     # writer-queue wiring is in place.
-    import queue as _queue
-    provider._retain_queue = _queue.Queue()
-    provider._shutting_down = threading.Event()
     provider._atexit_registered = True
     provider._ensure_writer = lambda: None
     provider._register_atexit = lambda: None
-    # Mode + API state used by _resolve_retain_target; stub the resolver
-    # so tests don't actually probe the API. Real probe behavior is
+    # Stub _resolve_retain_target so tests don't actually probe the API
+    # (_mode keeps its __init__ default). Real probe behavior is
     # exercised by tests in tests/plugins/memory/test_hindsight_provider.py.
-    provider._mode = "cloud"
-    provider._api_url = ""
-    provider._api_key = ""
-    provider._client = None
     provider._resolve_retain_target = lambda fb: (fb, None)
     # Stub the network-touching helper so any enqueued flush closure is
     # a no-op if ever drained in a unit test.
