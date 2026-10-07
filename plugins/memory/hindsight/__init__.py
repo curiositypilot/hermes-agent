@@ -30,7 +30,7 @@ from typing import Any, Callable, Dict, List, Optional
 from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
 from agent.secret_scope import UnscopedSecretError, get_secret
 from hermes_cli.config import cfg_get
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from hermes_time import now as _hermes_now
 from tools.registry import tool_error
 from utils import read_json_or_empty
@@ -52,6 +52,19 @@ from .settings import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_float_setting(value: Any, default: float) -> float:
+    """Parse a non-negative float config value, falling back on blank/invalid/negative input."""
+    if value is None or value == "" or isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid number Hindsight setting %r; using default %s", value, default)
+        return default
+    return parsed if parsed >= 0 else default
+
 
 _LOCAL_MODES = {"local", "local_embedded"}
 _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
@@ -595,6 +608,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         self._last_recall_returned, self._last_recall_count = False, 0
+        # recall_kanban_first_turn: set when the worker's one recall starts (any outcome).
+        self._kanban_first_turn_done = False
+        self._call_timeout = threading.local()  # per-thread override of the operation timeout
         self._apply_recall_settings({})
 
     @property
@@ -670,6 +686,11 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_kanban_workers", "description": "Auto-recall in Kanban worker processes (HERMES_KANBAN_TASK set). False skips automatic prefetch only; explicit recall/reflect tools remain available", "default": True},
+            {"key": "recall_kanban_first_turn", "description": "With recall_kanban_workers=false, still run ONE auto-recall per Kanban worker process, on its first turn, with the card's title + body start as the query. Pair with memory.kanban_external_prefetch_timeout_seconds in config.yaml (the slot wait exceeds the 8 s default)", "default": False},
+            {"key": "recall_kanban_skip_prefixes", "description": "Card-title prefixes that get no first-turn recall (comma-separated), e.g. critics that must judge the artifact, not the bank", "default": "critique/"},
+            {"key": "recall_kanban_slots", "description": "Host-wide concurrent first-turn recalls (flock slots under ~/.hermes/hindsight/locks, shared by every profile)", "default": 1},
+            {"key": "recall_kanban_slot_wait_s", "description": "Seconds a worker waits for a first-turn recall slot before skipping its recall", "default": 20.0},
+            {"key": "recall_kanban_recall_timeout_s", "description": "Seconds the first-turn recall call may take before its slot is released (bounds a hung server; the API timeout applies otherwise)", "default": 10.0},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
             {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
             {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
@@ -753,8 +774,11 @@ class HindsightMemoryProvider(MemoryProvider):
         return self._reflect_client
 
     def _run_sync(self, coro, timeout: float | None = None):
-        """Schedule *coro* on the shared loop using *timeout* (default: the configured timeout)."""
-        return _run_sync(coro, timeout=timeout or self._timeout)
+        """Schedule *coro* on the shared loop. Effective timeout: this thread's override first
+        (set by the Kanban first-turn recall so it cannot hold its slot for 120 s), then
+        *timeout*, then the configured timeout. Override first because
+        ``_run_hindsight_operation`` always passes *timeout* explicitly."""
+        return _run_sync(coro, timeout=getattr(self._call_timeout, "value", None) or timeout or self._timeout)
 
     def _run_hindsight_operation(self, operation, *, reflect: bool = False):
         """Run an async client operation; for local_embedded, a stale-daemon
@@ -1101,20 +1125,39 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_kanban_tag_templates = _normalize_retain_tags(cfg.get("recall_kanban_tags"))
         self._recall_kanban_tags_match = cfg.get("recall_kanban_tags_match") or "any"
         self._kanban_recall: tuple[str, list[str]] | None = None  # resolved lazily, once
+        self._kanban_card_title = ""  # cached with _kanban_recall from the same card read
+        # One first-turn recall per worker process even when recall_kanban_workers=false
+        # (t_b765c677): host-wide flock slots bound the concurrent rerank load of spawn bursts.
+        self._recall_kanban_first_turn = _parse_bool_setting(cfg.get("recall_kanban_first_turn"), False)
+        prefixes = cfg.get("recall_kanban_skip_prefixes", "critique/")
+        self._recall_kanban_skip_prefixes = tuple(
+            _normalize_retain_tags(prefixes if prefixes is not None else ""))
+        self._recall_kanban_slots = max(1, _parse_int_setting(cfg.get("recall_kanban_slots"), 1))
+        self._recall_kanban_slot_wait_s = _parse_float_setting(cfg.get("recall_kanban_slot_wait_s"), 20.0)
+        self._recall_kanban_recall_timeout_s = _parse_float_setting(
+            cfg.get("recall_kanban_recall_timeout_s"), 10.0)
+
+    def _kanban_first_turn_mode(self) -> bool:
+        """True in a Kanban worker whose automatic recall is limited to its first turn."""
+        return (self._recall_kanban_first_turn and not self._recall_kanban_workers
+                and bool(os.environ.get(_KANBAN_TASK_ENV, "").strip()))
 
     def _kanban_recall_context(self) -> tuple[str, list[str]]:
         """``(card query, recall tags)`` for a Kanban worker process, ``("", [])`` otherwise or
         when the knobs are off. Resolved on first auto-recall and cached: the card a worker
         serves never changes over the process's life. A card that cannot be read degrades to
-        today's behaviour (turn text, recall_tags), never to a failed recall."""
+        today's behaviour (turn text, recall_tags), never to a failed recall. The card title is
+        cached alongside (``_kanban_card_title``) for the first-turn skip-prefix check."""
         if self._kanban_recall is not None:
             return self._kanban_recall
         query, tags = "", []
         task_id = os.environ.get(_KANBAN_TASK_ENV, "").strip()
-        if task_id and (self._recall_kanban_card_query or self._recall_kanban_tag_templates):
+        # First-turn mode always queries with the card: the dispatcher's turn text is topic-free.
+        card_query = self._recall_kanban_card_query or self._kanban_first_turn_mode()
+        if task_id and (card_query or self._recall_kanban_tag_templates):
             tenant = os.environ.get(_KANBAN_TENANT_ENV, "").strip()
             task = None
-            if self._recall_kanban_card_query or not tenant:
+            if card_query or not tenant:
                 try:
                     from hermes_cli import kanban_db as kb
                     from hermes_cli.kanban_db_connect import connect_closing
@@ -1125,7 +1168,8 @@ class HindsightMemoryProvider(MemoryProvider):
                     logger.debug("Hindsight: could not read Kanban card %s for recall: %s", task_id, exc)
             if task is not None:
                 tenant = tenant or str(getattr(task, "tenant", "") or "").strip()
-                if self._recall_kanban_card_query:
+                self._kanban_card_title = str(getattr(task, "title", "") or "")
+                if card_query:
                     query = _kanban_recall_query(task.title, task.body, self._recall_kanban_body_chars)
             tags = _kanban_recall_tags(self._recall_kanban_tag_templates, tenant)
             logger.debug("Hindsight: Kanban recall for %s: query_len=%d tags=%s", task_id, len(query), tags)
@@ -1208,14 +1252,83 @@ class HindsightMemoryProvider(MemoryProvider):
     # -- recall ------------------------------------------------------------------
 
     def _recall_disabled(self) -> bool:
-        """Guards shared by the async and synchronous recall paths."""
+        """Guards shared by the async and synchronous recall paths. A pure read (prefetch calls
+        it twice per sync turn): the first-turn recall marks itself done in its own path."""
+        kanban_off = not self._recall_kanban_workers and os.environ.get(_KANBAN_TASK_ENV, "").strip()
         why = ("tools-only mode" if self._memory_mode == "tools" else "auto_recall disabled" if not self._auto_recall
                else "Kanban worker auto-recall disabled"
-               if not self._recall_kanban_workers and os.environ.get(_KANBAN_TASK_ENV, "").strip()
+               if kanban_off and not self._recall_kanban_first_turn
+               else "Kanban worker first-turn recall already ran"
+               if kanban_off and self._kanban_first_turn_done
                else "shutting down" if self._shutting_down.is_set() else None)
         if why:
             logger.debug("Prefetch: skipped (%s)", why)
         return why is not None
+
+    @contextlib.contextmanager
+    def _kanban_recall_slot(self):
+        """Yield True while holding one of ``recall_kanban_slots`` host-wide flock slots, False
+        when none frees up within ``recall_kanban_slot_wait_s``. The lock files live under the
+        Hermes ROOT (not the profile home) so workers of every profile share the same slots.
+        The kernel drops a flock when its process dies, so a crashed worker never holds one."""
+        try:
+            import fcntl
+        except ImportError:  # no flock (Windows): no host-wide bound, recall unthrottled
+            yield True
+            return
+        try:
+            lock_dir = get_default_hermes_root() / "hindsight" / "locks"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.info("Kanban first-turn recall skipped: lock dir unavailable (%s)", exc)
+            yield False
+            return
+        deadline = time.monotonic() + self._recall_kanban_slot_wait_s
+        held = None
+        while held is None:
+            for i in range(self._recall_kanban_slots):
+                fd = os.open(lock_dir / f"kanban-recall-{i}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    os.close(fd)
+                    continue
+                held = fd
+                break
+            if held is None:
+                if time.monotonic() >= deadline or self._shutting_down.is_set():
+                    break
+                time.sleep(0.25)
+        if held is None:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(held, fcntl.LOCK_UN)
+            os.close(held)
+
+    def _kanban_first_turn_recall(self, query: str) -> tuple[str, int]:
+        """The one automatic recall of a ``recall_kanban_first_turn`` worker. Marked done before
+        anything else, so a skip (prefix, no slot) or a failed/slow recall is never retried."""
+        self._kanban_first_turn_done = True
+        self._kanban_recall_context()  # one cached card read: query, tags and title
+        title = self._kanban_card_title
+        if any(title.startswith(prefix) for prefix in self._recall_kanban_skip_prefixes):
+            logger.debug("Kanban first-turn recall skipped: title prefix (%s)", title[:60])
+            return "", 0
+        with self._kanban_recall_slot() as got:
+            if not got:
+                logger.info("Kanban first-turn recall skipped: no slot")
+                return "", 0
+            # Bound the call itself: the manager's join timeout does not stop this thread, and a
+            # hung request would otherwise hold the slot for the full API timeout (120 s).
+            self._call_timeout.value = self._recall_kanban_recall_timeout_s or None
+            try:
+                return self._do_recall(query)
+            finally:
+                self._call_timeout.value = None
 
     def _recall(self, query: str, *, auto: bool = False, overrides: dict | None = None) -> list:
         """One recall. *auto* marks the injected auto-recall path, the only one the
@@ -1298,6 +1411,10 @@ class HindsightMemoryProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._recall_disabled():
             return self._finish_prefetch("", 0)
+        # recall_kanban_first_turn: the worker's one recall runs synchronously on its first
+        # prefetch in either recall_sync mode (no background result exists for turn 1).
+        if self._kanban_first_turn_mode():
+            return self._finish_prefetch(*self._kanban_first_turn_recall(query))
         # Opt-in: recall synchronously against the *current* message so the
         # injected memories match this turn's query, not the previous turn's.
         # See NousResearch/hermes-agent#5820.
@@ -1317,8 +1434,9 @@ class HindsightMemoryProvider(MemoryProvider):
         return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        # Sync mode recalls live each turn — nothing to prime in the background.
-        if self._recall_sync or self._recall_disabled():
+        # Sync mode recalls live each turn — nothing to prime in the background. A first-turn
+        # Kanban worker never primes either: its one recall belongs to turn 1, not the next turn.
+        if self._recall_sync or self._recall_disabled() or self._kanban_first_turn_mode():
             return
 
         def _run():
