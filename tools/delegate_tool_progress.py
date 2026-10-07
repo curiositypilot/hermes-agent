@@ -177,17 +177,20 @@ _NESTED_CHILDREN_NOTE = (
 
 def _build_child_system_prompt(
     goal: str, context: Optional[str] = None, *, workspace_path: Optional[str] = None, role: str = "leaf",
-    max_spawn_depth: int = 2, child_depth: int = 1,
+    max_spawn_depth: int = 2, child_depth: int = 1, memory_context: str = "",
 ) -> str:
     """Focused system prompt for a child agent. role='orchestrator' appends a delegation-capability block (modeled on
     OpenClaw's buildSubagentSystemPrompt); its depth note is literal truth grounded in the passed config so the LLM
-    can't confabulate nesting."""
+    can't confabulate nesting. ``memory_context`` is the parent's recall on the goal (children have no provider)."""
     # The goal is the child's first user turn (see ``_ChildRun.await_child``).
     # Keeping it out of the system prompt avoids sending OAuth Anthropic the
     # same task in both roles, while preserving the normal user-turn contract.
     parts = ["You are a focused subagent working on a specific delegated task."]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
+    # Independent of CONTEXT: a goal-only task still gets its recall.
+    if memory_context and memory_context.strip():
+        parts.append(f"\nRECALLED MEMORY (may be stale; verify before acting):\n{memory_context.strip()}")
     if workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"

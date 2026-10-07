@@ -333,6 +333,26 @@ def build_memory_context_block(raw_context: str) -> str:
     )
 
 
+def build_delegation_memory_block(raw_context: str) -> str:
+    """Fence recalled memory for a delegated child's system prompt. Unlike
+    :func:`build_memory_context_block` the note does not call it authoritative: the child
+    reads it under a "may be stale; verify before acting" header and must stay free to look
+    things up."""
+    if not raw_context or not raw_context.strip():
+        return ""
+    clean = _drop_repeated_recall_lines(sanitize_context(raw_context))
+    if not clean.strip():
+        return ""
+    return (
+        "<memory-context>\n"
+        "[System note: The following is memory recalled by the parent agent for this task, "
+        "NOT new user input. It may be stale or incomplete — use it as leads, and verify "
+        "anything you act on.]\n\n"
+        f"{clean.strip()}\n"
+        "</memory-context>"
+    )
+
+
 class MemoryManager:
     """Builtin provider (always first) plus at most one external provider.
 
@@ -500,6 +520,46 @@ class MemoryManager:
                 config=self._external_prefetch_spill_config,
             )
         return result
+
+    def delegation_context(self, query: str, *, timeout: Optional[float] = None) -> str:
+        """Parent-side read-only recall for a delegated child's goal, fenced for its system prompt.
+
+        External providers only, each bounded by ``timeout`` (default: the external prefetch timeout) on
+        its own thread. The thread is deliberately NOT tracked in ``_external_prefetch_threads``: a slow
+        child recall must never make the parent skip its own next-turn prefetch."""
+        if not query or not query.strip() or self._shutting_down:
+            return ""
+        limit = self._external_prefetch_timeout if timeout is None else float(timeout)
+        parts: List[str] = []
+        for provider in self._providers:
+            if provider.name == "builtin":
+                continue
+            fn = getattr(provider, "delegation_context", None)
+            if not callable(fn):
+                continue
+            result_box: Dict[str, Any] = {}
+
+            def _run(fn=fn, box=result_box) -> None:
+                try:
+                    box["value"] = fn(query) or ""
+                except Exception as exc:
+                    box["error"] = exc
+
+            thread = spawn_context_thread(_run, name=f"memory-delegation-{provider.name}")
+            thread.start()
+            thread.join(max(0.0, limit))
+            if thread.is_alive():
+                logger.info("Memory provider '%s' delegation recall timed out after %.1fs; child gets no block",
+                            provider.name, limit)
+                continue
+            if "error" in result_box:
+                logger.info("Memory provider '%s' delegation recall failed (non-fatal): %s",
+                            provider.name, result_box["error"])
+                continue
+            value = result_box.get("value", "")
+            if isinstance(value, str) and value.strip():
+                parts.append(value)
+        return build_delegation_memory_block("\n\n".join(parts))
 
     def describe_recall(self) -> str:
         """Deterministic recall indicator line (e.g. ``"🧠 Provider — recalled 3 memories"``); ``""`` if none.

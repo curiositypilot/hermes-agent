@@ -670,6 +670,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_kanban_workers", "description": "Auto-recall in Kanban worker processes (HERMES_KANBAN_TASK set). False skips automatic prefetch only; explicit recall/reflect tools remain available", "default": True},
+            {"key": "recall_delegate_children", "description": "Before delegate_task spawns subagents, recall once per child on its goal (parent-side, read-only) and put the result in the child's system prompt. Children never get a memory provider or memory tools", "default": True},
+            {"key": "recall_delegate_max_items", "description": "Maximum recalled memories handed to each delegate_task child (0 = none)", "default": 8},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
             {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
             {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
@@ -1076,6 +1078,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_tags_match = cfg.get("recall_tags_match", "any")
         self._auto_recall = cfg.get("auto_recall", True)
         self._recall_kanban_workers = _parse_bool_setting(cfg.get("recall_kanban_workers"), True)
+        # Parent-side recall handed to delegate_task children (they run with no provider).
+        self._recall_delegate_children = _parse_bool_setting(cfg.get("recall_delegate_children"), True)
+        self._recall_delegate_max_items = max(0, _parse_int_setting(cfg.get("recall_delegate_max_items"), 8))
         self._recall_sync = bool(cfg.get("recall_sync", False))
         self._recall_max_tokens = int(cfg.get("recall_max_tokens", 4096))
         self._recall_max_input_chars = int(cfg.get("recall_max_input_chars", 800))
@@ -1287,6 +1292,34 @@ class HindsightMemoryProvider(MemoryProvider):
             "Do not call tools to look up information that is already present here."
         )
         return f"{header}\n\n{result}"
+
+    def delegation_context(self, query: str) -> str:
+        """Parent-side recall on a delegate_task child's goal for its system prompt (the child itself
+        has no provider). Recalls on *query* as given — never the Kanban card text — and ignores
+        ``recall_kanban_workers`` (that opt-out is per-turn latency; this is one recall per child).
+        Leaves ``_prefetch_result`` and the recall indicator untouched."""
+        why = ("tools-only mode" if self._memory_mode == "tools" else "auto_recall disabled" if not self._auto_recall
+               else "recall_delegate_children disabled" if not self._recall_delegate_children
+               else "recall_delegate_max_items is 0" if self._recall_delegate_max_items <= 0
+               else "shutting down" if self._shutting_down.is_set() else None)
+        if why or not query or not query.strip():
+            logger.debug("Delegation recall: skipped (%s)", why or "empty query")
+            return ""
+        if self._recall_max_input_chars:
+            query = query[:self._recall_max_input_chars]
+        try:
+            results = self._recall(query, auto=True)
+        except Exception as e:
+            logger.info("Hindsight delegation recall failed: %s", e)
+            logger.debug("Hindsight delegation recall failure detail", exc_info=True)
+            return ""
+        lines = [f"- {r.text}" for r in results if getattr(r, "text", None)][:self._recall_delegate_max_items]
+        if not lines:
+            return ""
+        # Not the per-turn preamble: that one says "do not call tools to look things up", which a
+        # child debugging or auditing must remain free to do.
+        header = "# Hindsight Memory (recalled by the parent agent for this task's goal)"
+        return header + "\n\n" + "\n".join(lines)
 
     def _join_prefetch(self, timeout: float, *, log: bool = False) -> None:
         if not (self._prefetch_thread and self._prefetch_thread.is_alive()):
