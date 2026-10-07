@@ -72,6 +72,21 @@ class _RoutingClient:
         return _Response(self._payloads[url])
 
 
+@pytest.mark.parametrize("utilization", [0.0, 0.5, 1.0, 2.0, 37.0, 100.0])
+def test_anthropic_utilization_is_percent_at_every_value(monkeypatch, utilization):
+    # /api/oauth/usage reports utilization in percent (0-100). A "<= 1 means fraction" guess turned
+    # a fresh 1% session into 100% and held kanban cards on false quota (t_e1b8bf33).
+    monkeypatch.setattr("agent.account_usage.resolve_anthropic_token", lambda: "sk-ant-oat01-test")
+    monkeypatch.setattr(
+        "agent.account_usage.httpx.Client",
+        lambda timeout=15.0: _Client({"five_hour": {"utilization": utilization,
+                                                    "resets_at": "2026-10-07T22:30:00+00:00"}}),
+    )
+    snapshot = fetch_account_usage("anthropic")
+    assert snapshot is not None
+    assert [w.used_percent for w in snapshot.windows] == [utilization]
+
+
 def test_fetch_account_usage_codex(monkeypatch):
     monkeypatch.setattr(
         "agent.account_usage.resolve_codex_runtime_credentials",
