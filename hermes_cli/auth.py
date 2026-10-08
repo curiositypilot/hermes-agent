@@ -1046,9 +1046,11 @@ def _merge_billing_streak(result: Dict[str, Any], entry: Dict[str, Any], disk_en
     """Carry the newest billing streak across a pool rewrite.
 
     The streak (``agent.credential_pool.BILLING_STREAK_KEYS``) sizes the escalating billing bench
-    and is stamped by its own ``billing_streak_at``. A writer holding an older snapshot must not
-    overwrite another process's newer streak, and a ``hermes auth reset`` on disk that postdates
-    every streak ends it.
+    and is stamped by its own ``billing_streak_at``. The side whose latest mark (billing streak or
+    any status mark) is newer owns the streak keys: a writer holding an older snapshot must not
+    overwrite another process's newer streak, nor resurrect a streak that another process's newer
+    non-billing mark ended on purpose. A ``hermes auth reset`` on disk that postdates every streak
+    ends it.
     """
     from agent.credential_pool import BILLING_STREAK_KEYS, _parse_absolute_timestamp
 
@@ -1059,12 +1061,14 @@ def _merge_billing_streak(result: Dict[str, Any], entry: Dict[str, Any], disk_en
         return result
     if cleared_at >= max(mem_at, disk_at):
         return {k: v for k, v in result.items() if k not in BILLING_STREAK_KEYS}
-    # The writer's own newer mark wins even when it carries no streak: a non-billing mark after
-    # the disk's billing mark ended the streak on purpose.
     mem_ref = max(mem_at, _parse_absolute_timestamp(entry.get("last_status_at")) or 0.0)
-    if disk_at > mem_ref:
+    disk_ref = max(disk_at, _parse_absolute_timestamp(disk_entry.get("last_status_at")) or 0.0)
+    if disk_ref > mem_ref:
+        # The disk's mark is newer: its streak when that mark was billing, none when a
+        # non-billing mark ended the streak (``_mark_exhausted`` strips the keys).
         return {**{k: v for k, v in result.items() if k not in BILLING_STREAK_KEYS},
                 **{k: disk_entry[k] for k in BILLING_STREAK_KEYS if disk_entry.get(k) is not None}}
+    # The writer's own mark is newer (or the same): it wins even when it carries no streak.
     return result
 
 

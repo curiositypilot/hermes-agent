@@ -2,8 +2,8 @@
 
 A depleted account (xAI 403 spending-limit, a 402) does not refill in an hour. With a flat
 1 h billing bench every router re-picked the spent key each hour, paid one failed request
-and fell back: 17 billing fallbacks on one xai-oauth credential in 39 hours. The bench now
-doubles per consecutive billing mark (1 h, 2 h, 4 h, ...) up to a daily probe, and
+and fell back: 43 billing fallbacks on 26 cards from one xai-oauth credential in 39 hours. The
+bench now doubles per consecutive billing mark (1 h, 2 h, 4 h, ...) up to a daily probe, and
 ``hermes auth reset`` / a non-billing mark / a rotated secret end the streak.
 
 Every test drives the real pool against a temp ``HERMES_HOME`` with a fake clock.
@@ -259,6 +259,31 @@ def test_a_stale_writer_keeps_another_processs_newer_streak(home, clock):
     assert disk["billing_streak_at"] == entry.billing_streak_at
 
 
+def test_a_stale_writer_does_not_resurrect_a_streak_another_process_ended(home, clock):
+    """The mirror image: a writer holding its own older streak must not restore it over
+    another process's newer non-billing mark, which ended the streak on purpose."""
+    stale = _pool()
+    entry = _bill(stale)
+    entry = _probe_after_bench(stale, clock, entry)
+    entry = _bill(stale)
+    assert _disk_entry(home)["billing_streak"] == 2
+    clock.now += 5
+    other = _pool()
+    _bill(other, status_code=429, failure_reason="rate_limit")
+    assert "billing_streak" not in _disk_entry(home)
+    clock.now += 5
+    stale._persist()  # snapshot still carries streak 2
+    disk = _disk_entry(home)
+    assert "billing_streak" not in disk and "billing_streak_at" not in disk
+    fresh = _pool()
+    entry = fresh.entries()[0]
+    assert entry.billing_streak is None
+    entry = _probe_after_bench(fresh, clock, entry)
+    entry = _bill(fresh)
+    assert _bench(entry) == HOUR
+    assert entry.billing_streak == 1
+
+
 def test_a_rotated_secret_drops_the_streak(home, clock):
     from agent.credential_pool import _upsert_entry
 
@@ -287,30 +312,62 @@ def test_pool_availability_reports_the_escalated_bench(home, clock):
 
 
 # ── Replay of the xai-oauth incident ────────────────────────────────────────
-# Pinned from the board (``sqlite3 -readonly ~/.hermes/kanban.db``): ``provider_fallback`` events
-# from xai-oauth with reason=billing, 2026-10-06 21:00 .. 2026-10-08 12:00 UTC, one row per
-# routed card that reached xai after the first mark and fell back. These are the routes that
-# actually produced a billing failure, not every route (most routes inside a running bench were
-# refused at the pool check and never reached xai). The first mark is t_223daa8b.
-_FIRST_MARK = "2026-10-06 21:02:36"
-_ROUTES = [
-    "2026-10-06 23:16:45",  # t_9b365cbd / t_d198f919
-    "2026-10-07 01:17:30",  # t_9b365cbd / t_d198f919
-    "2026-10-07 01:34:38",  # t_8ef71af3 (review lane, 17 min after the previous mark)
-    "2026-10-07 02:44:05",  # t_2288ad56
-    "2026-10-07 04:36:45",  # t_a0967dc9
-    "2026-10-07 05:37:08",  # t_69b5b8bc
-    "2026-10-07 07:14:45",  # t_9428f40c
-    "2026-10-07 08:34:12",  # t_1245cb11
-    "2026-10-07 18:46:58",  # t_8b0bb66d
-    "2026-10-07 20:12:49",  # t_65d2e7ac
-    "2026-10-07 22:24:46",  # t_3cfce2dc
-    "2026-10-08 01:15:15",  # t_ac42b55f
-    "2026-10-08 02:16:37",  # t_b33b1db0
-    "2026-10-08 05:02:43",  # t_ff7249b0
-    "2026-10-08 07:54:50",  # t_a5971262
-    "2026-10-08 09:34:40",  # t_f2ccbaa6
-    "2026-10-08 11:52:54",  # t_7f073842 (the pinned critic)
+# Pinned from the board: every ``provider_fallback`` event from xai-oauth with reason=billing,
+# 2026-10-06 21:00 .. 2026-10-08 12:00 UTC (``sqlite3 -readonly ~/.hermes/kanban.db "select
+# task_id, datetime(created_at,'unixepoch') from task_events where kind='provider_fallback' and
+# payload like '%\"from_provider\": \"xai-oauth\"%' and payload like '%\"reason\": \"billing\"%'"``):
+# 43 events, 26 cards, 36 distinct seconds. The first row is the first mark.
+#
+# The replay models the credential-pool gate only: a route reaches xai when ``select`` hands
+# out the credential, and every probe fails billing again (the account stays empty). Events
+# inside a running bench on the real board (a worker's in-run primary restore every ~16 min on
+# t_0963c119 / t_223daa8b; parallel spawns in the same second) came from paths the pool gate
+# did not stop; the replay refuses them under both rules, so the two counts compare the bench
+# rules, not the board total.
+_EVENTS = [
+    ("2026-10-06 21:02:36", "t_223daa8b"),
+    ("2026-10-06 21:18:39", "t_223daa8b"),
+    ("2026-10-06 21:21:40", "t_9210012f"),
+    ("2026-10-06 21:21:40", "t_9b365cbd"),
+    ("2026-10-06 21:21:40", "t_a1744ab7"),
+    ("2026-10-06 21:21:40", "t_d198f919"),
+    ("2026-10-06 21:34:44", "t_223daa8b"),
+    ("2026-10-06 21:50:56", "t_223daa8b"),
+    ("2026-10-06 22:16:13", "t_19515a6a"),
+    ("2026-10-06 22:17:15", "t_0963c119"),
+    ("2026-10-06 22:33:21", "t_0963c119"),
+    ("2026-10-06 22:54:28", "t_0963c119"),
+    ("2026-10-06 23:10:45", "t_0963c119"),
+    ("2026-10-06 23:16:45", "t_9b365cbd"),
+    ("2026-10-06 23:16:45", "t_d198f919"),
+    ("2026-10-06 23:26:48", "t_0963c119"),
+    ("2026-10-06 23:42:54", "t_0963c119"),
+    ("2026-10-06 23:59:01", "t_0963c119"),
+    ("2026-10-07 00:15:06", "t_0963c119"),
+    ("2026-10-07 00:17:07", "t_9b365cbd"),
+    ("2026-10-07 00:17:07", "t_d198f919"),
+    ("2026-10-07 00:31:12", "t_0963c119"),
+    ("2026-10-07 01:17:30", "t_9b365cbd"),
+    ("2026-10-07 01:17:30", "t_d198f919"),
+    ("2026-10-07 01:34:38", "t_8ef71af3"),
+    ("2026-10-07 01:50:45", "t_b9588260"),
+    ("2026-10-07 02:44:05", "t_2288ad56"),
+    ("2026-10-07 04:36:45", "t_a0967dc9"),
+    ("2026-10-07 05:37:08", "t_69b5b8bc"),
+    ("2026-10-07 07:14:45", "t_9428f40c"),
+    ("2026-10-07 08:34:12", "t_1245cb11"),
+    ("2026-10-07 18:46:58", "t_8b0bb66d"),
+    ("2026-10-07 20:12:49", "t_65d2e7ac"),
+    ("2026-10-07 22:24:46", "t_3cfce2dc"),
+    ("2026-10-07 23:24:30", "t_11ac8569"),
+    ("2026-10-08 00:14:35", "t_54408c2a"),
+    ("2026-10-08 00:14:35", "t_5694f655"),
+    ("2026-10-08 01:15:15", "t_ac42b55f"),
+    ("2026-10-08 02:16:37", "t_b33b1db0"),
+    ("2026-10-08 05:02:43", "t_ff7249b0"),
+    ("2026-10-08 07:54:50", "t_a5971262"),
+    ("2026-10-08 09:34:40", "t_f2ccbaa6"),
+    ("2026-10-08 11:52:54", "t_7f073842"),  # the pinned critic
 ]
 
 
@@ -319,14 +376,15 @@ def _utc(stamp: str) -> float:
 
 
 def _replay(clock) -> list[str]:
-    """Route at each recorded time; a route reaches xai only when the pool hands out the
+    """Route at each recorded event; a route reaches xai only when the pool hands out the
     credential, and every such probe fails billing again (the account stays empty)."""
     pool = _pool()
-    clock.now = _utc(_FIRST_MARK)
+    first, *routes = _EVENTS
+    clock.now = _utc(first[0])
     assert pool.select() is not None
     _bill(pool)
     probes = []
-    for stamp in _ROUTES:
+    for stamp, _card in routes:
         clock.now = _utc(stamp)
         if pool.select() is None:
             continue
@@ -336,21 +394,25 @@ def _replay(clock) -> list[str]:
 
 
 def test_billing_backoff_replays_xai_incident(home, clock, monkeypatch):
-    assert len(_ROUTES) == 17  # observed: 17 billing failures after the first mark
+    assert len(_EVENTS) == 43
+    assert len({card for _stamp, card in _EVENTS}) == 26
+    assert len({stamp for stamp, _card in _EVENTS}) == 36
 
     new = _replay(clock)
     assert new == [
-        "2026-10-06 23:16:45",
-        "2026-10-07 01:17:30",
-        "2026-10-07 05:37:08",
-        "2026-10-07 18:46:58",
-        "2026-10-08 11:52:54",
+        "2026-10-06 22:16:13",  # t_19515a6a: 1 h bench ended 22:02, streak 2 -> 2 h
+        "2026-10-07 00:17:07",  # 2 h bench ended 00:16, streak 3 -> 4 h
+        "2026-10-07 04:36:45",  # 4 h bench ended 04:17, streak 4 -> 8 h
+        "2026-10-07 18:46:58",  # 8 h bench ended 12:36, streak 5 -> 16 h
+        "2026-10-08 11:52:54",  # 16 h bench ended 10:46: the daily-scale probe (t_7f073842)
     ]
 
-    # Old logic = a flat 1 h billing bench. Only t_8ef71af3 (17 min after a mark) was refused,
-    # so a flat bench lets 16 of the 17 recorded routes through to a failed request.
+    # Old logic = a flat 1 h billing bench: every event more than an hour after the previous
+    # probe reaches xai again (t_11ac8569 at 23:24:30 is the one hourly-scale route refused,
+    # 59 min 44 s after t_3cfce2dc).
     _write_store(home)
     monkeypatch.setattr("agent.credential_pool.EXHAUSTED_TTL_BILLING_MAX_SECONDS", HOUR)
     old = _replay(clock)
-    assert len(old) == 16
+    assert len(old) == 19
+    assert "2026-10-07 23:24:30" not in old
     assert set(new) <= set(old)
