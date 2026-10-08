@@ -300,7 +300,10 @@ RECALL_SCHEMA = {
     "description": (
         "Search long-term memory for specific facts. Returns memories ranked by relevance using "
         "semantic search, keyword matching, entity graph traversal, and reranking. For broad "
-        "questions (what are my preferences/plans/criteria for X) use hindsight_reflect instead."
+        "questions (what are my preferences/plans/criteria for X) use hindsight_reflect instead. "
+        "Before asking the user a question or stating a plan or status, run one recall per thing "
+        "it names (max 3), phrased 'the user decided or changed about <thing>: current status', "
+        "and read the whole result list, not only the top 5."
     ),
     "parameters": {"type": "object", "required": ["query"], "properties": {
         "query": {"type": "string", "description": "What to search for."},

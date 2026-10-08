@@ -264,6 +264,14 @@ class TestSchemas:
         assert "tags" in RETAIN_SCHEMA["parameters"]["properties"]
         assert "content" in RETAIN_SCHEMA["parameters"]["required"]
 
+    def test_recall_schema_steers_ask_time_decision_recall(self):
+        desc = RECALL_SCHEMA["description"]
+        assert "before asking" in desc.lower()
+        assert "plan or status" in desc
+        assert "decided or changed about" in desc
+        assert "max 3" in desc
+        # The plugin serves several profiles; never name one user in the shared schema.
+        assert "MB" not in desc
 
     def test_get_tool_schemas_returns_three(self, provider):
         schemas = provider.get_tool_schemas()
