@@ -141,7 +141,7 @@ async def test_queued_followup_carries_memory_query():
     )
     pending_event = SimpleNamespace(
         source=source, message_id="m9", channel_prompt=None, message_type=None, internal=False, metadata={},
-        reply_to_message_id="m8", reply_to_text=quote,
+        reply_to_message_id="m8", reply_to_text=quote, reply_expected=None,
     )
 
     await GatewayRunner._run_agent_queued_followup(
@@ -174,6 +174,7 @@ async def test_queued_followup_without_reply_passes_no_memory_query():
     )
     pending_event = SimpleNamespace(
         source=source, message_id="m9", channel_prompt=None, message_type=None, internal=False, metadata={},
+        reply_expected=None,
     )
 
     await GatewayRunner._run_agent_queued_followup(
