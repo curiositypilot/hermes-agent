@@ -48,6 +48,9 @@ def test_rate_limit_empty_chain_also_carries_the_hint(monkeypatch):
 
 
 CODEX_ONLY = [{"provider": "openai-codex", "model": "a"}, {"provider": "openai-codex", "model": "b"}]
+# The job itself stays unpinned: a pinned job never walks the chain (#100437), so the
+# same-provider wording only applies to jobs that run on the fleet's ``model.provider``.
+CODEX_PRIMARY = {"model": {"provider": "openai-codex"}}
 
 
 def _patch_chain(monkeypatch, cfg, chain):
@@ -56,8 +59,8 @@ def _patch_chain(monkeypatch, cfg, chain):
 
 
 def test_same_provider_only_chain_names_the_dead_provider_and_the_fix(monkeypatch):
-    _patch_chain(monkeypatch, {}, CODEX_ONLY)
-    job = {"name": "radar", "id": "ccc333", "provider": "openai-codex"}
+    _patch_chain(monkeypatch, CODEX_PRIMARY, CODEX_ONLY)
+    job = {"name": "radar", "id": "ccc333"}
     msg = _summarize_cron_failure_for_delivery(job, "HTTP 429: rate limit exceeded")
     assert "openai-codex" in msg
     assert "hermes fallback add" in msg
@@ -66,8 +69,8 @@ def test_same_provider_only_chain_names_the_dead_provider_and_the_fix(monkeypatc
 
 
 def test_mixed_chain_keeps_the_backups_failed_text(monkeypatch):
-    _patch_chain(monkeypatch, {}, [CODEX_ONLY[0], {"provider": "anthropic", "model": "c"}])
-    job = {"name": "radar", "id": "ccc333", "provider": "openai-codex"}
+    _patch_chain(monkeypatch, CODEX_PRIMARY, [CODEX_ONLY[0], {"provider": "anthropic", "model": "c"}])
+    job = {"name": "radar", "id": "ccc333"}
     msg = _summarize_cron_failure_for_delivery(job, "HTTP 429: rate limit exceeded")
     assert "No backup provider succeeded either." in msg
 
@@ -99,15 +102,15 @@ def test_unknown_primary_keeps_the_backups_failed_text(monkeypatch):
 def test_chat_only_backup_is_not_counted_as_a_cron_backup(monkeypatch):
     # Cron runs never try chat_only entries, so the other-provider chat_only entry cannot take over.
     chain = [CODEX_ONLY[0], {"provider": "openrouter", "model": "x", "chat_only": True}]
-    _patch_chain(monkeypatch, {}, chain)
-    job = {"name": "radar", "id": "fff666", "provider": "openai-codex"}
+    _patch_chain(monkeypatch, CODEX_PRIMARY, chain)
+    job = {"name": "radar", "id": "fff666"}
     msg = _summarize_cron_failure_for_delivery(job, "HTTP 429: rate limit exceeded")
     assert "Every backup provider is on `openai-codex`" in msg
     assert "succeeded either" not in msg
 
 
 def test_chat_only_entries_alone_read_as_no_backup_configured(monkeypatch):
-    _patch_chain(monkeypatch, {}, [{"provider": "openrouter", "model": "x", "chat_only": True}])
-    job = {"name": "radar", "id": "fff666", "provider": "openai-codex"}
+    _patch_chain(monkeypatch, CODEX_PRIMARY, [{"provider": "openrouter", "model": "x", "chat_only": True}])
+    job = {"name": "radar", "id": "fff666"}
     msg = _summarize_cron_failure_for_delivery(job, "HTTP 429: rate limit exceeded")
     assert "No backup provider is configured" in msg
