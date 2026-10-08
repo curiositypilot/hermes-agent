@@ -235,7 +235,7 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
         ("Mode", color("no-agent", Colors.DIM) + " (script stdout delivered directly)"
          if job.get("no_agent") else ""),
         ("Workdir", job.get("workdir")),
-        ("Data class", job.get("data_class")),
+        ("Class", job.get("data_class")),
         ("Last run", f"{job.get('last_run_at', '?')}  {_last_run_display(job)}"
          if job.get("last_status") else ""),
         ("Dispatch", _dispatch_display(job.get("last_dispatch"))),
