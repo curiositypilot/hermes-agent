@@ -185,3 +185,74 @@ def test_pinned_rate_limit_exits_75(monkeypatch):
     assert KANBAN_RATE_LIMIT_EXIT_CODE == 75
     assert _single_query_exit_code(verdict.result) == KANBAN_RATE_LIMIT_EXIT_CODE
     assert _single_query_exit_code({"failed": True, "failure_reason": "rate_limit"}) == 75
+
+
+# --- per-turn config sync (t_4b722398) --------------------------------------------------
+
+def test_cli_turn_sync_keeps_pinned_chain_empty(monkeypatch, tmp_path):
+    """The CLI re-syncs ``fallback_providers`` on every turn (``cli_chat_turn_mixin``); a
+    pinned worker's empty chain must survive it, an unpinned agent still adopts the chain."""
+    import os
+    from pathlib import Path
+    from hermes_cli.cli_chat_turn_mixin import CLIChatTurnMixin
+
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
+        "fallback_providers:\n"
+        "  - provider: anthropic\n    model: claude-sonnet-5-5\n"
+        "  - provider: antigravity\n    model: claude-opus-4-6-thinking\n"
+        "  - provider: antigravity\n    model: gemini-3.8-flash-tiered\n"
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_x")
+    monkeypatch.setenv("HERMES_KANBAN_PINNED", "1")
+    pinned = _chain(fallback=SNAPSHOT_20261006_CHAIN)
+    assert pinned._fallback_chain == [] and pinned._kanban_pinned_route is True
+
+    cli = SimpleNamespace(_fallback_model=None)
+    CLIChatTurnMixin._sync_fallback_chain_with_config(cli, pinned)
+    assert len(cli._fallback_model) == 3  # the sync did read the config chain
+    assert pinned._fallback_chain == [] and pinned._fallback_model is None
+
+    monkeypatch.delenv("HERMES_KANBAN_PINNED")
+    unpinned = _chain(fallback=[])
+    assert unpinned._fallback_chain == [] and unpinned._kanban_pinned_route is False
+    CLIChatTurnMixin._sync_fallback_chain_with_config(cli, unpinned)
+    assert [e["provider"] for e in unpinned._fallback_chain] == ["anthropic", "antigravity", "antigravity"]
+    assert unpinned._fallback_model == unpinned._fallback_chain[0]
+
+
+class _BillingErr(Exception):
+    status_code = 402
+
+    def __init__(self):
+        super().__init__("Error code: 402 - insufficient credits")
+        self.response = SimpleNamespace(headers={})
+        self.body = {"error": {"message": "insufficient credits", "type": "payment_required"}}
+
+
+def test_pinned_billing_ends_turn_and_exits_75(monkeypatch):
+    """Spec Change 2: with the chain empty, a billing wall on a pinned route ends the turn at
+    once (non-retryable client error, no fallback to activate) and the worker exits 75, so the
+    card requeues instead of failing. No fast-fail extension is needed for billing."""
+    from hermes_cli.cli_single_query import _single_query_exit_code
+    from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_x")
+    monkeypatch.setenv("HERMES_KANBAN_PINNED", "1")
+    err = _BillingErr()
+    classified = classify_api_error(err, provider="xai-oauth")
+    assert classified.reason == FailoverReason.billing
+    retry = SimpleNamespace(copilot_stale_cred_retry_attempted=False, primary_recovery_attempted=False,
+                            has_retried_429=False, restart_with_redirected_messages=False)
+    with patch("agent.turn_api_error.interruptible_backoff_sleep", lambda *a, **k: None), \
+         patch("agent.turn_api_error.compute_error_backoff", lambda *a, **k: 0.0):
+        verdict = settle_unrecovered_error(
+            _Agent(pinned=True), api_error=err, classified=classified, _retry=retry, status_code=402,
+            error_msg=str(err), error_context=None, is_context_length_error=False,
+            is_rate_limited=False, _is_zai_coding_overload=False, _provider="xai-oauth",
+            _base="https://example.invalid", _model="grok-4.7", messages=[], api_messages=[],
+            api_kwargs={}, active_system_prompt="", conversation_history=None, approx_tokens=10,
+            retry_count=0, max_retries=3, compression_attempts=0, api_call_count=1,
+        )
+    assert verdict.action == "return"
+    assert verdict.result["failure_reason"] == "billing"
+    assert _single_query_exit_code(verdict.result) == KANBAN_RATE_LIMIT_EXIT_CODE
