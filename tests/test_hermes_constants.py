@@ -102,7 +102,7 @@ class TestGetDefaultHermesRoot:
         monkeypatch.setenv("HERMES_HOME", str(profile))
         assert get_default_hermes_root() == scratch_home
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     def test_incident_t_9983b9fe_scratch_homes_isolate_kanban(self, tmp_path, monkeypatch):
         """Replay: the 3 recorded smoke homes must not resolve to the live kanban.db."""
         from hermes_cli import kanban_db as kb

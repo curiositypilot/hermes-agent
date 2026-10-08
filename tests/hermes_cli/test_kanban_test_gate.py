@@ -58,7 +58,7 @@ def test_validate_contract_rejects(value):
         validate_contract(value)
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_failing_command_refuses_completion_with_tail_and_keeps_run_open(board):
     conn, repo = board
     script = "; ".join(f"echo line{i}" for i in range(60)) + "; echo boom >&2; exit 3"
@@ -78,7 +78,7 @@ def test_failing_command_refuses_completion_with_tail_and_keeps_run_open(board):
     assert "test_gate" in kinds and "completed" not in kinds
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_passing_command_runs_in_workspace_and_lands_receipt_on_closed_run(board):
     conn, repo = board
     (repo / "marker").write_text("x")
@@ -93,7 +93,7 @@ def test_passing_command_runs_in_workspace_and_lands_receipt_on_closed_run(board
     assert meta["tests"]["exit_code"] == 0 and meta["tests"]["tail"] == "green"
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_request_review_is_gated_by_the_same_command(board):
     conn, repo = board
     tid, run_id = _claimed(conn, repo, "test:echo red; exit 1")
@@ -108,7 +108,7 @@ def test_request_review_is_gated_by_the_same_command(board):
     assert _run_metadata(conn, run2)["tests"]["exit_code"] == 0
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_kanban_complete_tool_surfaces_the_refusal_tail(board, monkeypatch):
     from tools import kanban_tools
 
@@ -121,7 +121,7 @@ def test_kanban_complete_tool_surfaces_the_refusal_tail(board, monkeypatch):
     assert kb.get_task(conn, tid).status == "running"
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_timed_out_command_is_killed_and_refused(tmp_path, monkeypatch):
     from hermes_cli import kanban_test_gate
 
