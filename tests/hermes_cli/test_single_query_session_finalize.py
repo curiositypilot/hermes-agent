@@ -262,3 +262,34 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")
+
+
+def test_single_query_kills_background_on_exit(monkeypatch):
+    """chat -q never calls agent.close(): background sessions (own process group) outlived the
+    process, so Kanban worker scopes kept shells alive for days (t_b1fa8477). Exit kills them
+    after the notify_on_complete linger; persist_on_release jobs survive."""
+    import tools.process_registry as registry_module
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    registry = ProcessRegistry()
+    for sid, persist in (("proc_volatile", False), ("proc_persisted", True)):
+        session = ProcessSession(id=sid, command="sleep 60", task_id="session-a", started_at=0.0)
+        session.persist_on_release = persist
+        registry._running[sid] = session
+    calls = []
+
+    def fake_kill(session_id, **kwargs):
+        calls.append(("kill", session_id, kwargs["source"]))
+        registry._running[session_id].exited = True
+        return {"status": "killed"}
+
+    registry.kill_process = fake_kill
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    monkeypatch.setattr(cli, "_notify_single_query_session_finalize", lambda _c: None)
+    monkeypatch.setattr(cli, "_wait_for_oneshot_background_completions", lambda _c: calls.append(("wait",)))
+    monkeypatch.setattr(cli, "_run_cleanup", lambda **_k: calls.append(("cleanup",)))
+
+    cli._finalize_single_query(SimpleNamespace(_release_active_session=lambda: None))
+
+    assert calls == [("wait",), ("kill", "proc_volatile", "kill_all"), ("cleanup",)]
+    assert registry._running["proc_persisted"].exited is False

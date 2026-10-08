@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -147,3 +148,120 @@ def test_one_failing_row_does_not_abort_the_sweep(conn):
         for p in (broken, healthy):
             p.kill()
             p.wait()
+
+
+# --- ended-run scopes (t_b1fa8477) ------------------------------------------------------------
+# A clean worker exit still left its background shells inside the run's ``--collect`` scope, which
+# kept the scope (and the shells) alive for days. The dispatcher stops the scope of an ended run.
+
+
+def _scope(tid, run_id):
+    return f"hermes-worker-kanban-{tid}-run-{run_id}.scope"
+
+
+@pytest.fixture
+def systemctl(monkeypatch):
+    """Stub ``systemctl --user list-units`` / ``stop``; ``units`` is what the user manager lists."""
+    from hermes_cli import kanban_db_run_scopes as rs
+    import tools.process_registry as pr
+
+    state = SimpleNamespace(units=[], listings=0, stopped=[], binary="/usr/bin/systemctl")
+
+    def fake_run(argv, **_kw):
+        state.listings += 1
+        out = "".join(f"{u} loaded active running hermes worker\n" for u in state.units)
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(rs, "_last_scan", {})
+    monkeypatch.setattr(rs.shutil, "which", lambda name: state.binary if name == "systemctl" else None)
+    monkeypatch.setattr(rs.subprocess, "run", fake_run)
+    monkeypatch.setattr(pr, "_stop_systemd_unit", lambda unit: state.stopped.append(unit) or True)
+    return state
+
+
+def _ended_run(conn, *, ended_ago: int) -> tuple[str, int]:
+    tid = kb.create_task(conn, title="finished", assignee="coder")
+    kb.claim_task(conn, tid, claimer=kb._claimer_id())
+    run_id = kb._current_run_id(conn, tid)
+    assert kb.complete_task(conn, tid, result="done", expected_run_id=run_id) is True
+    conn.execute("UPDATE task_runs SET ended_at = ended_at - ? WHERE id=?", (ended_ago, run_id))
+    return tid, run_id
+
+
+def test_reap_ended_run_scopes_stops_only_scopes_of_runs_ended_past_grace(conn, systemctl):
+    from hermes_cli.kanban_db_run_scopes import reap_ended_run_scopes
+
+    old_tid, old_run = _ended_run(conn, ended_ago=600)
+    fresh_tid, fresh_run = _ended_run(conn, ended_ago=0)
+    live_tid = kb.create_task(conn, title="running", assignee="coder")
+    kb.claim_task(conn, live_tid, claimer=kb._claimer_id())
+    live_run = kb._current_run_id(conn, live_tid)
+    systemctl.units = [
+        _scope(old_tid, old_run),
+        _scope(fresh_tid, fresh_run),          # ended < grace ago: worker may still be finalising
+        _scope(live_tid, live_run),            # ended_at IS NULL: a live worker (the dispatcher's own tick)
+        _scope("t_deadbeef", old_run),         # unknown pair: another board's run
+        _scope(live_tid, old_run),             # run id of this board, wrong task
+        f"hermes-worker-kanban-{old_tid}-run-missing.scope",
+    ]
+
+    assert reap_ended_run_scopes(conn) == [_scope(old_tid, old_run)]
+
+    assert systemctl.stopped == [_scope(old_tid, old_run)]
+    events = conn.execute(
+        "SELECT payload, run_id FROM task_events WHERE task_id=? AND kind='run_scope_reaped'", (old_tid,),
+    ).fetchall()
+    assert len(events) == 1 and events[0]["run_id"] == old_run
+    assert _scope(old_tid, old_run) in events[0]["payload"]
+
+
+def test_reap_ended_run_scopes_is_throttled_and_needs_systemctl(conn, systemctl):
+    from hermes_cli import kanban_db_run_scopes as rs
+
+    tid, run_id = _ended_run(conn, ended_ago=600)
+    systemctl.units = [_scope(tid, run_id)]
+    assert rs.reap_ended_run_scopes(conn) == [_scope(tid, run_id)]
+    assert rs.reap_ended_run_scopes(conn) == []  # within the interval: no second listing
+    assert systemctl.listings == 1
+
+    rs._last_scan.clear()
+    systemctl.binary = None
+    assert rs.reap_ended_run_scopes(conn) == []
+    assert systemctl.listings == 1
+
+
+def test_reap_ended_run_scopes_throttles_each_board_on_its_own(tmp_path, systemctl):
+    """The gateway ticks every board in one process: board a's scan must not starve board b."""
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_run_scopes as rs
+
+    a = kbc.connect(db_path=tmp_path / "a.db")
+    b = kbc.connect(db_path=tmp_path / "b.db")
+    unit_a, unit_b = _scope(*_ended_run(a, ended_ago=600)), _scope(*_ended_run(b, ended_ago=600))
+    a.commit()
+    b.commit()
+    systemctl.units = [unit_a, unit_b]
+
+    assert rs.reap_ended_run_scopes(a) == [unit_a]
+    assert rs.reap_ended_run_scopes(b) == [unit_b]
+    assert systemctl.listings == 2
+    assert rs.reap_ended_run_scopes(a) == [] and rs.reap_ended_run_scopes(b) == []
+    assert systemctl.listings == 2  # same board within the interval: no second listing
+
+
+def test_dispatch_tick_reports_reap_ended_run_scopes(conn, systemctl):
+    tid, run_id = _ended_run(conn, ended_ago=600)
+    systemctl.units = [_scope(tid, run_id)]
+
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 0, max_spawn=0)
+
+    assert result.reaped_run_scopes == [_scope(tid, run_id)]
+
+
+def test_dry_run_dispatch_tick_never_stops_run_scopes(conn, systemctl):
+    tid, run_id = _ended_run(conn, ended_ago=600)
+    systemctl.units = [_scope(tid, run_id)]
+
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 0, dry_run=True, max_spawn=0)
+
+    assert result.reaped_run_scopes == [] and systemctl.stopped == [] and systemctl.listings == 0
