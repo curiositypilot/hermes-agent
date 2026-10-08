@@ -198,6 +198,57 @@ def test_checkout_inside_a_guarded_root_is_not_hermes_state():
         guard.check(PROJECT_ROOT.parent / "config.yaml")
 
 
+@pytest.fixture(params=["absolute", "relative"])
+def linked_worktree(request, tmp_path):
+    """A default install inside a guarded home, with a kanban worktree checked out under it:
+    ``<home>/hermes-agent/.worktrees/t_1``, whose ``.git`` file names its private git dir
+    ``<home>/hermes-agent/.git/worktrees/t_1`` (git writes an absolute ``gitdir:``; with
+    ``worktree.useRelativePaths`` a relative one)."""
+    home = tmp_path / "home"
+    git_dir = home / "hermes-agent" / ".git" / "worktrees" / "t_1"
+    git_dir.mkdir(parents=True)
+    checkout = home / "hermes-agent" / ".worktrees" / "t_1"
+    checkout.mkdir(parents=True)
+    spelled = git_dir if request.param == "absolute" else Path("..", "..", ".git", "worktrees", "t_1")
+    (checkout / ".git").write_text(f"gitdir: {spelled}\n", encoding="utf-8")
+    return home, checkout, git_dir
+
+
+def test_linked_worktree_git_dir_belongs_to_the_checkout(linked_worktree, monkeypatch):
+    """hermes_bootstrap settles an interrupted update on import, probing the marker in the
+    checkout's git dir, which a linked worktree keeps outside the checkout."""
+    from hermes_cli._early_recovery import restore_interrupted_pull
+    from tests.home_io_guard import HomeIOGuard
+
+    home, checkout, git_dir = linked_worktree
+    other = git_dir.parent / "t_2"
+    other.mkdir()
+    with monkeypatch.context() as patcher:
+        HomeIOGuard(lambda: [home], checkout=checkout).install(patcher)
+        assert restore_interrupted_pull(checkout) is False
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            (other / "hermes-update-pull").is_file()
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            (home / "hermes-agent" / ".git" / "config").read_text(encoding="utf-8")
+
+
+def test_payload_manifest_probe_beside_the_checkout_is_read_only(linked_worktree, monkeypatch):
+    """Every install asks whether a sealed payload ships it by reading ``../manifest.json``;
+    for a checkout inside the home that lands in the home, but nothing may write it."""
+    from pm.environments import payload_command_dir, payload_venv
+    from tests.home_io_guard import HomeIOGuard
+
+    home, checkout, _ = linked_worktree
+    with monkeypatch.context() as patcher:
+        HomeIOGuard(lambda: [home], checkout=checkout).install(patcher)
+        assert payload_venv(checkout) is None
+        assert payload_command_dir(checkout) is None
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            (checkout.parent / "manifest.json").write_text("{}", encoding="utf-8")
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            (checkout.parent / "config.yaml").read_text(encoding="utf-8")
+
+
 def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
     """A Hermes-launched shell hands pytest TMPDIR=<home>/cache/scratch (tagged by
     HERMES_SCRATCH_DIR). With that home guarded, honoring it would put the session
