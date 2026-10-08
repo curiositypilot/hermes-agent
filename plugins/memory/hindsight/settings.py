@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__.rpartition(".")[0])
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
-# Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
+# Keep in sync with plugin.yaml; the venv-level pin is the `hindsight` extra in pyproject.toml.
 _MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 # Reflect runs an LLM agent loop server-side (primary model + failover hops), so it gets its

@@ -26,6 +26,32 @@ _MODE_ITEMS = [
 ]
 
 
+def _ensure_dependencies(mode: str) -> None:
+    """Client modes sync the ``hindsight`` extra through PM (the only sanctioned venv mutation).
+
+    The embedded runtime (``hindsight-all``) is not a declared extra: PM cannot install it, so the
+    operator is told exactly what to add instead of a raw pip/uv call against the Hermes venv.
+    """
+    if mode == "local_embedded":
+        import importlib.util
+
+        if importlib.util.find_spec("hindsight") is not None:
+            print("  ✓ Embedded runtime present")
+        else:
+            print("  ⚠ Embedded runtime missing: `hindsight-all` is not a declared Hermes extra, so "
+                  "`hermes pm install --extra` cannot add it; install it into the Hermes environment "
+                  "before using local_embedded")
+        return
+    from pm.extras import ensure_import
+
+    try:
+        ensure_import("hindsight")
+    except Exception as exc:  # pm.InstallError or a declined prompt; the wizard continues
+        print(f"  ⚠ Cannot install hindsight-client>={_MIN_CLIENT_VERSION}: {exc}")
+        return
+    print("  ✓ Dependencies up to date")
+
+
 def _secret_prompt(label: str) -> str:
     """Masked prompt on a TTY; plain readline when stdin is piped."""
     sys.stdout.write(label)
@@ -105,18 +131,7 @@ def run_setup(provider, hermes_home: str, config: dict) -> None:
         provider_config["llm_provider"] = llm_provider
 
     print("\n  Checking dependencies...")
-    # Environment-aware install: sealed hosted venvs redirect to the durable data volume.
-    from tools.lazy_deps import install_specs
-
-    deps = ["hindsight-all"] if mode == "local_embedded" else [f"hindsight-client>={_MIN_CLIENT_VERSION}"]
-    outcome = install_specs(deps, timeout=120)
-    if outcome.ok:
-        print("  ✓ Dependencies up to date")
-    elif outcome.blocked:
-        print(f"  ⚠ Cannot install dependencies: {outcome.reason}")
-    else:
-        print(f"  ⚠ Install failed:\n{(outcome.stderr or '').strip()}")
-        print(f"  Run manually: uv pip install --python {sys.executable} {' '.join(deps)}")
+    _ensure_dependencies(mode)
 
     if mode == "cloud":
         print("\n  Get your API key at https://ui.hindsight.vectorize.io\n")

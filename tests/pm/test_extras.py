@@ -237,7 +237,7 @@ def test_legacy_selection_carries_extras_the_main_era_venv_lazily_installed(monk
     assert {"fal", "telegram", "vertex", "exa"} <= set(selection)
     assert "messaging" not in selection
     assert "piper" not in selection
-    assert "hindsight" not in selection  # Catalog plugin owns this dependency, not a core extra.
+    assert "hindsight" in selection  # Fork: bundled plugins/memory/hindsight is a core extra (pyproject).
     assert extras.legacy_selection(tmp_path / "no-venv") == ["all"]
 
 

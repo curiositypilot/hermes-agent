@@ -76,15 +76,20 @@ _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 _KANBAN_TASK_ENV = "HERMES_KANBAN_TASK"
 _KANBAN_TENANT_ENV = "HERMES_TENANT"
 _AUTO_RETAIN_KILL_SWITCH_ENV = "HINDSIGHT_AUTO_RETAIN"
+_CLIENT_EXTRA = "hindsight"  # pyproject extra for hindsight-client (anchor in pm/extras.py)
 
 
 def _ensure_client_dependency() -> None:
-    """Lazily install the Hindsight client (``tools.lazy_deps``) before importing it."""
+    """Make the ``hindsight`` extra available through PM before importing the client.
+
+    ``pm.ensure_import`` is a no-op when ``hindsight_client`` already imports; otherwise PM syncs
+    the venv (prompting only on a TTY). Any PM failure surfaces as ImportError carrying PM's own
+    remedy text, so a missing client fails loud at the call site instead of deep in the SDK.
+    """
+    from pm.extras import ensure_import
+
     try:
-        from tools.lazy_deps import ensure as _lazy_ensure
-        _lazy_ensure("memory.hindsight", prompt=False)
-    except ImportError:
-        pass
+        ensure_import(_CLIENT_EXTRA)
     except Exception as exc:
         raise ImportError(str(exc)) from exc
 
@@ -117,28 +122,34 @@ def _cloud_api_key(config: dict) -> str:
     return config.get("apiKey") or config.get("api_key") or get_secret("HINDSIGHT_API_KEY", "")
 
 
-def _maybe_upgrade_client() -> None:
-    """Auto-upgrade an outdated hindsight-client via the environment-aware lazy_deps
-    installer (sealed hosted venvs redirect to the durable target)."""
+def _outdated_client_version() -> str | None:
+    """Installed hindsight-client version when it is below ``_MIN_CLIENT_VERSION``, else None
+    (also None when the client is not installed: the import site reports that)."""
+    from importlib.metadata import PackageNotFoundError, version as pkg_version
+
+    from packaging.version import InvalidVersion, Version
+
     try:
-        from importlib.metadata import version as pkg_version
-        from packaging.version import Version
         installed = pkg_version("hindsight-client")
-        if Version(installed) < Version(_MIN_CLIENT_VERSION):
-            logger.warning("hindsight-client %s is outdated (need >=%s), attempting upgrade...",
-                           installed, _MIN_CLIENT_VERSION)
-            from tools.lazy_deps import install_specs
-            outcome = install_specs([f"hindsight-client>={_MIN_CLIENT_VERSION}"], timeout=120)
-            if outcome.ok:
-                logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
-            elif outcome.blocked:
-                logger.warning("Auto-upgrade unavailable: %s. Run: uv pip install 'hindsight-client>=%s'",
-                               outcome.reason, _MIN_CLIENT_VERSION)
-            else:
-                logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
-                               (outcome.stderr or "").strip() or "install error", _MIN_CLIENT_VERSION)
-    except Exception:
-        pass  # packaging not available or other issue — proceed anyway
+        return installed if Version(installed) < Version(_MIN_CLIENT_VERSION) else None
+    except (PackageNotFoundError, InvalidVersion):
+        return None
+
+
+def _maybe_upgrade_client() -> None:
+    """Warn once per construction when the installed client is older than the plugin needs.
+
+    No runtime upgrade: PM owns the venv (the ``hindsight`` extra locks the client), a mid-session
+    sync cannot take effect before a restart, and this runs on every agent construction. The
+    warning carries PM's one install command.
+    """
+    installed = _outdated_client_version()
+    if installed is None:
+        return
+    from pm.extras import install_hint
+
+    logger.warning("hindsight-client %s is outdated (need >=%s); run: %s, then restart Hermes",
+                   installed, _MIN_CLIENT_VERSION, install_hint(_CLIENT_EXTRA))
 
 
 # update_mode='append' capability (Hindsight >= 0.5.0), cached per (API URL, key fingerprint)
