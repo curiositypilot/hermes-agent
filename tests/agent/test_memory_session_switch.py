@@ -9,6 +9,8 @@ for scoped writes) keep writing into the old session's record.
 
 
 
+import pytest
+
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
 

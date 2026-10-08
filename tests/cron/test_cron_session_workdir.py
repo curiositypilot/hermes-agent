@@ -31,7 +31,7 @@ class _FakeCronAgent:
         self.session_id = session_id
         self.session_db = session_db
 
-    def run_conversation(self, user_message, conversation_history=None, task_id=None):
+    def run_conversation(self, user_message, conversation_history=None, task_id=None, **kwargs):
         if self.session_db is not None:
             self.session_db.create_session(self.session_id, source="cron")
         return {"final_response": "ok"}
