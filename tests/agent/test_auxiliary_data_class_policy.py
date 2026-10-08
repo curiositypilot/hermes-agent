@@ -90,7 +90,7 @@ class _FakeClients:
         self.built: list[str] = []
         anthropic = SimpleNamespace(base_url="https://api.anthropic.com", _hermes_test_provider="anthropic")
 
-        def _try_anthropic(explicit_api_key=None):
+        def _try_anthropic(explicit_api_key=None, explicit_base_url=None):
             self.built.append("anthropic")
             return anthropic, "claude-sonnet-5"
 
@@ -161,7 +161,7 @@ def test_confidential_call_llm_per_goal_task_only_calls_the_main_provider(confid
     anthropic = SimpleNamespace(
         base_url="https://api.anthropic.com", _hermes_test_provider="anthropic",
         chat=SimpleNamespace(completions=SimpleNamespace(create=_create)))
-    with patch.object(ac, "_try_anthropic", lambda explicit_api_key=None: (anthropic, "claude-sonnet-5")), \
+    with patch.object(ac, "_try_anthropic", lambda explicit_api_key=None, explicit_base_url=None: (anthropic, "claude-sonnet-5")), \
             patch.object(ac, "_validate_llm_response", lambda resp, *_a, **_k: resp), \
             patch.object(ac, "_relay_sync_completion",
                          lambda client, kwargs, **_k: client.chat.completions.create(**kwargs)):
