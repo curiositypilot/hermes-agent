@@ -2,17 +2,18 @@
 (2026-10: ``snowballstemmer`` absent, tool_search silently off for weeks) is an issue naming the
 package and the install command; a version outside its specifier is a warning only."""
 
+import sys
 from pathlib import Path
 
-from hermes_cli import doctor_platform, main_install_repair
+from hermes_cli import declared_deps, doctor_platform
 
 
 def _run(monkeypatch, capsys, *, missing, drifted, should_fix=False):
     venv_python = Path("/fake/venv/bin/python")
     monkeypatch.setattr(doctor_platform, "_doctor_venv_python", lambda: venv_python)
     monkeypatch.setattr(doctor_platform, "_is_termux", lambda: False)
-    monkeypatch.setattr(main_install_repair, "missing_core_dependencies", lambda py, **kw: list(missing))
-    monkeypatch.setattr(main_install_repair, "drifted_core_dependencies", lambda py, **kw: list(drifted))
+    monkeypatch.setattr(declared_deps, "missing_core_dependencies", lambda py, **kw: list(missing))
+    monkeypatch.setattr(declared_deps, "drifted_core_dependencies", lambda py, **kw: list(drifted))
     finding = doctor_platform._check_declared_dependencies(should_fix)
     return finding, capsys.readouterr().out, venv_python
 
@@ -39,19 +40,14 @@ def test_all_declared_deps_present_is_ok(monkeypatch, capsys):
     assert finding.issues == [] and "all installed" in out
 
 
-def test_fix_runs_the_base_install_and_counts_the_repair(monkeypatch, capsys):
-    state = {"missing": ["snowballstemmer"]}
-    installs = []
-    monkeypatch.setattr(main_install_repair, "_default_venv_install_target", lambda: (["uv", "pip"], {"X": "1"}))
+def test_fix_never_hides_a_missing_dep(monkeypatch, capsys):
+    finding, _out, _ = _run(monkeypatch, capsys, missing=["snowballstemmer"], drifted=[], should_fix=True)
+    assert finding.fixed == 0 and any("snowballstemmer" in i for i in finding.issues)
 
-    def fake_verify(prefix, *, env=None, group="all"):
-        installs.append((prefix, env))
-        state["missing"] = []
 
-    monkeypatch.setattr(main_install_repair, "_verify_core_dependencies_installed", fake_verify)
-    monkeypatch.setattr(doctor_platform, "_doctor_venv_python", lambda: Path("/fake/py"))
-    monkeypatch.setattr(main_install_repair, "missing_core_dependencies", lambda py, **kw: list(state["missing"]))
-    monkeypatch.setattr(main_install_repair, "drifted_core_dependencies", lambda py, **kw: [])
-    finding = doctor_platform._check_declared_dependencies(True)
-    assert installs == [(["uv", "pip"], {"X": "1"})]
-    assert finding.fixed == 1 and finding.issues == []
+def test_probe_reports_missing_and_drifted_against_a_real_interpreter(monkeypatch):
+    monkeypatch.setattr(declared_deps, "_declared_base_dependencies",
+                        lambda: (["pytest>=0.0.1", "packaging<0.1", "no-such-dist-xyz>=1"],
+                                 ["pytest", "packaging", "no-such-dist-xyz"]))
+    assert declared_deps.missing_core_dependencies(Path(sys.executable)) == ["no-such-dist-xyz"]
+    assert [d[0] for d in declared_deps.drifted_core_dependencies(Path(sys.executable))] == ["packaging"]

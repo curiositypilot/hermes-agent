@@ -21,6 +21,9 @@ export interface KanbanTask {
   warnings?: null | { count: number; highest_severity?: null | string }
   /** Worker liveness (present on running cards) — drives the arc + run clock. */
   started_at?: null | number
+  /** Start of the CURRENT run row; null/absent when the task has no active
+   *  run (or the backend predates it) — the clock falls back to started_at. */
+  current_run_started_at?: null | number
   worker_pid?: null | number
   last_heartbeat_at?: null | number
   /** Dated schedule (epoch seconds): the dispatcher wakes a `scheduled` card
@@ -28,6 +31,14 @@ export interface KanbanTask {
   scheduled_until?: null | number
   /** What the wake does: `start` → ready/todo, `ask` → blocked for a human. */
   scheduled_then?: 'ask' | 'start' | null
+  /** Typed block reason set by the backend on kanban_block (one of
+   *  VALID_BLOCK_KINDS — `dependency`, `needs_input`, `capability`,
+   *  `transient`; null for legacy/un-typed blocks). Kept across unblock, so
+   *  render it as CURRENT only while status is `blocked`. */
+  block_kind?: null | string
+  /** Unblock-loop counter — how many times this task re-blocked for the same
+   *  reason after a human unblock. 0/absent on legacy payloads. */
+  block_recurrences?: number
 }
 
 export interface KanbanColumn {
@@ -93,7 +104,17 @@ export interface KanbanEvent {
 export interface KanbanAttachment {
   id: number | string
   filename: string
+  stored_path?: null | string
   size?: null | number
+}
+
+/** GET /tasks/:id `link_tasks` — one resolved row per linked task, so the UI
+ *  renders titles instead of raw ids. Additive: older backends omit it and
+ *  the drawer falls back to shortId chips. */
+export interface KanbanLinkTask {
+  id: string
+  title: string
+  status: string
 }
 
 /** Fields present only on the detail endpoint (beyond the card's KanbanTask).
@@ -127,6 +148,7 @@ export interface KanbanTaskDetail {
    *  section instead of offering uploads the backend would 404 on. */
   attachments?: KanbanAttachment[] | null
   links: { parents: string[]; children: string[] }
+  link_tasks?: KanbanLinkTask[] | null
   runs: KanbanRun[]
 }
 

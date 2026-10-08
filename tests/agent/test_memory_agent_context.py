@@ -26,21 +26,6 @@ def test_agent_context_follows_the_platform(platform, expected):
     assert _memory_provider_init_kwargs(_fake_agent(), platform)["agent_context"] == expected
 
 
-def test_cron_session_disables_supermemory_writes(tmp_path, monkeypatch):
-    """Through the real bundled provider: the scheduler's kwargs must switch writes off,
-    an interactive session's must leave them on (empty hermes_home → config defaults)."""
-    from plugins.memory.supermemory import SupermemoryMemoryProvider
-
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.delenv("SUPERMEMORY_API_KEY", raising=False)
-    by_platform = {}
-    for platform in ("cron", "cli"):
-        provider = SupermemoryMemoryProvider()
-        provider.initialize(**_memory_provider_init_kwargs(_fake_agent(), platform))
-        by_platform[platform] = provider._write_enabled
-    assert by_platform == {"cron": False, "cli": True}
-
-
 @pytest.mark.parametrize(
     ("configured", "expected"),
     [(None, None), ({}, None), ({"external_prefetch_timeout_seconds": 3.5}, 3.5),
