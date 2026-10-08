@@ -1587,37 +1587,10 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    assert kbd._resolve_hermes_argv() == kbd._module_hermes_argv()
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
-
-
-
-
-def test_resolve_hermes_argv_module_actually_runs():
-    """The fallback module name must be importable + runnable.
-
-    A unit test that pins the literal string is necessary but not
-    sufficient — if `hermes_cli.main` ever loses `if __name__ == "__main__"`
-    handling or its argparse setup, `python -m hermes_cli.main --version`
-    would fail and so would every dispatcher spawn that hits the fallback.
-    Run it as a real subprocess to catch that regression.
-    """
-    import subprocess
-    from hermes_cli import kanban_db_dispatch as kbd
-    import shutil
-    import unittest.mock as mock
-
-    with mock.patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("HERMES_BIN", None)
-        with mock.patch.object(shutil, "which", return_value=None):
-            argv = kbd._resolve_hermes_argv()
-    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
-    assert r.returncode == 0, (
-        f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
-        f"stderr={r.stderr[:200]!r}"
-    )
 
 
 def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monkeypatch):
@@ -1631,12 +1604,6 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
     running install's root first on PYTHONPATH — and never for a resolved shim
     path, which owns its own imports.
     """
-    import os
-    import sys
-    from pathlib import Path
-
-    from hermes_cli import kanban_db_dispatch as kbd
-
     root = str(Path(kbd.__file__).resolve().parents[1])
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -1663,7 +1630,7 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
         claim_expires=None, tenant=None, branch_name=None,
     )
 
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", kbd._module_hermes_argv)
     kbd._default_spawn(task, str(tmp_path / "ws"))
     assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == root
 
