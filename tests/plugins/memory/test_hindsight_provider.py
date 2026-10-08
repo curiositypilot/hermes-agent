@@ -1401,6 +1401,59 @@ class TestRecallRelevanceFloor:
         assert fields["recall_min_reranker"]["default"] == ""
         assert fields["recall_prefer_observations"]["default"] is False
 
+    # Relative floor (t_4107c22b): keep items >= ratio x the turn's best reranker score.
+    @staticmethod
+    def _scored(*scores):
+        return SimpleNamespace(results=[
+            SimpleNamespace(text=f"m{i}", scores=None if s is None else SimpleNamespace(reranker=s))
+            for i, s in enumerate(scores)])
+
+    def test_relative_floor_keeps_items_near_top(self, provider_with_config):
+        p = provider_with_config(recall_min_relative_reranker=0.2, recall_sync=True)
+        p._client.arecall = AsyncMock(return_value=self._scored(0.9, 0.3, 0.1, 0.05))
+        block = p.prefetch("replace the brake pads on my car")
+        assert "m0" in block and "m1" in block and block.index("m0") < block.index("m1")
+        assert "m2" not in block and "m3" not in block
+
+    def test_relative_floor_skips_tool_recall(self, provider_with_config):
+        p = provider_with_config(recall_min_relative_reranker=0.2)
+        p._client.arecall = AsyncMock(return_value=self._scored(0.9, 0.3, 0.1, 0.05))
+        out = json.loads(p.handle_tool_call("hindsight_recall", {"query": "brake pads"}))["result"]
+        assert all(f"m{i}" in out for i in range(4))
+
+    def test_relative_floor_fail_open_without_scores(self, provider_with_config):
+        p = provider_with_config(recall_min_relative_reranker=0.2)
+        # Unscored results are kept; dict-shaped scores filter like RecallScores objects.
+        p._client.arecall = AsyncMock(return_value=SimpleNamespace(results=[
+            SimpleNamespace(text="a", scores={"reranker": 0.9}),
+            SimpleNamespace(text="b", scores=None),
+            SimpleNamespace(text="c", scores={"reranker": 0.1}),
+            SimpleNamespace(text="d"),
+        ]))
+        assert [r.text for r in p._recall("q", auto=True)] == ["a", "b", "d"]
+        # No result has a score -> everything kept.
+        p._client.arecall = AsyncMock(return_value=self._scored(None, None))
+        assert [r.text for r in p._recall("q", auto=True)] == ["m0", "m1"]
+
+    @pytest.mark.parametrize("scores", [(0.0, 0.0), (-0.2, -0.5), (0.0, None)])
+    def test_relative_floor_fail_open_when_top_not_positive(self, provider_with_config, scores):
+        p = provider_with_config(recall_min_relative_reranker=0.2)
+        p._client.arecall = AsyncMock(return_value=self._scored(*scores))
+        assert [r.text for r in p._recall("q", auto=True)] == [f"m{i}" for i in range(len(scores))]
+
+    @pytest.mark.parametrize("value", [None, "", "abc", 1.5])
+    def test_relative_floor_unset_or_invalid_is_off(self, provider_with_config, value):
+        cfg = {} if value is None else {"recall_min_relative_reranker": value}
+        p = provider_with_config(**cfg)
+        assert p._recall_min_relative_reranker is None
+        resp = self._scored(0.9, 0.3, 0.1, 0.05)
+        p._client.arecall = AsyncMock(return_value=resp)
+        assert p._recall("q", auto=True) == resp.results
+
+    def test_schema_lists_relative_floor(self, provider):
+        fields = {f["key"]: f for f in provider.get_config_schema()}
+        assert fields["recall_min_relative_reranker"]["default"] == ""
+
     @pytest.mark.asyncio
     async def test_pinned_client_serializes_floor_and_prefer_observations(self, provider_with_config):
         hindsight_client = pytest.importorskip(

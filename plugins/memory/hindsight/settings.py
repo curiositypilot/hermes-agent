@@ -109,6 +109,23 @@ def _parse_score_floor(value: Any) -> float | None:
     return floor
 
 
+def _reranker_score(result: Any) -> float | None:
+    """A recall result's reranker score, or None when absent/non-numeric.
+
+    ``result.scores`` is a ``RecallScores`` object (``.reranker``) from the client, or a
+    plain dict with ``"reranker"`` in older/mocked shapes."""
+    scores = getattr(result, "scores", None)
+    if scores is None:
+        return None
+    value = scores.get("reranker") if isinstance(scores, dict) else getattr(scores, "reranker", None)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _daemon_llm_provider(provider: str) -> str:
     return "openai" if provider in _OPENAI_WIRE_PROVIDERS else provider
 
