@@ -56,7 +56,9 @@ hermes_compose_env() {
         echo "no bootstrap Python found; run setup-hermes.sh" >&2
         return 1
     }
-    script="$(PYTHONHOME= PYTHONPATH="$repo" "$python" -m pm.environments --format "$dialect")" &&
+    # -P: `python -m` puts the cwd ahead of PYTHONPATH, so from a linked worktree
+    # the worktree's own pm would key a different install (t_5177c277).
+    script="$(PYTHONHOME= PYTHONPATH="$repo" "$python" -P -m pm.environments --format "$dialect")" &&
         [ -n "$script" ] || {
         echo "could not read pm env (run ./setup-hermes.sh first)" >&2
         return 1
