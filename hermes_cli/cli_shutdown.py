@@ -359,4 +359,13 @@ def _finalize_single_query(cli) -> None:
         _wait_for_oneshot_background_completions(cli)
     except Exception:
         logger.debug("one-shot background completion wait failed", exc_info=True)
+    try:
+        # chat -q never calls agent.close() (the -z path's _close_agent does), and background
+        # children run in their own session, so they would outlive this process: kanban workers
+        # left shells running for days. Lifecycle source: persist_on_release jobs survive.
+        from tools.process_registry import process_registry
+        process_registry.kill_all(source="kill_all")
+    except OSError as exc:
+        # Exit must still finish its cleanup; anything but an OS-level kill error raises.
+        logger.warning("one-shot background session kill failed: %s", exc)
     _run_cleanup(notify_session_finalize=False)

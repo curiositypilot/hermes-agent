@@ -25,6 +25,7 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli.kanban_db_run_scopes import _restart_safe_worker_argv, reap_ended_run_scopes
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -111,6 +112,8 @@ class DispatchResult:
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
+    reaped_run_scopes: list[str] = field(default_factory=list)
+    """Worker scope units of ended runs stopped by ``reap_ended_run_scopes``."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -2370,6 +2373,8 @@ def _run_reclaim_phase(
     finished can spawn this same tick)."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
+    if not dry_run:
+        result.reaped_run_scopes = reap_ended_run_scopes(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
@@ -3001,44 +3006,6 @@ def _open_worker_log(task: Task, board: Optional[str]):
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
     return open(log_path, "ab")
-
-
-def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
-    """Wrap a systemd-hosted dispatcher's worker in the shared restart-safe scope.
-
-    Kanban workers are long-lived agentic runs that outlive the dispatcher
-    tick, so they never take cron's degraded mode under the managed gateway:
-    ``require_restart_safe_scope=True`` makes the helper raise
-    ``RestartSafeScopeUnavailable`` there (an infrastructure spawn failure the
-    dispatcher does not charge to the card). Under any other systemd unit
-    (``Type=oneshot`` dispatch timers, #113612) ``outlives_parent=True`` gets the
-    worker its own scope so the unit's cgroup teardown cannot kill it.
-    """
-    from tools.process_registry import restart_safe_gateway_child_argv
-
-    if task.current_run_id is None:
-        # Outside managed systemd this is harmless, but a managed dispatch must
-        # never mint an untraceable worker.  Check topology through the shared
-        # helper first, using a placeholder suffix that cannot be launched.
-        dispatch = restart_safe_gateway_child_argv(
-            command,
-            unit_suffix=f"kanban-{task.id}-run-missing",
-            require_restart_safe_scope=True,
-            outlives_parent=True,
-        )
-        if dispatch.mode != "in_process":
-            raise RuntimeError(
-                "cannot create restart-safe systemd scope for Kanban worker: "
-                "the claimed task has no current run id"
-            )
-        return command
-
-    return restart_safe_gateway_child_argv(
-        command,
-        unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
-        require_restart_safe_scope=True,
-        outlives_parent=True,
-    ).argv
 
 
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
