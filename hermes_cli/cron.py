@@ -248,6 +248,7 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
          if job.get("no_agent") else ""),
         ("Workdir", job.get("workdir")),
         ("Python", job.get("interpreter")),
+        ("Class", job.get("data_class")),
         ("Last run", f"{job.get('last_run_at', '?')}  {_last_run_display(job)}"
          if job.get("last_status") else ""),
         ("Dispatch", _dispatch_display(job.get("last_dispatch"))),
@@ -759,7 +760,7 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("model", "model"), ("provider", "model_provider"), ("pinned", "pinned"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
-                   ("interpreter", "interpreter"))
+                   ("interpreter", "interpreter"), ("data_class", "data_class"))
 
 
 def _job_api_kwargs(args) -> Dict[str, Any]:
@@ -774,7 +775,8 @@ _JOB_DETAIL_LINES = (
     ("no_agent", "  Mode: no-agent (script stdout delivered directly)"),
     ("continuity", "  Continuity: on (each run sees the previous run's output)"),
     ("workdir", "  Workdir: {}"),
-    ("interpreter", "  Python: {}"))
+    ("interpreter", "  Python: {}"),
+    ("data_class", "  Data class: {} (provider allowlist + fallback policy)"))
 
 
 def _print_job_details(job_data: Dict[str, Any]) -> None:

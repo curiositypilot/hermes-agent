@@ -6,6 +6,7 @@ repository on PYTHONPATH.
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 from collections.abc import Mapping
@@ -267,13 +268,55 @@ def inherit_data_class(child_row: Any, parent_rows: list[Any]) -> str | None:
     return result
 
 
+# Per-run class bound by a non-Kanban unattended runner (a cron job's ``data_class``). A ContextVar,
+# not os.environ: parallel cron jobs share one process, and copy_context() carries it into the
+# agent thread.
+_SCOPED_DATA_CLASS: contextvars.ContextVar[str] = contextvars.ContextVar("hermes_scoped_data_class", default="")
+
+
+def validate_data_class(label: Any) -> str:
+    """Lowercased label of a configured class; ``ProviderDenied`` for an unknown or empty one."""
+    text = str(label or "").strip().lower()
+    _class_policy(text)
+    return text
+
+
+def bind_data_class(label: str) -> contextvars.Token:
+    """Bind ``label`` (validated) as this context's class; undo with ``reset_data_class(token)``."""
+    return _SCOPED_DATA_CLASS.set(validate_data_class(label))
+
+
+def reset_data_class(token: contextvars.Token) -> None:
+    _SCOPED_DATA_CLASS.reset(token)
+
+
+def fallback_permits(provider: str, data_class: str) -> bool:
+    """Side-effect-free: may a ``data_class`` run switch to ``provider`` as a fallback?"""
+    if not fallback_allowed(data_class):
+        return False
+    allowed = allowed_providers(data_class)
+    return allowed == "any" or str(provider or "").strip().lower() in allowed
+
+
 def current_data_class() -> str:
-    """Resolve and validate the current worker's policy class.
+    """Resolve and validate the current run's policy class.
 
     Kanban workers must receive the dispatcher-resolved environment value. A
     missing value on a worker retries resolution from its durable task row;
-    ordinary non-Kanban sessions retain the ``internal`` default.
+    ordinary non-Kanban sessions retain the ``internal`` default. A class bound
+    with ``bind_data_class`` combines with that base: a restricted class always
+    wins over an unrestricted one, and two different restricted classes fail closed.
     """
+    base = _base_data_class()
+    scoped = _SCOPED_DATA_CLASS.get()
+    if not scoped or scoped == base or not is_restricted(scoped):
+        return base
+    if not is_restricted(base):
+        return scoped
+    raise ProviderDenied(f"bound data class {scoped!r} conflicts with worker data class {base!r}")
+
+
+def _base_data_class() -> str:
     env_class = (os.environ.get("HERMES_DATA_CLASS") or "").strip()
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if env_class:

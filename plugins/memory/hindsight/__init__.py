@@ -52,6 +52,7 @@ from .settings import (
     _normalize_observation_scopes, _normalize_project_aliases, _normalize_retain_contexts,
     _normalize_retain_tags, _observation_scope_tag_groups, _parse_bool_setting, _parse_int_setting,
     _parse_score_floor, _reranker_score, _resolve_bank_id_template,
+    _DATED_RECALL_HEADER, _format_recall_lines,
 )
 
 logger = logging.getLogger(__name__)
@@ -713,6 +714,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_delegate_children", "description": "Before delegate_task spawns subagents, recall once per child on its goal (parent-side, read-only) and put the result in the child's system prompt. Children never get a memory provider or memory tools", "default": True},
             {"key": "recall_delegate_max_items", "description": "Maximum recalled memories handed to each delegate_task child (0 = none)", "default": 8},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
+            {"key": "recall_show_dates", "description": "Prefix each auto-recalled memory with the date it was recorded ('- [YYYY-MM-DD] text', from mentioned_at, else occurred_start) and add one line telling the model the newer of two conflicting facts supersedes the older. Applies to auto-recall and delegate_task children, not the hindsight_recall tool", "default": False},
             {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
             {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
@@ -1140,6 +1142,8 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = list([] if configured_types is None else configured_types) or ["observation"]
         self._recall_prompt_preamble = cfg.get("recall_prompt_preamble", "")
         self._recall_indicator = bool(cfg.get("recall_indicator", True))
+        # Opt-in: prefix each auto-recalled fact with its date plus one "newer supersedes older" line.
+        self._recall_show_dates = _parse_bool_setting(cfg.get("recall_show_dates"), False)
         # Auto-recall abstention: a server-side reranker floor (min_scores.reranker) so an
         # off-topic turn injects nothing instead of the top-N zero-score results. None = no floor.
         self._recall_min_reranker = _parse_score_floor(cfg.get("recall_min_reranker"))
@@ -1431,12 +1435,19 @@ class HindsightMemoryProvider(MemoryProvider):
                          self._bank_id, len(query), self._budget)
             results = self._recall(query, auto=True)
             logger.debug("Recall: returned %d results", len(results))
-            return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
+            return self._render_recall_lines(_format_recall_lines(results, self._recall_show_dates)), len(results)
         except Exception as e:
             # INFO (not debug): a turn with no memory block needs a logged cause at the default level.
             logger.info("Hindsight recall failed: %s", e)
             logger.debug("Hindsight recall failure detail", exc_info=True)
             return "", 0
+
+    def _render_recall_lines(self, lines: list) -> str:
+        """Join injected bullet lines; with ``recall_show_dates`` the dated-facts header leads them."""
+        if not lines:
+            return ""
+        body = "\n".join(lines)
+        return f"{_DATED_RECALL_HEADER}\n{body}" if self._recall_show_dates else body
 
     def _finish_prefetch(self, result: str, count: int) -> str:
         """Record indicator state (cleared on empty turns, never a stale count); format the block."""
@@ -1472,13 +1483,13 @@ class HindsightMemoryProvider(MemoryProvider):
             # Fail-open by contract (memory never blocks a child spawn), but loud: exact error + traceback.
             logger.warning("Hindsight delegation recall failed; child gets no block: %r", e, exc_info=True)
             return ""
-        lines = [f"- {r.text}" for r in results if getattr(r, "text", None)][:self._recall_delegate_max_items]
+        lines = _format_recall_lines(results, self._recall_show_dates)[:self._recall_delegate_max_items]
         if not lines:
             return ""
         # Not the per-turn preamble: that one says "do not call tools to look things up", which a
         # child debugging or auditing must remain free to do.
         header = "# Hindsight Memory (recalled by the parent agent for this task's goal)"
-        return header + "\n\n" + "\n".join(lines)
+        return header + "\n\n" + self._render_recall_lines(lines)
 
     def _join_prefetch(self, timeout: float, *, log: bool = False) -> None:
         if not (self._prefetch_thread and self._prefetch_thread.is_alive()):

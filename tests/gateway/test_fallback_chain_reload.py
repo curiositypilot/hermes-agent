@@ -70,6 +70,27 @@ def test_apply_fallback_chain_skips_while_cooldown_holds_fallback():
     assert agent._fallback_activated is True
 
 
+def test_apply_fallback_chain_keeps_pinned_route_empty():
+    """A pinned Kanban route's empty chain survives the config re-apply (t_4b722398)."""
+    from gateway.run import GatewayRunner
+
+    agent = SimpleNamespace(
+        platform="cli",
+        _kanban_pinned_route=True,
+        _fallback_chain=[],
+        _fallback_model=None,
+        _fallback_index=0,
+        _fallback_activated=False,
+    )
+    GatewayRunner._apply_fallback_chain_to_agent(agent, [
+        {"provider": "anthropic", "model": "claude-sonnet-5-5"},
+        {"provider": "antigravity", "model": "claude-opus-4-6-thinking"},
+        {"provider": "antigravity", "model": "gemini-3.8-flash-tiered"},
+    ])
+
+    assert agent._fallback_chain == []
+    assert agent._fallback_model is None
+    assert agent._fallback_index == 0
 
 
 def test_load_fallback_model_static_unchanged_contract(tmp_path, monkeypatch):

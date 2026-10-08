@@ -2084,3 +2084,42 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+
+def test_concurrent_create_with_same_idempotency_key_yields_one_task(kanban_home, monkeypatch):
+    """Two concurrent creates with one idempotency key return the same id and
+    insert one row. A barrier holds both threads past any pre-transaction
+    lookup (in ``_new_task_id``) so the race is forced, not left to timing;
+    the key lookup must run inside the ``BEGIN IMMEDIATE`` write txn."""
+    import threading
+
+    real_new_id = kb._new_task_id
+    barrier_holder: dict = {}
+
+    def synced_new_id():
+        barrier = barrier_holder.get("b")
+        if barrier is not None:
+            try:
+                barrier.wait(timeout=2)
+            except threading.BrokenBarrierError:
+                pass
+        return real_new_id()
+
+    monkeypatch.setattr(kb, "_new_task_id", synced_new_id)
+
+    def create(key):
+        with kbc.connect() as conn:
+            return kb.create_task(conn, title="dup", assignee="a", idempotency_key=key)
+
+    for run in range(20):
+        key = f"race-{run}"
+        barrier_holder["b"] = threading.Barrier(2)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            ids = list(pool.map(create, [key, key]))
+        with kbc.connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ?", (key,),
+            ).fetchall()
+        assert len(rows) == 1, f"run {run}: {len(rows)} rows for one key"
+        assert ids[0] == ids[1] == rows[0]["id"], f"run {run}: {ids}"

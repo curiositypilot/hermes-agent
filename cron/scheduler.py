@@ -1820,12 +1820,17 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
             job_id, "auth" if is_auth else "transient network", resolve_exc,
             "trying fallback" if chain else (
                 "not falling back: the job is pinned" if _job_route_pinned(job) else "no fallback configured"))
+        from agent.provider_policy import current_data_class, fallback_permits
+        data_class = current_data_class()
         for entry in chain:
             if not isinstance(entry, dict):
                 continue
             fb_provider = str(entry.get("provider") or "").strip()
             fb_model = str(entry.get("model") or "").strip()
             if not fb_provider or not fb_model:
+                continue
+            if not fallback_permits(fb_provider, data_class):
+                logger.info("Job '%s': fallback %s skipped (data class %s)", job_id, fb_provider, data_class)
                 continue
             try:
                 from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
@@ -2395,8 +2400,16 @@ class _CronRunScope:
         self._cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
         self._cron_session_token = None
         self._non_dispatcher_token = None
+        self._data_class = str(job.get("data_class") or "").strip()
+        self._data_class_token = None
 
     def enter(self) -> None:
+        # A job's data class filters its provider routes exactly as a Kanban worker's does
+        # (main provider allowlist, fallback chain, auxiliary routing). An unknown class raises
+        # ProviderDenied here, so the run fails closed before any provider is resolved.
+        if self._data_class:
+            from agent.provider_policy import bind_data_class
+            self._data_class_token = bind_data_class(self._data_class)
         # Scope cron approval policy; exit() RESETS via token (pinning "" would suppress the legacy
         # os.environ fallback used by standalone entrypoints/tests).
         self._cron_session_token = self._cron_session_var.set("1")
@@ -2416,6 +2429,9 @@ class _CronRunScope:
             self._cron_session_var.reset(self._cron_session_token)
         if self._non_dispatcher_token is not None:
             exit_non_dispatcher_owned_context(self._non_dispatcher_token)
+        if self._data_class_token is not None:
+            from agent.provider_policy import reset_data_class
+            reset_data_class(self._data_class_token)
         for name in _CRON_DELIVERY_VARS:
             self._var_map[name].set("")
 

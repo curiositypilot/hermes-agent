@@ -584,6 +584,22 @@ class BaseEnvironment(ABC):
             result["cwd_observed"] = True
             result["cwd"] = cwd_path
         result["output"] = cleaned
+        self._strip_cwd_marker_from_spill(result.get("full_output_path"))
+
+    def _strip_cwd_marker_from_spill(self, path) -> None:
+        """The spill file tees the raw stream, so it ends with the same marker line just cut from
+        ``output``; strip it there too, or the "full output" is not the command's output (a JSON
+        dump stops parsing). Spill trouble never fails the command; the handle stays usable."""
+        if not path:
+            return
+        try:
+            from tools.spill_safety import write_text_exclusive
+            spill = Path(path)
+            split = _split_cwd_marker(spill.read_text(encoding="utf-8", errors="replace"), self._cwd_marker)
+            if split is not None:
+                write_text_exclusive(spill, split[1], private=True, overwrite=True, errors="replace")
+        except OSError:
+            logger.warning("could not strip cwd marker from spill %s", path, exc_info=True)
 
     # --- Hooks ---
     def _before_execute(self) -> None:

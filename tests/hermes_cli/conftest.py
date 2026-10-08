@@ -2,7 +2,33 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
+
+
+def _is_fresh_import_target(name: str) -> bool:
+    return name.startswith(("hermes_cli", "hermes_state")) or name == "hermes_constants"
+
+
+@pytest.fixture
+def fresh_hermes_modules():
+    """Re-import ``hermes_cli`` / ``hermes_state`` / ``hermes_constants`` for one test.
+
+    Some fixtures need module-level state rebuilt against a fresh HERMES_HOME.
+    Purging those modules without restoring them leaves every later test in
+    the process holding the old module objects (imported at collection) while
+    the code under test lazily imports new copies, so monkeypatches and plugin
+    hooks land on objects nothing calls. Restore the exact snapshot at
+    teardown and drop every copy imported in between.
+    """
+    saved = {n: m for n, m in sys.modules.items() if _is_fresh_import_target(n)}
+    for name in saved:
+        del sys.modules[name]
+    yield
+    for name in [n for n in sys.modules if _is_fresh_import_target(n)]:
+        del sys.modules[name]
+    sys.modules.update(saved)
 
 
 @pytest.fixture

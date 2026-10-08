@@ -81,6 +81,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Absolute or ~ path to a Python in your own venv (e.g. ~/venvs/report/bin/python) "
             "for a .py --script / --monitor-script, so it can import packages Hermes does not "
             "ship. .sh/.bash still run under bash. Omit to use Hermes' Python.")
+    cron_create.add_argument("--data-class", dest="data_class",
+        help="Data class from kanban.data_policies.classes (e.g. 'confidential') for every "
+            "run: the main provider must be on its allowlist and fallbacks are filtered "
+            "exactly as for a Kanban card of that class. Omit for the default class.")
     cron_create.add_argument(
         "--continuity", dest="continuity", action="store_const", const=True, default=None,
         help="Each run wakes up with the job's own previous output injected "
@@ -151,6 +155,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--interpreter",
         help="Absolute or ~ path to a Python for a .py script / monitor script. "
             "Pass empty string to clear (back to Hermes' Python).")
+    cron_edit.add_argument("--data-class", dest="data_class",
+        help="Set the job's data class (kanban.data_policies.classes). Pass empty string "
+            "to clear it.")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

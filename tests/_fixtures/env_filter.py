@@ -195,6 +195,16 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+    # Dispatcher-resolved worker class: a restricted value leaking from a worker shell filters
+    # every provider route the tests resolve (fallback walks, auxiliary routing).
+    "HERMES_DATA_CLASS",
+    # systemd's per-unit marker is inherited by every descendant of a
+    # systemd-launched gateway, so pytest run from a Kanban worker or a
+    # CI runner sees it. ``restart_safe_gateway_child_argv`` reads it to
+    # decide whether a worker spawn needs a transient scope, which turns
+    # every ``_default_spawn`` test into a live systemd-run probe that
+    # raises without a user bus. Tests of that path set it explicitly.
+    "INVOCATION_ID",
     # Pytest is routinely launched from a delegated worker.  The worker
     # lineage marker must not make parent-state tests run as delegated
     # children; tests that exercise child behavior set it explicitly.

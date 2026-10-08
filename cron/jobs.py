@@ -1768,6 +1768,20 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_data_class(value: Any) -> Optional[str]:
+    """A configured ``kanban.data_policies`` class (lowercased), None for unset/empty, else
+    ValueError: an unknown class must never persist and fail every fire."""
+    text = _normalize_job_optional_text(value)
+    if text is None:
+        return None
+    from agent.provider_policy import ProviderDenied, validate_data_class
+
+    try:
+        return validate_data_class(text)
+    except ProviderDenied as exc:
+        raise ValueError(f"Invalid data_class {value!r}: {exc} (see kanban.data_policies.classes)") from exc
+
+
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
@@ -1792,6 +1806,7 @@ _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "data_class": _normalize_data_class,
 }
 
 
@@ -1858,6 +1873,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    data_class: Optional[str] = None,
     failure_deliver: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
@@ -1873,7 +1889,8 @@ def create_job(
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
-    (a venv can be rebuilt or moved after creation)."""
+    (a venv can be rebuilt or moved after creation).
+    data_class: ``kanban.data_policies`` class bound for every run (provider allowlist + fallback)."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1897,6 +1914,7 @@ def create_job(
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    normalized_data_class = _normalize_data_class(data_class)
 
     _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
     prompt_text = _coerce_job_text(prompt).strip()
@@ -1961,6 +1979,7 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
+        ("data_class", normalized_data_class),
     ):
         if value is not None:
             job[key] = value
