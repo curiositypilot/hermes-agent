@@ -51,7 +51,7 @@ from .settings import (
     _KANBAN_QUERY_BODY_CHARS, _apply_project_aliases, _kanban_recall_query, _kanban_recall_tags,
     _normalize_observation_scopes, _normalize_project_aliases, _normalize_retain_contexts,
     _normalize_retain_tags, _observation_scope_tag_groups, _parse_bool_setting, _parse_int_setting,
-    _parse_score_floor, _resolve_bank_id_template,
+    _parse_score_floor, _reranker_score, _resolve_bank_id_template,
 )
 
 logger = logging.getLogger(__name__)
@@ -714,6 +714,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "recall_min_reranker", "description": "Auto-recall relevance floor (0-1): drop results whose normalized reranker score is below it, so an off-topic turn injects nothing. Blank applies no floor. The explicit hindsight_recall tool is not filtered.", "default": ""},
+            {"key": "recall_min_relative_reranker", "description": "Auto-recall relative floor (0-1): keep only items scoring >= this fraction of the turn's best reranker score. Blank or 0 applies no relative floor. The explicit hindsight_recall tool is not filtered.", "default": ""},
             {"key": "recall_kanban_card_query", "description": "In Kanban workers (HERMES_KANBAN_TASK set), auto-recall with the card's title + the start of its body instead of the dispatcher's topic-free 'work kanban task <id>' message", "default": False},
             {"key": "recall_kanban_body_chars", "description": "Card-body characters appended to the title for recall_kanban_card_query (0 = title only). Longer queries dilute the reranker score", "default": _KANBAN_QUERY_BODY_CHARS},
             {"key": "recall_kanban_tags", "description": "Auto-recall tag filter for Kanban workers, replacing recall_tags there (comma-separated or list; '{tenant}' expands to the card's tenant and the tag is dropped for untenanted cards), e.g. 'project:{tenant},scope:personal'. Blank keeps recall_tags", "default": ""},
@@ -1128,6 +1129,9 @@ class HindsightMemoryProvider(MemoryProvider):
         # Auto-recall abstention: a server-side reranker floor (min_scores.reranker) so an
         # off-topic turn injects nothing instead of the top-N zero-score results. None = no floor.
         self._recall_min_reranker = _parse_score_floor(cfg.get("recall_min_reranker"))
+        # Relative floor: keep auto-recall items scoring >= this fraction of the turn's best
+        # reranker score, cutting the weak tail behind one strong hit. None/0 = off.
+        self._recall_min_relative_reranker = _parse_score_floor(cfg.get("recall_min_relative_reranker"))
         self._recall_prefer_observations = _parse_bool_setting(cfg.get("recall_prefer_observations"), False)
         # Kanban-worker auto-recall (Retrieval·W2). Both default off: today's query and filter.
         self._recall_kanban_card_query = _parse_bool_setting(cfg.get("recall_kanban_card_query"), False)
@@ -1372,9 +1376,23 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["min_scores"] = {"reranker": self._recall_min_reranker}
         resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
         results = resp.results or []
+        if auto and self._recall_min_relative_reranker:
+            results = self._apply_relative_floor(results, self._recall_min_relative_reranker)
         # Fail-open append of the surfaced ids; the nightly dream's age review reads them (recall_log.py).
         log_recalled(results, query)
         return results
+
+    @staticmethod
+    def _apply_relative_floor(results: list, ratio: float) -> list:
+        """Keep results scoring >= ratio x the best reranker score, in server order.
+        Fail-open: no scored result or a non-positive top keeps everything, and an
+        unscored result is always kept."""
+        scored = [s for s in (_reranker_score(r) for r in results) if s is not None]
+        top = max(scored) if scored else None
+        if top is None or top <= 0:
+            return results
+        cut = ratio * top
+        return [r for r in results if (s := _reranker_score(r)) is None or s >= cut]
 
     def _reflect(self, query: str, overrides: dict | None = None) -> str | None:
         resp = self._run_hindsight_operation(
