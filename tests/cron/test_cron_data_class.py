@@ -140,9 +140,12 @@ def test_pre_agent_resolve_fallback_skips_denied_providers(monkeypatch):
         return {"provider": requested, "api_key": "k", "base_url": "https://x"}
 
     monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve)
+    # Unpinned jobs (no provider/model/base_url of their own) reach the primary through
+    # cron.default_provider; a pinned job never borrows the global chain (#100437), so it is
+    # the unpinned walk that the data class must filter.
     jc = scheduler._CronJobConfig(cfg=load_config_readonly(), model="claude-opus-5-5",
-                                  model_cfg={}, cron_default_provider="")
-    job = {"id": "j1", "provider": "anthropic", "data_class": "confidential"}
+                                  model_cfg={}, cron_default_provider="anthropic")
+    job = {"id": "j1", "data_class": "confidential"}
     scope = scheduler._CronRunScope(job, "j1", "exec-1")
     try:
         scope.enter()
@@ -153,7 +156,7 @@ def test_pre_agent_resolve_fallback_skips_denied_providers(monkeypatch):
     assert tried == ["anthropic"]
 
     tried.clear()
-    runtime, model = scheduler._resolve_job_runtime({"id": "j2", "provider": "anthropic"}, "j2", jc)
+    runtime, model = scheduler._resolve_job_runtime({"id": "j2"}, "j2", jc)
     assert runtime["provider"] == "xai-oauth" and model == "grok-4.7"
 
 

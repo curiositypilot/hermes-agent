@@ -253,8 +253,8 @@ def _pinned_kanban_rate_limit_fast_fail(agent: Any, api_error: Any, error_contex
         return False
     if retry_count >= 2:
         return True
-    from agent.turn_recovery_autorecover import _retry_after_seconds
-    wait = _retry_after_seconds(api_error)
+    from agent.retry_utils import provider_retry_after_seconds
+    wait = provider_retry_after_seconds(api_error)
     reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
     if reset_at:
         from agent.fallback_cooldown import _provider_reset_delay
