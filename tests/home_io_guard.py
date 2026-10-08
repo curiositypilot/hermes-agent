@@ -18,17 +18,48 @@ _INTERPRETER_PREFIXES = tuple({
     # whose site-packages sits under the (real) Hermes home; third-party imports from it are the
     # interpreter's installation, not Hermes state.
     Path(p).resolve() for p in sys.path if p and Path(p).name in ("site-packages", "dist-packages")
-} | {
-    # The default install checks the repo out INSIDE the home (install.sh:
-    # INSTALL_DIR=$HERMES_HOME/hermes-agent). Reading test data, sources for tracebacks, or the
-    # checkout's own .venv is not Hermes state; without this every run from a default install
-    # trips on its first traceback.
-    Path(__file__).resolve().parent.parent,
 })
-# The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
-# Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes
-# resolve once at import, as before: they are fixed for the process lifetime.
+# The default install checks the repo out INSIDE the home (install.sh:
+# INSTALL_DIR=$HERMES_HOME/hermes-agent), and kanban worktrees sit under it too.
+_CHECKOUT = Path(__file__).resolve().parent.parent
+# PurePath comparison folds case on Windows; ``os.path.normcase`` (identity on POSIX) reproduces
+# that for the check() fast path's string compares.
 _normcase = os.path.normcase
+
+
+def _linked_git_dir(checkout: Path) -> Path | None:
+    """The private git dir of a linked worktree (``<main>/.git/worktrees/<id>``), or None.
+
+    A linked worktree's ``.git`` is a file naming that dir; a main checkout's is a directory
+    (already inside the checkout) and an unpacked tarball has none.
+    """
+    try:
+        text = (checkout / ".git").read_text(encoding="utf-8-sig")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("gitdir:"):
+            return (checkout / line.removeprefix("gitdir:").strip()).resolve()
+    return None
+
+
+def checkout_exemptions(checkout: Path) -> tuple[tuple[str, ...], frozenset[str]]:
+    """What the running checkout itself may touch inside a guarded root: (prefixes, probe paths).
+
+    Prefixes: the checkout (test data, sources for tracebacks, its own .venv; without it every
+    run from a default install trips on its first traceback) and a linked worktree's git dir
+    (hermes_bootstrap probes the interrupted-update marker there on import). Probe paths are
+    read-only: ``<checkout>/../manifest.json`` is where every install asks whether a sealed
+    payload ships it (pm.environments._payload_manifest, pm.runtime._resident_runtime).
+    """
+    prefixes = {checkout}
+    git_dir = _linked_git_dir(checkout)
+    if git_dir is not None:
+        prefixes.add(git_dir)
+    probes = frozenset({_normcase(os.fspath(checkout.parent / "manifest.json"))})
+    return tuple(_normcase(os.fspath(p)) for p in prefixes), probes
+
+
 _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
 
 
@@ -47,12 +78,14 @@ def _contains(path: str, prefix: str) -> bool:
 
 
 class HomeIOGuard:
-    def __init__(self, roots, installed_apps=lambda: ()):
+    def __init__(self, roots, installed_apps=lambda: (), *, checkout: Path = _CHECKOUT):
         self.roots = roots
         # The machine's installed desktop app (``packaged_gui_app_paths()`` before any test ran):
         # deleting, replacing or writing into it is refused. Reads stay allowed: several update
         # paths only probe it.
         self.installed_apps = installed_apps
+        own_prefixes, self.probes = checkout_exemptions(checkout)
+        self.prefixes = _INTERPRETER_PREFIX_STRS + own_prefixes
         self.checking = threading.local()
         self.directories: dict[int, Path] = {}
 
@@ -96,10 +129,9 @@ class HomeIOGuard:
                     return
             # The interpreter's own installation (a PM-managed python under ~/.hermes/tools):
             # stdlib source reads (linecache, traceback) are not Hermes state either, nor is
-            # realpath() walking up through its ancestors.
-            for prefix in _INTERPRETER_PREFIX_STRS:
-                if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
-                    return
+            # realpath() walking up through its ancestors. Same for the running checkout.
+            if self._own_install(absolute, metadata=metadata, destructive=destructive):
+                return
             # Check the lexical path first: resolving must not probe a protected
             # tree merely to decide that the original path was forbidden.
             for root in roots:
@@ -110,7 +142,7 @@ class HomeIOGuard:
             if metadata and resolved in roots:
                 return
             # A fixture symlink to the running interpreter resolves into its installation.
-            for prefix in _INTERPRETER_PREFIX_STRS:
+            for prefix in self.prefixes:
                 if _within(resolved, prefix):
                     return
             for root in roots:
@@ -118,6 +150,13 @@ class HomeIOGuard:
                     self.refuse(value)
         finally:
             self.checking.active = False
+
+    def _own_install(self, absolute, *, metadata, destructive):
+        """*absolute* is the interpreter's or the checkout's own file, or the read-only probe."""
+        if not destructive and absolute in self.probes:
+            return True
+        return any(_within(absolute, prefix) or (metadata and _contains(absolute, prefix))
+                   for prefix in self.prefixes)
 
     def _refuse_installed_app_change(self, value, absolute):
         """Fail on a change to an installed app (already normalized, literal and resolved);
