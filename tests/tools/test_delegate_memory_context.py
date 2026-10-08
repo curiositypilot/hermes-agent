@@ -92,23 +92,26 @@ def test_manager_error_builds_child_without_block():
 
 
 def test_slow_manager_past_deadline_builds_child_without_block():
+    # Bounds leave >= 2 s of slack for a loaded runner (a child build alone costs ~0.2 s warm):
+    # the recall sleeps 3 s, the deadline is 0.2 s, so finishing under 2.5 s proves the deadline cut it.
     def slow(_q):
-        time.sleep(1.0)
+        time.sleep(3.0)
         return _BLOCK
     start = time.monotonic()
     children, built = _build(_parent(_FakeManager(slow, timeout=0.2)), ["anything"])
-    assert time.monotonic() - start < 0.9
+    assert time.monotonic() - start < 2.5
     assert len(children) == 1
     assert "RECALLED MEMORY" not in built[0]["ephemeral_system_prompt"]
 
 
 def test_batch_recalls_run_concurrently():
+    # Three sequential recalls would take 6 s; concurrent ones 2 s plus the child builds.
     def slow(q):
-        time.sleep(1.0)
+        time.sleep(2.0)
         return f"<memory-context>\n- fact for {q}\n</memory-context>"
     start = time.monotonic()
-    children, built = _build(_parent(_FakeManager(slow, timeout=5.0)), ["a", "b", "c"])
-    assert time.monotonic() - start < 2.0
+    children, built = _build(_parent(_FakeManager(slow, timeout=8.0)), ["a", "b", "c"])
+    assert time.monotonic() - start < 5.0
     assert len(children) == 3
     for goal, kwargs in zip(["a", "b", "c"], built):
         assert f"fact for {goal}" in kwargs["ephemeral_system_prompt"]
