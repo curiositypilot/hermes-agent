@@ -8,21 +8,17 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 
 import pytest
 
 
 @pytest.fixture()
-def isolated_kanban_home(monkeypatch):
+def isolated_kanban_home(monkeypatch, fresh_hermes_modules):
     """Spin up a fresh HERMES_HOME with a clean kanban DB."""
     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
-    # Force-reimport so the fresh HERMES_HOME is picked up.
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+    # fresh_hermes_modules force-reimports so the fresh HERMES_HOME is picked up.
     from hermes_cli import kanban_db
     yield kanban_db, test_home
     # Cleanup is best-effort; tempfile dir survives but pytest isolation

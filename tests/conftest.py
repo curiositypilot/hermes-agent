@@ -362,6 +362,13 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # children; tests that exercise child behavior set it explicitly.
     "HERMES_DELEGATED_CHILD_CONTEXT",
     "HERMES_TENANT",
+    # systemd's per-unit marker is inherited by every descendant of a
+    # systemd-launched gateway, so pytest run from a Kanban worker or a
+    # CI runner sees it. ``restart_safe_gateway_child_argv`` reads it to
+    # decide whether a worker spawn needs a transient scope, which turns
+    # every ``_default_spawn`` test into a live systemd-run probe that
+    # raises without a user bus. Tests of that path set it explicitly.
+    "INVOCATION_ID",
     # Honcho host selection changes which nested config block wins. A local
     # shell override leaked "myhost" into the full suite and flipped 20
     # otherwise-unrelated config tests away from the default "hermes" host.
