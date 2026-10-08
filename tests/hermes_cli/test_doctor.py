@@ -41,6 +41,57 @@ def _no_browser_downloads(monkeypatch):
     monkeypatch.setattr("pm.client._request", refuse)
 
 
+def _isolate_install(monkeypatch, tmp_path):
+    """Point doctor's install probes at a fresh tree, not the host's install.
+
+    A full ``run_doctor`` reaches ``_check_command_installation``, which reads the
+    selected venv under ``PROJECT_ROOT`` and resolves ``~/.local/bin/hermes``. On a
+    default install both lead into the real Hermes home (the checkout lives at
+    ``~/.hermes/hermes-agent`` and the command links into its venv), so the
+    home-I/O guard fails the test on that host only.
+    """
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    home.mkdir(exist_ok=True)
+    project.mkdir(exist_ok=True)
+    monkeypatch.delenv("PREFIX", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    return home, project
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("isolated", [True, False])
+def test_isolate_install_keeps_host_command_link_out_of_reach(monkeypatch, tmp_path, capsys, isolated):
+    """Regression: a host whose ``~/.local/bin/hermes`` links into the real Hermes home
+    (every default install) made full ``run_doctor`` tests fail the home-I/O guard."""
+    real_root = (Path.home() / ".hermes").resolve()  # the root the guard refuses
+    host_home = tmp_path / "host"
+    host_link = host_home / ".local" / "bin" / "hermes"
+    host_link.parent.mkdir(parents=True)
+    host_link.symlink_to(real_root / "hermes-agent" / "venv" / "bin" / "hermes")
+    monkeypatch.setattr(Path, "home", lambda: host_home)
+    monkeypatch.delenv("PREFIX", raising=False)
+    project = tmp_path / "project"
+    if isolated:
+        _isolate_install(monkeypatch, tmp_path)
+    else:
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    # A real entry point, so the check gets as far as resolving the command link.
+    entry = project / "venv" / "bin" / "hermes"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("#!/bin/sh\n", encoding="utf-8")
+    (project / ".install_method").write_text("git", encoding="utf-8")
+
+    if not isolated:
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            doctor_platform._check_command_installation(False)
+        return
+    finding = doctor_platform._check_command_installation(False)
+    assert "~/.local/bin/hermes not found" in capsys.readouterr().out
+    assert any("Missing ~/.local/bin/hermes" in issue for issue in finding.issues)
+
+
 def _tls_out_normalized(out: str) -> str:
     """Doctor print matcher for TLS rows: key on words, not spacing."""
     return " ".join(out.lower().split())
@@ -228,6 +279,7 @@ class TestDoctorEnvFileEncoding:
         )
 
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
+        _isolate_install(monkeypatch, tmp_path)
 
         orig_read_text = pathlib.Path.read_text
 
@@ -270,6 +322,7 @@ class TestDoctorEnvFileEncoding:
         env_path.write_bytes(b"OPENAI_API_KEY=sk-test\xff\n")
 
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
+        _isolate_install(monkeypatch, tmp_path)
 
         fake_model_tools = types.SimpleNamespace(
             check_tool_availability=lambda *a, **kw: (_ for _ in ()).throw(SystemExit(0)),
@@ -317,6 +370,7 @@ def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
     monkeypatch.setenv("VERCEL_TOKEN", "super-secret-value")
     monkeypatch.delenv("VERCEL_PROJECT_ID", raising=False)
     monkeypatch.setenv("VERCEL_TEAM_ID", "team")
+    _isolate_install(monkeypatch, tmp_path)
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "vercel" else None)
 
     fake_model_tools = types.SimpleNamespace(
@@ -1340,6 +1394,7 @@ class TestDoctorStaleMaxIterationsDrift:
         monkeypatch.setattr(doctor_mod, "get_hermes_home", lambda: hermes_home)
         # Point the config helpers at the temp home.
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        _isolate_install(monkeypatch, tmp_path)
         if os_environ_value is not None:
             # Simulate the gateway bridge having already overridden os.environ.
             monkeypatch.setenv("HERMES_MAX_ITERATIONS", str(os_environ_value))
