@@ -830,7 +830,8 @@ _TOOL_DOC_LINES = [
     ("patch", "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict\n"
      "    Replaces old_string with new_string in the file."),
     ("terminal", "  terminal(command: str, timeout=None, workdir=None) -> dict\n"
-     "    Foreground only (no background/pty). Returns {\"output\": \"...\", \"exit_code\": N}"),
+     "    Foreground only (no background/pty). Returns {\"output\": \"...\", \"exit_code\": N}\n"
+     "    Over 50KB, output is head+tail cut and full_output_path holds the full text: parse that file, not output."),
 ]
 
 
