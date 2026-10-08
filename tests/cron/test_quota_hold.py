@@ -562,11 +562,11 @@ def day_clock(monkeypatch, tmp_path):
 
 
 def test_day_two_reprobe_delivers_its_alert_through_the_tick(tmp_path, day_clock, monkeypatch):
-    """The re-probe's alert is delivered by the real scheduler path, not just composed: the
-    provider's remaining window shrinks, so the failure signature changes and a new incident
-    alerts. The job is parked again each time. The repeat-alert cooldown is pinned above the
-    24 h cap, so only the signature change can deliver the day-2 alert."""
-    monkeypatch.setattr(sched, "_failure_repeat_alert_hours", lambda: 48.0)
+    """The re-probe's alert is delivered by the real scheduler path, not just composed, and the
+    job is parked again each time. The shrinking ``retry after <N>s`` does NOT mint a new incident
+    (durations are masked out of the signature, cron/incidents.py #129587), so the day-2 alert is
+    the same incident's repeat alert: the cooldown is pinned below the 24 h cap so it has lapsed."""
+    monkeypatch.setattr(sched, "_failure_repeat_alert_hours", lambda: 12.0)
     with cron_jobs.use_cron_store(tmp_path):
         job = create_job("probe", "every 15m", deliver="telegram:123")
         deliveries: list = []
