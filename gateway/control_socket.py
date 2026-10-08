@@ -119,6 +119,33 @@ def build_status_payload() -> dict[str, Any]:
             "answered_at": time.time(), "answering_pid": os.getpid()}
 
 
+def peer_shares_user_namespace(sock: Any) -> bool:
+    """Linux: False when the connecting process lives in another user namespace.
+
+    Sandboxed Kanban workers (``kanban.sandbox: bwrap``) run in their own user namespace with
+    ``gateway.sock`` masked at spawn, but a gateway restart mid-run binds a fresh socket inode at
+    the same path, which the worker's mount namespace then sees. Same UID, so the 0600 mode does
+    not stop it; the namespace check does. Non-Linux, or no peer credentials: True (unchanged).
+    """
+    if not sys.platform.startswith("linux") or sock is None or not hasattr(socket, "SO_PEERCRED"):
+        return True
+    try:
+        own = os.readlink("/proc/self/ns/user")
+    except OSError:
+        return True
+    try:
+        import struct
+        creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, uid, _gid = struct.unpack("3i", creds)
+        if uid != os.geteuid():  # windows-footgun: ok — Linux-only (early return above)
+            return True  # another account (e.g. root CLI): the socket mode already decided; not a worker
+        if pid <= 0:
+            return False
+        return os.readlink(f"/proc/{pid}/ns/user") == own
+    except OSError:
+        return False
+
+
 class GatewayControlServer:
     """Gateway-owned control socket server (identify/status, v1): ``start()`` after the PID-file claim,
     ``stop()`` on shutdown. All failures are non-fatal — the gateway never refuses to serve messaging
@@ -231,6 +258,9 @@ class GatewayControlServer:
 
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
+            if not peer_shares_user_namespace(writer.get_extra_info("socket")):
+                logger.info("Gateway control socket: refused a peer from another user namespace (sandboxed worker)")
+                return
             raw = await asyncio.wait_for(reader.readline(), timeout=_DEFAULT_CLIENT_TIMEOUT)
             if not raw or len(raw) > _MAX_REQUEST_BYTES:
                 return

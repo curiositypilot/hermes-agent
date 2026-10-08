@@ -1,5 +1,6 @@
 """Module-form worker argv: the interpreter-bound ``python -P -m hermes_cli.main``
-invocation the dispatcher falls back to, and the ``PYTHONPATH`` pin it needs.
+invocation the dispatcher falls back to, the ``PYTHONPATH`` pin it needs, and the pure
+path helpers ``_resolve_hermes_argv`` uses for a resolved shim.
 
 Split out of ``hermes_cli.kanban_db_dispatch`` (which imports these names and is
 where ``_resolve_hermes_argv``/``_default_spawn`` read them).
@@ -7,10 +8,22 @@ where ``_resolve_hermes_argv``/``_default_spawn`` read them).
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 _MODULE_ENTRY = ["-m", "hermes_cli.main"]
+
+
+def _absolute_hermes_path(path: str) -> str:
+    """Return an absolute filesystem path for a resolved Hermes shim."""
+    expanded = os.path.expanduser(path)
+    return expanded if os.path.isabs(expanded) else os.path.abspath(expanded)
+
+
+def _is_windows_batch_shim(path: str) -> bool:
+    """Return true for Windows shell/batch shims that should not be argv[0]."""
+    return path.lower().endswith((".cmd", ".bat"))
 
 
 def _module_hermes_argv() -> list[str]:
