@@ -1042,6 +1042,32 @@ def _merge_pool_row_generation(
     return _merge_disk_cooldown_state(merged, merge_disk, provider_id)
 
 
+def _merge_billing_streak(result: Dict[str, Any], entry: Dict[str, Any], disk_entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Carry the newest billing streak across a pool rewrite.
+
+    The streak (``agent.credential_pool.BILLING_STREAK_KEYS``) sizes the escalating billing bench
+    and is stamped by its own ``billing_streak_at``. A writer holding an older snapshot must not
+    overwrite another process's newer streak, and a ``hermes auth reset`` on disk that postdates
+    every streak ends it.
+    """
+    from agent.credential_pool import BILLING_STREAK_KEYS, _parse_absolute_timestamp
+
+    mem_at = _parse_absolute_timestamp(entry.get("billing_streak_at")) or 0.0
+    disk_at = _parse_absolute_timestamp(disk_entry.get("billing_streak_at")) or 0.0
+    cleared_at = _parse_absolute_timestamp(disk_entry.get("status_cleared_at")) or 0.0
+    if not (mem_at or disk_at):
+        return result
+    if cleared_at >= max(mem_at, disk_at):
+        return {k: v for k, v in result.items() if k not in BILLING_STREAK_KEYS}
+    # The writer's own newer mark wins even when it carries no streak: a non-billing mark after
+    # the disk's billing mark ended the streak on purpose.
+    mem_ref = max(mem_at, _parse_absolute_timestamp(entry.get("last_status_at")) or 0.0)
+    if disk_at > mem_ref:
+        return {**{k: v for k, v in result.items() if k not in BILLING_STREAK_KEYS},
+                **{k: disk_entry[k] for k in BILLING_STREAK_KEYS if disk_entry.get(k) is not None}}
+    return result
+
+
 def _merge_disk_cooldown_state(
     entry: Dict[str, Any], disk_entry: Optional[Dict[str, Any]], provider_id: str,
 ) -> Dict[str, Any]:
@@ -1067,6 +1093,14 @@ def _merge_disk_cooldown_state(
         merged = {**entry, "model_cooldowns": merged_cooldowns} if merged_cooldowns else entry
         disk_status_fields = {f: disk_entry.get(f) for f in _POOL_STATUS_FIELDS}
 
+        # A token change means the caller re-authed this entry and intentionally cleared its status
+        # (and billing streak): never resurrect the old cooldown onto fresh credentials.
+        mem_access = entry.get("access_token") or ""
+        disk_access = disk_entry.get("access_token") or ""
+        token_changed = bool(mem_access and disk_access and mem_access != disk_access)
+        if not token_changed:
+            merged = _merge_billing_streak(merged, entry, disk_entry)
+
         mem_ts = _parse_absolute_timestamp(entry.get("last_status_at")) or 0.0
         cleared_ts = _parse_absolute_timestamp(disk_entry.get("status_cleared_at")) or 0.0
         if entry.get("last_status") in (STATUS_DEAD, STATUS_EXHAUSTED) and cleared_ts > mem_ts:
@@ -1074,11 +1108,7 @@ def _merge_disk_cooldown_state(
         disk_status = disk_entry.get("last_status")
         if disk_status not in (STATUS_DEAD, STATUS_EXHAUSTED):
             return merged
-        # A token change means the caller re-authed this entry and intentionally cleared its status:
-        # never resurrect the old cooldown onto fresh credentials.
-        mem_access = entry.get("access_token") or ""
-        disk_access = disk_entry.get("access_token") or ""
-        if mem_access and disk_access and mem_access != disk_access:
+        if token_changed:
             return entry
         disk_ts = _parse_absolute_timestamp(disk_entry.get("last_status_at")) or 0.0
         if disk_ts <= mem_ts:

@@ -10,12 +10,14 @@ if TYPE_CHECKING:
 
 
 def _cleared_status_copy(entry: PooledCredential) -> PooledCredential:
-    from agent.credential_pool import _CLEAR_STATUS
+    from agent.credential_pool import BILLING_STREAK_KEYS, _CLEAR_STATUS
 
     # The reset marker lets a live pool in another process tell "reset after my cooldown" from
-    # "never had a status" — both read as bare None on disk (#89415).
+    # "never had a status" — both read as bare None on disk (#89415). The reset also ends the
+    # billing streak, so a topped-up account is not benched for the escalated window again.
+    dropped = {"failure_reason", *BILLING_STREAK_KEYS}
     return replace(entry, **_CLEAR_STATUS, model_cooldowns=None, status_cleared_at=time.time(),
-                   extra={k: v for k, v in entry.extra.items() if k != "failure_reason"})
+                   extra={k: v for k, v in entry.extra.items() if k not in dropped})
 
 
 class CredentialNotSavedError(RuntimeError):
@@ -47,6 +49,7 @@ class CredentialPoolAdminMixin:
             stale = [
                 e for e in self._entries
                 if e.last_status or e.last_status_at or e.last_error_code or e.failure_reason or e.model_cooldowns
+                or e.billing_streak is not None
             ]
             if stale:
                 stale_ids = {e.id for e in stale}
