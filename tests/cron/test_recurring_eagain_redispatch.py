@@ -54,6 +54,12 @@ def wedge_env(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs_mod, "JOBS_FILE", hermes_home / "cron" / "jobs.json")
     monkeypatch.setattr(jobs_mod, "OUTPUT_DIR", hermes_home / "cron" / "output")
 
+    # tick() starts a git worktree-prune thread when the install root has
+    # .worktrees/; its git Popen calls would consume the one-shot EAGAIN
+    # injected below. Stub it so only the job script spawns a process.
+    import cron.scheduler as sched_mod
+    monkeypatch.setattr(sched_mod, "_maybe_run_worktree_maintenance", lambda: None)
+
     # Create a recurring no_agent interval job.
     job = jobs_mod.create_job(
         prompt="probe",
