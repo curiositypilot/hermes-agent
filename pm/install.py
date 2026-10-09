@@ -179,7 +179,7 @@ def lazy_installs_allowed() -> bool:
     ):
         return False
     try:
-        from hermes_cli.config import cfg_get, load_config_readonly, require_readable_config_before_write
+        from hermes_cli.config import FailedConfigRead, cfg_get, load_config_readonly, read_raw_config_readonly
     except ModuleNotFoundError as exc:
         return exc.name in {"hermes_cli", "hermes_cli.config"}
     except ImportError:
@@ -187,7 +187,11 @@ def lazy_installs_allowed() -> bool:
     try:
         # The normal loader falls back to defaults on invalid YAML. A broken
         # security policy must not grant permission to acquire dependencies.
-        require_readable_config_before_write()
+        # The raw reader caches only a good parse (keyed on the file
+        # signature) and re-checks a broken file on every call, so warm
+        # calls skip the YAML parse yet still fail closed.
+        if isinstance(read_raw_config_readonly(), FailedConfigRead):
+            return False
         return cfg_get(load_config_readonly(), "security", "allow_lazy_installs", default=True) is True
     except Exception:
         return False
