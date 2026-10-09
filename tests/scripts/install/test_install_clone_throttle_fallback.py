@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -54,6 +55,15 @@ stage_repository
 
 
 POWERSHELL = next((c for c in ("pwsh", "powershell") if shutil.which(c)), None)
+
+
+def _host_git_version() -> tuple:
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
+    match = re.search(r"(\d+)\.(\d+)", out)
+    return (int(match[1]), int(match[2])) if match else (0, 0)
+
+
+HOST_GIT_HAS_REFETCH = _host_git_version() >= (2, 36)  # `git fetch --refetch` arrived in 2.36
 
 
 def _run_repository_stage(installer: str, tmp_path: Path, install: Path, origin_url: str) -> subprocess.CompletedProcess:
@@ -111,7 +121,16 @@ def test_existing_treeless_checkout_is_refetched_before_update(tmp_path, install
     head = git(install, "rev-parse", "HEAD").stdout.strip()
 
     result = _run_repository_stage(installer, tmp_path, install, origin.as_uri())
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert git(install, "config", "--get", "remote.origin.partialclonefilter").stdout.strip() == "blob:none"
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
     assert git(install, "rev-parse", "HEAD").stdout.strip() == head, "the checkout was re-cloned, not converted"
-    git(install, "rev-list", "HEAD", "--", "history.txt", GIT_NO_LAZY_FETCH="1")  # history answers offline
+    # The Windows installer runs its pinned Git; elsewhere both installers run the host git.
+    if (installer == "ps1" and os.name == "nt") or HOST_GIT_HAS_REFETCH:
+        assert git(install, "config", "--get", "remote.origin.partialclonefilter").stdout.strip() == "blob:none"
+        git(install, "rev-list", "HEAD", "--", "history.txt", GIT_NO_LAZY_FETCH="1")  # history answers offline
+    else:
+        # git < 2.36 has no `fetch --refetch`: the checkout stays treeless, as `hermes update` leaves it.
+        assert git(install, "config", "--get", "remote.origin.partialclonefilter").stdout.strip() == "tree:0"
+        if installer == "sh":
+            assert "unknown option" not in output, output
+            assert "2.36" in output, output

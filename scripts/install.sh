@@ -565,7 +565,15 @@ stage_repository() {
             # directory snapshots again on every history walk (#129514). Fetch its trees once; the
             # new filter is recorded only after that succeeds, so `hermes update` retries otherwise.
             if [ "$(git -C "$INSTALL_DIR" config --get remote.origin.partialclonefilter)" = tree:0 ]; then
-                if run_logged --may-fail "Fetching directory history once (treeless checkout)" \
+                # `fetch --refetch` exists from git 2.36. `hermes update` leaves a treeless checkout
+                # alone on older git (hermes_cli/gitlock.py), so nothing would retry it there.
+                local git_major=0 git_minor=0
+                if [[ "$(git --version 2>/dev/null)" =~ ([0-9]+)\.([0-9]+) ]]; then
+                    git_major="${BASH_REMATCH[1]}" git_minor="${BASH_REMATCH[2]}"
+                fi
+                if [ "$git_major" -lt 2 ] || { [ "$git_major" -eq 2 ] && [ "$git_minor" -lt 36 ]; }; then
+                    log_warn "converting this treeless checkout needs git 2.36+ (found $git_major.$git_minor); it stays treeless until git is upgraded"
+                elif run_logged --may-fail "Fetching directory history once (treeless checkout)" \
                     git -C "$INSTALL_DIR" -c gc.auto=0 -c maintenance.auto=false fetch --refetch \
                     --filter=blob:none origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"; then
                     git -C "$INSTALL_DIR" config remote.origin.partialclonefilter blob:none \

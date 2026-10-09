@@ -93,6 +93,9 @@ def test_lsp_package_manager_config_selects_installer_argv_and_never_falls_back_
     from agent.lsp import install as install_mod
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # Pin the PM store: otherwise store_root walks the checkout's parents, which are real-home
+    # paths when the checkout lives under ~/.hermes.
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "tools"))
     staging = str(install_mod.hermes_lsp_bin_dir().parent)
     cfg = {"lsp": {}}
     monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: cfg)
