@@ -161,6 +161,12 @@ def _identity(lockfile: Lockfile, name: str, target: str):
     return (target, tuple(a["sha256"] for a in artifacts))
 
 
+# The worker's copy of the policy its client decided before spawning it (sent
+# in the stdin request, never through env), so the worker skips importing
+# hermes_cli.config and every provider plugin behind it. None = read config.
+_lazy_policy_override: bool | None = None
+
+
 def lazy_installs_allowed() -> bool:
     """Policy: may pm install things on demand right now?
 
@@ -178,6 +184,8 @@ def lazy_installs_allowed() -> bool:
         "yes",
     ):
         return False
+    if _lazy_policy_override is not None:
+        return _lazy_policy_override
     try:
         from hermes_cli.config import FailedConfigRead, cfg_get, load_config_readonly, read_raw_config_readonly
     except ModuleNotFoundError as exc:
