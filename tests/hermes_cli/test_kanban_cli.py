@@ -114,6 +114,65 @@ def test_kanban_edit_updates_documented_task_fields(kanban_home):
     assert any(event.kind == "reprioritized" for event in events)
 
 
+def _edited_events(task_id):
+    with kbc.connect_closing() as conn:
+        return [event for event in kb.list_events(conn, task_id) if event.kind == "edited"]
+
+
+def _contract_of(task_id):
+    with kbc.connect_closing() as conn:
+        return kb.get_task(conn, task_id).completion_contract
+
+
+def _edit_contract(task_id, contract):
+    return kc._cmd_edit(argparse.Namespace(
+        task_id=task_id, title=None, body=None, priority=None, result=None,
+        summary=None, metadata=None, completion_contract=contract,
+    ))
+
+
+def test_kanban_edit_sets_completion_contract(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="gated", completion_contract="local-only")
+
+    kc.run_slash(f"edit {task_id} --completion-contract 'test:true'")
+
+    assert _contract_of(task_id) == "test:true"
+    [event] = _edited_events(task_id)
+    assert event.payload["fields"] == ["completion_contract"]
+    assert event.payload["completion_contract"] == {"old": "local-only", "new": "test:true"}
+
+
+def test_kanban_edit_rejects_invalid_completion_contract(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="gated", completion_contract="local-only")
+
+    assert _edit_contract(task_id, "not a contract") == 2
+
+    assert _contract_of(task_id) == "local-only"
+    assert _edited_events(task_id) == []
+
+
+def test_kanban_edit_completion_contract_refuses_done_task(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="gated", completion_contract="local-only")
+        assert kb.complete_task(conn, task_id, result="done")
+
+    assert _edit_contract(task_id, "test:true") != 0
+
+    assert _contract_of(task_id) == "local-only"
+
+
+def test_kanban_edit_completion_contract_unchanged_is_noop(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="gated", completion_contract="test:true")
+
+    assert _edit_contract(task_id, "test:true") == 0
+
+    assert _contract_of(task_id) == "test:true"
+    assert _edited_events(task_id) == []
+
+
 def test_worker_link_preserves_foreign_child_rules(kanban_home, monkeypatch):
     with kbc.connect_closing() as conn:
         worker = kb.create_task(conn, title="worker")

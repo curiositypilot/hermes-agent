@@ -3227,53 +3227,50 @@ def edit_task(
     body: Optional[str] = None, priority: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
+    completion_contract: Optional[str] = None,
 ) -> bool:
-    """Edit task fields, optionally backfilling a completed task's result."""
-    changed_fields = [
-        field for field, value in (("title", title), ("body", body), ("priority", priority))
-        if value is not None
-    ]
+    """Edit task fields, optionally backfilling a completed task's result. A new
+    ``completion_contract`` is validated first (ValueError) and refused on done/archived tasks."""
+    from hermes_cli.kanban_pr_acceptance import validate_contract
+    from hermes_cli.kanban_pr_acceptance_store import stage_contract_edit
+    if completion_contract is not None:
+        completion_contract = validate_contract(completion_contract)
+    fields = (("title", title), ("body", body), ("priority", priority))
     with write_txn(conn):
         status = _task_status(conn, task_id)
         if status is None or (result is not None and status != "done"):
             return False
-        assignments = []
-        params = []
-        for field, value in (("title", title), ("body", body), ("priority", priority)):
-            if value is not None:
-                assignments.append(f"{field} = ?")
-                params.append(value)
+        contract_change = completion_contract and stage_contract_edit(conn, task_id, status, completion_contract)
+        if contract_change is False:
+            return False
+        if contract_change:
+            fields += (("completion_contract", completion_contract),)
+        changed_fields = [field for field, value in fields if value is not None]
+        assignments = [f"{field} = ?" for field in changed_fields]
+        params = [value for _field, value in fields if value is not None]
         if result is not None:
             assignments.append("result = ?")
             params.append(result)
             changed_fields.append("result")
         if not assignments:
-            return False
-        conn.execute(
-            f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?",
-            (*params, task_id),
-        )
+            return completion_contract is not None  # an unchanged contract is a successful no-op
+        conn.execute(f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?", (*params, task_id))
         if priority is not None:
             _append_event(conn, task_id, "reprioritized", {"priority": priority})
         if result is None:
             non_priority_fields = [field for field in changed_fields if field != "priority"]
             if non_priority_fields:
-                _append_event(conn, task_id, "edited", {"fields": non_priority_fields})
+                contract_payload = {"completion_contract": contract_change} if contract_change else {}
+                _append_event(conn, task_id, "edited", {"fields": non_priority_fields, **contract_payload})
         else:
             handoff_summary = summary if summary is not None else result
             changed_fields.append("summary")
             if metadata is not None:
                 changed_fields.append("metadata")
             run = conn.execute(
-            """
-            SELECT id FROM task_runs
-             WHERE task_id = ?
-               AND outcome = 'completed'
-             ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
-             LIMIT 1
-            """,
-            (task_id,),
-        ).fetchone()
+                "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+                "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1", (task_id,),
+            ).fetchone()
             if run is None:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="completed", summary=handoff_summary, metadata=metadata,

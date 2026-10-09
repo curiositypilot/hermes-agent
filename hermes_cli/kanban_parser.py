@@ -337,6 +337,10 @@ _SPECS = [
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, help="Replace the task priority"),
         _arg("--result", help="Backfilled task result text for a done task"),
+        _arg("--completion-contract", metavar="CONTRACT",
+             help="Replace the completion gate: local-only, test:<command>, OWNER/REPO, or exact "
+                  "GitHub PR URL. Cannot be used on done/archived tasks or with --result; on a "
+                  "running task the worker's next complete/review sees stale ownership once."),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
     _cmd("block", [
