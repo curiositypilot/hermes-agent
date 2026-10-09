@@ -22,6 +22,16 @@ def _snapshot(conn, task_id):
     return tuple(row) if row else None
 
 
+def stage_contract_edit(conn, task_id, status, contract):
+    """``kanban edit --completion-contract`` (validated *contract*): the ``{old, new}`` change,
+    None when unchanged, False on done/archived (the gate already ran; an edit would rewrite
+    history). A running gate sees the edit as a stale snapshot and refuses, never accepts."""
+    if status in ("done", "archived"):
+        return False
+    old = _snapshot(conn, task_id)[2]
+    return None if (old or "local-only") == contract else {"old": old, "new": contract}
+
+
 def _run_test_gate(conn, task_id, snapshot):
     row = conn.execute("SELECT workspace_path FROM tasks WHERE id=?", (task_id,)).fetchone()
     return snapshot, run_test_contract(snapshot[2], row["workspace_path"] if row else None)

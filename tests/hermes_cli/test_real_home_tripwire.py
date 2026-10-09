@@ -168,6 +168,24 @@ def test_path_metadata_exemption_tracks_path_changes(protected_home, monkeypatch
         guard.check(target, metadata=True)
 
 
+def test_path_entry_itself_is_command_lookup_only_for_metadata(protected_home, monkeypatch):
+    """A kanban worktree run inherits ``<main checkout>/.hermes/bin`` on PATH from the
+    dispatcher's PM environment; ``_resolve_hermes_bin_dir`` asks ``isdir`` of that entry
+    after ``shutil.which`` found hermes in it. The entry lives in the real home but outside
+    the worktree checkout, so the exemption must cover the entry, not only its children,
+    and only for metadata."""
+    from tests.home_io_guard import HomeIOGuard
+
+    entry = protected_home / "empty"
+    guard = HomeIOGuard(lambda: [protected_home])
+    monkeypatch.setenv("PATH", str(entry))
+    guard.check(entry, metadata=True)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(entry, metadata=False)  # listing or opening it is still a state read
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(protected_home / "file.txt", metadata=True)  # a sibling is not on PATH
+
+
 def test_relative_path_metadata_exemption_tracks_working_directory(protected_home, tmp_path, monkeypatch):
     from tests.home_io_guard import HomeIOGuard
 

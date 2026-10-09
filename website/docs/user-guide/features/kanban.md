@@ -1005,7 +1005,7 @@ hermes kanban show <id> [--json]
 hermes kanban assign <id> <profile>                    # or 'none' to unassign
 hermes kanban reassign <id>... <profile>               # bulk re-assign tasks to a profile
 hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body / priority in place
-        [--priority N]
+        [--priority N] [--completion-contract CONTRACT] # replace the completion gate (not on done/archived)
 hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)
 hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
