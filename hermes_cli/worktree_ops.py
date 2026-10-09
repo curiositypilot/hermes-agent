@@ -313,6 +313,37 @@ def _ensure_worktrees_gitignored(repo_root: str) -> None:
         logger.debug("Could not update .gitignore: %s", e)
 
 
+def ensure_worktrees_excluded(repo_root) -> None:
+    """Make git ignore ``<repo_root>/.worktrees/`` via the repo-local ``info/exclude`` (fail-soft).
+
+    ``info/exclude`` rather than ``.gitignore``: it is untracked, so ignoring the nested
+    worktrees cannot itself dirty the main checkout. The common dir is used so a *repo_root*
+    that is a linked worktree still writes the exclude every worktree shares.
+    """
+    try:
+        if _git(["check-ignore", "-q", ".worktrees/"], repo_root, timeout=5).returncode == 0:
+            return
+        common = _git_out(["rev-parse", "--git-common-dir"], repo_root, timeout=5)
+        if not common:
+            return
+        common_dir = Path(common)
+        if not common_dir.is_absolute():
+            common_dir = Path(repo_root) / common_dir
+        exclude = common_dir / "info" / "exclude"
+        existing = exclude.read_text(encoding="utf-8-sig", errors="replace") if exclude.exists() else ""
+        # A negating .gitignore (``!.worktrees``) outranks info/exclude, so check-ignore stays
+        # non-zero after the append; the membership check keeps repeat calls from re-appending.
+        if ".worktrees/" in (line.strip() for line in existing.splitlines()):
+            return
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with open(exclude, "a", encoding="utf-8") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            f.write(".worktrees/\n")
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug("Could not add .worktrees/ to info/exclude in %s: %s", repo_root, e)
+
+
 def _worktreeinclude_entries(repo_root) -> list:
     """Non-blank, non-comment entries of *repo_root*/``.worktreeinclude`` (``[]`` when absent).
 

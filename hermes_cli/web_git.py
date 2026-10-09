@@ -18,6 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from hermes_cli._subprocess_compat import harden_git_argv, noninteractive_git_env
+from hermes_cli.worktree_ops import ensure_worktrees_excluded
 
 _GIT_TIMEOUT = 30
 _GH_TIMEOUT = 30
@@ -693,6 +694,7 @@ def _worktree_for_existing(root: str, raw_name: str) -> dict:
     if not remote and existing == _default_branch(root):
         _git_ok(root, ["switch", existing])
         return {"path": root, "branch": existing, "repoRoot": root}
+    ensure_worktrees_excluded(root)
     target = _unique_dir(os.path.join(root, ".worktrees", _slugify(existing)))
     if remote:
         # Best-effort freshness: on failure (offline, branch gone) the last known ref is still
@@ -721,6 +723,7 @@ def worktree_add(cwd: str, options: dict) -> dict:
 
     slug = _slugify(options.get("name") or f"work-{os.urandom(4).hex()}")
     branch = _sanitize_branch(options.get("branch") or "") or f"hermes/{slug}"
+    ensure_worktrees_excluded(root)
     target = _unique_dir(os.path.join(root, ".worktrees", slug))
     args = ["worktree", "add", "-b", branch, target]
     if options.get("base"):
