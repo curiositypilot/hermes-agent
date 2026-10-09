@@ -71,6 +71,9 @@ def main():
     context = request["context"]
     paths.repo_root = lambda: Path(context["repo"])
     paths.lockfile_path = lambda: Path(context["lockfile"])
+    if "lazy_installs_allowed" in context:
+        from pm import install
+        install._lazy_policy_override = bool(context["lazy_installs_allowed"])
 
     call = 0
     callback_lock = threading.Lock()
