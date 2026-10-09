@@ -360,6 +360,9 @@ def test_collect_fleet_versions_falls_back_to_state_file(tmp_path: Path, monkeyp
     monkeypatch.setattr(
         "gateway.control_socket.identify_gateway", lambda h, **kw: None
     )
+    # The stand-in "gateway" is this pytest process, whose venv may belong to another checkout
+    # (worktrees share the main venv); that would classify it "external", not the case under test.
+    monkeypatch.setattr("hermes_cli.update_receipt._gateway_code_root", lambda pid, home: None)
     (home / "gateway_state.json").write_text(
         json.dumps(
             {
@@ -481,3 +484,46 @@ def test_windows_pipe_query_is_bounded_when_the_peer_never_answers(home: Path, m
         assert time.monotonic() - start < 2.0
     finally:
         released.set()
+
+
+def _bwrap_userns_available() -> bool:
+    import shutil
+    import subprocess
+
+    if not sys.platform.startswith("linux") or not shutil.which("bwrap"):
+        return False
+    try:
+        return subprocess.run(["bwrap", "--unshare-user", "--ro-bind", "/", "/", "true"],
+                              capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+@pytest.mark.skipif(not _bwrap_userns_available(), reason="needs bwrap + unprivileged user namespaces")
+def test_peer_from_another_user_namespace_is_refused(home: Path):
+    """A sandboxed Kanban worker (own user namespace, same UID) gets no answer even when it can
+    reach the socket path (a gateway restart re-binds a fresh inode under the worker's mask);
+    a same-namespace client still does."""
+    import subprocess
+
+    async def scenario():
+        server = GatewayControlServer(home, verb_handlers={"identify": lambda: {"pid": 11}})
+        assert await server.start()
+        try:
+            loop = asyncio.get_running_loop()
+            same_ns = await loop.run_in_executor(None, lambda: identify_gateway(home))
+            path = str(resolve_client_socket_path(home))
+            client = ("import socket,sys;s=socket.socket(socket.AF_UNIX);s.settimeout(3);"
+                      f"s.connect({path!r});s.sendall(b'{{\"verb\":\"identify\",\"id\":1}}\\n');"
+                      "sys.stdout.write(s.recv(4096).decode())")
+            proc = await asyncio.create_subprocess_exec(
+                "bwrap", "--unshare-user", "--ro-bind", "/", "/", "--dev", "/dev",
+                sys.executable, "-c", client, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, _err = await asyncio.wait_for(proc.communicate(), timeout=20)
+            return same_ns, out
+        finally:
+            await server.stop()
+
+    same_ns, sandboxed_reply = _run(scenario())
+    assert same_ns == {"pid": 11}
+    assert sandboxed_reply == b""

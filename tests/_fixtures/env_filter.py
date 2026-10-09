@@ -210,6 +210,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # children; tests that exercise child behavior set it explicitly.
     "HERMES_DELEGATED_CHILD_CONTEXT",
     "HERMES_TENANT",
+    # A sandboxed Kanban worker (kanban.sandbox: bwrap) pins its per-run scratch dir; pytest run
+    # from that worker must still see get_scratch_dir() derive from the per-test HERMES_HOME.
+    "HERMES_SANDBOX",
+    "HERMES_SANDBOX_SCRATCH_DIR",
     # Honcho host selection changes which nested config block wins. A local
     # shell override leaked "myhost" into the full suite and flipped 20
     # otherwise-unrelated config tests away from the default "hermes" host.

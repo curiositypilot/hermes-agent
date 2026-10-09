@@ -387,3 +387,15 @@ def test_prune_releases_git_worktree_registration_of_idle_entry(tmp_path):
     listing = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo, capture_output=True,
                              text=True, stdin=subprocess.DEVNULL, check=True).stdout
     assert str(tree) not in listing and not tree.exists()
+
+
+def test_sandboxed_worker_scratch_wins_for_every_home(tmp_path, monkeypatch):
+    """Inside a kanban.sandbox worker the shared scratch is hidden; get_scratch_dir() (and the
+    TMPDIR it feeds) resolve to the run's private dir whatever home is asked for."""
+    private = tmp_path / "cache" / "scratch" / "kanban-t_1-r1"
+    private.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_SANDBOX_SCRATCH_DIR", str(private))
+    assert get_scratch_dir() == private
+    assert get_scratch_dir(tmp_path / "other-home") == private
+    monkeypatch.setenv("HERMES_SANDBOX_SCRATCH_DIR", "relative/ignored")
+    assert get_scratch_dir(tmp_path / "h") == tmp_path / "h" / "cache" / "scratch"

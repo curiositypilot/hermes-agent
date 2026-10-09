@@ -26,8 +26,9 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.kanban_db_run_scopes import _restart_safe_worker_argv, reap_ended_run_scopes
+from hermes_cli.kanban_sandbox import SandboxUnavailable, worker_sandbox
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
-from hermes_cli.kanban_db_dispatch_argv import _module_hermes_argv
+from hermes_cli.kanban_db_dispatch_argv import _absolute_hermes_path, _is_windows_batch_shim, _module_hermes_argv
 from hermes_cli.kanban_db_dispatch_argv import _propagate_module_import_root
 
 if TYPE_CHECKING:
@@ -2315,9 +2316,9 @@ def _dispatch_lane_task(
     except Exception as exc:
         from tools.process_registry import RestartSafeScopeUnavailable
 
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
-        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
+        # The host refused the spawn (no restart-safe scope, or the configured sandbox cannot
+        # be built): nothing about the card ran, so it must not spend the card's retry budget (#114720).
+        infrastructure = isinstance(exc, (RestartSafeScopeUnavailable, SandboxUnavailable))
         if infrastructure:
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
         if _record_task_failure(
@@ -2703,12 +2704,6 @@ def _rotate_worker_log(
         pass
 
 
-def _absolute_hermes_path(path: str) -> str:
-    """Return an absolute filesystem path for a resolved Hermes shim."""
-    expanded = os.path.expanduser(path)
-    return expanded if os.path.isabs(expanded) else os.path.abspath(expanded)
-
-
 def _looks_like_path(value: str) -> bool:
     """Return true when a command override is an explicit path, not a name."""
     expanded = os.path.expanduser(value)
@@ -2719,11 +2714,6 @@ def _looks_like_path(value: str) -> bool:
         or "\\" in expanded
         or bool(re.match(r"^[A-Za-z]:", expanded))
     )
-
-
-def _is_windows_batch_shim(path: str) -> bool:
-    """Return true for Windows shell/batch shims that should not be argv[0]."""
-    return path.lower().endswith((".cmd", ".bat"))
 
 
 def _path_search_names(command: str) -> list[str]:
@@ -3116,30 +3106,37 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # The module argv must carry the import context that made it resolvable:
     # the shim's in-process path injection is invisible to the bare child.
     _propagate_module_import_root(cmd, env)
-    # A worker spawned by a managed systemd gateway must leave the gateway's
-    # cgroup before startup; otherwise restarting the service kills the worker
-    # that is performing the handoff.
-    cmd = _restart_safe_worker_argv(task, cmd)
-    from tools.process_registry import systemd_user_bus_env
-    env = systemd_user_bus_env(env)
-    log_f = _open_worker_log(task, board)
-    try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
-        )
-    except FileNotFoundError:
-        log_f.close()
-        raise RuntimeError(
-            "`hermes` executable not found on PATH. "
-            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
-        )
+    # kanban.sandbox: bwrap (per tenant) wraps the worker between the systemd scope and `hermes`;
+    # a configured sandbox that cannot be built raises SandboxUnavailable (spawn deferred).
+    with worker_sandbox(task, cmd, env, workspace, profile_home) as (cmd, env, pass_fds, log_prefix):
+        # A worker spawned by a managed systemd gateway must leave the gateway's
+        # cgroup before startup; otherwise restarting the service kills the worker
+        # that is performing the handoff.
+        cmd = _restart_safe_worker_argv(task, cmd)
+        from tools.process_registry import systemd_user_bus_env
+        env = systemd_user_bus_env(env)
+        log_f = _open_worker_log(task, board)
+        if log_prefix:
+            log_f.write(log_prefix)
+            log_f.flush()
+        try:
+            proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+                cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                stdin=subprocess.DEVNULL,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
+                pass_fds=pass_fds,
+            )
+        except FileNotFoundError:
+            log_f.close()
+            raise RuntimeError(
+                "`hermes` executable not found on PATH. "
+                "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+            )
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
     if _kb._IS_WINDOWS:

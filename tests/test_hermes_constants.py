@@ -466,16 +466,19 @@ class TestSecureParentDir:
         secure_parent_dir(target2)
         assert called_with2 == [], "must not chmod dirs inside the install tree"
 
-    def test_install_tree_siblings_still_hardened(self, monkeypatch):
+    def test_install_tree_siblings_still_hardened(self, monkeypatch, tmp_path):
         """Paths OUTSIDE the install tree must still be chmod'd.
 
         Negative boundary for the install-tree exclusion (#93050): the guard
         compares path components, so a sibling directory whose name merely
         starts with the install root's name (``<install_root>-data``) must
         still receive parent-dir hardening. Pins that the exclusion cannot
-        silently widen into a string-prefix match.
+        silently widen into a string-prefix match. The install root is a
+        temporary one: siblings of a checkout that lives under the real
+        Hermes home (Kanban worktrees) are real-home paths.
         """
-        install_root = Path(hermes_constants.__file__).resolve().parent
+        install_root = (tmp_path / "opt" / "hermes").resolve()
+        monkeypatch.setattr(hermes_constants, "_INSTALL_ROOT", install_root)
 
         # Prefix-named sibling of the install root (/opt/hermes-data/...).
         prefix_sibling = Path(str(install_root) + "-data")

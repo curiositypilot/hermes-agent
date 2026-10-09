@@ -901,7 +901,15 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
 
     Permissions follow :func:`apply_secure_dir_policy`, so an explicit ``HERMES_HOME_MODE`` or
     a managed/shared home is honored instead of a blanket ``0700`` (#117347).
+
+    Inside a sandboxed Kanban worker (``HERMES_SANDBOX_SCRATCH_DIR``, set by
+    ``hermes_cli.kanban_sandbox``) the shared dir is hidden and the run's private scratch is the
+    only writable one, so it wins for every home.
     """
+    # health: allow HX002 -- process-internal handoff the sandbox launcher sets per run, not user config
+    sandbox_scratch = os.environ.get("HERMES_SANDBOX_SCRATCH_DIR", "").strip()
+    if sandbox_scratch and os.path.isabs(sandbox_scratch):
+        return Path(sandbox_scratch)
     base = Path(home) if home is not None else get_hermes_home()
     scratch = base / "cache" / "scratch"
     try:
