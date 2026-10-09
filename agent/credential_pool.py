@@ -138,6 +138,16 @@ EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60
 # an hour of hard failures. Throttles (429/403/5xx) reset in seconds, so a sole
 # credential cools down briefly instead.
 EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS = 60
+# A depleted account does not refill in an hour: each billing mark that follows
+# the previous one doubles the bench (1 h, 2 h, 4 h, ...) up to a daily probe.
+EXHAUSTED_TTL_BILLING_MAX_SECONDS = 24 * 60 * 60
+# A billing mark continues the streak when it lands within this long after the
+# previous bench ENDED (not after the previous mark): a capped 24 h bench is then
+# followed by another 24 h bench instead of dropping back to 1 h.
+BILLING_STREAK_CONTINUE_SECONDS = 24 * 60 * 60
+# ``entry.extra`` keys holding the billing streak; persisted in auth.json and
+# cleared by ``hermes auth reset``, a non-billing mark, or a rotated secret.
+BILLING_STREAK_KEYS = ("billing_streak", "billing_streak_at")
 
 # ``FailoverReason.billing`` as a bare string: the pool persists classified
 # failure semantics to JSON and must not import the classifier.
@@ -179,6 +189,9 @@ _EXTRA_KEYS = frozenset({
     # raw status cannot size a cooldown; persisted so a restart doesn't downgrade
     # a billing bench to a 60s transient cooldown.
     "failure_reason",
+    # Consecutive billing marks and when the last one landed: sizes the escalating
+    # billing bench. Kept apart from ``last_status_at``, which ``_MARK_OK`` clears.
+    "billing_streak", "billing_streak_at",
 })
 
 # Nous singleton metadata mirrored between auth.json state and ``entry.extra``.
@@ -375,6 +388,7 @@ def _exhausted_ttl(
     *,
     sole_credential: bool = False,
     failure_reason: Optional[str] = None,
+    billing_streak: Optional[int] = None,
 ) -> int:
     """Return cooldown seconds based on the HTTP status that caused exhaustion.
 
@@ -388,6 +402,10 @@ def _exhausted_ttl(
     bench regardless of status; 402 is billing by definition.
     Unverified billing (#82154) gets the short cooldown regardless of pool
     size (the credential may be healthy), unless the status is a true 402.
+
+    *billing_streak* is the number of consecutive billing marks: a billing
+    bench doubles per mark (``base * 2**(streak-1)``), capped at
+    ``EXHAUSTED_TTL_BILLING_MAX_SECONDS``. Absent counts as 1.
     """
     if error_code == 401:
         return EXHAUSTED_TTL_401_SECONDS
@@ -397,7 +415,47 @@ def _exhausted_ttl(
     is_billing = error_code == 402 or failure_reason == FAILURE_REASON_BILLING
     if sole_credential and not is_billing:
         return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
+    if is_billing:
+        streak = _coerce_streak(billing_streak)
+        # Bound the exponent so a corrupt streak cannot build a huge int.
+        return min(base * 2 ** min(streak - 1, 32), EXHAUSTED_TTL_BILLING_MAX_SECONDS)
     return base
+
+
+def _coerce_streak(value: Any) -> int:
+    """A persisted ``billing_streak`` as an int >= 1 (absent or malformed -> 1)."""
+    try:
+        streak = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return max(streak, 1)
+
+
+def _is_billing_mark(status_code: Optional[int], failure_reason: Optional[str]) -> bool:
+    """The same billing test ``_exhausted_ttl`` sizes the bench by."""
+    return status_code == 402 or failure_reason == FAILURE_REASON_BILLING
+
+
+def _without_billing_streak(extra: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in extra.items() if k not in BILLING_STREAK_KEYS}
+
+
+def _next_billing_streak(extra: Dict[str, Any], now: float) -> int:
+    """Streak for a billing mark at *now*: previous + 1 when the mark lands within
+    ``BILLING_STREAK_CONTINUE_SECONDS`` after the previous bench ended, else 1.
+
+    A mark while the previous bench is still running (requests already in flight when
+    the first one failed) is the same probe, not a new one: the streak stays put."""
+    prev_at = _parse_absolute_timestamp(extra.get("billing_streak_at"))
+    if prev_at is None or extra.get("billing_streak") is None:
+        return 1
+    prev = _coerce_streak(extra.get("billing_streak"))
+    prev_bench_end = prev_at + _exhausted_ttl(None, failure_reason=FAILURE_REASON_BILLING, billing_streak=prev)
+    if now < prev_bench_end:
+        return prev
+    if now - prev_bench_end > BILLING_STREAK_CONTINUE_SECONDS:
+        return 1
+    return prev + 1
 
 
 def _parse_absolute_timestamp(value: Any) -> Optional[float]:
@@ -477,6 +535,7 @@ def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) 
             entry.last_error_code,
             sole_credential=sole_credential,
             failure_reason=entry.failure_reason,
+            billing_streak=entry.billing_streak,
         )
     return None
 
@@ -1244,11 +1303,19 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             updated_extra["failure_reason"] = failure_reason
         else:
             updated_extra.pop("failure_reason", None)
+        # Billing escalates its bench per consecutive mark; anything else ends the
+        # streak. Keyed on ``billing_streak_at``: ``_MARK_OK`` clears ``last_status_at``.
+        now = time.time()
+        if not terminal and _is_billing_mark(status_code, failure_reason):
+            updated_extra["billing_streak"] = _next_billing_streak(entry.extra, now)
+            updated_extra["billing_streak_at"] = now
+        else:
+            updated_extra = _without_billing_streak(updated_extra)
         return self._adopt(
             entry,
             persist=persist,
             last_status=STATUS_DEAD if terminal else STATUS_EXHAUSTED,
-            last_status_at=time.time(),
+            last_status_at=now,
             last_error_code=status_code,
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
@@ -2060,7 +2127,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             return entry
         cleared_at = self._reset_cleared_after(entry)
         if cleared_at is not None:
-            return self._adopt(entry, persist=False, **_MARK_OK, status_cleared_at=cleared_at)
+            # The reset ends the billing streak too: a topped-up account comes back at once,
+            # and the next billing mark starts again at the 1 h bench.
+            return self._adopt(entry, persist=False, **_MARK_OK, status_cleared_at=cleared_at,
+                               extra=_without_billing_streak(entry.extra))
         if entry.source != _RESYNC_SOURCE.get(self.provider):
             return entry
         if self.provider == "anthropic":
@@ -2505,9 +2575,13 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
     # A rotated token makes the old exhaustion/error state stale.
     if token_changed and existing.last_status is not None:
         field_updates.update(_CLEAR_STATUS)
-    if field_updates or extra_updates:
-        if extra_updates:
-            field_updates["extra"] = {**existing.extra, **extra_updates}
+    # ... and a new secret (re-auth, rotated key) must not inherit the old account's
+    # escalated billing bench.
+    drop_streak = token_changed and any(k in existing.extra for k in BILLING_STREAK_KEYS)
+    if field_updates or extra_updates or drop_streak:
+        if extra_updates or drop_streak:
+            base_extra = _without_billing_streak(existing.extra) if drop_streak else existing.extra
+            field_updates["extra"] = {**base_extra, **extra_updates}
         updated = replace(existing, **field_updates)
         entries[existing_idx] = updated
         # Runtime-only borrowed secret updates refresh the in-memory entry
