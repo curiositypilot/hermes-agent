@@ -16,13 +16,25 @@ from pm.runtime import is_runtime, runtime_command, runtime_environment
 from pm.worker_operations import OPERATIONS
 
 
-def _missing_or_refuse(name):
+def _missing_or_refuse(name, *, explicit=False):
+    """The chain's missing packages; refuse here what the worker would refuse anyway.
+
+    A target gap is static package data, so a worker spawned for it only raises
+    the same error at ``pm.install._install`` -- ~2 s per call for callers that
+    probe on every use (``selected_git_env`` on POSIX, #129792).
+    """
     from pm.install import _refuse_lazy, is_installed, lazy_installs_allowed
     from pm.registry import walk
+    from pm.store import current_target
 
-    missing = [package.name for package in walk([name]) if not is_installed(package.name)]
-    if missing and not lazy_installs_allowed():
-        raise _refuse_lazy(name, ", ".join(missing))
+    missing = [package for package in walk([name]) if not is_installed(package.name)]
+    if missing and not explicit and not lazy_installs_allowed():
+        raise _refuse_lazy(name, ", ".join(package.name for package in missing))
+    target = current_target()
+    for package in missing:
+        reason = package.missing_reason(target)
+        if reason is not None:
+            raise InstallError(package.name, f"unavailable on {target}: {reason}", "none")
     return missing
 
 
@@ -186,8 +198,9 @@ def ensure(name, *, base_env=None, explicit=False, progress=None, pause_event=No
         from pm.install import ensure as direct
         return direct(name, base_env=base_env, explicit=explicit, progress=progress,
                       pause_event=pause_event, download_progress=download_progress)
-    if not explicit and not isinstance(get_package(name), StatePackage):
-        if not _missing_or_refuse(name):
+    if not isinstance(get_package(name), StatePackage):
+        # An explicit install still reaches the worker when nothing is missing: it re-verifies.
+        if not _missing_or_refuse(name, explicit=explicit) and not explicit:
             return Runner(name, env_for(name, base_env=base_env))
     if pause_event is not None and pause_event.is_set():
         from pm.downloader import DownloadPaused
