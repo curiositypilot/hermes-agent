@@ -237,10 +237,12 @@ _SCHEMA_CHILD_KEYS = frozenset({
 })
 
 
-def _normalize_type_array(value: list, out: dict) -> None:
+def _normalize_type_array(value: list, out: dict, *, object_branch: dict | None = None) -> None:
     """Normalize a ``type: [...]`` array into *out* (llama.cpp and Gemini-via-OpenAI reject arrays).
     Per AI-SDK: one non-null type → ``type: X`` (+ ``nullable`` if ``null`` present); several →
-    ``anyOf`` of single-type schemas so EVERY branch survives; none → ``null``/object fallback."""
+    ``anyOf`` of single-type schemas so EVERY branch survives; none → ``null``/object fallback.
+    *object_branch* replaces the bare ``{"type": "object"}`` branch (the branches never pass
+    through ``_sanitize_node``, so they would otherwise lack ``properties``)."""
     has_null = "null" in value
     non_null = [t for t in value if isinstance(t, str) and t != "null"]
     if not non_null:
@@ -249,7 +251,8 @@ def _normalize_type_array(value: list, out: dict) -> None:
     if len(non_null) == 1:
         out["type"] = non_null[0]
     else:
-        out["anyOf"] = [{"type": t} for t in non_null]
+        out["anyOf"] = [copy.deepcopy(object_branch) if t == "object" and object_branch
+                        else {"type": t} for t in non_null]
     if has_null:
         out.setdefault("nullable", True)
 
@@ -297,7 +300,10 @@ def _sanitize_node(node: Any, path: str, *, top: bool = False) -> Any:
         # ``nullable: true``. * all-null / empty → ``type: "null"`` (or object fallback). Ported from
         # anomalyco/opencode#31877.
         if key == "type" and isinstance(value, list):
-            _normalize_type_array(value, out)
+            # A nested ``object`` branch follows the same free-form rule as an object node below.
+            _normalize_type_array(value, out, object_branch=None if top else (
+                _empty_object() if any(k in node for k in _KEY_DECLARING_KEYS)
+                else _freeform_object()))
         elif key in _SCHEMA_MAP_KEYS and isinstance(value, dict):
             renames = prop_renames if key == "properties" else {}
             out[key] = {

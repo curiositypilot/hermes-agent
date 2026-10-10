@@ -713,3 +713,19 @@ def test_bare_string_object_is_freeform():
     props = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]
     assert props["payload"] == _FREEFORM
     assert props["junk"] == _FREEFORM
+
+
+def test_multitype_array_object_branch_is_freeform():
+    """``type: ["object", "string"]`` (MCP schemas): the generated anyOf ``object`` branch gets
+    ``properties`` + ``additionalProperties: true`` like a nested object node, unless the node
+    already declares its keys."""
+    tools = [_tool("t", {"type": "object", "properties": {
+        "x": {"type": ["object", "string", "null"]},
+        "closed": {"type": ["object", "string"], "additionalProperties": False},
+    }})]
+    props = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]
+    assert props["x"]["anyOf"] == [_FREEFORM, {"type": "string"}]
+    assert props["x"]["nullable"] is True
+    assert props["closed"]["anyOf"] == [
+        {"type": "object", "properties": {}, "required": []}, {"type": "string"}]
+    assert props["closed"]["additionalProperties"] is False
