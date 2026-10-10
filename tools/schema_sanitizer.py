@@ -254,6 +254,23 @@ def _normalize_type_array(value: list, out: dict) -> None:
         out.setdefault("nullable", True)
 
 
+_OBJECT_BRANCH_KEYS = ("properties", "required", *_KEY_DECLARING_KEYS)
+
+
+def _apply_object_rule(obj: dict, *, open_if_freeform: bool) -> None:
+    """Give an object schema ``properties`` (+ ``additionalProperties: true`` when
+    *open_if_freeform* and none were declared) and a ``required`` list of declared keys only."""
+    if not isinstance(obj.get("properties"), dict):
+        obj["properties"] = {}
+        if open_if_freeform:
+            obj["additionalProperties"] = True
+    # Always emit a list: ``required: []`` is valid everywhere, while a missing or
+    # non-list key reads as ``null`` on strict OpenAI-compatible proxies (#56123).
+    required = obj.get("required")
+    obj["required"] = ([r for r in required if isinstance(r, str) and r in obj["properties"]]
+                       if isinstance(required, list) else [])
+
+
 def _sanitize_node(node: Any, path: str, *, top: bool = False) -> Any:
     """Recursively sanitize a JSON-Schema fragment: bare-string schemas → ``{"type": <value>}``
     (unknown strings → permissive object); object nodes gain ``properties: {}``, and nested
@@ -285,6 +302,7 @@ def _sanitize_node(node: Any, path: str, *, top: bool = False) -> Any:
     prop_renames = (_rename_property_keys(props_in, f"{path}.properties")
                     if isinstance(props_in, dict) else {})
     out: dict = {}
+    type_branches = None  # anyOf built from a multi-type ``type`` array
     for key, value in node.items():
         # JSON Schema ``type`` arrays (e.g. ``["number", "string"]``, common in MCP tool schemas) are
         # rejected by several tool-call backends: * llama.cpp's grammar generator only accepts a singular
@@ -297,7 +315,9 @@ def _sanitize_node(node: Any, path: str, *, top: bool = False) -> Any:
         # ``nullable: true``. * all-null / empty → ``type: "null"`` (or object fallback). Ported from
         # anomalyco/opencode#31877.
         if key == "type" and isinstance(value, list):
+            prior = out.get("anyOf")
             _normalize_type_array(value, out)
+            type_branches = out["anyOf"] if out.get("anyOf") is not prior else None
         elif key in _SCHEMA_MAP_KEYS and isinstance(value, dict):
             renames = prop_renames if key == "properties" else {}
             out[key] = {
@@ -328,16 +348,16 @@ def _sanitize_node(node: Any, path: str, *, top: bool = False) -> Any:
             required = out.get("required", [])
             required = required if isinstance(required, list) else []
             out["required"] = required + [key for key in lifted if key not in required]
+    open_if_freeform = not top and not any(k in node for k in _KEY_DECLARING_KEYS)
+    if type_branches is not None and not top and type_branches is out.get("anyOf"):
+        # Strict grammars build the union from the branches alone and ignore sibling keywords,
+        # so the ``object`` branch carries the node's (already sanitized) object keywords.
+        for branch in type_branches:
+            if branch == {"type": "object"}:
+                branch.update({k: copy.deepcopy(out[k]) for k in _OBJECT_BRANCH_KEYS if k in out})
+                _apply_object_rule(branch, open_if_freeform=open_if_freeform)
     if out.get("type") == "object":
-        if not isinstance(out.get("properties"), dict):
-            out["properties"] = {}
-            if not top and not any(k in node for k in _KEY_DECLARING_KEYS):
-                out["additionalProperties"] = True
-        # Always emit a list: ``required: []`` is valid everywhere, while a missing or
-        # non-list key reads as ``null`` on strict OpenAI-compatible proxies (#56123).
-        required = out.get("required")
-        out["required"] = ([r for r in required if isinstance(r, str) and r in out["properties"]]
-                           if isinstance(required, list) else [])
+        _apply_object_rule(out, open_if_freeform=open_if_freeform)
     return out
 
 

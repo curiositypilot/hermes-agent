@@ -713,3 +713,40 @@ def test_bare_string_object_is_freeform():
     props = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]
     assert props["payload"] == _FREEFORM
     assert props["junk"] == _FREEFORM
+
+
+def test_multitype_array_object_branch_is_freeform():
+    """``type: ["object", "string"]`` (MCP schemas): the generated anyOf ``object`` branch gets
+    ``properties`` + ``additionalProperties: true`` like a nested object node, unless the node
+    already declares its keys."""
+    tools = [_tool("t", {"type": "object", "properties": {
+        "x": {"type": ["object", "string", "null"]},
+        "closed": {"type": ["object", "string"], "additionalProperties": False},
+    }})]
+    props = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]
+    assert props["x"]["anyOf"] == [_FREEFORM, {"type": "string"}]
+    assert props["x"]["nullable"] is True
+    assert props["closed"]["anyOf"] == [
+        {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+        {"type": "string"}]
+    assert props["closed"]["additionalProperties"] is False
+
+
+def test_multitype_array_object_branch_carries_declared_object_keywords():
+    """Strict grammars build the union from the anyOf branches and ignore siblings, so the
+    ``object`` branch itself carries the node's sanitized ``additionalProperties`` and declared
+    ``properties``/``required`` (closed, not free-form)."""
+    tools = [_tool("t", {"type": "object", "properties": {
+        "open": {"type": ["object", "string"], "additionalProperties": True},
+        "ints": {"type": ["object", "string"], "additionalProperties": "integer"},
+        "keyed": {"type": ["object", "string"], "properties": {"a": {"type": "string"}},
+                  "required": ["a", "missing"]},
+    }})]
+    props = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]
+    assert props["open"]["anyOf"][0] == _FREEFORM
+    assert props["ints"]["anyOf"][0] == {
+        "type": "object", "properties": {}, "required": [],
+        "additionalProperties": {"type": "integer"}}
+    assert props["keyed"]["anyOf"][0] == {
+        "type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+    assert props["keyed"]["anyOf"][1] == {"type": "string"}
