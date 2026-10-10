@@ -942,3 +942,17 @@ class TestAssemblyImportFailureIsLoud:
         assert defs
         records = [r for r in caplog.records if r.name == "model_tools" and "boom" in r.getMessage()]
         assert [r.levelno for r in records] == [logging.WARNING]
+
+
+class TestBridgeSchemaFreeformObjects:
+    """The bridge is assembled after ``sanitize_tool_schemas`` runs, so its free-form objects must
+    already be open: strict-grammar providers read a missing ``additionalProperties`` as false and
+    could then only emit ``tool_call`` arguments as ``{}`` (#96610)."""
+
+    def test_tool_call_arguments_admit_any_keys(self):
+        from tools.tool_search import TOOL_CALL_NAME, bridge_tool_schemas
+        schemas = {s["function"]["name"]: s for s in bridge_tool_schemas(5)}
+        params = schemas[TOOL_CALL_NAME]["function"]["parameters"]
+        arguments = params["properties"]["calls"]["items"]["properties"]["arguments"]
+        assert arguments["type"] == "object"
+        assert arguments["additionalProperties"] is True

@@ -15,6 +15,10 @@ from tools.schema_sanitizer import (
 )
 
 
+# A nested object with no declared keys: open, so strict grammars do not collapse it to ``{}``.
+_FREEFORM = {"type": "object", "properties": {}, "required": [], "additionalProperties": True}
+
+
 def _tool(name: str, parameters: dict) -> dict:
     return {"type": "function", "function": {"name": name, "parameters": parameters}}
 
@@ -129,7 +133,7 @@ def test_anyof_nested_objects_sanitized():
     })]
     out = sanitize_tool_schemas(tools)
     variants = out[0]["function"]["parameters"]["properties"]["opt"]["anyOf"]
-    assert variants[0] == {"type": "object", "properties": {}, "required": []}
+    assert variants[0] == _FREEFORM
     assert variants[1] == {"type": "string"}
 
 
@@ -195,7 +199,7 @@ def test_additional_properties_schema_sanitized():
     })]
     out = sanitize_tool_schemas(tools)
     field = out[0]["function"]["parameters"]["properties"]["dict_field"]
-    assert field["additionalProperties"] == {"type": "object", "properties": {}, "required": []}
+    assert field["additionalProperties"] == _FREEFORM
 
 
 def test_items_sanitized_in_array_schema():
@@ -210,7 +214,7 @@ def test_items_sanitized_in_array_schema():
     })]
     out = sanitize_tool_schemas(tools)
     items = out[0]["function"]["parameters"]["properties"]["bag"]["items"]
-    assert items == {"type": "object", "properties": {}, "required": []}
+    assert items == _FREEFORM
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -355,7 +359,7 @@ def test_dependent_schemas_still_recursively_sanitized():
     tools = [_tool("t", copy.deepcopy(schema))]
     out = sanitize_tool_schemas(tools)
     dep_schemas = out[0]["function"]["parameters"]["dependentSchemas"]
-    assert dep_schemas["owner"] == {"type": "object", "properties": {}, "required": []}, (
+    assert dep_schemas["owner"] == _FREEFORM, (
         f"dependentSchemas['owner'] was not fully sanitized: {dep_schemas['owner']!r}"
     )
 
@@ -630,3 +634,82 @@ def test_registered_tool_schemas_stay_inside_llama_cpp_repetition_limit():
                 if isinstance(val, int) and val >= 2000:
                     offenders.append((name, key, val))
     assert not offenders, offenders
+
+
+# ---- free-form objects (strict-grammar providers read missing additionalProperties as false) ----
+
+
+def test_freeform_nested_object_gets_additional_properties():
+    """``delegate_task.tasks[].output_schema`` / ``kanban_complete.metadata`` shape: a nested
+    ``type: object`` with no ``properties``. Without the marker, grammar-constrained providers
+    (wafer, reka, inference-net) could only emit ``{}`` for it."""
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "metadata": {"type": "object", "description": "free-form facts"},
+            "tasks": {"type": "array", "items": {
+                "type": "object",
+                "properties": {"output_schema": {"type": "object", "description": "JSON Schema"}},
+            }},
+        },
+    })]
+    params = sanitize_tool_schemas(tools)[0]["function"]["parameters"]
+    for node in (params["properties"]["metadata"],
+                 params["properties"]["tasks"]["items"]["properties"]["output_schema"]):
+        assert node["additionalProperties"] is True
+        assert node["properties"] == {}
+    # The items object declares properties, so it stays as declared.
+    assert "additionalProperties" not in params["properties"]["tasks"]["items"]
+
+
+def test_explicit_additional_properties_not_overwritten():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "closed": {"type": "object", "additionalProperties": False},
+            "typed_map": {"type": "object", "additionalProperties": {"type": "string"}},
+        },
+    })]
+    props = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]
+    assert props["closed"]["additionalProperties"] is False
+    assert props["typed_map"]["additionalProperties"] == {"type": "string"}
+
+
+def test_declared_empty_properties_not_reopened():
+    """An explicit ``properties: {}`` is an intentionally empty object, not a free-form one."""
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {"nothing": {"type": "object", "properties": {}}},
+    })]
+    nothing = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]["nothing"]
+    assert nothing == {"type": "object", "properties": {}, "required": []}
+
+
+def test_key_declaring_keywords_not_reopened():
+    """``patternProperties`` / ``unevaluatedProperties`` already say which keys are allowed;
+    ``additionalProperties: true`` would widen the first and disarm the second."""
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "by_pattern": {"type": "object", "patternProperties": {"^x-": {"type": "string"}}},
+            "sealed": {"type": "object", "unevaluatedProperties": False},
+        },
+    })]
+    props = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]
+    assert "additionalProperties" not in props["by_pattern"]
+    assert "additionalProperties" not in props["sealed"]
+
+
+def test_top_level_params_not_stamped():
+    """No-arg tools keep a closed parameters object so models are not invited to invent args."""
+    out = sanitize_tool_schemas([_tool("t", {"type": "object"}),
+                                 {"type": "function", "function": {"name": "u"}}])
+    for tool in out:
+        assert "additionalProperties" not in tool["function"]["parameters"]
+
+
+def test_bare_string_object_is_freeform():
+    tools = [_tool("t", {"type": "object", "properties": {"payload": "object", "junk": "not-a-type"}})]
+    props = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]
+    assert props["payload"] == _FREEFORM
+    assert props["junk"] == _FREEFORM

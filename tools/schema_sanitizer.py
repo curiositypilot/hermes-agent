@@ -26,6 +26,18 @@ def _empty_object() -> dict:
     return {"type": "object", "properties": {}, "required": []}
 
 
+def _freeform_object() -> dict:
+    """A nested object that admits any keys. Strict-grammar providers (xgrammar-style) read an
+    unspecified ``additionalProperties`` as false, so ``properties: {}`` alone permits only ``{}``."""
+    return {**_empty_object(), "additionalProperties": True}
+
+
+# Beside a missing ``properties``, these still declare which keys an object takes, so a node
+# carrying one is not free-form (``additionalProperties: true`` would also disarm
+# ``unevaluatedProperties``).
+_KEY_DECLARING_KEYS = ("additionalProperties", "patternProperties", "unevaluatedProperties")
+
+
 def _rewrite(schema: Any, fn: Callable[[dict], Any]) -> Any:
     """Bottom-up map over a schema tree: lists/dicts recurse, then *fn* sees each dict."""
     if isinstance(schema, list):
@@ -93,7 +105,7 @@ def _sanitize_single_tool(tool: dict) -> dict:
         fn["parameters"] = _empty_object()
         return out
     name = fn.get("name", "<tool>")
-    top = _sanitize_node(params, path=name)
+    top = _sanitize_node(params, path=name, top=True)
     top = top if isinstance(top, dict) else {}  # guarantee an object with properties on top
     top["type"] = "object"
     if not isinstance(top.get("properties"), dict):
@@ -242,11 +254,14 @@ def _normalize_type_array(value: list, out: dict) -> None:
         out.setdefault("nullable", True)
 
 
-def _sanitize_node(node: Any, path: str) -> Any:
+def _sanitize_node(node: Any, path: str, *, top: bool = False) -> Any:
     """Recursively sanitize a JSON-Schema fragment: bare-string schemas → ``{"type": <value>}``
-    (unknown strings → permissive object); object nodes gain ``properties: {}``; ``type`` arrays
-    are normalized; property keys are renamed to the provider-safe pattern and ``required``
-    follows, with entries missing from ``properties`` pruned.
+    (unknown strings → permissive object); object nodes gain ``properties: {}``, and nested
+    free-form ones (no ``properties`` declared) also ``additionalProperties: true`` (strict
+    grammars otherwise allow only ``{}``; the *top* tool parameters stay closed so no-arg tools
+    do not invite invented args); ``type`` arrays are normalized; property keys are renamed to
+    the provider-safe pattern and ``required`` follows, with entries missing from ``properties``
+    pruned.
 
     - Normalizes ``type: [X, "null"]`` arrays to single ``type: X`` (keeping ``nullable: true`` as a hint),
     and multi-type arrays like ``["number", "string"]`` to an ``anyOf`` of single-type schemas so no branch
@@ -257,10 +272,10 @@ def _sanitize_node(node: Any, path: str) -> Any:
         if node in _BARE_TYPE_NAMES:
             logger.debug("schema_sanitizer[%s]: replacing bare-string schema %r with {'type': %r}",
                          path, node, node)
-            return _empty_object() if node == "object" else {"type": node}
+            return _freeform_object() if node == "object" else {"type": node}
         logger.debug("schema_sanitizer[%s]: replacing non-schema string %r "
-                     "with empty object schema", path, node)
-        return _empty_object()
+                     "with free-form object schema", path, node)
+        return _freeform_object()
     if isinstance(node, list):
         return [_sanitize_node(item, f"{path}[{i}]") for i, item in enumerate(node)]
     if not isinstance(node, dict):
@@ -316,6 +331,8 @@ def _sanitize_node(node: Any, path: str) -> Any:
     if out.get("type") == "object":
         if not isinstance(out.get("properties"), dict):
             out["properties"] = {}
+            if not top and not any(k in node for k in _KEY_DECLARING_KEYS):
+                out["additionalProperties"] = True
         # Always emit a list: ``required: []`` is valid everywhere, while a missing or
         # non-list key reads as ``null`` on strict OpenAI-compatible proxies (#56123).
         required = out.get("required")
