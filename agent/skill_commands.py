@@ -191,16 +191,38 @@ def strip_auto_loaded_skill_blocks(content: Any) -> Any:
     return "\n\n".join(parts)
 
 
+# @-reference expansion (agent/context_references.py::preprocess_context_references_async) appends
+# "--- Context Warnings ---" and "--- Attached Context ---" after the typed message; same footer
+# shape as title_generator._CONTEXT_FOOTER_RE. The typed message keeps its @file:/@url: tokens.
+_CONTEXT_FOOTER_RE = re.compile(r"(?:\A|\n+)--- (?:Context Warnings|Attached Context) ---\n")
+
+
+def strip_context_reference_footer(content: str) -> str:
+    """The typed message without the expanded @-reference footer (warnings + attached bodies).
+
+    Memory keeps the @file:/@url: tokens as pointers but not the pasted file and page bodies: those
+    are documents, not conversation, and page templates repeat the same boilerplate in every body,
+    so one retain extracted the same claim once per page (t_f913c7ce: 22% of desktop auto-retain
+    facts and half its same-document twins came from attached bodies)."""
+    match = _CONTEXT_FOOTER_RE.search(content)
+    return content if match is None else content[:match.start()].rstrip()
+
+
 def extract_user_text_for_memory(content: Any) -> Optional[str]:
-    """What memory providers should see of a user turn: auto-loaded skill blocks removed, then the
-    ``/skill`` scaffolding reduced to the user's instruction. ``None`` when nothing user-authored is
-    left (a bare ``/skill`` invocation or an auto-load block with no text)."""
+    """What memory providers should see of a user turn: auto-loaded skill blocks removed, the
+    ``/skill`` scaffolding reduced to the user's instruction, then the expanded @-reference footer
+    removed (last, so it goes wherever the expansion put it relative to the scaffolding). ``None``
+    when nothing user-authored is left (a bare ``/skill`` invocation or an auto-load block with no
+    text)."""
     if not isinstance(content, str):
         return None
     stripped = strip_auto_loaded_skill_blocks(content)
     if stripped is not content and not stripped:
         return None
-    return extract_user_instruction_from_skill_message(stripped)
+    instruction = extract_user_instruction_from_skill_message(stripped)
+    if not instruction:
+        return instruction
+    return strip_context_reference_footer(instruction) or None
 
 
 def _describe_auto_loaded_skill_turn(content: str) -> Optional[str]:
