@@ -109,6 +109,41 @@ def test_request_review_is_gated_by_the_same_command(board):
 
 
 @pytest.mark.platforms("linux")
+def test_receipt_keeps_implementer_tests(board):
+    conn, repo = board
+    implementer_tests = ["true -> ok"]
+    tid, run_id = _claimed(conn, repo, "test:true")
+    assert kb.complete_task(conn, tid, summary="done", metadata={"tests": implementer_tests},
+                            expected_run_id=run_id)
+    meta = _run_metadata(conn, run_id)
+    assert meta["tests"] == implementer_tests
+    assert meta["test_gate"]["kind"] == "test_gate" and meta["test_gate"]["exit_code"] == 0
+
+    tid2, run2 = _claimed(conn, repo, "test:true")
+    ok, reason = kb.request_review(conn, tid2, summary="ready", metadata={"tests": implementer_tests},
+                                   expected_run_id=run2, with_reason=True)
+    assert ok is True, reason
+    meta = _run_metadata(conn, run2)
+    assert meta["tests"] == implementer_tests
+    assert meta["test_gate"]["kind"] == "test_gate" and meta["test_gate"]["exit_code"] == 0
+
+
+@pytest.mark.platforms("linux")
+def test_prior_receipt_in_tests_is_replaced_by_the_latest_attempt(board):
+    conn, repo = board
+    tid, run_id = _claimed(conn, repo, "test:test -f marker")
+    assert kb.complete_task(conn, tid, summary="early", expected_run_id=run_id) is False
+    refused = _run_metadata(conn, run_id)
+    assert refused["tests"]["ok"] is False and refused["test_gate"]["ok"] is False
+
+    (repo / "marker").write_text("x")
+    assert kb.complete_task(conn, tid, summary="done", expected_run_id=run_id)
+    meta = _run_metadata(conn, run_id)
+    assert meta["tests"]["ok"] is True and meta["tests"]["exit_code"] == 0
+    assert meta["test_gate"]["ok"] is True and meta["test_gate"]["exit_code"] == 0
+
+
+@pytest.mark.platforms("linux")
 def test_kanban_complete_tool_surfaces_the_refusal_tail(board, monkeypatch):
     from tools import kanban_tools
 

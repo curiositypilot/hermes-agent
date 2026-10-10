@@ -93,7 +93,7 @@ def record_acceptance(conn, task_id, acceptance):
         if not isinstance(current, dict):
             current = {}
         conn.execute("UPDATE task_runs SET metadata=? WHERE id=?",
-                     (json.dumps({**current, "tests": receipt}, ensure_ascii=False), snapshot[0]))
+                     (json.dumps(_merge_receipt(current, receipt), ensure_ascii=False), snapshot[0]))
     if not receipt["ok"]:
         if test_gate:
             detail = refusal_detail(receipt)
@@ -103,8 +103,20 @@ def record_acceptance(conn, task_id, acceptance):
     return receipt["ok"]
 
 
+def _merge_receipt(meta, receipt):
+    """The receipt always lands under ``test_gate``; it fills ``tests`` only when the
+    implementer left none (or ``tests`` is a prior attempt's receipt), so the
+    implementer's own test evidence survives the gate."""
+    merged = {**meta, "test_gate": receipt}
+    tests = meta.get("tests")
+    if not tests or (isinstance(tests, dict) and tests.get("kind") == "test_gate"):
+        merged["tests"] = receipt
+    return merged
+
+
 def with_test_receipt(metadata, acceptance):
-    """Handoff metadata with the passing test receipt under ``tests``."""
+    """Handoff metadata with the passing test receipt under ``test_gate``, and under
+    ``tests`` only when the handoff carries no ``tests`` of its own (see ``_merge_receipt``)."""
     if not acceptance or acceptance[1].get("kind") != "test_gate":
         return metadata
-    return {**(metadata if isinstance(metadata, dict) else {}), "tests": acceptance[1]}
+    return _merge_receipt(metadata if isinstance(metadata, dict) else {}, acceptance[1])
