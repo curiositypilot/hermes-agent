@@ -219,3 +219,68 @@ class TestAutoLoadedSkillStrip:
         assert provider.synced == [user_text]
         assert provider.queued == [user_text]
         assert provider.prefetched == [user_text]
+
+
+def _expand(message, cwd):
+    """The real @-reference expansion (context_references), as CLI/TUI/gateway run it."""
+    from agent.context_references import preprocess_context_references
+
+    return preprocess_context_references(message, cwd=cwd, context_length=200_000, allowed_root=cwd).message
+
+
+class TestContextReferenceFooterStrip:
+    """t_f913c7ce: expanded @file:/@url: bodies are documents, not conversation; memory keeps the typed
+    message (with its @ tokens as pointers) and drops the "--- Attached Context ---" footer."""
+
+    def test_attached_file_body_is_dropped(self, tmp_path):
+        from agent.skill_commands import extract_user_text_for_memory
+
+        (tmp_path / "specs.md").write_text("Bolt pattern 5x114.3, centre bore 64.1 mm.\n" * 20)
+        typed = "do these fit? @file:specs.md"
+        turn = _expand(typed, tmp_path)
+        assert "--- Attached Context ---" in turn and "centre bore" in turn  # the model sees the body
+
+        assert extract_user_text_for_memory(turn) == typed
+
+    def test_warnings_footer_is_dropped(self, tmp_path):
+        from agent.skill_commands import extract_user_text_for_memory
+
+        typed = "look at @file:missing.md"
+        turn = _expand(typed, tmp_path)
+        assert "--- Context Warnings ---" in turn
+
+        assert extract_user_text_for_memory(turn) == typed
+
+    def test_footer_only_turn_is_skipped(self):
+        from agent.skill_commands import extract_user_text_for_memory
+
+        assert extract_user_text_for_memory("--- Attached Context ---\n\n📄 @file:a.md (3 tokens)\nbody") is None
+
+    def test_inline_mention_is_untouched(self):
+        from agent.skill_commands import extract_user_text_for_memory
+
+        text = "why does my prompt show --- Attached Context --- twice?"
+        assert extract_user_text_for_memory(text) == text
+
+    def test_skill_instruction_keeps_scaffold_strip(self, tmp_path):
+        from agent.skill_commands import extract_user_text_for_memory
+
+        (tmp_path / "a.md").write_text("file body that must not be retained\n")
+        turn = _expand(_SINGLE_SKILL_TURN + " using @file:a.md", tmp_path)
+
+        assert extract_user_text_for_memory(turn) == "make a skill for release triage using @file:a.md"
+
+    def test_memory_manager_fan_out_drops_footer(self, tmp_path):
+        mgr, provider = _manager_with_recorder()
+        (tmp_path / "page.md").write_text("page boilerplate repeated on every page\n")
+        typed = "compare @file:page.md"
+        turn = _expand(typed, tmp_path)
+
+        mgr.sync_all(turn, "Done.")
+        mgr.queue_prefetch_all(turn)
+        mgr.prefetch_all(turn)
+        mgr.flush_pending(timeout=5.0)
+
+        assert provider.synced == [typed]
+        assert provider.queued == [typed]
+        assert provider.prefetched == [typed]
