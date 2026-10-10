@@ -160,6 +160,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_SESSION_KEY",
     "HERMES_GATEWAY_SESSION",
     "HERMES_CRON_SESSION",
+    # One-shot marker (`hermes -z`, `chat -q`); every Kanban worker shell exports it, and it
+    # switches on the one-shot delegation spawn budget and approval mode for tests that never
+    # asked for them. Tests of that path set it explicitly.
+    "HERMES_SINGLE_QUERY_SESSION",
     "_HERMES_GATEWAY",
     "HERMES_PLATFORM",
     "HERMES_MODEL",
