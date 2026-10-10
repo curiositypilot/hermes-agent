@@ -18,7 +18,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
 
-from hermes_cli.worktree_ops import release_lsp_clients
+from hermes_cli.worktree_ops import ensure_worktrees_excluded, release_lsp_clients
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -692,6 +692,8 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
         return
     target.parent.mkdir(parents=True, exist_ok=True)
+    if _path_key(target.parent.resolve(strict=False)) == _path_key((repo_root / ".worktrees").resolve(strict=False)):
+        ensure_worktrees_excluded(repo_root)
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
     else:
