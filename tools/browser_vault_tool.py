@@ -14,7 +14,8 @@ tools):
   resolved locally, the page origin must EXACTLY match the item's bound
   origin (pre-checked AND re-asserted synchronously inside the fill script),
   the field is chosen by the ported login-control classifier, injection runs
-  exclusively over the supervisor CDP WebSocket (never argv), and the tool
+  exclusively over the supervisor CDP WebSocket (never argv; in Camofox mode,
+  which has no CDP endpoint, over the Camofox REST evaluate request body), and the tool
   result reports only ``{filled_fields, kind, origin, success}`` — the
   password never appears in tool results, logs, or the session DB, and its
   exact bytes are registered with the browser-result redaction boundary so
@@ -53,14 +54,72 @@ def _check_vault_available() -> bool:
 # JS evaluation plumbing (server-side; results never carry secret values)
 # ---------------------------------------------------------------------------
 
+def _camofox_active() -> bool:
+    try:
+        from tools.browser_camofox import is_camofox_mode
+        return bool(is_camofox_mode())
+    except Exception:  # pragma: no cover — in-repo module
+        return False
+
+
+def _camofox_transport_is_local() -> bool:
+    """True when requests to the Camofox server stay off the public internet in cleartext: https, or a
+    loopback / private / single-label (Docker service) host. Gate for sending secret-bearing expressions."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    from tools.browser_camofox import get_camofox_url
+
+    parts = urlsplit(get_camofox_url())
+    if parts.scheme == "https":
+        return True
+    host = (parts.hostname or "").lower()
+    if not host:
+        return False
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")) or "." not in host:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private
+
+
+def _camofox_eval(task_id: str, expression: str) -> Dict[str, Any]:
+    """Evaluate JS on the task's open Camofox tab via its REST API (``POST /tabs/{id}/evaluate``).
+
+    Camofox (Camoufox/Firefox) exposes no CDP endpoint, so neither the supervisor nor the agent-browser
+    CLI can reach its page; the CLI fallback launched a separate blank Chromium and the origin read came
+    back ``about:blank``. The expression travels in the JSON body of the request (never argv) and the
+    server logs only the result type. Never opens a tab: no tab means there is no page to read or fill."""
+    from tools.browser_camofox import _get_session, _post
+
+    session = _get_session(task_id)
+    tab_id = session.get("tab_id")
+    if not tab_id:
+        return {"success": False, "error": "No browser session. Call browser_navigate first."}
+    try:
+        resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": session["user_id"]})
+    except Exception as exc:
+        return {"success": False, "error": f"Camofox evaluate failed: {str(exc)[:200]}"}
+    if isinstance(resp, dict):
+        if resp.get("error"):
+            return {"success": False, "error": str(resp.get("error"))[:200]}
+        return {"success": True, "result": resp.get("result")}
+    return {"success": True, "result": resp}
+
+
 def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
     """Evaluate NON-SECRET JS on the current page (inspection, origin reads).
 
-    Prefers the supervisor's persistent CDP WebSocket, falls back to the
-    agent-browser CLI ``eval`` command. Never use this for expressions that
-    embed secret values — the fallback places the expression in subprocess
-    argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
+    Camofox mode evaluates over the Camofox REST API (its page is unreachable
+    by CDP). Otherwise prefers the supervisor's persistent CDP WebSocket, falls
+    back to the agent-browser CLI ``eval`` command. Never use this for
+    expressions that embed secret values — the fallback places the expression
+    in subprocess argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
     """
+    if _camofox_active():
+        return _camofox_eval(task_id, expression)
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
@@ -93,7 +152,11 @@ def _ensure_supervisor(task_id: str):
     Cloud/CDP-override sessions and browser_exec attach their supervisor when the session is created;
     a local agent-browser ``--session`` has no ``cdp_url`` of its own, so nothing did. Ask the daemon
     for the packaged Chromium's endpoint (``get cdp-url``: same daemon, same reaper) and attach.
-    Returns None when no endpoint is reachable; the fill then refuses rather than touching argv."""
+    Returns None when no endpoint is reachable; the fill then refuses rather than touching argv.
+    Always None in Camofox mode: asking agent-browser for a CDP URL would launch an unrelated blank
+    Chromium instead of reaching the Camofox page."""
+    if _camofox_active():
+        return None
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
@@ -124,7 +187,21 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
     credential bytes — in subprocess argv, visible to any process listing.
     When no supervisor session is available the caller gets a typed refusal
     (``error_type='supervisor_required'``) and nothing is written.
+
+    Camofox mode has no CDP socket; its REST evaluate carries the expression
+    in an HTTP request body (not argv), so it is used when the server is
+    reached over https or a local/private address, and refused otherwise.
     """
+    if _camofox_active():
+        if not _camofox_transport_is_local():
+            return {"success": False, "error_type": "insecure_transport",
+                    "error": ("Vault fill refused: the Camofox server is reached over plain HTTP on a public "
+                              "address, so the credential would cross the network unencrypted. Use https or a "
+                              "local Camofox URL.")}
+        res = _camofox_eval(task_id, expression)
+        if not res.get("success"):
+            res.setdefault("error_type", "eval_failed")
+        return res
     try:
         supervisor = _ensure_supervisor(task_id)
     except Exception as exc:

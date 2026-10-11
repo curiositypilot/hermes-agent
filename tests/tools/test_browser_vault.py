@@ -640,6 +640,108 @@ class TestVaultHardening:
         assert not mode & 0o077, oct(mode)
 
 
+class TestCamofoxBackend:
+    """Camofox (Camoufox/Firefox) has no CDP endpoint. The vault must reach its page over the Camofox REST
+    evaluate API: the agent-browser fallback launched an unrelated blank Chromium, read about:blank, and
+    every fill failed with "Could not determine the current page origin"."""
+
+    @pytest.fixture()
+    def camofox(self, monkeypatch):
+        from tools import browser_camofox, browser_vault_tool
+
+        posts = []
+        page = {"href": "https://login.olx.pt/?client_id=x&state=y"}
+
+        def fake_post(path, body, timeout=None):
+            posts.append((path, body))
+            if body["expression"] == "window.location.href":
+                return {"ok": True, "result": page["href"]}
+            return {"ok": True, "result": json.dumps({"filled": 1})}
+
+        def no_cli(*a, **k):
+            raise AssertionError("agent-browser must not be used in Camofox mode")
+
+        monkeypatch.setattr(browser_vault_tool, "_camofox_active", lambda: True)
+        monkeypatch.setattr(browser_camofox, "_get_session",
+                            lambda task_id: {"user_id": "hermes_u", "tab_id": "tab-1", "session_key": "k"})
+        monkeypatch.setattr(browser_camofox, "_post", fake_post)
+        monkeypatch.setattr(browser_camofox, "get_camofox_url", lambda: "http://localhost:9377")
+        monkeypatch.setattr("tools.browser_tool_session._run_browser_command", no_cli)
+        return posts, page
+
+    def test_origin_read_goes_through_the_camofox_tab(self, camofox):
+        from tools import browser_vault_tool
+
+        posts, _ = camofox
+        assert browser_vault_tool._current_page_origin("t1") == "https://login.olx.pt"
+        assert posts == [("/tabs/tab-1/evaluate", {"expression": "window.location.href", "userId": "hermes_u"})]
+
+    def test_no_supervisor_attach_in_camofox_mode(self, camofox):
+        from tools import browser_vault_tool
+
+        assert browser_vault_tool._ensure_supervisor("t1") is None
+        assert browser_vault_tool._focus_bound_origin("t1", "https://login.olx.pt", "login") is None
+
+    def test_secret_fill_uses_rest_body_on_local_server(self, camofox):
+        from tools import browser_vault_tool
+
+        posts, _ = camofox
+        out = browser_vault_tool._eval_js_secret("t1", "/*fill*/")
+        assert out == {"success": True, "result": json.dumps({"filled": 1})}
+        assert posts[-1][1]["expression"] == "/*fill*/"
+
+    def test_secret_fill_refused_over_public_plain_http(self, camofox, monkeypatch):
+        from tools import browser_camofox, browser_vault_tool
+
+        posts, _ = camofox
+        for url in ("http://8.8.8.8:9377", "http://camofox.example.com:9377"):
+            monkeypatch.setattr(browser_camofox, "get_camofox_url", lambda url=url: url)
+            out = browser_vault_tool._eval_js_secret("t1", "/*fill*/")
+            assert out["success"] is False and out["error_type"] == "insecure_transport"
+        assert posts == []
+        for url in ("https://camofox.example.com", "http://camofox:9377", "http://192.168.1.5:9377"):
+            monkeypatch.setattr(browser_camofox, "get_camofox_url", lambda url=url: url)
+            assert browser_vault_tool._camofox_transport_is_local() is True
+
+    def test_no_tab_means_no_origin(self, camofox, monkeypatch):
+        from tools import browser_camofox, browser_vault_tool
+
+        monkeypatch.setattr(browser_camofox, "_get_session",
+                            lambda task_id: {"user_id": "hermes_u", "tab_id": None, "session_key": "k"})
+        assert browser_vault_tool._current_page_origin("t1") is None
+
+    def test_full_fill_on_camofox_page(self, store, camofox):
+        """End to end through browser_vault_fill: origin read, inspection and fill all ride the REST API."""
+        from tools import browser_vault_tool
+
+        posts, page = camofox
+        meta = _add_login(store, origin="https://login.olx.pt", password="s3cret-pw")
+        controls = [
+            {"autocomplete": "email", "formIndex": 0, "index": 0, "label": "", "name": "username", "type": "email"},
+            {"autocomplete": "current-password", "formIndex": 0, "index": 1, "label": "", "name": "password",
+             "type": "password"},
+        ]
+
+        def fake_post(path, body, timeout=None):
+            posts.append((path, body))
+            expr = body["expression"]
+            if expr == "window.location.href":
+                return {"ok": True, "result": page["href"]}
+            if "data-hermes-vault-slot\", nonce" in expr:
+                return {"ok": True, "result": json.dumps(controls)}
+            return {"ok": True, "result": json.dumps({"filled": 1})}
+
+        from tools import browser_camofox
+        with patch.object(browser_camofox, "_post", side_effect=fake_post), \
+             patch("agent.vault_store.get_vault_store", return_value=store):
+            raw = browser_vault_tool.browser_vault_fill(meta.id, task_id="t1")
+        out = json.loads(raw)
+        assert out["success"] is True, out
+        assert out["origin"] == "https://login.olx.pt"
+        assert out["filled_fields"] == 1
+        assert "s3cret-pw" not in raw
+
+
 
 
 def test_every_registered_tool_schema_declares_openai_style_parameters():
