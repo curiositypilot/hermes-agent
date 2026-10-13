@@ -8,6 +8,7 @@ import {
   SiMattermost,
   SiQq,
   SiSignal,
+  SiSimplex,
   SiTelegram,
   SiWechat,
   SiWhatsapp
@@ -48,8 +49,12 @@ interface PlatformIconSpec {
   Icon?: ComponentType<SVGProps<SVGSVGElement>>
   color: string
   kind: IconKind
+  monochrome?: boolean
   monogram?: string
 }
+
+// Monogram tint for brands with no Simple Icons entry to source a hex from.
+const NEUTRAL_MONOGRAM = '#64748B'
 
 const PLATFORM_ICONS: Record<string, PlatformIconSpec> = {
   telegram: { Icon: SiTelegram, color: '#26A5E4', kind: 'brand' },
@@ -59,6 +64,8 @@ const PLATFORM_ICONS: Record<string, PlatformIconSpec> = {
   mattermost: { Icon: SiMattermost, color: '#0058CC', kind: 'brand' },
   matrix: { Icon: SiMatrix, color: '#000000', kind: 'brand' },
   signal: { Icon: SiSignal, color: '#3A76F0', kind: 'brand' },
+  // Black mark by design: follow the text color so it stays visible in dark themes.
+  simplex: { Icon: SiSimplex, color: '#000000', kind: 'brand', monochrome: true },
   whatsapp: { Icon: SiWhatsapp, color: '#25D366', kind: 'brand' },
   bluebubbles: { Icon: SiApple, color: '#0BD318', kind: 'brand' },
   photon: { Icon: PhotonIcon, color: '#6366F1', kind: 'brand' },
@@ -68,8 +75,11 @@ const PLATFORM_ICONS: Record<string, PlatformIconSpec> = {
   webhook: { Icon: LinkIcon, color: '#71717A', kind: 'generic' },
   api_server: { Icon: Globe, color: '#64748B', kind: 'generic' },
   weixin: { Icon: SiWechat, color: '#07C160', kind: 'brand' },
+  wecom: { color: NEUTRAL_MONOGRAM, kind: 'brand', monogram: 'W' },
   qqbot: { Icon: SiQq, color: '#EB1923', kind: 'brand' },
-  yuanbao: { Icon: SiBilibili, color: '#FB7299', kind: 'brand' }
+  yuanbao: { Icon: SiBilibili, color: '#FB7299', kind: 'brand' },
+  dingtalk: { color: NEUTRAL_MONOGRAM, kind: 'brand', monogram: 'D' },
+  feishu: { color: NEUTRAL_MONOGRAM, kind: 'brand', monogram: 'F' }
 }
 
 interface PlatformAvatarProps extends Omit<ComponentPropsWithoutRef<'span'>, 'children'> {
