@@ -104,6 +104,25 @@ class TestKnownPrefixes:
         ]:
             assert redact_sensitive_text(benign) == benign
 
+    def test_cloudflare_token_prefixes(self):
+        """Cloudflare cfut_/cfat_/cfk_ credentials (40 chars + checksum) redact by prefix."""
+        body = "aB3dE5fG7h" * 4 + "x1y2z3w4"  # 48 alphanumeric chars, concatenated: push protection
+        for prefix in ("cfut_", "cfat_", "cfk_"):
+            token = prefix + body
+            for kwargs in ({}, {"force": True}):
+                result = redact_sensitive_text(f"leaked {token} in output", **kwargs)
+                assert body not in result and body[:20] not in result, (token, kwargs, result)
+
+    def test_cloudflare_prefix_requires_length_and_boundary(self):
+        """Short or embedded cf prefixes and bare 32-hex account ids are not secrets."""
+        for benign in [
+            "cfut_short",
+            "cfut_" + "a" * 39,                      # under the 40-char documented body
+            "mycfut_" + "aB3dE5fG7h" * 4 + "x1y2z3w4",  # embedded: lookbehind blocks
+            "0123456789abcdef" * 2,                  # account id: an identifier, not a credential
+        ]:
+            assert redact_sensitive_text(benign, force=True) == benign
+
     def test_agentmail_prefix_needs_a_key_shaped_hex_suffix(self):
         """``am_`` is a common identifier prefix; only the documented hex key body is a secret (#10983)."""
         for benign in ["schema.am_example_identifier_123", "path/to/am_monthly_report.sql"]:

@@ -207,6 +207,12 @@ _PREFIX_PATTERNS = [
     r"glwt-[A-Za-z0-9_\-]{10,}",        # GitLab workspace token
     r"GR1348941[A-Za-z0-9_\-]{10,}",    # GitLab legacy runner registration token
     r"pk-lf-[A-Za-z0-9\-]{8,}",         # Langfuse public key (sk-lf- already covered by sk- pattern)
+    # Cloudflare prefixed credentials: prefix + 40 chars + checksum
+    # (developers.cloudflare.com/fundamentals/api/get-started/token-formats). One literal
+    # prefix per entry: a combined ``cf(?:ut|at|k)_`` would pre-screen on ``cf``.
+    r"cfut_[A-Za-z0-9]{40,}",           # Cloudflare user API token
+    r"cfat_[A-Za-z0-9]{40,}",           # Cloudflare account API token
+    r"cfk_[A-Za-z0-9]{40,}",            # Cloudflare global API key
 ]
 
 # ENV assignment: KEY=value where KEY carries a secret-like name. Uppercase keys
