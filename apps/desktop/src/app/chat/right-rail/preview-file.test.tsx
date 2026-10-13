@@ -289,3 +289,124 @@ describe('LocalFilePreview save', () => {
     }
   })
 })
+
+// Stale-on-disk guard: a pre-save re-read that cannot confirm the file still
+// holds the text the user started from (it turned binary, or the read failed)
+// must stop the save and offer the conflict choice, never write blind.
+describe('LocalFilePreview save validation', () => {
+  type DiskState = 'binary' | 'text' | 'unreadable'
+
+  function setup() {
+    let state: DiskState = 'text'
+    const writes: string[] = []
+
+    vi.stubGlobal('hermesDesktop', {
+      readFileText: async () => {
+        if (state === 'unreadable') {
+          throw new Error('EACCES: permission denied')
+        }
+
+        return state === 'binary'
+          ? { binary: true, path: '/workspace/note.txt', truncated: false }
+          : { binary: false, path: '/workspace/note.txt', text: 'original', truncated: false }
+      },
+      writeTextFile: async (_file: string, content: string) => {
+        writes.push(content)
+
+        return { path: '/workspace/note.txt' }
+      }
+    })
+
+    const rangeDescriptors = Object.getOwnPropertyDescriptors(Range.prototype)
+
+    Object.defineProperties(Range.prototype, {
+      getClientRects: { configurable: true, value: () => [] },
+      getBoundingClientRect: { configurable: true, value: () => new DOMRect() }
+    })
+
+    const restore = () => {
+      for (const key of ['getClientRects', 'getBoundingClientRect']) {
+        if (rangeDescriptors[key]) {
+          Object.defineProperty(Range.prototype, key, rangeDescriptors[key])
+        } else {
+          Reflect.deleteProperty(Range.prototype, key)
+        }
+      }
+    }
+
+    const rendered = render(
+      <LocalFilePreview
+        reloadKey={0}
+        target={{
+          kind: 'file',
+          label: 'note.txt',
+          path: '/workspace/note.txt',
+          previewKind: 'text',
+          source: '/workspace/note.txt',
+          url: 'file:///workspace/note.txt'
+        }}
+      />
+    )
+
+    return {
+      async editAndSave(nextState: DiskState) {
+        fireEvent.click(await screen.findByRole('button', { name: 'Edit' }))
+        const editor = EditorView.findFromDOM(rendered.container.querySelector('.cm-content')!)!
+        act(() => editor.dispatch({ changes: { from: editor.state.doc.length, insert: ' edited' } }))
+        state = nextState
+        fireEvent.click(screen.getByRole('button', { name: /Save/ }))
+      },
+      restore,
+      writes
+    }
+  }
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    $dirtyPreviewUrls.set({})
+  })
+
+  it.each<DiskState>(['binary', 'unreadable'])(
+    'refuses to save and shows the conflict when the file is now %s',
+    async nextState => {
+      const harness = setup()
+
+      try {
+        await harness.editAndSave(nextState)
+
+        await screen.findByRole('button', { name: /Overwrite/ })
+        expect(harness.writes).toEqual([])
+        expect($dirtyPreviewUrls.get()['file:///workspace/note.txt']).toBe(true)
+      } finally {
+        harness.restore()
+      }
+    }
+  )
+
+  it('writes when the file on disk is unchanged', async () => {
+    const harness = setup()
+
+    try {
+      await harness.editAndSave('text')
+
+      await waitFor(() => expect(harness.writes).toEqual(['original edited']))
+      expect(screen.queryByRole('button', { name: /Overwrite/ })).toBeNull()
+    } finally {
+      harness.restore()
+    }
+  })
+
+  it.each<DiskState>(['binary', 'unreadable'])('writes on Overwrite after a %s conflict', async nextState => {
+    const harness = setup()
+
+    try {
+      await harness.editAndSave(nextState)
+
+      fireEvent.click(await screen.findByRole('button', { name: /Overwrite/ }))
+      await waitFor(() => expect(harness.writes).toEqual(['original edited']))
+    } finally {
+      harness.restore()
+    }
+  })
+})
