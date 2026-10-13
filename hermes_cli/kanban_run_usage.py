@@ -1,7 +1,9 @@
 """Token usage of a Kanban run, read from the worker's session row at run close.
 
 A dispatcher-spawned worker stamps ``worker_session_id`` into the metadata of its
-terminal board call (``tools/kanban_tools.py::_stamp_worker_session_metadata``).
+terminal board call (``tools/kanban_tools.py::_stamp_worker_session_metadata``)
+and, while the run is open, on every heartbeat (``heartbeat_current_worker_from_env``),
+so a run the dispatcher closes (crash, quota, timeout, stale) still names its session.
 The worker's own ``state.db`` (under the run's profile home) already accumulates
 per-session token counters, so the run close copies them into
 ``task_runs.metadata.usage`` instead of adding new plumbing.
@@ -119,3 +121,22 @@ def with_run_usage(profile: Optional[str], metadata: Optional[dict]) -> Optional
         return metadata
     usage = usage_for_run(profile, metadata)
     return {**metadata, "usage": usage} if usage else metadata
+
+
+def with_run_close_usage(conn: sqlite3.Connection, run_id: int, metadata: Optional[dict]) -> Optional[dict]:
+    """Metadata to write when the board closes ``run_id``, with ``usage`` when readable.
+
+    A passed ``worker_session_id`` wins; else the one the worker's heartbeat stamped
+    on the open run (``kanban_db_dispatch.heartbeat_worker``) is added, and only that
+    key, so a dispatcher close (crash, quota, timeout, stale) bills the session too.
+    """
+    row = conn.execute(
+        "SELECT profile, json_extract(metadata, '$.worker_session_id') AS sid FROM task_runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    stamped = row["sid"] if row else None
+    if stamped and not (metadata or {}).get("worker_session_id"):
+        metadata = {**(metadata or {}), "worker_session_id": stamped}
+    if not (metadata and metadata.get("worker_session_id")):
+        return metadata
+    return with_run_usage(row["profile"] if row else None, metadata)
