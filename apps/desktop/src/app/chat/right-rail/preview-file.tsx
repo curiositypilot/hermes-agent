@@ -1071,11 +1071,23 @@ export function LocalFilePreview({
       // Also guards Overwrite: bypassing a content conflict never authorizes
       // writing the same path on another connection/profile or this device.
       requireEditorOwner()
-      await writeDesktopFileText(filePath, draftRef.current)
-      baselineRef.current = draftRef.current
-      setDirty(false)
+      // Only the snapshot actually written becomes the baseline. Keystrokes
+      // typed while the write is pending stay dirty and in the editor, so the
+      // next Save writes them instead of the post-save reload dropping them.
+      const text = draftRef.current
+      await writeDesktopFileText(filePath, text)
+      baselineRef.current = text
       setConflict(false)
-      setEditing(false)
+
+      // Recompute against the new baseline: keystrokes during the write were
+      // judged against the old one (a revert to it read as clean).
+      const stillDirty = draftRef.current !== text
+      setDirty(stillDirty)
+
+      if (!stillDirty) {
+        setEditing(false)
+      }
+
       notifyWorkspaceChanged()
       setSelfReload(n => n + 1)
     } catch (error) {
