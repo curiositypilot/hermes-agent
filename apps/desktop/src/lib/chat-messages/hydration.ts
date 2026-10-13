@@ -144,6 +144,24 @@ function displayContentForMessage(role: SessionMessage['role'], content: unknown
   return [missing.join('\n'), visibleText].filter(Boolean).join('\n\n') || visibleText
 }
 
+/**
+ * Openers of role=user rows the gateway and agent write as model-facing
+ * bookkeeping: model-switch / personality notices (tui_gateway/server.py) and
+ * the todo snapshot context compaction re-injects (tools/todo_tool.py
+ * TODO_INJECTION_HEADER). The user never typed them, so they are neither a
+ * bubble nor a prompt. One list for the transcript and the reconciler.
+ */
+const GATEWAY_MARKER_PREFIXES = [
+  '[System:',
+  '[Your active task list was preserved across context compression]'
+] as const
+
+export function isGatewayMarkerText(text: string): boolean {
+  const opening = text.trimStart()
+
+  return GATEWAY_MARKER_PREFIXES.some(prefix => opening.startsWith(prefix))
+}
+
 function transcriptContent(
   displayKind: SessionMessage['display_kind'],
   role: SessionMessage['role'],
@@ -153,7 +171,15 @@ function transcriptContent(
     return null
   }
 
-  return role === 'user' && LEGACY_HEARTBEAT_ROW_RE.test(content.trim()) ? null : content
+  if (role !== 'user') {
+    return content
+  }
+
+  // A typed row (model_switch, personality_switch, ...) already carries the
+  // backend's display decision; only untyped scaffolding is dropped here.
+  const untypedMarker = displayKind === undefined && isGatewayMarkerText(content)
+
+  return untypedMarker || LEGACY_HEARTBEAT_ROW_RE.test(content.trim()) ? null : content
 }
 
 /**
