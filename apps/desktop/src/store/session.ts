@@ -403,9 +403,11 @@ export async function ensureDefaultWorkspaceCwd(shouldPublish: () => boolean = (
     // it means the incoming gateway has no memory of its own, so any workspace
     // still live from the outgoing gateway is stale and must be cleared rather
     // than left in place (seedLiveCwd's cwd-truthy guard would otherwise skip
-    // publishing and leave the old path looking valid — #114306).
+    // publishing and leave the old path looking valid — #114306). The
+    // configured default fills that gap; it names a path on the gateway host,
+    // so it is published as-is rather than through the local-FS sanitizer.
     if (shouldPublish() && !$activeSessionId.get()) {
-      setCurrentCwdTransient(remembered)
+      setCurrentCwdTransient(remembered || configured)
     }
 
     return
