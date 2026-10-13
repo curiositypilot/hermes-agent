@@ -1289,7 +1289,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                          "screenshot_path": str(screenshot_path)}
         _lp._copy_fallback_warning(response_data, result)
         if annotate and result.get("data", {}).get("annotations"):
-            response_data["annotations"] = result["data"]["annotations"]
+            response_data["annotations"] = _snapshot._redact_browser_output(result["data"]["annotations"])
         return _dumps(response_data)
     except Exception as e:
         # Keep a captured screenshot — the failure is in the analysis, not the capture,

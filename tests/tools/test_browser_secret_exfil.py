@@ -287,3 +287,21 @@ class TestAgentBrowserOutputRedaction:
             analysis = _analyze_screenshot_with_aux_llm(shot, "what key is shown?")
         assert fake_key not in analysis
         assert analysis.startswith("The settings page shows the key")
+
+    @pytest.mark.parametrize("native", [False, True], ids=["aux_path", "native_path"])
+    def test_vision_annotations_scrub_vault_value(self, tmp_path, native):
+        import tools.browser_tool as bt
+
+        shot = tmp_path / "shot.png"
+        shot.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        capture = {"success": True, "data": {"path": str(shot), "annotations": [
+            {"ref": "e1", "name": f"Password {_FAKE_VAULT_VALUE}"}]}}
+        with patch.object(bt, "_capture_vision_screenshot", return_value=(capture, shot, None)), \
+             patch.object(bt, "_blocked_private_page_content", return_value=None), \
+             patch("tools.vision_tools._should_use_native_vision_fast_path", return_value=native), \
+             patch("tools.vision_tools._resize_image_for_vision", return_value="data:image/png;base64,AA"), \
+             patch("tools.browser_tool_vision._analyze_screenshot_with_aux_llm", return_value="ok"):
+            out = bt.browser_vision("what is shown?", annotate=True, task_id=f"av-{native}")
+        text = out if isinstance(out, str) else json.dumps(out, default=str)
+        assert "Password " in text  # annotations are still returned
+        assert _FAKE_VAULT_VALUE not in text
