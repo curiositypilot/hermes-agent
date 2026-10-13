@@ -31,7 +31,7 @@ _COMPACTION_INTERNAL_FIELDS = (
 
 
 def project_compaction_message_for_display(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Return authentic transcript content, or ``None`` for a pure handoff.
+    """Return authentic transcript content, or ``None`` for a pure handoff or todo-snapshot row.
 
     Model-facing recovery history retains the complete carrier. Display
     projections instead remove the handoff, inherited tool state, and internal
@@ -41,7 +41,7 @@ def project_compaction_message_for_display(message: Dict[str, Any]) -> Optional[
     if not isinstance(message, dict):
         return None
     if not is_compaction_summary_message(message):
-        return message.copy()
+        return _strip_todo_snapshot_for_display(message.copy())
 
     projected = ContextCompressor._strip_context_summary_handoff_message(message)
     if projected is None:
@@ -51,4 +51,24 @@ def project_compaction_message_for_display(message: Dict[str, Any]) -> Optional[
     for key in _COMPACTION_INTERNAL_FIELDS:
         projected.pop(key, None)
     projected.pop("display_kind", None)
-    return projected
+    return _strip_todo_snapshot_for_display(projected)
+
+
+def _strip_todo_snapshot_for_display(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Drop the compaction todo snapshot from a user row; ``None`` when it was the whole row.
+
+    ``_fold_todo_snapshot`` appends the snapshot to the trailing real user turn, so without this
+    the user's own bubble shows the task list. Mutates *message*, which callers pass as a copy.
+    """
+    if message.get("role") != "user":
+        return message
+    from agent.conversation_compression import _strip_stale_todo_snapshot, _todo_snapshot_is_only_content
+
+    content = message.get("content")
+    stripped = _strip_stale_todo_snapshot(content)
+    if stripped == content:
+        return message
+    if _todo_snapshot_is_only_content(content, stripped):
+        return None
+    message["content"] = stripped
+    return message

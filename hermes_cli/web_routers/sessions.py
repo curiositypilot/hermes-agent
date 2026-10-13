@@ -703,6 +703,12 @@ def _project_for_display(messages: list, *, home=None, inline_images: bool = Tru
                 steer_text := _extract_steer_text_from_message(message)):
             message = {**message, "display_content": steer_text}
         if not is_compaction_summary_message(message):
+            # A todo snapshot folded into a real user turn at compaction is display-stripped here too.
+            display_view = project_compaction_message_for_display(message)
+            if display_view is None:
+                message = {**message, "display_kind": message.get("display_kind") or "hidden"}
+            elif display_view.get("content") != message.get("content") and "display_content" not in message:
+                message = {**message, "display_content": display_view.get("content")}
             projected_messages.append(message)
             continue
         display_view = project_compaction_message_for_display(message)
