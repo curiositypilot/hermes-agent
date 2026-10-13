@@ -1,6 +1,15 @@
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 
-import { isMessagingSource, sessionSourceSearchTerms } from './session-source'
+import { PlatformAvatar } from '@/app/messaging/platform-icon'
+
+import {
+  isMessagingSource,
+  MESSAGING_SESSION_SOURCE_IDS,
+  sessionSourceLabel,
+  sessionSourceSearchTerms
+} from './session-source'
 
 // Regression guard for #46761 / PR #47395: Photon (iMessage) must keep its own
 // sidebar section. refreshMessagingSessions() filters rows through
@@ -27,5 +36,31 @@ describe('photon messaging source registration', () => {
     expect(isMessagingSource('cli')).toBe(false)
     expect(isMessagingSource(null)).toBe(false)
     expect(isMessagingSource(undefined)).toBe(false)
+  })
+})
+
+// SimpleX sessions (plugins/platforms/simplex) were filtered out of every
+// sidebar section: not local, and not a known messaging source (#136856).
+describe('simplex messaging source registration', () => {
+  it('treats simplex as a messaging source (own sidebar section)', () => {
+    expect(isMessagingSource('simplex')).toBe(true)
+    expect(isMessagingSource(' SimpleX ')).toBe(true)
+  })
+
+  it('labels simplex sessions with the brand spelling', () => {
+    expect(sessionSourceLabel('simplex')).toBe('SimpleX')
+  })
+})
+
+// A platform added to the messaging list without an icon entry renders the
+// grey "unknown thing" monogram chip. Pin every messaging platform to a
+// branded chip so the next adapter cannot ship half-registered.
+describe('messaging platform icons', () => {
+  it.each(MESSAGING_SESSION_SOURCE_IDS)('%s renders a branded platform chip', id => {
+    const markup = renderToStaticMarkup(
+      createElement(PlatformAvatar, { platformId: id, platformName: sessionSourceLabel(id) ?? id })
+    )
+
+    expect(markup).toContain('color-mix(')
   })
 })
