@@ -631,11 +631,14 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    worker_session_id: Optional[str] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
     Liveness signal orthogonal to the PID check: a worker whose forked child
     (train loop, crawl) is stuck can still have a live Python process.
+    ``worker_session_id`` is stamped on the open run (other metadata keys kept) so a
+    dispatcher close (crash, quota, timeout, stale) still bills the worker's session.
     Returns False if the task is not running or its claim expired.
     """
     now = int(time.time())
@@ -648,18 +651,13 @@ def heartbeat_worker(
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False
-        run_id = (
-            int(expected_run_id)
-            if expected_run_id is not None
-            else _kb._current_run_id(conn, task_id)
-        )
+        run_id = int(expected_run_id) if expected_run_id is not None else _kb._current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute("UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?", (now, run_id))
-        _kb._append_event(
-            conn, task_id, "heartbeat",
-            {"note": note} if note else None,
-            run_id=run_id,
-        )
+        if run_id is not None and worker_session_id:
+            conn.execute("UPDATE task_runs SET metadata = json_set(COALESCE(metadata, '{}'), '$.worker_session_id', ?)"
+                         " WHERE id = ? AND ended_at IS NULL", (worker_session_id, run_id))
+        _kb._append_event(conn, task_id, "heartbeat", {"note": note} if note else None, run_id=run_id)
     return True
 
 
