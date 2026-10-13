@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -708,6 +709,23 @@ class TestCamofoxBackend:
 
         monkeypatch.setattr(browser_camofox, "_get_session",
                             lambda task_id: {"user_id": "hermes_u", "tab_id": None, "session_key": "k"})
+        assert browser_vault_tool._current_page_origin("t1") is None
+
+    @pytest.mark.parametrize("failure", [
+        requests.ConnectionError("refused"),
+        requests.HTTPError("410 Client Error: Gone"),
+        ValueError("Expecting value: line 1 column 1"),
+    ])
+    def test_camofox_server_failure_is_an_error_result(self, camofox, monkeypatch, failure):
+        """A dead server, an HTTP error status (closed tab) or a non-JSON body is reported, not raised."""
+        from tools import browser_camofox, browser_vault_tool
+
+        def failing_post(path, body, timeout=None):
+            raise failure
+
+        monkeypatch.setattr(browser_camofox, "_post", failing_post)
+        out = browser_vault_tool._eval_js("t1", "window.location.href")
+        assert out["success"] is False and out["error"].startswith("Camofox evaluate failed")
         assert browser_vault_tool._current_page_origin("t1") is None
 
     def test_full_fill_on_camofox_page(self, store, camofox):

@@ -55,11 +55,8 @@ def _check_vault_available() -> bool:
 # ---------------------------------------------------------------------------
 
 def _camofox_active() -> bool:
-    try:
-        from tools.browser_camofox import is_camofox_mode
-        return bool(is_camofox_mode())
-    except Exception:  # pragma: no cover — in-repo module
-        return False
+    from tools.browser_camofox import is_camofox_mode
+    return bool(is_camofox_mode())
 
 
 def _camofox_transport_is_local() -> bool:
@@ -92,6 +89,8 @@ def _camofox_eval(task_id: str, expression: str) -> Dict[str, Any]:
     CLI can reach its page; the CLI fallback launched a separate blank Chromium and the origin read came
     back ``about:blank``. The expression travels in the JSON body of the request (never argv) and the
     server logs only the result type. Never opens a tab: no tab means there is no page to read or fill."""
+    import requests
+
     from tools.browser_camofox import _get_session, _post
 
     session = _get_session(task_id)
@@ -100,7 +99,7 @@ def _camofox_eval(task_id: str, expression: str) -> Dict[str, Any]:
         return {"success": False, "error": "No browser session. Call browser_navigate first."}
     try:
         resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": session["user_id"]})
-    except Exception as exc:
+    except (requests.RequestException, ValueError) as exc:  # transport/HTTP status, non-JSON body
         return {"success": False, "error": f"Camofox evaluate failed: {str(exc)[:200]}"}
     if isinstance(resp, dict):
         if resp.get("error"):
