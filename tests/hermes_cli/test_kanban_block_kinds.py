@@ -53,8 +53,10 @@ def _running_task(conn, title="t", parents=()):
 
 
 def _make_running_again(conn, tid):
+    # The retry gate refuses an unchanged re-run after a block; a body edit is an
+    # iteration but not an answer to the block, so the loop breaker still counts it.
     with kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.execute("UPDATE tasks SET status='ready', body = COALESCE(body, '') || '.' WHERE id=?", (tid,))
     assert kb.claim_task(conn, tid, claimer="worker") is not None
 
 
@@ -141,7 +143,10 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
         assert kb.recompute_ready(conn) == 0
         assert kb.get_task(conn, child).status == "blocked"
 
-        # A cron/human unblocks; the worker re-declares the same impossible wait.
+        # A cron/human unblocks after editing the body (the retry gate refuses an
+        # unchanged re-run); the worker re-declares the same impossible wait.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET body = 'retry' WHERE id = ?", (child,))
         assert kb.unblock_task(conn, child)
         assert kb.claim_task(conn, child, claimer="worker") is not None
         assert kb.block_task(conn, child, reason="still waiting", kind="dependency")

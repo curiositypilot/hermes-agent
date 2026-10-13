@@ -51,6 +51,7 @@ with tempfile.TemporaryDirectory(prefix='hermes-pr-live-') as home:
                 def reclaim():
                     with connect() as other:
                         kb.block_task(other, tid, reason='Reassigned during acceptance')
+                        kb.add_comment(other, tid, 'operator', 'Reassigned during acceptance')
                         kb.unblock_task(other, tid)
                         state['replacement'] = kb.claim_task(other, tid).current_run_id
                 state.update(conclusion=outcome, race=reclaim)
