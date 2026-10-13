@@ -378,21 +378,37 @@ def _fetch_snapshot(session: Dict[str, Any]) -> tuple[str, int]:
     return _redact_browser_output(snapshot), data.get("refsCount", 0)
 
 
+_TAB_GONE_ERROR = ("The browser tab is gone (the Camofox server restarted or reaped the tab). "
+                   "Call browser_navigate to reopen the page; element refs from earlier snapshots are no longer valid.")
+
+
+def _is_tab_gone(exc: BaseException) -> bool:
+    """True for an HTTP 404 (tab reaped after idling) or 410 Gone (server restarted, old tab id is
+    dead: ``code: tab_destroyed``) from Camofox. Decided by status code, never by message text."""
+    response = getattr(exc, "response", None)
+    return isinstance(exc, requests.HTTPError) and response is not None and response.status_code in (404, 410)
+
+
+def _forget_dead_tab(session: Optional[Dict[str, Any]]) -> None:
+    """Drop the session's dead tab id so later calls stop hitting it (the next navigate opens a fresh tab)."""
+    if session and session.get("tab_id"):
+        logger.warning("Camofox tab %s is gone (404/410); dropping it.", session["tab_id"])
+        session["tab_id"] = None
+
+
 def _navigate_tab(task_id: Optional[str], browser_url: str) -> tuple[Dict[str, Any], dict]:
     """Open ``browser_url`` in the task's tab (creating it if missing) and return
-    ``(session, navigate_response)``. A 404 on the existing tab means the server
-    garbage-collected it — recreate instead of failing."""
+    ``(session, navigate_response)``. A 404 (server reaped the idle tab) or 410 (server
+    restarted) on the existing tab means it is gone — recreate instead of failing."""
     session = _get_session(task_id)
     if session["tab_id"]:
         try:
             data = _post(_tab_path(session, "navigate"), {"userId": session["user_id"], "url": browser_url}, timeout=60)
             return session, data
         except requests.HTTPError as e:
-            if e.response is None or e.response.status_code != 404:
+            if not _is_tab_gone(e):
                 raise
-            logger.warning("Camofox tab %s returned 404 — tab was garbage collected. Creating a fresh tab.",
-                           session["tab_id"])
-            session["tab_id"] = None
+            _forget_dead_tab(session)
     return _ensure_tab(task_id, browser_url), {"ok": True, "url": browser_url}
 
 
@@ -458,13 +474,18 @@ def _require_tab(task_id: Optional[str], action: Optional[str] = None) -> tuple[
 
 def _with_tab(task_id: Optional[str], guard_action: Optional[str], body: Callable[[Dict[str, Any]], str]) -> str:
     """Require a tab (+ private-page guard when ``guard_action`` is set), then run ``body(session)``;
-    any exception becomes a ``tool_error``."""
+    any exception becomes a ``tool_error``. A dead tab (404/410) is dropped and the error tells the
+    model to navigate: the action is not replayed on a fresh tab (the page and its refs are lost)."""
+    session = None
     try:
         session, blocked = _require_tab(task_id, guard_action)
         if blocked:
             return blocked
         return body(session)
     except Exception as e:
+        if _is_tab_gone(e):
+            _forget_dead_tab(session)
+            return tool_error(_TAB_GONE_ERROR, success=False)
         return tool_error(str(e), success=False)
 
 
@@ -493,6 +514,7 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
 
 def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     """Type text into an element by ref via Camofox."""
+    session = None
     try:
         session, blocked = _require_tab(task_id, "type")
         if blocked:
@@ -507,6 +529,9 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         response = {"success": True, "typed": display_text, "element": clean_ref}
         return json.dumps(redact_browser_typed_text_for_display(response, text))
     except Exception as e:
+        if _is_tab_gone(e):
+            _forget_dead_tab(session)
+            return tool_error(_TAB_GONE_ERROR, success=False)
         from agent.display import redact_browser_typed_text_for_display
         return tool_error(redact_browser_typed_text_for_display(str(e), text), success=False)
 
