@@ -185,6 +185,60 @@ class TestBrowserSnapshotRedaction:
         assert "ref=e5" in content
 
 
+class TestPasswordFieldMask:
+    """Password-like textbox values are masked by accessible name even when the value was never
+    registered with the vault scrub (gateway restart, a human typing over VNC, registry eviction)."""
+
+    FAKE = "Hunter2Fake!xyz"
+
+    @pytest.mark.parametrize("ref", ["[e7]", "[ref=e7]"])
+    @pytest.mark.parametrize("name", ["Password", "Senha", "Palavra-passe", "PIN", "Enter your password", "CVV"])
+    def test_masks_password_like_names(self, name, ref):
+        from tools.browser_tool_snapshot import _redact_browser_output
+
+        line = f'- textbox "{name}" {ref}: {self.FAKE}'
+        out = _redact_browser_output(f'- heading "Sign in" [level=1]\n  {line}\n- button "Log in" [e8]')
+        assert self.FAKE not in out
+        assert f'  - textbox "{name}" {ref}: «masked-secret-field»' in out
+        assert '- button "Log in" [e8]' in out
+
+    def test_keeps_non_secret_values(self):
+        from tools.browser_tool_snapshot import _redact_browser_output
+
+        text = (
+            '- textbox "Email" [e6]: me@example.com\n'
+            '- textbox "Search" [e3]: pinball\n'
+            '- textbox "Spinner name" [e4]: x\n'
+            '- textbox "Desenha a tua assinatura" [e5]: rabisco'
+        )
+        assert _redact_browser_output(text) == text
+
+    def test_empty_password_field_unchanged(self):
+        from tools.browser_tool_snapshot import _redact_browser_output
+
+        assert _redact_browser_output('- textbox "Password" [e7]') == '- textbox "Password" [e7]'
+
+    def test_snapshot_fields_masks_unregistered_password(self):
+        from agent.redact import clear_vault_redaction_values
+        from tools import browser_tool
+
+        clear_vault_redaction_values()
+        snapshot = f'- textbox "Email" [e6]: me@example.com\n- textbox "Password" [e7]: {self.FAKE}'
+        fields = browser_tool._snapshot_fields({"data": {"snapshot": snapshot, "refs": {"e6": {}, "e7": {}}}})
+        assert self.FAKE not in fields["snapshot"]
+        assert '- textbox "Password" [e7]: «masked-secret-field»' in fields["snapshot"]
+        assert "me@example.com" in fields["snapshot"]
+
+    def test_stored_snapshot_masks_password_field(self):
+        from pathlib import Path
+        from tools.browser_tool_snapshot import _store_full_snapshot
+
+        stored = _store_full_snapshot(f'- textbox "Password" [ref=e7]: {self.FAKE}\n- button "Log in" [ref=e8]')
+        assert stored is not None
+        content = Path(stored).read_text(encoding="utf-8")
+        assert self.FAKE not in content
+        assert '- textbox "Password" [ref=e7]: «masked-secret-field»' in content
+
 
 
 
