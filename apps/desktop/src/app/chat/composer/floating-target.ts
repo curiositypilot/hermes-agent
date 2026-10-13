@@ -28,9 +28,15 @@ const inInlineEdit = (el: Element | null) => Boolean(el?.closest(EDIT_COMPOSER_R
  * own focus, exactly like the inline edit: moving the pointer must not hand the
  * caret back to the pane composer, and a refused redirect must leave that
  * element's focusin visible to React. Composer editors are excluded, so
- * hover-switching between panes keeps behaving as before (#114245). */
+ * hover-switching between panes keeps behaving as before (#114245).
+ *
+ * A media element's native controls are the same: Chromium retargets focus in
+ * their shadow DOM (the three-dot "more" menu) to the <audio>/<video> host, and
+ * pulling it back to the composer closed that menu the instant it opened. */
 const keepsOwnFocus = (el: Element | null) =>
-  inInlineEdit(el) || (isEditableTarget(el) && !el?.closest('[data-slot="composer-rich-input"]'))
+  inInlineEdit(el) ||
+  Boolean(el?.closest('audio, video')) ||
+  (isEditableTarget(el) && !el?.closest('[data-slot="composer-rich-input"]'))
 
 /** Focus inside an open floating layer — a popover, menu, listbox or dialog
  * portaled over the transcript — is the user's own as well. Radix moves focus
