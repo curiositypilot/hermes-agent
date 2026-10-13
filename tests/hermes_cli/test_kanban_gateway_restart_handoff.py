@@ -168,7 +168,7 @@ def test_oneshot_unit_dispatcher_scope_wraps_or_warns_never_dooms_silently(
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: True)
     monkeypatch.setattr(
         process_registry, "_build_systemd_scope_argv",
-        lambda cmd, unit_suffix: ["systemd-run", "--user", "--scope", "--unit", f"hermes-worker-{unit_suffix}", *cmd],
+        lambda cmd, unit_suffix, **_kw: ["systemd-run", "--user", "--scope", "--unit", f"hermes-worker-{unit_suffix}", *cmd],
     )
 
     kbd._default_spawn(task, str(workspace))

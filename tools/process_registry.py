@@ -37,6 +37,9 @@ from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_termination import ProcessTerminationMixin
 from tools.process_registry_results import load_completed_results, save_completed_result
 from tools.process_registry_env_log import log_delta_command
+from tools.process_registry_memory import (
+    explicit_worker_memory_max_bytes, gateway_cgroup_memory_max, physical_memory_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,47 +147,36 @@ def _worker_memory_max_bytes() -> int:
                 "expected an integer representing at least %d MiB",
                 override, _MIN_WORKER_MEMORY_MAX_BYTES // (1024 * 1024))
     candidates: List[int] = []
-    try:
-        for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
-            if line.startswith("0::"):
-                relative = line.partition("::")[2].lstrip("/")
-                raw_limit = (
-                    Path("/sys/fs/cgroup") / relative / "memory.max"
-                ).read_text(encoding="utf-8-sig").strip()
-                if raw_limit.isdigit():
-                    cgroup_limit = int(raw_limit)
-                    if cgroup_limit >= _MIN_WORKER_MEMORY_MAX_BYTES:
-                        candidates.append(cgroup_limit)
-                break
-    except (OSError, ValueError):
-        pass
-
-    try:
-        physical_bytes = int(os.sysconf("SC_PHYS_PAGES")) * int(
-            os.sysconf("SC_PAGE_SIZE")
-        )
-        physical_bound = min(
+    cgroup_limit = gateway_cgroup_memory_max(_MIN_WORKER_MEMORY_MAX_BYTES)
+    if cgroup_limit is not None:
+        candidates.append(cgroup_limit)
+    physical_bytes = physical_memory_bytes()
+    if physical_bytes is not None:
+        candidates.append(min(
             _WORKER_MEMORY_MAX_CAP_BYTES,
             max(_MIN_WORKER_MEMORY_MAX_BYTES, physical_bytes // 2),
-        )
-        candidates.append(physical_bound)
-    except (OSError, ValueError, TypeError):
-        pass
+        ))
     safe_bound = min(candidates) if candidates else _DEFAULT_WORKER_MEMORY_MAX_BYTES
     return min(override_bound, safe_bound) if override_bound else safe_bound
 
 
-def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> List[str]:
+def _systemd_scope_argv(
+    binary: str, unit_name: str, *argv: str, memory_max_bytes: Optional[int] = None,
+) -> List[str]:
     """``systemd-run --user --scope`` argv shared by the probe and real spawns.
     ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl.
     No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486).
-    ``--expand-environment=no`` keeps the command byte-identical (#132385)."""
+    ``--expand-environment=no`` keeps the command byte-identical (#132385).
+    An explicit *memory_max_bytes* (``kanban.worker_memory_max_mb``) is clamped to half of RAM and
+    the gateway cgroup but not to the 4 GiB default cap; None keeps the default bound."""
     no_expand = ["--expand-environment=no"] if _SYSTEMD_RUN_NO_EXPAND else []
+    memory_max = (
+        _worker_memory_max_bytes() if memory_max_bytes is None
+        else explicit_worker_memory_max_bytes(memory_max_bytes)
+    )
     return [
         binary, "--user", "--scope", "--quiet", *no_expand, "--unit", unit_name, "--collect",
-        "--property", "MemoryAccounting=yes",
-        "--property", f"MemoryMax={_worker_memory_max_bytes()}",
-        "--", *argv,
+        "--property", "MemoryAccounting=yes", "--property", f"MemoryMax={memory_max}", "--", *argv,
     ]
 
 
@@ -324,7 +316,9 @@ def _is_supervised_gateway_process() -> bool:
         return False
 
 
-def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[str]:
+def _build_systemd_scope_argv(
+    shell_argv: List[str], unit_suffix: str, *, memory_max_bytes: Optional[int] = None,
+) -> List[str]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation with its own
     memory accounting, so an OOM in the worker cannot kill the gateway cgroup.
 
@@ -337,7 +331,9 @@ def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[s
     if binary is None:
         # Caller should have probed availability; never pass None into Popen anyway.
         return shell_argv
-    return _systemd_scope_argv(binary, f"hermes-worker-{unit_suffix}", *shell_argv)
+    return _systemd_scope_argv(
+        binary, f"hermes-worker-{unit_suffix}", *shell_argv, memory_max_bytes=memory_max_bytes,
+    )
 
 
 _scope_degraded_warned = False
@@ -413,7 +409,7 @@ def scoped_spawn_lost_user_bus(spawn_env: Dict[str, str]) -> bool:
 
 def restart_safe_gateway_child_argv(
     command: List[str], *, unit_suffix: str, require_restart_safe_scope: bool,
-    outlives_parent: bool = False,
+    outlives_parent: bool = False, memory_max_bytes: Optional[int] = None,
 ) -> GatewayChildDispatch:
     """Place a managed-systemd gateway child outside the gateway cgroup.
 
@@ -433,7 +429,7 @@ def restart_safe_gateway_child_argv(
     (``KillMode``, lifetime) is not knowable here, so without a user bus it
     degrades with a loud warning instead of refusing: a long-lived
     ``Type=simple`` sequencer without linger keeps working. A cron job blocks its
-    caller until it finishes and never needs this.
+    caller until it finishes and never needs this. ``memory_max_bytes``: see ``_systemd_scope_argv``.
     """
     if not _IS_LINUX:
         return GatewayChildDispatch("in_process", command)
@@ -461,7 +457,9 @@ def restart_safe_gateway_child_argv(
             f"/run/user/{os.getuid()}/bus). On a system-level service install, run "  # windows-footgun: ok — behind the _IS_LINUX return above
             "`sudo loginctl enable-linger <gateway-user>` and restart the gateway."
         )
-    scoped = _build_systemd_scope_argv(command, unit_suffix=unit_suffix)
+    scoped = _build_systemd_scope_argv(
+        command, unit_suffix=unit_suffix, memory_max_bytes=memory_max_bytes,
+    )
     if scoped == command:
         return _degrade("systemd-run disappeared after the availability probe")
     return GatewayChildDispatch("scoped", scoped)
