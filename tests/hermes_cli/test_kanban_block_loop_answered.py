@@ -172,13 +172,16 @@ def test_auto_decompose_skips_finished_triage_cards(kanban_home: Path) -> None:
 
 
 def test_real_loop_still_trips_despite_worker_chatter(kanban_home: Path) -> None:
-    """Same kind, only an unblock in between; worker comments on its own runs
+    """Same kind, only an unblock and a body edit in between (the retry gate refuses
+    an unchanged re-run; an edit is not an answer); worker comments on its own runs
     (before the block / after the claim) are not answers."""
     with kbc.connect_closing() as conn:
         tid = _ready_task(conn)
         run = _claim(conn, tid)
         kb.add_comment(conn, tid, "default", "still stuck")
         kb.block_task(conn, tid, kind="capability", expected_run_id=run, reason="no creds")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET body = 'retry' WHERE id = ?", (tid,))
         kb.unblock_task(conn, tid)
         run = _claim(conn, tid)
         kb.add_comment(conn, tid, "default", "still no creds")

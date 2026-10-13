@@ -441,6 +441,17 @@ survives each unblock (it resets only on a successful `complete`). To keep an
 unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
 parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
+
+An unblock alone does not re-run a task the worker blocked. The `ready → running`
+claim runs a **retry gate**: when the newest attempt that ran the card ended
+`blocked` (any kind but `transient`/`dependency`) or `changes_requested`, the
+re-run needs a changed input — a comment posted after that run (the "what changed /
+why" note; `unblock --reason` writes one), or a different title, body, model,
+complexity, assignee, skills, runtime limit or parent set. A reviewer's
+`changes_requested` reason counts as the note. With a change, a `retry_iteration`
+event records `{changed, note}`; without one, the card goes back to `blocked`
+(`needs_input`, reason `retry without change`) instead of spawning. Infra restarts
+(crash, timeout, rate limit, spawn failure, reclaim) are not iterations and pass.
 :::
 
 ## Enabling tools for a chat profile
@@ -1454,7 +1465,8 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 |---|---|---|
 | `created` | `{assignee, status, parents, tenant}` | Task inserted. `run_id` is `NULL`. |
 | `promoted` | — | `todo → ready` because all parents hit `done`. `run_id` is `NULL`. |
-| `claimed` | `{lock, expires, run_id}` | Dispatcher atomically claimed a `ready` task for spawn. |
+| `claimed` | `{lock, expires, run_id, input_fingerprint}` | Dispatcher atomically claimed a `ready` task for spawn. `input_fingerprint` holds per-field digests the retry gate compares on the next claim. |
+| `retry_iteration` | `{after_run, after_outcome, changed, note}` | The claim re-ran a card whose last attempt was blocked or got `changes_requested`, and the input changed (`changed` lists the fields, `note` is the newest comment or the review reason). A re-run with nothing changed is parked instead as `blocked` with `reason: retry without change`. |
 | `completed` | `{result_len, summary?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |
 | `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. A `kind=dependency` block with no incomplete parent lands here as `needs_input` (payload adds `requested_kind: dependency`, `rekind_reason: no_open_parent`) because `todo` would only get it re-promoted and respawned on the next dispatch tick. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
 | `dependency_wait` | `{reason, kind}` or `{reason: parent_not_done, demoted: true, parent}` | Worker blocked with `kind=dependency` while at least one parent is still open — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked` and no recurrence is counted. No human needed. Also emitted when `link`/`kanban_link` puts a `ready` child under a parent that is not `done`: the child drops back to `todo` and this event records why (the `ready → running` claim re-checks parents, so nothing can run it until the parent completes or the link is removed with `hermes kanban unlink`). |

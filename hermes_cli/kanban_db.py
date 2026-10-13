@@ -2353,11 +2353,8 @@ def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional[Task]:
-    """Atomically transition ``ready -> running``.
-
-    Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
-    """
+    """Atomically ``ready -> running``; ``None`` when lost, not ``ready``, or held by a gate
+    (undone parent; retry without change, ``kanban_db_retry_gate``)."""
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -2376,7 +2373,10 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        from hermes_cli.kanban_db_retry_gate import gate_claim
+        if _task_status(conn, task_id) != "ready" or (claim_extra := gate_claim(conn, task_id)) is None:
+            return None
+        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now, event_extra=claim_extra)
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
