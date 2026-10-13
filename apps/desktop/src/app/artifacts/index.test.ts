@@ -589,6 +589,49 @@ ${payload}
     ])
   })
 
+  // #131978: URL pathnames are percent-encoded, so the label must be decoded
+  // back to the name the user saved (CJK, spaces) instead of %E6%B5%8B….
+  it('labels URL artifacts with their decoded file name', () => {
+    const artifacts = collectArtifactsForSession(makeSession(), [
+      {
+        content: [
+          'Workbook: [测试文件](file:///C:/x/测试文件.xlsx)',
+          'Report: https://example.com/files/quarterly%20report.pdf',
+          'Broken: https://example.com/files/broken%E6.pdf',
+          'Plain: https://example.com/files/summary.pdf'
+        ].join('\n\n'),
+        role: 'assistant',
+        timestamp: 2000
+      }
+    ])
+
+    expect(Object.fromEntries(artifacts.map(artifact => [artifact.value, artifact.label]))).toEqual({
+      'file:///C:/x/测试文件.xlsx': '测试文件.xlsx',
+      'https://example.com/files/quarterly%20report.pdf': 'quarterly report.pdf',
+      'https://example.com/files/broken%E6.pdf': 'broken%E6.pdf',
+      'https://example.com/files/summary.pdf': 'summary.pdf'
+    })
+  })
+
+  it('labels local path artifacts with their raw base name', () => {
+    const artifacts = collectArtifactsForSession(makeSession(), [
+      {
+        content: [
+          '[Image: report](#media:C%3A%5CUsers%5CMorten%5CMy%20Report.png)',
+          'Chart: /tmp/generated/growth-100%25.pdf'
+        ].join('\n\n'),
+        role: 'assistant',
+        timestamp: 2000
+      }
+    ])
+
+    // A raw filesystem path is not percent-encoded: a literal % in its name stays.
+    expect(Object.fromEntries(artifacts.map(artifact => [artifact.value, artifact.label]))).toEqual({
+      'C:\\Users\\Morten\\My Report.png': 'My Report.png',
+      '/tmp/generated/growth-100%25.pdf': 'growth-100%25.pdf'
+    })
+  })
+
   it('collects #media: hrefs stored on explicit tool artifact keys', () => {
     const artifacts = collectArtifactsForSession(makeSession(), [
       {
