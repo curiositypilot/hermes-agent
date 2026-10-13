@@ -77,7 +77,8 @@ def _native_vision_result(
     if lp_fallback_warning:
         meta["fallback_warning"] = lp_fallback_warning
     if annotate and result.get("data", {}).get("annotations"):
-        meta["annotations"] = result["data"]["annotations"]
+        from tools.browser_tool_snapshot import _redact_browser_output
+        meta["annotations"] = _redact_browser_output(result["data"]["annotations"])
     native_result["text_summary"] = f"{native_result.get('text_summary', '')} Screenshot path: {screenshot_path}".strip()
     return native_result
 
@@ -141,4 +142,5 @@ def _analyze_screenshot_with_aux_llm(screenshot_path: Path, question: str) -> st
         response = call_llm(**call_kwargs)
 
     from agent.redact import redact_sensitive_text  # the LLM may have read secrets off the screenshot
-    return redact_sensitive_text((response.choices[0].message.content or "").strip())
+    # force=True: tool output is a model boundary, redacted even with security.redact_secrets off.
+    return redact_sensitive_text((response.choices[0].message.content or "").strip(), force=True)

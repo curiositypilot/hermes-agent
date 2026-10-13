@@ -486,9 +486,12 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None, user_tas
 
 def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
     """Click an element by ref via Camofox."""
+    from tools.browser_tool_snapshot import _redact_browser_output
+
     clean_ref = ref.lstrip("@")  # our tool convention prefixes refs with @
     return _tab_action(task_id, "click", "click", {"ref": clean_ref},
-                       lambda data: {"success": True, "clicked": clean_ref, "url": data.get("url", "")})
+                       lambda data: {"success": True, "clicked": clean_ref,
+                                     "url": _redact_browser_output(data.get("url", ""))})
 
 
 def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
@@ -519,7 +522,10 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
 
 def camofox_back(task_id: Optional[str] = None) -> str:
     """Navigate back via Camofox."""
-    return _tab_action(task_id, None, "back", {}, lambda data: {"success": True, "url": data.get("url", "")})
+    from tools.browser_tool_snapshot import _redact_browser_output
+
+    return _tab_action(task_id, None, "back", {},
+                       lambda data: {"success": True, "url": _redact_browser_output(data.get("url", ""))})
 
 
 def camofox_press(key: str, task_id: Optional[str] = None) -> str:
@@ -577,7 +583,9 @@ def camofox_vision(question: str, annotate: bool = False, task_id: Optional[str]
         annotation_context = ""
         if annotate:
             try:
-                snapshot = _snapshot_data(session).get("snapshot", "")
+                from tools.browser_tool_snapshot import _redact_browser_output
+                # Redact before the cut: a secret straddling char 3000 would keep its prefix.
+                snapshot = _redact_browser_output(_snapshot_data(session).get("snapshot", ""))
                 annotation_context = f"\n\nAccessibility tree (element refs for interaction):\n{snapshot[:3000]}"
             except Exception:
                 pass

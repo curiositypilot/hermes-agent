@@ -781,7 +781,9 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     if blocked is not None:
         return blocked
 
-    response = {"success": True, "url": final_url, "title": title}
+    # Only the returned copies are redacted; the redirect and bot-title checks need the raw values.
+    response = {"success": True, "url": _snapshot._redact_browser_output(final_url),
+                "title": _snapshot._redact_browser_output(title)}
     features = session_info.get("features") or {}
     if features.get("real_profile"):  # auditability: this ran on the user's real-profile copy-browser
         response["used_real_profile"] = True
@@ -798,8 +800,9 @@ def _add_navigate_warnings(response: Dict[str, Any], title: str, first_nav_sessi
     """Bot-detection hint from the page title; on first navigation, the session's stealth features."""
     title_lower = title.lower()
     if any(pattern in title_lower for pattern in _BOT_DETECTION_TITLE_PATTERNS):
+        shown_title = _snapshot._redact_browser_output(title)  # raw title only for the match above
         response["bot_detection_warning"] = (
-            f"Page title '{title}' suggests bot detection. The site may have blocked this request. "
+            f"Page title '{shown_title}' suggests bot detection. The site may have blocked this request. "
             "Options: 1) Try adding delays between actions, 2) Access different pages first, "
             "3) Enable advanced stealth (BROWSERBASE_ADVANCED_STEALTH=true, requires Scale plan), "
             "4) Some sites have very aggressive bot detection that may be unavoidable."
@@ -938,7 +941,8 @@ def browser_back(task_id: Optional[str] = None) -> str:
         blocked = _blocked_private_page(effective_task_id, "Browser history navigation (back) landed on this address.")
         if blocked is not None:
             return blocked
-    return _tool_response(result, {"url": result.get("data", {}).get("url", "")}, "Failed to go back")
+    url = _snapshot._redact_browser_output(result.get("data", {}).get("url", ""))
+    return _tool_response(result, {"url": url}, "Failed to go back")
 
 
 def browser_press(key: str, task_id: Optional[str] = None) -> str:

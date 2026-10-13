@@ -2,7 +2,7 @@
 
 import json
 import socket
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import pytest
 
 
@@ -225,3 +225,65 @@ class TestBrowserSupervisorRedaction:
         assert result["pending_dialogs"][0]["message"].startswith("Enter API key sk-")
         assert result["pending_dialogs"][0]["default_prompt"].startswith("sk-")
         assert result["recent_dialogs"][0]["message"].startswith("Recent key sk-")
+
+
+_FAKE_VAULT_VALUE = "FakeVaultPw-9xQ!"
+
+
+class TestAgentBrowserOutputRedaction:
+    """agent-browser (non-Camofox) results are a model boundary: page URLs, titles and the
+    aux vision reply are force-redacted (intake t_96fdc9ed)."""
+
+    @pytest.fixture(autouse=True)
+    def _vault_value(self, monkeypatch):
+        from agent.redact import clear_vault_redaction_values, register_vault_redaction_value
+
+        monkeypatch.delenv("CAMOFOX_URL", raising=False)
+        register_vault_redaction_value(_FAKE_VAULT_VALUE)
+        yield
+        clear_vault_redaction_values()
+
+    def test_back_url_scrubs_vault_value(self):
+        from tools.browser_tool import browser_back
+
+        url = f"https://login.example/cb?session={_FAKE_VAULT_VALUE}"
+        with patch("tools.browser_tool_session._run_browser_command",
+                   return_value={"success": True, "data": {"url": url}}), \
+             patch("tools.browser_tool._blocked_private_page", return_value=None):
+            raw = browser_back(task_id="ab1")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert _FAKE_VAULT_VALUE not in raw
+        assert result["url"].startswith("https://login.example/cb?session=")
+
+    def test_navigate_url_and_title_scrub_vault_value(self):
+        from tools.browser_tool import browser_navigate
+
+        # A redirect lands on a URL carrying the value; the bot-check title carries it too.
+        data = {"title": f"Just a moment... {_FAKE_VAULT_VALUE}",
+                "url": f"https://login.example/cb?session={_FAKE_VAULT_VALUE}"}
+        with patch("tools.browser_tool_session._run_browser_command",
+                   return_value={"success": True, "data": data}), \
+             patch("tools.browser_tool_session._get_session_info", return_value={"_first_nav": False}), \
+             patch("tools.browser_tool_cloud._is_local_backend", return_value=True):
+            raw = browser_navigate("https://login.example/start", task_id="ab2")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert _FAKE_VAULT_VALUE not in raw
+        assert "bot_detection_warning" in result  # the check still sees the raw title
+
+    def test_aux_vision_reply_redacted_with_redaction_disabled(self, tmp_path, monkeypatch):
+        from tools.browser_tool_vision import _analyze_screenshot_with_aux_llm
+
+        monkeypatch.setattr("agent.redact._redact_enabled", lambda: False)  # security.redact_secrets: false
+        fake_key = "sk-" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4"
+        shot = tmp_path / "shot.png"
+        shot.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        reply = MagicMock()
+        reply.choices = [MagicMock()]
+        reply.choices[0].message.content = f"The settings page shows the key {fake_key}"
+        with patch("agent.auxiliary_client.call_llm", return_value=reply), \
+             patch("tools.browser_tool._get_vision_model", return_value=None):
+            analysis = _analyze_screenshot_with_aux_llm(shot, "what key is shown?")
+        assert fake_key not in analysis
+        assert analysis.startswith("The settings page shows the key")

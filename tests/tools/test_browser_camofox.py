@@ -388,3 +388,32 @@ class TestCamofoxVaultRedaction:
         assert json.loads(raw)["success"] is True
         assert fake_key not in raw
 
+    @patch("tools.browser_camofox.requests.post")
+    def test_click_and_back_url_scrub_vault_value(self, mock_post):
+        from tools.browser_camofox import camofox_back
+
+        self._open_tab(mock_post, "vr5")
+        mock_post.return_value = _mock_response(json_data={
+            "ok": True, "url": f"https://login.example/cb?session={_FAKE_VAULT_VALUE}"})
+        for raw in (camofox_click("@e1", task_id="vr5"), camofox_back(task_id="vr5")):
+            result = json.loads(raw)
+            assert result["success"] is True
+            assert _FAKE_VAULT_VALUE not in raw
+            assert result["url"].startswith("https://login.example/cb?session=")
+
+    @patch("tools.browser_camofox.requests.post")
+    @patch("tools.browser_camofox.requests.get")
+    def test_vision_annotation_redacts_before_truncation(self, mock_get, mock_post):
+        self._open_tab(mock_post, "vr6")
+        # The vault value straddles the 3000-char annotation cut: 10 chars before it.
+        mock_get.return_value = _mock_response(json_data={
+            "snapshot": "x" * (3000 - 10) + _FAKE_VAULT_VALUE, "refsCount": 1})
+        llm_reply = MagicMock()
+        llm_reply.choices = [MagicMock()]
+        llm_reply.choices[0].message.content = "ok"
+        with patch("agent.auxiliary_client.call_llm", return_value=llm_reply) as mock_llm, \
+             patch("tools.browser_camofox._save_screenshot", return_value="/dev/null"):
+            result = json.loads(camofox_vision("q", annotate=True, task_id="vr6"))
+        assert result["success"] is True
+        prompt = mock_llm.call_args.kwargs["messages"][0]["content"][0]["text"]
+        assert _FAKE_VAULT_VALUE[:10] not in prompt
