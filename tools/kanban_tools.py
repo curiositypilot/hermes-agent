@@ -850,6 +850,7 @@ def _handle_block(args: dict, **kw) -> str:
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
+    metadata = _stamp_worker_session_metadata(tid, None)
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
@@ -869,7 +870,8 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
+        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+                           metadata=metadata)
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
         landed_kind = kb.get_task(conn, tid).block_kind
         extra: dict = {"block_kind": landed_kind}
@@ -891,6 +893,7 @@ def _handle_schedule(args: dict, **kw) -> str:
     raw_reason = args.get("reason")
     _check(raw_reason is None or isinstance(raw_reason, str), "reason must be a string")
     reason = _redact(raw_reason.strip()) if raw_reason and raw_reason.strip() else None
+    metadata = _stamp_worker_session_metadata(tid, None)
     with _board(args.get("board")) as (kb, conn):
         # The goal loop treats ``scheduled`` as terminal like ``blocked``, so
         # parking would bypass the completion judge (see kanban_block, #38696).
@@ -900,7 +903,7 @@ def _handle_schedule(args: dict, **kw) -> str:
                f"in {sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} for a genuine external "
                "blocker, or kanban_complete so the completion judge can evaluate it.")
         ok = kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), metadata=metadata)
         _check(ok, f"could not schedule {tid} (unknown id or not in todo/ready/running/blocked)")
         return _ok_landed(kb, conn, tid, "scheduled", reason=reason)
 
@@ -957,9 +960,10 @@ def _handle_request_changes(args: dict, **kw) -> str:
     tid = _worker_guard("kanban_request_changes", args)
     reason = _redact(
         _require_text(args, "reason", "reason is required — describe the changes needed"))
+    metadata = _stamp_worker_session_metadata(tid, None)
     with _board(args.get("board")) as (kb, conn):
         ok, detail = kb.request_changes(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), metadata=metadata)
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
         return _ok_landed(kb, conn, tid, "ready", implementer=detail)
 

@@ -309,6 +309,46 @@ def test_request_review_accepts_installed_profile(monkeypatch, worker_env, tmp_p
         assert (task.status, task.assignee) == ("review", "verifier")
 
 
+def _bind_worker(monkeypatch, conn, tid):
+    """Point the worker env at ``tid``'s live run (what the dispatcher pins at spawn)."""
+    from hermes_cli import kanban_db as kb
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(conn, tid).current_run_id))
+
+
+def test_block_schedule_request_changes_stamp_worker_session_id(monkeypatch, worker_env):
+    """Every worker transition that closes a run names the worker session, so the
+    run gets its token usage (only complete/request_review did, t_c530d54c)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "s_worker")
+    out = json.loads(kt._handle_block({"reason": "need a decision", "kind": "needs_input"}))
+    assert out.get("ok") is True, out
+    with kbc.connect() as conn:
+        assert kb.latest_run(conn, worker_env).metadata["worker_session_id"] == "s_worker"
+        sched = kb.create_task(conn, title="sched", assignee="test-worker")
+        kb.claim_task(conn, sched)
+        _bind_worker(monkeypatch, conn, sched)
+    out = json.loads(kt._handle_schedule({"reason": "until 2099-01-01: wait"}))
+    assert out.get("ok") is True, out
+    with kbc.connect() as conn:
+        assert kb.latest_run(conn, sched).metadata["worker_session_id"] == "s_worker"
+        rev = kb.create_task(conn, title="rev", assignee="test-worker")
+        kb.claim_task(conn, rev)
+        assert kb.request_review(conn, rev, summary="ready",
+                                 expected_run_id=kb.get_task(conn, rev).current_run_id)
+        assert kb.claim_review_task(conn, rev, claimer="reviewer:1") is not None
+        _bind_worker(monkeypatch, conn, rev)
+    monkeypatch.setenv("HERMES_SESSION_ID", "s_reviewer")
+    out = json.loads(kt._handle_request_changes({"reason": "add a regression test"}))
+    assert out.get("ok") is True, out
+    with kbc.connect() as conn:
+        run = kb.latest_run(conn, rev)
+        assert (run.outcome, run.metadata["worker_session_id"]) == ("changes_requested", "s_reviewer")
+
+
 def test_unbound_worker_cannot_mutate_card(monkeypatch, worker_env):
     """A dispatcher-spawned worker that cannot resolve its run id must be refused
     on every run-lifecycle mutation. ``expected_run_id=None`` would silently skip

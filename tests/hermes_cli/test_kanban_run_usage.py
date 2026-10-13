@@ -57,6 +57,19 @@ def test_complete_records_worker_session_usage_across_compression(home):
     assert usage["session_ids"] == ["s_child", "s_root"]
 
 
+def test_block_records_worker_session_usage(home):
+    # Blocked runs are billed too (t_c530d54c): the block path carries the session id.
+    _session(home, "s_root", model="m-1", provider="prov", inp=100, out=10, cached=1000)
+    _session(home, "s_child", parent="s_root", model="m-1", provider="prov", inp=50, out=5, cached=500)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="demo", assignee="default")
+        assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
+        assert kb.block_task(conn, tid, reason="x", metadata={"worker_session_id": "s_child"})
+        usage = _run_metadata(conn, tid)["usage"]
+    assert usage["model"] == "m-1" and usage["provider"] == "prov"
+    assert (usage["input_tokens"], usage["output_tokens"], usage["cached_tokens"]) == (150, 15, 1500)
+
+
 def test_missing_session_closes_run_without_usage(home):
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="demo", assignee="default")
