@@ -1217,6 +1217,75 @@ describe('workspaceCwdForNewSession', () => {
     expect($currentCwd.get()).toBe('')
   })
 
+  it('seeds a remote gateway with no remembered workspace from the configured default project dir', async () => {
+    // Boot into a remote gateway with Settings > Sessions > Default project
+    // directory set: the draft must start attached to it (as local mode and
+    // workspaceCwdForNewSession already do), not on "No project open". The
+    // path lives on the gateway host, so the local-FS sanitizer never sees it.
+    const sanitizeWorkspaceCwd = vi.fn(async () => ({ cwd: '' }))
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = {
+      sanitizeWorkspaceCwd,
+      settings: {
+        getDefaultProjectDir: vi.fn(async () => ({
+          defaultLabel: '/srv/projects/default',
+          dir: '/srv/projects/default',
+          resolvedCwd: '/srv/projects/default'
+        }))
+      }
+    }
+
+    $connection.set({ baseUrl: 'http://backend-a', mode: 'remote' } as never)
+    expect(getRememberedWorkspaceCwd()).toBe('')
+
+    await ensureDefaultWorkspaceCwd(() => true)
+
+    expect($currentCwd.get()).toBe('/srv/projects/default')
+    expect(sanitizeWorkspaceCwd).not.toHaveBeenCalled()
+  })
+
+  it('keeps the remembered remote workspace over the configured default project dir', async () => {
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = {
+      sanitizeWorkspaceCwd: vi.fn(async (cwd: string) => ({ cwd })),
+      settings: {
+        getDefaultProjectDir: vi.fn(async () => ({
+          defaultLabel: '/srv/projects/default',
+          dir: '/srv/projects/default',
+          resolvedCwd: '/srv/projects/default'
+        }))
+      }
+    }
+
+    $connection.set({ baseUrl: 'http://backend-a', mode: 'remote' } as never)
+    setCurrentCwd('/srv/projects/picked')
+    $currentCwd.set('')
+
+    await ensureDefaultWorkspaceCwd(() => true)
+
+    expect($currentCwd.get()).toBe('/srv/projects/picked')
+  })
+
+  it('does not seed the configured remote default over an active session', async () => {
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = {
+      sanitizeWorkspaceCwd: vi.fn(async (cwd: string) => ({ cwd })),
+      settings: {
+        getDefaultProjectDir: vi.fn(async () => ({
+          defaultLabel: '/srv/projects/default',
+          dir: '/srv/projects/default',
+          resolvedCwd: '/srv/projects/default'
+        }))
+      }
+    }
+
+    $connection.set({ baseUrl: 'http://backend-a', mode: 'remote' } as never)
+    $activeSessionId.set('sess-1')
+    $currentCwd.set('/srv/live/session')
+
+    await ensureDefaultWorkspaceCwd(() => true)
+
+    expect($currentCwd.get()).toBe('/srv/live/session')
+  })
+
   it('scopes the local workspace memory per profile, keeping the bare key for default (#96834)', () => {
     $connection.set({ baseUrl: '', mode: 'local', profile: 'default' } as never)
     setCurrentCwd('/home/user/default-project')
