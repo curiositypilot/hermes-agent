@@ -91,8 +91,9 @@ def _camofox_eval(task_id: str, expression: str) -> Dict[str, Any]:
     Camofox (Camoufox/Firefox) exposes no CDP endpoint, so neither the supervisor nor the agent-browser
     CLI can reach its page; the CLI fallback launched a separate blank Chromium and the origin read came
     back ``about:blank``. The expression travels in the JSON body of the request (never argv) and the
-    server logs only the result type. Never opens a tab: no tab means there is no page to read or fill."""
-    from tools.browser_camofox import _get_session, _post
+    server logs only the result type. Never opens a tab: no tab means there is no page to read or fill.
+    A 404/410 (tab reaped, or server restarted) drops the dead tab id and asks for a navigate."""
+    from tools.browser_camofox import _TAB_GONE_ERROR, _forget_dead_tab, _get_session, _is_tab_gone, _post
 
     session = _get_session(task_id)
     tab_id = session.get("tab_id")
@@ -101,6 +102,9 @@ def _camofox_eval(task_id: str, expression: str) -> Dict[str, Any]:
     try:
         resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": session["user_id"]})
     except Exception as exc:
+        if _is_tab_gone(exc):
+            _forget_dead_tab(session)
+            return {"success": False, "error": _TAB_GONE_ERROR}
         return {"success": False, "error": f"Camofox evaluate failed: {str(exc)[:200]}"}
     if isinstance(resp, dict):
         if resp.get("error"):

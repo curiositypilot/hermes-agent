@@ -1119,8 +1119,12 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
 
 
 def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
-    """Evaluate JS via Camofox's /tabs/{tab_id}/evaluate endpoint (if available)."""
-    from tools.browser_camofox import _ensure_tab, _post
+    """Evaluate JS via Camofox's /tabs/{tab_id}/evaluate endpoint (if available).
+
+    A 404/410 means the tab is gone (reaped, or the server restarted): the dead id is dropped and the
+    model is told to navigate, since the next eval would otherwise run on a fresh about:blank tab."""
+    from tools.browser_camofox import _TAB_GONE_ERROR, _ensure_tab, _forget_dead_tab, _is_tab_gone, _post
+    tab_info = None
     try:
         tab_info = _ensure_tab(task_id or "default")
         tab_id = tab_info.get("tab_id") or tab_info.get("id")
@@ -1135,7 +1139,10 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
 
         return _dumps(_eval_ok_response(parsed), default=str)
     except Exception as e:
-        if any(code in str(e) for code in ("404", "405", "501")):  # server without eval support
+        if _is_tab_gone(e):
+            _forget_dead_tab(tab_info)
+            return tool_error(_TAB_GONE_ERROR, success=False)
+        if getattr(getattr(e, "response", None), "status_code", None) in (405, 501):  # server without eval support
             return json.dumps(_err("JavaScript evaluation is not supported by this Camofox server. "
                                    "Use browser_snapshot or browser_vision to inspect page state."))
         return tool_error(str(e), success=False)
