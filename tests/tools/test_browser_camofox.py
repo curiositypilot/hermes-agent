@@ -3,6 +3,8 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 from tools.browser_camofox import (
     camofox_click,
@@ -309,4 +311,80 @@ class TestBrowserToolRouting:
         from tools.browser_tool_install import check_browser_requirements
         assert check_browser_requirements() is True
 
+
+# ---------------------------------------------------------------------------
+# Secret redaction at the model boundary (vault-filled values, known prefixes)
+# ---------------------------------------------------------------------------
+
+
+_FAKE_VAULT_VALUE = "FakeVaultPw-9xQ!"
+
+
+class TestCamofoxVaultRedaction:
+    """A vault-filled password renders as the textbox value in the accessibility tree;
+    every Camofox page-text result must scrub it like the agent-browser path does."""
+
+    @pytest.fixture(autouse=True)
+    def _vault_value(self, monkeypatch):
+        from agent.redact import clear_vault_redaction_values, register_vault_redaction_value
+
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        register_vault_redaction_value(_FAKE_VAULT_VALUE)
+        yield
+        clear_vault_redaction_values()
+
+    @staticmethod
+    def _open_tab(mock_post, task_id):
+        mock_post.return_value = _mock_response(json_data={"tabId": f"tab_{task_id}", "url": "https://login.example"})
+        camofox_navigate("https://login.example", task_id=task_id)
+
+    @patch("tools.browser_camofox.requests.post")
+    @patch("tools.browser_camofox.requests.get")
+    def test_snapshot_scrubs_registered_vault_value(self, mock_get, mock_post):
+        self._open_tab(mock_post, "vr1")
+        mock_get.return_value = _mock_response(json_data={
+            "snapshot": f'- textbox "Password" [e7]: {_FAKE_VAULT_VALUE}', "refsCount": 1})
+
+        from tools.browser_tool import browser_snapshot
+        for raw in (camofox_snapshot(task_id="vr1"), browser_snapshot(task_id="vr1")):
+            result = json.loads(raw)
+            assert result["success"] is True
+            assert _FAKE_VAULT_VALUE not in raw
+            assert "«redacted-vault-secret»" in result["snapshot"]
+            assert "[e7]" in result["snapshot"]  # ref stays usable
+
+    @patch("tools.browser_camofox.requests.post")
+    @patch("tools.browser_camofox.requests.get")
+    def test_navigate_autosnapshot_scrubs_registered_vault_value(self, mock_get, mock_post):
+        mock_post.return_value = _mock_response(json_data={"tabId": "tab_vr2", "url": "https://login.example"})
+        mock_get.return_value = _mock_response(json_data={
+            "snapshot": f'- textbox "Password" [e7]: {_FAKE_VAULT_VALUE}', "refsCount": 1})
+        raw = camofox_navigate("https://login.example", task_id="vr2")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "«redacted-vault-secret»" in result["snapshot"]
+        assert _FAKE_VAULT_VALUE not in raw
+
+    @patch("tools.browser_camofox.requests.post")
+    @patch("tools.browser_camofox.requests.get")
+    def test_get_images_scrubs_registered_vault_value(self, mock_get, mock_post):
+        self._open_tab(mock_post, "vr3")
+        mock_get.return_value = _mock_response(json_data={
+            "snapshot": f'- img "x" [e9]\n  - /url: https://a.example/?t={_FAKE_VAULT_VALUE}'})
+        raw = camofox_get_images(task_id="vr3")
+        result = json.loads(raw)
+        assert result["success"] is True and result["count"] == 1
+        assert _FAKE_VAULT_VALUE not in raw
+
+    @patch("tools.browser_camofox.requests.post")
+    @patch("tools.browser_camofox.requests.get")
+    def test_snapshot_redacts_known_prefix_secret(self, mock_get, mock_post, monkeypatch):
+        monkeypatch.setenv("HERMES_REDACT_SECRETS", "false")  # tool output is redacted regardless
+        fake_key = "sk-" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4"
+        self._open_tab(mock_post, "vr4")
+        mock_get.return_value = _mock_response(json_data={
+            "snapshot": f'- textbox "API key" [e3]: {fake_key}', "refsCount": 1})
+        raw = camofox_snapshot(task_id="vr4")
+        assert json.loads(raw)["success"] is True
+        assert fake_key not in raw
 

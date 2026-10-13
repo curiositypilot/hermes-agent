@@ -366,15 +366,16 @@ def _parse_snapshot_images(snapshot: str) -> list[Dict[str, str]]:
 
 def _fetch_snapshot(session: Dict[str, Any]) -> tuple[str, int]:
     """``(snapshot_text, refs_count)`` truncated like the main browser tool (line boundaries,
-    full tree stored to cache/web, read_file pointer appended). Lazy import: ``browser_tool``
-    imports this module."""
-    from tools.browser_tool_snapshot import _truncate_snapshot
+    full tree stored to cache/web, read_file pointer appended), then secret-redacted: tool output
+    is a model boundary, and a vault-filled password renders as the textbox value. Lazy import:
+    ``browser_tool`` imports this module."""
+    from tools.browser_tool_snapshot import _redact_browser_output, _truncate_snapshot
     from tools.browser_tool import get_browser_snapshot_threshold
     data = _snapshot_data(session)
     snapshot, threshold = data.get("snapshot", ""), get_browser_snapshot_threshold()
     if len(snapshot) > threshold:
         snapshot = _truncate_snapshot(snapshot, max_chars=threshold)
-    return snapshot, data.get("refsCount", 0)
+    return _redact_browser_output(snapshot), data.get("refsCount", 0)
 
 
 def _navigate_tab(task_id: Optional[str], browser_url: str) -> tuple[Dict[str, Any], dict]:
@@ -400,7 +401,9 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
     try:
         browser_url, rewrite_info = _rewrite_loopback_url_for_camofox(url)
         session, data = _navigate_tab(task_id, browser_url)
-        result = {"success": True, "url": data.get("url", browser_url), "title": data.get("title", "")}
+        from tools.browser_tool_snapshot import _redact_browser_output
+        result = {"success": True, "url": _redact_browser_output(data.get("url", browser_url)),
+                  "title": _redact_browser_output(data.get("title", ""))}
         if rewrite_info:
             result["requested_url"], result["url_rewrite"] = url, rewrite_info
             result["warning"] = ("Rewrote loopback URL for Docker-hosted Camofox: "
@@ -537,8 +540,10 @@ def camofox_close(task_id: Optional[str] = None) -> str:
 
 def camofox_get_images(task_id: Optional[str] = None) -> str:
     """Get images on the current page via Camofox (parsed from the snapshot)."""
+    from tools.browser_tool_snapshot import _redact_browser_output
+
     def body(session):
-        images = _parse_snapshot_images(_snapshot_data(session).get("snapshot", ""))
+        images = _redact_browser_output(_parse_snapshot_images(_snapshot_data(session).get("snapshot", "")))
         return json.dumps({"success": True, "images": images, "count": len(images)})
     return _with_tab(task_id, "extract page images", body)
 
@@ -580,7 +585,7 @@ def camofox_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # sent alongside it must not leak secret values.
         from agent.redact import redact_sensitive_text
         from agent.auxiliary_client import call_llm
-        vision_prompt = f"Analyze this browser screenshot and answer: {question}{redact_sensitive_text(annotation_context)}"
+        vision_prompt = f"Analyze this browser screenshot and answer: {question}{redact_sensitive_text(annotation_context, force=True)}"
         timeout, temperature = _vision_llm_settings()
         response = call_llm(
             messages=[{"role": "user", "content": [
@@ -589,7 +594,7 @@ def camofox_vision(question: str, annotate: bool = False, task_id: Optional[str]
             task="vision", temperature=temperature, timeout=timeout)
         analysis = (response.choices[0].message.content or "").strip() if response.choices else ""
         # Redact secrets the vision LLM may have read from the screenshot.
-        return json.dumps({"success": True, "analysis": redact_sensitive_text(analysis), "screenshot_path": screenshot_path})
+        return json.dumps({"success": True, "analysis": redact_sensitive_text(analysis, force=True), "screenshot_path": screenshot_path})
     return _with_tab(task_id, "capture a screenshot", body)
 
 
