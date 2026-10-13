@@ -97,6 +97,23 @@ def test_dispatcher_close_records_usage_from_heartbeat_stamp(home):
     assert usage["session_ids"] == ["s_child", "s_root"]
 
 
+def test_block_without_metadata_records_usage_from_heartbeat_stamp(home):
+    # The goal-loop turn-budget block (cli_single_query._block) passes no metadata;
+    # the heartbeat stamp is its only source of usage (t_2bba330e).
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    _session(home, "s_goal", model="m-2", provider="prov", inp=7, out=3, cached=70)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="demo", assignee="default")
+        assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
+        run = _open_run(conn, tid)
+        assert kbd.heartbeat_worker(conn, tid, worker_session_id="s_goal", expected_run_id=run)
+        assert kb.block_task(conn, tid, reason="turn budget", expected_run_id=run)
+        meta = _run_metadata(conn, tid)
+    assert meta["worker_session_id"] == "s_goal"
+    assert (meta["usage"]["input_tokens"], meta["usage"]["output_tokens"]) == (7, 3)
+
+
 def test_heartbeat_stamp_preserves_open_run_metadata(home):
     from hermes_cli import kanban_db_dispatch as kbd
 
