@@ -25,6 +25,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _configured_worker_memory_max_bytes() -> Optional[int]:
+    """``kanban.worker_memory_max_mb`` in bytes, or None (unset, invalid, <= 0, unreadable config)
+    so the worker scope keeps the default MemoryMax bound."""
+    from hermes_cli.config import load_config_readonly
+
+    try:
+        raw = ((load_config_readonly() or {}).get("kanban") or {}).get("worker_memory_max_mb")
+    except Exception:  # health: allow BLE001 -- a config read must never block a spawn; logged with traceback
+        logger.warning("could not read kanban.worker_memory_max_mb; using the default", exc_info=True)
+        return None
+    if raw is None:
+        return None
+    try:
+        mib = int(raw) if not isinstance(raw, bool) else 0
+    except (TypeError, ValueError):
+        mib = 0
+    if mib <= 0:
+        logger.warning(
+            "ignoring kanban.worker_memory_max_mb=%r: expected a positive integer (MiB)", raw,
+        )
+        return None
+    return mib * 1024 * 1024
+
+
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     """Wrap a systemd-hosted dispatcher's worker in the shared restart-safe scope.
 
@@ -35,8 +59,11 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     dispatcher does not charge to the card). Under any other systemd unit
     (``Type=oneshot`` dispatch timers, #113612) ``outlives_parent=True`` gets the
     worker its own scope so the unit's cgroup teardown cannot kill it.
+    ``kanban.worker_memory_max_mb`` sets the scope's MemoryMax above the 4 GiB default cap.
     """
     from tools.process_registry import restart_safe_gateway_child_argv
+
+    memory_max_bytes = _configured_worker_memory_max_bytes()
 
     if task.current_run_id is None:
         # Outside managed systemd this is harmless, but a managed dispatch must
@@ -47,6 +74,7 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
             unit_suffix=f"kanban-{task.id}-run-missing",
             require_restart_safe_scope=True,
             outlives_parent=True,
+            memory_max_bytes=memory_max_bytes,
         )
         if dispatch.mode != "in_process":
             raise RuntimeError(
@@ -60,6 +88,7 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
         unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
         require_restart_safe_scope=True,
         outlives_parent=True,
+        memory_max_bytes=memory_max_bytes,
     ).argv
 
 

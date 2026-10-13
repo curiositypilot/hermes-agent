@@ -1959,11 +1959,11 @@ DEFAULT_CONFIG = {
         # on a 1 GiB VM. On hosts where total memory can't be read (macOS/Windows), unset falls back to no
         # cap. Set an explicit value to override the derived default in either direction.
         "max_in_progress": None,
-        # Per-profile cap: positive int = no profile runs more than N workers; excess defers a tick.
-        # Unset (None) means "no per-profile cap" — backward-compatible with existing installs. Useful for
-        # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
-        # pool while leaving other profiles idle. See #21582.
+        # Per-profile cap: positive int = no profile runs more than N workers; excess defers a tick. Unset
+        # (None) means "no per-profile cap" — backward-compatible with existing installs. Useful for fan-out
+        # workflows that would otherwise saturate one profile's local model / API quota / browser pool. #21582.
         "max_in_progress_per_profile": None,
+        "worker_memory_max_mb": None,  # Worker scope MemoryMax (MiB); lifts the 4 GiB default, still <= RAM/2
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a
