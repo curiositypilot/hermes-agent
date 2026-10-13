@@ -37,6 +37,7 @@ $HERMES_HOME/SOUL.md
 - If `SOUL.md` exists but is empty, or cannot be loaded, Hermes falls back to a built-in default identity
 - If `SOUL.md` has content, that content is injected verbatim after security scanning and truncation
 - SOUL.md is **not** duplicated in the context files section — it appears only once, as the identity
+- Lines between a `<!-- chat-only -->` line and a `<!-- /chat-only -->` line are left out for Kanban workers (they talk to the board, not to you). Every other session gets them, and the marker lines themselves never reach a prompt
 
 That makes `SOUL.md` a true per-user or per-instance identity, not just an additive layer.
 

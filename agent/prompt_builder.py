@@ -1652,10 +1652,49 @@ def _omitted_headings(content: str, start: int, end: int, limit: int = 15) -> li
     return headings[:limit] + (["..."] if len(headings) > limit else [])
 
 
-def load_soul_md(context_length: Optional[int] = None, home_override: "Path | None" = None) -> Optional[str]:
+# SOUL.md lines between these two marker lines talk to the user in chat (reply shape, act-vs-ask etiquette).
+# A dispatcher-owned Kanban worker drops them; every other session keeps the text. The marker lines never
+# reach a prompt, so marking a SOUL.md leaves chat prompts byte-identical.
+SOUL_CHAT_ONLY_START = "<!-- chat-only -->"
+SOUL_CHAT_ONLY_END = "<!-- /chat-only -->"
+
+
+def strip_soul_chat_only(text: str, *, drop_sections: bool) -> str:
+    """*text* without the chat-only marker lines; with *drop_sections* also without the lines they enclose.
+
+    A dropped block also swallows the blank lines after it when the kept text already ends in a blank line,
+    so cutting a whole section leaves one paragraph break. Unbalanced markers keep every section (a lost
+    end marker must not cut the rest of the identity) and log a warning."""
+    if SOUL_CHAT_ONLY_START not in text and SOUL_CHAT_ONLY_END not in text:
+        return text
+    lines = text.splitlines(keepends=True)
+    markers = [t for t in (line.strip() for line in lines) if t in (SOUL_CHAT_ONLY_START, SOUL_CHAT_ONLY_END)]
+    if markers != [SOUL_CHAT_ONLY_START, SOUL_CHAT_ONLY_END] * (len(markers) // 2):
+        logger.warning("SOUL.md chat-only markers are unbalanced; keeping every section")
+        drop_sections = False
+    out: list[str] = []
+    inside = after_block = False
+    for line in lines:
+        tag = line.strip()
+        if tag in (SOUL_CHAT_ONLY_START, SOUL_CHAT_ONLY_END):
+            inside = tag == SOUL_CHAT_ONLY_START
+            after_block = drop_sections and not inside
+            continue
+        if drop_sections and inside:
+            continue
+        if after_block and not tag and (not out or not out[-1].strip()):
+            continue
+        after_block = False
+        out.append(line)
+    return "".join(out)
+
+
+def load_soul_md(context_length: Optional[int] = None, home_override: "Path | None" = None,
+                 drop_chat_only: bool = False) -> Optional[str]:
     """SOUL.md from HERMES_HOME (identity slot #1), or None.
 
-    Callers must pass ``skip_soul=True`` to ``build_context_files_prompt`` so it isn't injected twice.
+    ``drop_chat_only`` removes the ``SOUL_CHAT_ONLY_*`` marked sections (Kanban workers); marker lines are
+    always removed. Callers must pass ``skip_soul=True`` to ``build_context_files_prompt`` so it isn't injected twice.
     ``home_override`` pins the profile home (a thread that lost the HERMES_HOME ContextVar reads the wrong one).
 
     ``home_override`` scopes the read to an explicit profile home (the agent knows its own home from its
@@ -1677,7 +1716,7 @@ def load_soul_md(context_length: Optional[int] = None, home_override: "Path | No
             # Plugin-era desktop builds appended a frozen Bot Mode roster to SOUL.md; the server
             # now injects the live section in Bot Chat only, so the copy is dead weight everywhere.
             from tools.bot_mode_probe import strip_legacy_protocol
-            content = strip_legacy_protocol(content).strip()
+            content = strip_soul_chat_only(strip_legacy_protocol(content), drop_sections=drop_chat_only).strip()
         if not content:
             return None
         # `hermes profile install <git-url>` / `profile update` plant a third-party SOUL.md into a

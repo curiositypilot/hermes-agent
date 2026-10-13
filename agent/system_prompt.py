@@ -544,9 +544,14 @@ def _memory_parts(agent: Any) -> List[str]:
 def _identity_parts(agent: Any, ctx_len: Optional[int]) -> Tuple[List[str], bool]:
     """SOUL.md (primary identity; cron keeps the persona while skipping cwd
     instructions, scoped to the agent's OWN home) or the default identity.
+    A dispatcher-owned Kanban worker gets SOUL.md without its chat-only sections; the
+    choice is fixed for the process, so the worker's prompt stays byte-stable.
     Returns ``(parts, soul_loaded)``."""
+    from agent.delegation_context import owned_kanban_task
+
     wants_soul = agent.load_soul_identity or not agent.skip_context_files
-    _soul_content = _pb.load_soul_md(ctx_len, home_override=_agent_home(agent)) if wants_soul else None
+    _soul_content = _pb.load_soul_md(ctx_len, home_override=_agent_home(agent),
+                                     drop_chat_only=bool(owned_kanban_task())) if wants_soul else None
     return ([_soul_content], True) if _soul_content else ([DEFAULT_AGENT_IDENTITY], False)
 
 

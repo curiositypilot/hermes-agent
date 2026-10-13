@@ -195,6 +195,8 @@ def load_soul_md() -> Optional[str]:
 
 When `load_soul_md()` returns content, it replaces the hardcoded `DEFAULT_AGENT_IDENTITY`. The `build_context_files_prompt()` function is then called with `skip_soul=True` to prevent SOUL.md from appearing twice (once as identity, once as a context file).
 
+`load_soul_md(drop_chat_only=...)` also handles `<!-- chat-only -->` / `<!-- /chat-only -->` marker lines (`strip_soul_chat_only`): the marker lines are always removed, so a marked SOUL.md gives chat sessions the same bytes as an unmarked one. `_identity_parts()` in `agent/system_prompt.py` passes `drop_chat_only=True` for the dispatcher-owned Kanban worker (`owned_kanban_task()`), which then gets SOUL.md without the enclosed lines. Unbalanced markers keep everything and log a warning.
+
 If `SOUL.md` doesn't exist, the system falls back to:
 
 ```
