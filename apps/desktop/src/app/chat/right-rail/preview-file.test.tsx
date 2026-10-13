@@ -1,10 +1,12 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { EditorView } from '@codemirror/view'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { setAlwaysExternalLinks } from '@/store/external-links'
 import { $previewTabs } from '@/store/preview'
+import { $dirtyPreviewUrls } from '@/store/preview-edit'
 
-import { MarkdownPreview } from './preview-file'
+import { LocalFilePreview, MarkdownPreview } from './preview-file'
 
 // Behavior tests for the .md file preview renderer: input markdown goes
 // through normalizeFilePreviewMath -> Streamdown (+ KaTeX math plugin) and must
@@ -115,5 +117,142 @@ describe('MarkdownPreview', () => {
 
     expect(container.querySelector('a[href^="javascript:"]')).toBeNull()
     expect($previewTabs.get()).toEqual([])
+  })
+})
+
+// Spot editor save: only the snapshot actually written becomes the saved
+// baseline. Keystrokes typed while the write is pending must stay dirty and
+// in the editor, not be marked clean and discarded by the post-save reload.
+describe('LocalFilePreview save', () => {
+  const url = 'file:///workspace/note.txt'
+
+  function setup() {
+    let disk = 'original'
+    let releaseWrite: (() => void) | null = null
+    const writes: string[] = []
+
+    vi.stubGlobal('hermesDesktop', {
+      readFileText: async () => ({ binary: false, path: '/workspace/note.txt', text: disk, truncated: false }),
+      writeTextFile: (_file: string, content: string) => {
+        writes.push(content)
+
+        return new Promise<{ path: string }>(resolve => {
+          releaseWrite = () => {
+            disk = content
+            resolve({ path: '/workspace/note.txt' })
+          }
+        })
+      }
+    })
+
+    const rangeDescriptors = Object.getOwnPropertyDescriptors(Range.prototype)
+
+    Object.defineProperties(Range.prototype, {
+      getClientRects: { configurable: true, value: () => [] },
+      getBoundingClientRect: { configurable: true, value: () => new DOMRect() }
+    })
+
+    const restore = () => {
+      for (const key of ['getClientRects', 'getBoundingClientRect']) {
+        if (rangeDescriptors[key]) {
+          Object.defineProperty(Range.prototype, key, rangeDescriptors[key])
+        } else {
+          Reflect.deleteProperty(Range.prototype, key)
+        }
+      }
+    }
+
+    const rendered = render(
+      <LocalFilePreview
+        reloadKey={0}
+        target={{
+          kind: 'file',
+          label: 'note.txt',
+          path: '/workspace/note.txt',
+          previewKind: 'text',
+          source: '/workspace/note.txt',
+          url
+        }}
+      />
+    )
+
+    return {
+      disk: () => disk,
+      async edit() {
+        fireEvent.click(await screen.findByRole('button', { name: 'Edit' }))
+
+        return EditorView.findFromDOM(rendered.container.querySelector('.cm-content')!)!
+      },
+      async finishWrite() {
+        await waitFor(() => expect(releaseWrite).not.toBeNull())
+        await act(async () => {
+          releaseWrite!()
+          releaseWrite = null
+        })
+      },
+      restore,
+      writes
+    }
+  }
+
+  const type = (editor: EditorView, text: string) =>
+    act(() => editor.dispatch({ changes: { from: editor.state.doc.length, insert: text } }))
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    $dirtyPreviewUrls.set({})
+  })
+
+  it('keeps keystrokes typed during an in-flight save dirty and in the editor', async () => {
+    const harness = setup()
+
+    try {
+      const editor = await harness.edit()
+      type(editor, ' first')
+      fireEvent.click(screen.getByRole('button', { name: /Save/ }))
+      await waitFor(() => expect(harness.writes).toEqual(['original first']))
+      type(editor, ' second')
+      await harness.finishWrite()
+
+      expect(harness.disk()).toBe('original first')
+      expect(editor.dom.isConnected).toBe(true)
+      expect(editor.state.doc.toString()).toBe('original first second')
+      expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull()
+      await waitFor(() =>
+        expect((screen.getByRole('button', { name: /Save/ }) as HTMLButtonElement).disabled).toBe(false)
+      )
+      expect($dirtyPreviewUrls.get()[url]).toBe(true)
+
+      // The baseline is the written snapshot, so the next Save passes the
+      // stale-on-disk check (no conflict banner) and writes the rest.
+      fireEvent.click(screen.getByRole('button', { name: /Save/ }))
+      await waitFor(() => expect(harness.writes).toEqual(['original first', 'original first second']))
+      await harness.finishWrite()
+      expect(screen.queryByRole('button', { name: /Overwrite/ })).toBeNull()
+      await screen.findByRole('button', { name: 'Edit' })
+      expect(harness.disk()).toBe('original first second')
+      expect($dirtyPreviewUrls.get()[url]).toBeUndefined()
+    } finally {
+      harness.restore()
+    }
+  })
+
+  it('marks the draft clean and leaves edit mode when nothing was typed during the save', async () => {
+    const harness = setup()
+
+    try {
+      const editor = await harness.edit()
+      type(editor, ' first')
+      fireEvent.click(screen.getByRole('button', { name: /Save/ }))
+      await harness.finishWrite()
+
+      await screen.findByRole('button', { name: 'Edit' })
+      expect(harness.disk()).toBe('original first')
+      expect(harness.writes).toEqual(['original first'])
+      expect($dirtyPreviewUrls.get()[url]).toBeUndefined()
+    } finally {
+      harness.restore()
+    }
   })
 })
