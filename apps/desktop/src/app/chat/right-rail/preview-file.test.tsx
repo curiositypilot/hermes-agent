@@ -238,6 +238,39 @@ describe('LocalFilePreview save', () => {
     }
   })
 
+  it('keeps a revert to the old baseline typed during an in-flight save dirty and savable', async () => {
+    const harness = setup()
+
+    try {
+      const editor = await harness.edit()
+      type(editor, ' first')
+      fireEvent.click(screen.getByRole('button', { name: /Save/ }))
+      await waitFor(() => expect(harness.writes).toEqual(['original first']))
+      // Delete ' first' while the write pends: the draft now equals the OLD
+      // baseline, which the per-keystroke check reads as clean.
+      act(() => editor.dispatch({ changes: { from: 'original'.length, to: editor.state.doc.length } }))
+      await harness.finishWrite()
+
+      expect(harness.disk()).toBe('original first')
+      expect(editor.dom.isConnected).toBe(true)
+      expect(editor.state.doc.toString()).toBe('original')
+      await waitFor(() =>
+        expect((screen.getByRole('button', { name: /Save/ }) as HTMLButtonElement).disabled).toBe(false)
+      )
+      expect($dirtyPreviewUrls.get()[url]).toBe(true)
+
+      fireEvent.click(screen.getByRole('button', { name: /Save/ }))
+      await waitFor(() => expect(harness.writes).toEqual(['original first', 'original']))
+      await harness.finishWrite()
+      expect(screen.queryByRole('button', { name: /Overwrite/ })).toBeNull()
+      await screen.findByRole('button', { name: 'Edit' })
+      expect(harness.disk()).toBe('original')
+      expect($dirtyPreviewUrls.get()[url]).toBeUndefined()
+    } finally {
+      harness.restore()
+    }
+  })
+
   it('marks the draft clean and leaves edit mode when nothing was typed during the save', async () => {
     const harness = setup()
 

@@ -1079,8 +1079,12 @@ export function LocalFilePreview({
       baselineRef.current = text
       setConflict(false)
 
-      if (draftRef.current === text) {
-        setDirty(false)
+      // Recompute against the new baseline: keystrokes during the write were
+      // judged against the old one (a revert to it read as clean).
+      const stillDirty = draftRef.current !== text
+      setDirty(stillDirty)
+
+      if (!stillDirty) {
         setEditing(false)
       }
 
