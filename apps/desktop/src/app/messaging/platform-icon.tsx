@@ -62,7 +62,8 @@ const PLATFORM_ICONS: Record<string, PlatformIconSpec> = {
   // Slack removed from Simple Icons by Salesforce request — letter monogram.
   slack: { color: '#4A154B', kind: 'brand', monogram: 'S' },
   mattermost: { Icon: SiMattermost, color: '#0058CC', kind: 'brand' },
-  matrix: { Icon: SiMatrix, color: '#000000', kind: 'brand' },
+  // Black mark by design: follow the text color so it stays visible in dark themes.
+  matrix: { Icon: SiMatrix, color: '#000000', kind: 'brand', monochrome: true },
   signal: { Icon: SiSignal, color: '#3A76F0', kind: 'brand' },
   // Black mark by design: follow the text color so it stays visible in dark themes.
   simplex: { Icon: SiSimplex, color: '#000000', kind: 'brand', monochrome: true },
