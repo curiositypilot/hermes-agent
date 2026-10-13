@@ -10,6 +10,7 @@ import {
   textPart,
   toChatMessages
 } from '@/lib/chat-messages'
+import { isGatewayMarkerText } from '@/lib/chat-messages/hydration'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { parseErrorSurface } from '@/lib/error-surface'
@@ -560,14 +561,15 @@ export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMes
  * (#75825).
  *
  * Gateway bookkeeping markers (the model-switch / personality notices written
- * by tui_gateway/server.py) are persisted as role=user but are not user turns.
+ * by tui_gateway/server.py, the compaction todo snapshot) are persisted as
+ * role=user but are not user turns.
  * They must not take part in ordinal pairing on either side: a stored marker
  * between two real user turns shifts every later user ordinal, so the optimistic
  * row misses its committed copy and is appended a second time at the end of the
  * transcript — the duplicated user bubble of #67603.
  */
 const isGatewaySystemMarker = (message: ChatMessage): boolean =>
-  message.role === 'user' && chatMessageText(message).trimStart().startsWith('[System:')
+  message.role === 'user' && isGatewayMarkerText(chatMessageText(message))
 
 /**
  * Does the row carry anything a viewer would miss — streamed answer text, or

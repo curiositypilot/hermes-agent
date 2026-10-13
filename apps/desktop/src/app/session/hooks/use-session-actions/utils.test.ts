@@ -972,6 +972,29 @@ describe('preserveLocalPendingTurnMessages', () => {
     expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
   })
 
+  // The compaction todo snapshot is a role=user row too (tools/todo_tool.py
+  // TODO_INJECTION_HEADER). It is no more a prompt than a [System: …] marker.
+  it('does not count the compaction task-list row as a prompt when pairing the optimistic turn', () => {
+    const taskList = '[Your active task list was preserved across context compression]\n- [ ] ship the fix'
+
+    const previous = [
+      msg('1-user', 'user', 'first'),
+      msg('2-assistant', 'assistant', 'first answer'),
+      msg('user-optimistic', 'user', 'second question')
+    ]
+
+    const next = [
+      msg('s1-user', 'user', 'first'),
+      msg('s2-assistant', 'assistant', 'first answer'),
+      msg('s3-todo', 'user', taskList),
+      msg('s4-user', 'user', 'second question'),
+      msg('s5-assistant', 'assistant', 'second answer'),
+      msg('s6-todo', 'user', taskList)
+    ]
+
+    expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
+  })
+
   it('still keeps a genuinely uncommitted optimistic turn when a marker is present', () => {
     const previous = [
       msg('1-user', 'user', 'first'),

@@ -562,6 +562,30 @@ describe('toChatMessages', () => {
     ])
   })
 
+  it('never paints the compaction task-list row as a user bubble', () => {
+    // Context compaction injects the todo snapshot as a standalone role=user row
+    // (tools/todo_tool.py TODO_INJECTION_HEADER); the user never wrote it.
+    const messages = toChatMessages([
+      { role: 'user', content: 'refactor the parser', timestamp: 1 },
+      { role: 'assistant', content: 'Working on it.', timestamp: 2 },
+      {
+        role: 'user',
+        content: '[Your active task list was preserved across context compression]\n- [ ] split the lexer',
+        timestamp: 3
+      },
+      { role: 'assistant', content: 'Lexer split.', timestamp: 4 },
+      { role: 'user', content: 'now add tests', timestamp: 5 }
+    ])
+
+    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'assistant', 'user'])
+    expect(messages.map(chatMessageText)).toEqual([
+      'refactor the parser',
+      'Working on it.',
+      'Lexer split.',
+      'now add tests'
+    ])
+  })
+
   // Hermes closes a failed turn with an assistant-role row (agent/turn_failure_copy.py);
   // painted as the model's reply it read as the assistant refusing the request.
   it('renders the failed-turn boundary as a Hermes notice, not a model reply', () => {
