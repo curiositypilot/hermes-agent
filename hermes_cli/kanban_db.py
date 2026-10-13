@@ -3298,14 +3298,14 @@ def edit_task(
 
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    kind: Optional[str] = None, expected_run_id: Optional[int] = None, metadata: Optional[dict] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
     re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
     promote it into a context-free respawn. ``transient`` still counts
     toward the loop breaker so a forever-flaky task escalates. True on any
-    transition.
+    transition. ``metadata`` lands on the closed run (``worker_session_id`` -> usage).
 
     An already-``blocked`` card that the failure breaker parked UNTYPED
     (``block_kind IS NULL``, no live run) is classified in place when *kind*
@@ -3384,7 +3384,7 @@ def block_task(
             return False
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
-        )
+            metadata=metadata)
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
         if kind == "dependency":
@@ -3685,7 +3685,7 @@ def _nonblank_str(value: Any) -> Optional[str]:
 
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
-) -> tuple[bool, Optional[str]]:
+    metadata: Optional[dict] = None) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
     gating reapplied. Returns ``(ok, implementer | reason)``."""
@@ -3737,7 +3737,7 @@ def request_changes(
             return False, "task changed during review handoff"
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
-        )
+            metadata=metadata)
         _append_event(
             conn,
             task_id,
@@ -4144,7 +4144,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     expected_run_id: Optional[int] = None, until=None, then: Optional[str] = None,
-) -> bool:
+    metadata: Optional[dict] = None) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable).
 
     ``until`` (``YYYY-MM-DD[THH:MM]`` local, or epoch) + ``then`` (``start`` |
@@ -4189,7 +4189,7 @@ def schedule_task(
             return False
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
-        )
+            metadata=metadata)
         payload = {"reason": reason}
         if until_ts is not None:
             payload.update(until=until_ts, then=mode)
