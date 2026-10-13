@@ -343,7 +343,7 @@ class TestCamofoxVaultRedaction:
     def test_snapshot_scrubs_registered_vault_value(self, mock_get, mock_post):
         self._open_tab(mock_post, "vr1")
         mock_get.return_value = _mock_response(json_data={
-            "snapshot": f'- textbox "Password" [e7]: {_FAKE_VAULT_VALUE}', "refsCount": 1})
+            "snapshot": f'- textbox "Username" [e7]: {_FAKE_VAULT_VALUE}', "refsCount": 1})
 
         from tools.browser_tool import browser_snapshot
         for raw in (camofox_snapshot(task_id="vr1"), browser_snapshot(task_id="vr1")):
@@ -358,7 +358,7 @@ class TestCamofoxVaultRedaction:
     def test_navigate_autosnapshot_scrubs_registered_vault_value(self, mock_get, mock_post):
         mock_post.return_value = _mock_response(json_data={"tabId": "tab_vr2", "url": "https://login.example"})
         mock_get.return_value = _mock_response(json_data={
-            "snapshot": f'- textbox "Password" [e7]: {_FAKE_VAULT_VALUE}', "refsCount": 1})
+            "snapshot": f'- textbox "Username" [e7]: {_FAKE_VAULT_VALUE}', "refsCount": 1})
         raw = camofox_navigate("https://login.example", task_id="vr2")
         result = json.loads(raw)
         assert result["success"] is True

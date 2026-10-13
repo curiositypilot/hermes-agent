@@ -30,6 +30,37 @@ def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
     return None
 
 
+# Accessible names of fields whose value is a secret. ARIA snapshots carry no input type, so
+# the name is the only signal left when the value was never registered with the vault scrub
+# (gateway restart with a re-adopted tab, a human typing over VNC, registry eviction).
+# CVV/CVC/CSC: vault kind ``payment`` fills card forms. Over-masking is the safe failure.
+_SECRET_FIELD_NAME_RE = re.compile(
+    r"password|passwd|passcode|passphrase|\bsenha|palavra[- ]?passe|contrase(?:ñ|n)a|mot de passe"
+    r"|passwort|\bpin\b|\bcvv\b|\bcvc\b|\bcsc\b|security code",
+    re.IGNORECASE,
+)
+# ``- textbox "<name>" [ref=e7] [active]: <value>``; the name may hold Playwright-escaped quotes.
+_ARIA_VALUE_FIELD_RE = re.compile(
+    r'^(\s*- (?:textbox|spinbutton) "((?:[^"\\]|\\.)*)"(?: \[[^\]]*\])*): (\S.*)$',
+    re.MULTILINE,
+)
+_MASKED_SECRET_FIELD = "«masked-secret-field»"
+
+
+def _mask_secret_field_values(text: str) -> str:
+    """Mask the value of textbox/spinbutton lines whose accessible name looks like a secret.
+
+    Role, name and every ``[...]`` ref/attr survive, so the model can still act on the field
+    by ref and see that it is filled. Empty fields and non-ARIA text are left unchanged.
+    """
+    def _sub(match: "re.Match[str]") -> str:
+        if _SECRET_FIELD_NAME_RE.search(match.group(2)):
+            return f"{match.group(1)}: {_MASKED_SECRET_FIELD}"
+        return match.group(0)
+
+    return _ARIA_VALUE_FIELD_RE.sub(_sub, text)
+
+
 def _store_full_snapshot(snapshot_text: str) -> Optional[str]:
     """Write a full snapshot to cache/web and return its path (None on failure — best-effort).
 
@@ -43,7 +74,7 @@ def _store_full_snapshot(snapshot_text: str) -> Optional[str]:
         from hermes_constants import get_hermes_dir
         from agent.redact import redact_sensitive_text
 
-        content = redact_sensitive_text(snapshot_text, force=True)
+        content = redact_sensitive_text(_mask_secret_field_values(snapshot_text), force=True)
         if len(content) > _bt.MAX_STORED_SNAPSHOT_CHARS:
             content = (
                 content[:_bt.MAX_STORED_SNAPSHOT_CHARS]
@@ -111,11 +142,12 @@ def _truncate_snapshot(snapshot_text: str, max_chars: Optional[int] = None) -> s
 def _redact_browser_output(value: Any) -> Any:
     """Force-redact secrets in browser-originated data (snapshots, console, eval
     results can carry page-rendered keys/cookies/tokens). Tool output is a model
-    boundary, so this applies even when global log redaction is disabled."""
+    boundary, so this applies even when global log redaction is disabled. Password-like
+    field values are masked by name first, since the vault scrub only knows registered bytes."""
     from agent.redact import redact_sensitive_text
 
     if isinstance(value, str):
-        return redact_sensitive_text(value, force=True)
+        return redact_sensitive_text(_mask_secret_field_values(value), force=True)
     if isinstance(value, list):
         return [_redact_browser_output(item) for item in value]
     if isinstance(value, tuple):
