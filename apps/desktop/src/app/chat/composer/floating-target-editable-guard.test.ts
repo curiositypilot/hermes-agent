@@ -61,6 +61,37 @@ describe('floating composer focus-follow vs a focused transcript text field', ()
     expect(document.activeElement).not.toBe(editor)
   })
 
+  // Chromium retargets focus inside a media element's shadow controls (the
+  // three-dot "more" menu) to the <audio>/<video> host; pulling it back to the
+  // composer closed that menu the instant it opened (#135225).
+  it.each(['audio', 'video'] as const)('leaves focus on a transcript <%s controls> element', tag => {
+    const { editor, surface } = mountPane('surface-1')
+    const media = document.createElement(tag)
+    media.controls = true
+    // jsdom has no native media focusability; Chromium makes a controls host focusable.
+    media.tabIndex = 0
+    surface.appendChild(media)
+    unregister.push(registerFloatingComposer('surface-1', { groupId: 'g1', target: 'main' }))
+
+    media.focus()
+    expect(document.activeElement).toBe(media)
+
+    movePointerOver(media, 43)
+    expect(document.activeElement).toBe(media)
+    expect(document.activeElement).not.toBe(editor)
+  })
+
+  it('still refocuses the composer when a plain transcript element takes focus', () => {
+    const { editor, surface } = mountPane('surface-1')
+    const plain = document.createElement('div')
+    plain.tabIndex = 0
+    surface.appendChild(plain)
+    unregister.push(registerFloatingComposer('surface-1', { groupId: 'g1', target: 'main' }))
+
+    plain.focus()
+    expect(document.activeElement).toBe(editor)
+  })
+
   it('still moves the caret to the hovered pane composer when it sits in another pane composer', () => {
     const a = mountPane('surface-a')
     const b = mountPane('surface-b')
