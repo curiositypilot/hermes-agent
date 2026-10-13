@@ -1052,19 +1052,20 @@ export function LocalFilePreview({
       // Stale-on-disk guard: re-read what's on disk now and compare to the
       // snapshot the user started from. If something changed underneath (an
       // agent edit, an external save), don't clobber it silently — surface the
-      // choice. `force` is the user picking "overwrite" from that banner.
+      // choice. `force` is the user picking "overwrite" from that banner. A
+      // file that is now binary or can't be re-read can't be shown unchanged,
+      // so it takes the same path instead of being overwritten blind.
       if (!force) {
-        try {
-          const current = await readTextPreview(filePath)
+        const unchanged = await readTextPreview(filePath).then(
+          current => !current.binary && (current.text ?? '') === baselineRef.current,
+          () => false
+        )
 
-          if (!current.binary && (current.text ?? '') !== baselineRef.current) {
-            setConflict(true)
-            setSaving(false)
+        if (!unchanged) {
+          setConflict(true)
+          setSaving(false)
 
-            return
-          }
-        } catch {
-          // Couldn't re-read for the check — fall through and attempt the write.
+          return
         }
       }
 
