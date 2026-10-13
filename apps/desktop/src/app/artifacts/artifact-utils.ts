@@ -256,16 +256,34 @@ export async function artifactImageSrc(value: string): Promise<string> {
   return resolveMediaDisplaySrc(value)
 }
 
+function pathBaseName(value: string): string {
+  return value.split(/[\\/]/).filter(Boolean).pop() || value
+}
+
+function decodeUrlSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment)
+  } catch {
+    return segment
+  }
+}
+
 function artifactLabel(value: string): string {
+  // `C:\dir\file` parses as a URL with a `c:` scheme; it is a raw path.
+  if (isWindowsPath(value)) {
+    return pathBaseName(value)
+  }
+
   try {
     const url = new URL(value)
     const item = url.pathname.split('/').filter(Boolean).pop()
 
-    return item || value
+    // URL pathnames are percent-encoded (CJK, spaces): show the saved name.
+    return item ? decodeUrlSegment(item) : value
   } catch {
-    const parts = value.split(/[\\/]/).filter(Boolean)
-
-    return parts.pop() || value
+    // Raw filesystem paths are never percent-encoded (`#media:` hrefs are
+    // decoded before they get here), so a literal `%` in the name stays.
+    return pathBaseName(value)
   }
 }
 
