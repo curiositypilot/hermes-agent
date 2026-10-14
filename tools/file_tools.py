@@ -130,7 +130,7 @@ def _clamped_line_numbers(numbered_content: str) -> list[int]:
     return nums
 
 
-def _add_clamped_lines_hint(result_dict: dict, path: str) -> None:
+def _add_clamped_lines_hint(result_dict: dict, path: str, *, extracted: bool = False) -> None:
     """Name the lines the per-line clamp cut and give the exact command that reads the rest.
 
     The clamp (``tool_output.max_line_length``) appends ``... [truncated]`` to an over-long
@@ -139,9 +139,11 @@ def _add_clamped_lines_hint(result_dict: dict, path: str) -> None:
     3,100-char deal log clamped at 2,000; the model resumed at ``cut -c2400-`` and skipped
     the verdict that sat in chars 2,000-2,400). Report the line numbers and the clamp width
     and point at a character-exact Python read (GNU ``cut -c`` counts bytes, so it drifts
-    on non-ASCII text).
+    on non-ASCII text). ``extracted``: the numbers count extracted document text, not the
+    raw file's lines, so a raw-file recipe would print the wrong bytes; no recipe then.
     """
-    nums = _clamped_line_numbers(result_dict.get("content") or "")
+    nums = (_clamped_line_numbers(result_dict.get("content") or "")
+            if result_dict.get("truncated_lines") else [])
     if not nums:
         return
     from tools.tool_output_limits import get_max_line_length
@@ -152,14 +154,25 @@ def _add_clamped_lines_hint(result_dict: dict, path: str) -> None:
     first = nums[0]
     result_dict["clamped_lines"] = nums[:50]
     result_dict["clamped_at_chars"] = width
-    recipe = (
-        "python3 -c \"import sys; print(open(sys.argv[1], encoding='utf-8', errors='replace')"
-        f".read().split('\\n')[{first - 1}][{width}:])\" {shlex.quote(path)}")
     hint = (
         f"Line(s) {shown} exceed {width:,} chars and were clamped mid-line at the "
-        f"'{_LINE_CLAMP_MARKER}' marker; offset/limit cannot reach the rest. Before acting on a "
-        f"clamped line, read its remainder (character-exact; GNU cut -c counts bytes), e.g. for "
-        f"line {first}: terminal {recipe}")
+        f"'{_LINE_CLAMP_MARKER}' marker; offset/limit cannot reach the rest. ")
+    if extracted:
+        hint += (
+            "These numbers count the extracted document text, not the raw file: before acting on "
+            "a clamped line, convert the document to text in terminal and read that line's "
+            f"remainder from char {width:,} on (character-exact; GNU cut -c counts bytes).")
+    else:
+        # expanduser: a model-supplied '~/x' is quoted below, so the shell would not expand it.
+        # newline='': universal newlines would split a lone '\r' and shift the line numbers.
+        # utf-8-sig: the read path strips a leading BOM, so line 1's offsets must too.
+        recipe = (
+            "python3 -c \"import os, sys; print(open(os.path.expanduser(sys.argv[1]), encoding='utf-8-sig', "
+            "errors='replace', newline='')"
+            f".read().split('\\n')[{first - 1}][{width}:])\" {shlex.quote(path)}")
+        hint += (
+            "Before acting on a clamped line, read its remainder (character-exact; GNU cut -c "
+            f"counts bytes), e.g. for line {first}: terminal {recipe}")
     prior = result_dict.get("hint")
     result_dict["hint"] = f"{prior} {hint}" if prior else hint
 
@@ -533,7 +546,7 @@ def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task
         _apply_char_budget(result_dict, result_dict["content"], offset, total_lines, max_chars)
     if truncated_lines:
         result_dict["truncated_lines"] = True
-        _add_clamped_lines_hint(result_dict, path)
+        _add_clamped_lines_hint(result_dict, path, extracted=True)
     if result_dict["content"]:
         rendered = result_dict["content"]
         result_dict["content"] = redact_sensitive_text(
@@ -737,7 +750,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                 and version_before == cached_version and content_served_in_generation):
             return _dedup_stub_or_block(task_data, dedup_key, path)
 
-        result = file_ops.read_file(resolved_str if _file_ops_uses_host_paths(file_ops) else path, offset, limit)
+        read_path = resolved_str if _file_ops_uses_host_paths(file_ops) else path
+        result = file_ops.read_file(read_path, offset, limit)
         result_dict = result.to_dict()
 
         # Failed reads cannot establish whole-file knowledge.
@@ -764,8 +778,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
             redacted = result.content != unredacted
             result_dict["content"] = result.content
 
-        if result_dict.get("truncated_lines"):
-            _add_clamped_lines_hint(result_dict, path)
+        _add_clamped_lines_hint(result_dict, read_path)
 
         if result.content:
             conflicts = count_conflict_blocks(result.content)
