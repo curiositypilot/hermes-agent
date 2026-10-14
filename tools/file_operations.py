@@ -811,7 +811,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         return ReadResult(
             content=self._add_line_numbers(content, offset), total_lines=total_lines,
             file_size=file_size, truncated=truncated, hint=" ".join(hint_parts),
-            truncated_lines=True if truncated_lines else None)
+            truncated_lines=True if truncated_lines else None, _source_encoding=encoding)
 
     def read_file(self, path: str, offset: int = 1, limit: int = 2000) -> ReadResult:
         """Read a file with pagination, binary detection, and line numbers.

@@ -130,7 +130,31 @@ def _clamped_line_numbers(numbered_content: str) -> list[int]:
     return nums
 
 
-def _add_clamped_lines_hint(result_dict: dict, path: str, *, extracted: bool = False) -> None:
+def _clamp_remainder_recipe(path: str, line: int, width: int, encoding: str | None) -> str:
+    """``python3 -c`` command printing ``line``'s text from char ``width`` on, decoded the way
+    the read decoded it.
+
+    expanduser: a model-supplied '~/x' is quoted, so the shell would not expand it.
+    newline='': universal newlines would split a lone '\\r' and shift the line numbers.
+    UTF-8 (``encoding`` None): utf-8-sig, since the read strips a leading BOM. Transcoded
+    UTF-16 (``encoding`` = the codec ``_try_read_utf16`` detected, passed as argv so it is
+    never spliced into code): mirror that read — decode the raw bytes, drop one leading BOM
+    (an explicit -le/-be codec keeps it), fold CRLF.
+    """
+    idx = f"[{line - 1}][{width}:]"
+    if encoding is None:
+        return (
+            "python3 -c \"import os, sys; print(open(os.path.expanduser(sys.argv[1]), encoding='utf-8-sig', "
+            f"errors='replace', newline='').read().split('\\\\n'){idx})\" {shlex.quote(path)}")
+    return (
+        "python3 -c \"import os, sys; t = open(os.path.expanduser(sys.argv[1]), 'rb').read()"
+        ".decode(sys.argv[2], 'replace'); t = t[1:] if t[:1] == chr(0xfeff) else t; "
+        f"print(t.replace(chr(13) + chr(10), chr(10)).split(chr(10)){idx})\" "
+        f"{shlex.quote(path)} {shlex.quote(encoding)}")
+
+
+def _add_clamped_lines_hint(result_dict: dict, path: str, *, extracted: bool = False,
+                            encoding: str | None = None) -> None:
     """Name the lines the per-line clamp cut and give the exact command that reads the rest.
 
     The clamp (``tool_output.max_line_length``) appends ``... [truncated]`` to an over-long
@@ -141,6 +165,8 @@ def _add_clamped_lines_hint(result_dict: dict, path: str, *, extracted: bool = F
     and point at a character-exact Python read (GNU ``cut -c`` counts bytes, so it drifts
     on non-ASCII text). ``extracted``: the numbers count extracted document text, not the
     raw file's lines, so a raw-file recipe would print the wrong bytes; no recipe then.
+    ``encoding``: the codec a UTF-16 file was transcoded from, so the recipe decodes it the
+    same way (a UTF-8 recipe printed NUL-interleaved bytes from the wrong offset).
     """
     nums = (_clamped_line_numbers(result_dict.get("content") or "")
             if result_dict.get("truncated_lines") else [])
@@ -163,13 +189,7 @@ def _add_clamped_lines_hint(result_dict: dict, path: str, *, extracted: bool = F
             "a clamped line, convert the document to text in terminal and read that line's "
             f"remainder from char {width:,} on (character-exact; GNU cut -c counts bytes).")
     else:
-        # expanduser: a model-supplied '~/x' is quoted below, so the shell would not expand it.
-        # newline='': universal newlines would split a lone '\r' and shift the line numbers.
-        # utf-8-sig: the read path strips a leading BOM, so line 1's offsets must too.
-        recipe = (
-            "python3 -c \"import os, sys; print(open(os.path.expanduser(sys.argv[1]), encoding='utf-8-sig', "
-            "errors='replace', newline='')"
-            f".read().split('\\n')[{first - 1}][{width}:])\" {shlex.quote(path)}")
+        recipe = _clamp_remainder_recipe(path, first, width, encoding)
         hint += (
             "Before acting on a clamped line, read its remainder (character-exact; GNU cut -c "
             f"counts bytes), e.g. for line {first}: terminal {recipe}")
@@ -778,7 +798,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
             redacted = result.content != unredacted
             result_dict["content"] = result.content
 
-        _add_clamped_lines_hint(result_dict, read_path)
+        # getattr: file ops are duck-typed (test fakes return their own result class).
+        _add_clamped_lines_hint(result_dict, read_path,
+                                encoding=getattr(result, "_source_encoding", None))
 
         if result.content:
             conflicts = count_conflict_blocks(result.content)
