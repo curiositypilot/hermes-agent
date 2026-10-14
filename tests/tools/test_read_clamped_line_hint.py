@@ -12,6 +12,8 @@ import shlex
 import subprocess
 import sys
 
+import pytest
+
 from tools.file_tools import _add_clamped_lines_hint, _clamped_line_numbers, read_file_tool
 from tools.tool_output_limits import _reset_tool_output_limits_cache, get_max_line_length
 
@@ -109,3 +111,27 @@ class TestClampedLineHint:
         hint = result.get("hint") or ""
         assert "extracted document text" in hint
         assert "python3 -c" not in hint
+
+    @pytest.mark.parametrize("codec, text_of", [
+        # BOM + CRLF, clamped line 1: the recipe must drop the BOM and fold CRLF like the read.
+        ("utf-16", lambda line: line + "\r\nshort\r\n"),
+        # No BOM: the read detects the byte order by zero-byte parity; the recipe must use it.
+        ("utf-16-be", lambda line: "x\n" + line + "\n"),
+    ])
+    def test_utf16_recipe_decodes_like_the_transcoding_read(self, tmp_path, monkeypatch, codec, text_of):
+        """A UTF-16 file is transcoded for display; a UTF-8 recipe printed NUL-interleaved bytes
+        from about half the clamp width instead of the remainder (t_d5555cdf)."""
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        _reset_tool_output_limits_cache()
+        width = get_max_line_length()
+        line = _long_line(width)
+        p = tmp_path / "u16.txt"
+        p.write_bytes(text_of(line).encode(codec))
+        result = json.loads(read_file_tool(str(p)))
+        assert result["hint"].startswith("Transcoded from UTF-16")
+        clamped = result["clamped_lines"]
+        assert clamped == [1 if codec == "utf-16" else 2]
+        argv = shlex.split(result["hint"].split("terminal ", 1)[1])
+        argv[0] = sys.executable
+        out = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", check=True).stdout
+        assert out.rstrip("\n") == line[width:]
