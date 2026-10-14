@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import stat
 import threading
 import time
@@ -112,6 +113,68 @@ def _apply_char_budget(result_dict: dict, content: str, offset: int, total_lines
             " Note: the first line alone exceeded the budget and was "
             "clamped mid-line; its remainder is not retrievable via offset.")
     return trimmed
+
+
+_LINE_CLAMP_MARKER = "... [truncated]"
+
+
+def _clamped_line_numbers(numbered_content: str) -> list[int]:
+    """Line numbers (from the ``N|`` gutter) whose text ends with the per-line clamp marker."""
+    nums: list[int] = []
+    for line in (numbered_content or "").split("\n"):
+        if not line.endswith(_LINE_CLAMP_MARKER):
+            continue
+        gutter = line.split("|", 1)[0]
+        if gutter.isdigit():
+            nums.append(int(gutter))
+    return nums
+
+
+def _add_clamped_lines_hint(result_dict: dict, path: str, *, extracted: bool = False) -> None:
+    """Name the lines the per-line clamp cut and give the exact command that reads the rest.
+
+    The clamp (``tool_output.max_line_length``) appends ``... [truncated]`` to an over-long
+    line and ``offset``/``limit`` can never reach the remainder, so a bare
+    ``truncated_lines: true`` left the model guessing where the cut was (2026-10-14: a
+    3,100-char deal log clamped at 2,000; the model resumed at ``cut -c2400-`` and skipped
+    the verdict that sat in chars 2,000-2,400). Report the line numbers and the clamp width
+    and point at a character-exact Python read (GNU ``cut -c`` counts bytes, so it drifts
+    on non-ASCII text). ``extracted``: the numbers count extracted document text, not the
+    raw file's lines, so a raw-file recipe would print the wrong bytes; no recipe then.
+    """
+    nums = (_clamped_line_numbers(result_dict.get("content") or "")
+            if result_dict.get("truncated_lines") else [])
+    if not nums:
+        return
+    from tools.tool_output_limits import get_max_line_length
+    width = get_max_line_length()
+    shown = ", ".join(str(n) for n in nums[:10])
+    if len(nums) > 10:
+        shown += f" and {len(nums) - 10} more"
+    first = nums[0]
+    result_dict["clamped_lines"] = nums[:50]
+    result_dict["clamped_at_chars"] = width
+    hint = (
+        f"Line(s) {shown} exceed {width:,} chars and were clamped mid-line at the "
+        f"'{_LINE_CLAMP_MARKER}' marker; offset/limit cannot reach the rest. ")
+    if extracted:
+        hint += (
+            "These numbers count the extracted document text, not the raw file: before acting on "
+            "a clamped line, convert the document to text in terminal and read that line's "
+            f"remainder from char {width:,} on (character-exact; GNU cut -c counts bytes).")
+    else:
+        # expanduser: a model-supplied '~/x' is quoted below, so the shell would not expand it.
+        # newline='': universal newlines would split a lone '\r' and shift the line numbers.
+        # utf-8-sig: the read path strips a leading BOM, so line 1's offsets must too.
+        recipe = (
+            "python3 -c \"import os, sys; print(open(os.path.expanduser(sys.argv[1]), encoding='utf-8-sig', "
+            "errors='replace', newline='')"
+            f".read().split('\\n')[{first - 1}][{width}:])\" {shlex.quote(path)}")
+        hint += (
+            "Before acting on a clamped line, read its remainder (character-exact; GNU cut -c "
+            f"counts bytes), e.g. for line {first}: terminal {recipe}")
+    prior = result_dict.get("hint")
+    result_dict["hint"] = f"{prior} {hint}" if prior else hint
 
 
 # Above this size, a wide read (limit > 200) gets a hint toward targeted reads.
@@ -481,6 +544,9 @@ def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task
     max_chars = _get_max_read_chars()
     if len(result_dict["content"]) > max_chars:
         _apply_char_budget(result_dict, result_dict["content"], offset, total_lines, max_chars)
+    if truncated_lines:
+        result_dict["truncated_lines"] = True
+        _add_clamped_lines_hint(result_dict, path, extracted=True)
     if result_dict["content"]:
         rendered = result_dict["content"]
         result_dict["content"] = redact_sensitive_text(
@@ -684,7 +750,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                 and version_before == cached_version and content_served_in_generation):
             return _dedup_stub_or_block(task_data, dedup_key, path)
 
-        result = file_ops.read_file(resolved_str if _file_ops_uses_host_paths(file_ops) else path, offset, limit)
+        read_path = resolved_str if _file_ops_uses_host_paths(file_ops) else path
+        result = file_ops.read_file(read_path, offset, limit)
         result_dict = result.to_dict()
 
         # Failed reads cannot establish whole-file knowledge.
@@ -710,6 +777,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                 unredacted, file_read=True, secret_file=_is_secret_file_arg(resolved_str))
             redacted = result.content != unredacted
             result_dict["content"] = result.content
+
+        _add_clamped_lines_hint(result_dict, read_path)
 
         if result.content:
             conflicts = count_conflict_blocks(result.content)
@@ -1159,7 +1228,7 @@ READ_FILE_SCHEMA = {
     # route we trust (_read_file_schema_overrides). Scanned-page coverage
     # teaching lives in the response-time NEEDS-OCR warning
     # (read_extract.py); the schema doesn't pre-teach it.
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Documents auto-extract to readable text: .ipynb, Office (.docx/.xlsx/.pptx and legacy .doc/.ppt/.xls), PDF (text layer), OpenDocument, RTF, EPUB, SQLite (.db/.sqlite: schema, row counts, first rows). Cannot read images/binary — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. A single line longer than ~2K chars is clamped at '... [truncated]' and listed in clamped_lines with a hint naming the command that reads its remainder (offset cannot reach it). Documents auto-extract to readable text: .ipynb, Office (.docx/.xlsx/.pptx and legacy .doc/.ppt/.xls), PDF (text layer), OpenDocument, RTF, EPUB, SQLite (.db/.sqlite: schema, row counts, first rows). Cannot read images/binary — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
