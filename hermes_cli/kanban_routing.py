@@ -54,6 +54,17 @@ provider furthest ahead of its budget line is tried first and the configured
 order breaks ties. Pay-as-you-go providers stay behind every quota provider.
 Tiers keep their escalation order; the review lane and pinned/profile routes
 are not re-ordered.
+
+Quota mode (``data/quota/mode.json``, written by ``scripts/quota_mode.py`` after
+every quota snapshot; design: workspace/projects/ai-factory/quota-system-redesign.md
+§ 4): while the file is fresh (``max_age_seconds``) and names a mode, it is the
+whole gate for ``anthropic``: one ``min_priority`` (closed 4, critical 3, tight
+2, normal/open 0) replaces that provider's level bands, pace bands and reserve.
+``open`` is spend-down: every tier and the review lane try Opus (then any other
+Anthropic model) first, and the dispatcher wakes cards parked in ``scheduled``
+for quota (reason mentions quota, wake date no later than a day after the
+reset). Missing, stale or ``unknown`` mode falls back to the bands. Off with the
+gate (``quota_gate.enabled: false``); ``hermes kanban route`` prints it either way.
 """
 
 from __future__ import annotations
@@ -114,6 +125,8 @@ class QuotaGateConfig:
     from the same ``bands`` entries (a band may carry ``below`` and/or ``pace_below``)."""
     reserve: dict[str, float] = field(default_factory=dict)
     """provider (or ``default``) -> fraction subtracted from ``pace_headroom``."""
+    mode_file: str = ""
+    """``""`` = ``<HERMES_HOME>/data/quota/mode.json`` (quota mode, see module doc)."""
 
     def _for(self, table: dict, provider: str) -> tuple[tuple[float, int], ...]:
         # A provider listed in ``bands`` owns its whole policy (both kinds);
@@ -216,6 +229,7 @@ def _parse_quota_gate(raw: Any) -> QuotaGateConfig:
         bands=level,
         pace_bands={k: v for k, v in pace.items() if v},
         reserve=_parse_reserve(raw.get("reserve")),
+        mode_file=str(raw.get("mode_file") or "").strip(),
     )
 
 
@@ -572,6 +586,79 @@ def read_headroom(gate: QuotaGateConfig, *, now: Optional[float] = None) -> Quot
     return snap
 
 
+MODE_PROVIDER = "anthropic"
+QUOTA_MODES = ("closed", "critical", "tight", "normal", "open")
+_MODE_MIN_PRIORITY = {"closed": 4, "critical": 3, "tight": 2, "normal": 0, "open": 0}
+
+
+@dataclass
+class QuotaMode:
+    """What ``mode.json`` says this tick (Anthropic only). ``active`` = fresh and a
+    known mode: then it replaces the bands for ``anthropic``."""
+    path: str
+    status: str
+    """``ok`` | ``missing`` | ``unreadable`` | ``stale``."""
+    mode: Optional[str] = None
+    """A ``QUOTA_MODES`` name, ``unknown`` (no fresh reading) or None."""
+    min_priority: int = 0
+    reason: str = ""
+    since: Optional[str] = None
+    resets_at: Optional[float] = None
+    age_seconds: Optional[float] = None
+
+    @property
+    def active(self) -> bool:
+        return self.status == "ok" and self.mode in QUOTA_MODES
+
+    @property
+    def spend_down(self) -> bool:
+        return self.active and self.mode == "open"
+
+    def describe(self) -> str:
+        age = f", {int(self.age_seconds // 60)} min old" if self.age_seconds is not None else ""
+        if self.status != "ok":
+            return f"{self.status} ({self.path}{age}) -> anthropic falls back to bands"
+        if not self.active:
+            return f"{self.mode or '?'}{age} -> anthropic falls back to bands — {self.reason}"
+        return f"anthropic {self.mode}: cards need P{self.min_priority} (since {self.since}{age}) — {self.reason}"
+
+
+def default_mode_path() -> str:
+    from hermes_constants import get_hermes_home
+    return str(get_hermes_home() / "data" / "quota" / "mode.json")
+
+
+def read_mode(gate: QuotaGateConfig, *, now: Optional[float] = None) -> QuotaMode:
+    """Read ``mode.json``. Never raises, never touches the network; ignores ``enabled``
+    (callers decide whether it gates)."""
+    import os
+    now = time.time() if now is None else now
+    path = os.path.expanduser(gate.mode_file) if gate.mode_file else default_mode_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return QuotaMode(path, "missing")
+    except (OSError, ValueError):
+        return QuotaMode(path, "unreadable")
+    if not isinstance(data, dict):
+        return QuotaMode(path, "unreadable")
+    try:
+        age = now - float(data["written_at_epoch"])
+    except (TypeError, KeyError, ValueError):
+        return QuotaMode(path, "unreadable")
+    mode = str(data.get("mode") or "").strip().lower() or None
+    return QuotaMode(path, "stale" if age > gate.max_age_seconds else "ok", mode=mode,
+                     min_priority=_MODE_MIN_PRIORITY.get(mode or "", 0), reason=str(data.get("reason") or ""),
+                     since=data.get("since"), resets_at=_parse_iso_epoch(data.get("resets_at")), age_seconds=age)
+
+
+def _spend_down_key(cand: "TierCandidate") -> tuple[bool, bool]:
+    """Opus first, then any other Anthropic model, then the rest (stable)."""
+    anthropic = (cand.provider or "").strip().lower() == MODE_PROVIDER
+    return (not anthropic, not (anthropic and "opus" in cand.model.lower()))
+
+
 def required_priority(bands: tuple[tuple[float, int], ...], headroom: float) -> tuple[int, Optional[float]]:
     """``(min priority, the band threshold that set it)``; ``(0, None)`` when no band matches.
     Same math for level bands (``below`` vs headroom) and pace bands
@@ -595,8 +682,11 @@ class QuotaVerdict:
     required: int
     resets_at: Optional[float] = None
     kind: str = "level"
+    mode: Optional[str] = None
 
     def describe(self) -> str:
+        if self.kind == "mode":
+            return f"{self.provider} quota mode {self.mode} needs P{self.required}"
         if self.kind == "pace":
             return f"{self.provider} pace {self.headroom:+.2f} < {self.below:+.2f} needs P{self.required}"
         return f"{self.provider} headroom {_pct(self.headroom)} < {_pct(self.below)} needs P{self.required}"
@@ -680,6 +770,17 @@ class RoutingContext:
         self._recent: Optional[dict[tuple[str, str], tuple[int, str]]] = None
         self._memo: dict[tuple[Optional[str], Optional[str], str], Availability] = {}
         self._quota: Optional[QuotaSnapshot] = None
+        self._mode: Optional[QuotaMode] = None
+
+    def quota_mode(self) -> QuotaMode:
+        """``mode.json``, read once per context (per dispatcher tick)."""
+        if self._mode is None:
+            self._mode = read_mode(self.cfg.quota_gate, now=self.now)
+        return self._mode
+
+    def spend_down(self) -> bool:
+        """Anthropic quota mode ``open`` with the gate on: Opus first, wake quota parks."""
+        return self.cfg.quota_gate.enabled and self.quota_mode().spend_down
 
     def quota(self) -> QuotaSnapshot:
         """The headroom file, read once per context (per dispatcher tick)."""
@@ -695,6 +796,13 @@ class RoutingContext:
         gate = self.cfg.quota_gate
         if not gate.enabled or not provider:
             return None
+        if provider.strip().lower() == MODE_PROVIDER:
+            mode = self.quota_mode()
+            if mode.active:
+                if priority >= mode.min_priority:
+                    return None
+                return QuotaVerdict(MODE_PROVIDER, 0.0, 0.0, mode.min_priority, mode.resets_at,
+                                    kind="mode", mode=mode.mode)
         snap = self.quota()
         if snap.status != "ok":
             return None
@@ -719,9 +827,15 @@ class RoutingContext:
         behind every quota provider (in static order): pace ordering must never
         turn a paid fallthrough into a paid first choice."""
         cands = list(cands)
-        if not self.cfg.pace_order:
-            return cands
-        return sorted(cands, key=lambda c: (self._is_payg(c.provider), -self.pace_key(c.provider)))
+        if self.cfg.pace_order:
+            cands = sorted(cands, key=lambda c: (self._is_payg(c.provider), -self.pace_key(c.provider)))
+        return self.spend_down_order(cands)
+
+    def spend_down_order(self, cands: "list[TierCandidate] | tuple[TierCandidate, ...]") -> list[TierCandidate]:
+        """In quota mode ``open``: Opus first, other Anthropic models next, the rest
+        in their existing order. Otherwise unchanged."""
+        cands = list(cands)
+        return sorted(cands, key=_spend_down_key) if self.spend_down() else cands
 
     def _is_payg(self, provider: Optional[str]) -> bool:
         return bool(provider) and provider.strip().lower() in self.cfg.quota_gate.payg_providers
@@ -926,7 +1040,7 @@ class RoutingContext:
         implementer's run. The quota gate applies with the card's priority."""
         if not self.cfg.review:
             return None
-        walk = self._walk([(None, c) for c in self.cfg.review], task, profile_home)
+        walk = self._walk([(None, c) for c in self.spend_down_order(self.cfg.review)], task, profile_home)
         if walk.chosen is not None:
             return RouteDecision("review", lane="review", candidate=walk.chosen[1], skipped=walk.skipped)
         if walk.gated:

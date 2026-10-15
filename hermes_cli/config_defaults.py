@@ -2033,7 +2033,16 @@ DEFAULT_CONFIG = {
                 # Per provider (or "default") fraction held back from pace_headroom before pace
                 # bands and pace_order compare it, e.g. {anthropic: 0.20} keeps 20% for chat.
                 "reserve": {},
+                # Anthropic quota mode written by scripts/quota_mode.py ("" =
+                # <HERMES_HOME>/data/quota/mode.json). While fresh (max_age_seconds) it replaces the
+                # anthropic bands/pace/reserve with one min_priority (closed 4, critical 3, tight 2,
+                # normal/open 0); "open" = Opus first in every tier + review lane and quota-parked
+                # cards woken. Missing/stale/unknown = bands as above.
+                "mode_file": "",
             },
+            # Force the quota mode until the week resets (closed|critical|tight|normal|open, or
+            # null). Read by scripts/quota_mode.py, not by the dispatcher.
+            "quota_mode_override": None,
             # Within each tier, try the candidate whose provider is furthest ahead of its budget
             # line first (pace_headroom - reserve, descending; unknown pace = 0.0). The configured
             # order breaks ties; payg_providers always stay last. Tier escalation order, the review

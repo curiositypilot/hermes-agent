@@ -660,10 +660,15 @@ def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
 
     gate = cfg.quota_gate
     snap = ctx.quota()
+    mode = ctx.quota_mode()
     providers = []
     for name in sorted(snap.providers):
         req = kr.gate_requirement(gate, snap, name)
         if req is None:  # pragma: no cover - name comes from snap.providers
+            continue
+        if name == kr.MODE_PROVIDER and mode.active:
+            providers.append({"provider": name, "headroom": req.headroom, "required_priority": mode.min_priority,
+                              "mode": mode.mode, "resets_at": int(mode.resets_at) if mode.resets_at else None})
             continue
         providers.append({
             "provider": name, "headroom": req.headroom, "required_priority": req.required,
@@ -676,6 +681,10 @@ def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
         providers.append({"provider": name, "headroom": None, "required_priority": 0,
                           "band_below": None, "resets_at": None, "unknown": why})
     return {
+        "mode": {"file": mode.path, "status": mode.status, "mode": mode.mode, "active": mode.active,
+                 "min_priority": mode.min_priority, "reason": mode.reason, "since": mode.since,
+                 "age_seconds": int(mode.age_seconds) if mode.age_seconds is not None else None,
+                 "spend_down": gate.enabled and mode.spend_down, "line": mode.describe()},
         "enabled": gate.enabled, "file": snap.path, "status": snap.status,
         "age_seconds": int(snap.age_seconds) if snap.age_seconds is not None else None,
         "max_age_seconds": gate.max_age_seconds, "payg_providers": list(gate.payg_providers),
@@ -686,6 +695,11 @@ def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
 
 
 def _print_quota_gate(q: dict) -> None:
+    m = q.get("mode") or {}
+    if m:
+        off = "" if q["enabled"] else " [advisory: gate disabled]"
+        spend = " — spend-down: Opus first, quota parks woken" if m.get("spend_down") else ""
+        print(f"\nQuota mode: {m['line']}{spend}{off}")
     if not q["enabled"]:
         print("\nQuota gate: disabled (kanban.routing.quota_gate.enabled: false)")
         return
@@ -699,6 +713,11 @@ def _print_quota_gate(q: dict) -> None:
     for p in q["providers"]:
         if p["headroom"] is None:
             print(f"  ?  {p['provider']}: unknown ({p.get('unknown')}) -> gate open")
+            continue
+        if p.get("mode"):
+            mark = "ok " if q["card_priority"] is None or q["card_priority"] >= p["required_priority"] else "-- "
+            print(f"  {mark}{p['provider']}: headroom {p['headroom'] * 100:.0f}% -> quota mode {p['mode']} "
+                  f"needs P{p['required_priority']} (bands, pace and reserve not used)")
             continue
         band = f" (< {p['band_below'] * 100:.0f}%)" if p["band_below"] is not None else ""
         mark = "ok " if q["card_priority"] is None or q["card_priority"] >= p["required_priority"] else "-- "
@@ -735,7 +754,7 @@ def _cmd_route(args: argparse.Namespace) -> int:
                              "pace": ctx.pace_key(cand.provider) if cfg.pace_order else None})
             tiers.append({"tier": tier, "candidates": rows})
         review = []
-        for cand in cfg.review:
+        for cand in ctx.spend_down_order(cfg.review):
             avail = ctx.availability(cand, home)
             review.append({**cand.as_dict(), "available": avail.available, "reason": avail.reason,
                            "until": int(avail.until) if avail.until else None})
