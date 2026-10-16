@@ -542,8 +542,6 @@ def board_exists(board: Optional[str] = None) -> bool:
     return _dir_holds_board(board_dir(slug))
 
 
-
-
 def _explicit_board_slug(board: Optional[str]) -> Optional[str]:
     """Explicit caller intent: a direct ``board=`` argument, else the scoped
     ``--board`` context (CLI ``hermes kanban --board``, dashboard plugin_api);
@@ -596,7 +594,7 @@ def _board_path(
     pin = os.environ.get(env_var, "").strip() if env_var else ""
     slug = _explicit_board_slug(board)
     if pin and (slug is None or _explicit_board_intent_pinned()):
-        return Path(pin).expanduser()
+        return checked_pin(env_var, Path(pin).expanduser())
     if slug is None:
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
@@ -4745,6 +4743,7 @@ from hermes_cli.kanban_db_connect import (  # noqa: E402
     init_db,
     write_txn,
 )
+from hermes_cli.kanban_db_pin_guard import KanbanPathConflict, checked_pin  # noqa: E402,F401
 from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _cleanup_workspace,
     _is_managed_scratch_path,
