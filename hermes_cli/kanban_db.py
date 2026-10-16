@@ -1318,12 +1318,11 @@ def create_task(
 
     now = int(time.time())
 
-    # Only persistent kinds inherit the board ``default_workdir``: a scratch
-    # task inheriting it would point cleanup at the user's source tree.
-    if workspace_path is None and project_repo is None and workspace_kind in {"dir", "worktree"}:
-        board_default = _board_meta_for(board).get("default_workdir")
-        if board_default:
-            workspace_path = str(board_default)
+    # Persistent kinds inherit the board default_workdir. An unanchored
+    # worktree is rejected here so dispatch does not burn spawn retries.
+    from hermes_cli.kanban_db_workspace import _resolve_created_workspace_path
+    workspace_path = _resolve_created_workspace_path(
+        board, workspace_kind, workspace_path, project_repo)
 
     # A ``dir`` workspace on a git repo is a shared checkout: parallel workers
     # collide in it. Default it to worktree isolation unless the caller opted

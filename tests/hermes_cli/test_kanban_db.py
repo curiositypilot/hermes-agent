@@ -764,6 +764,18 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 
 
 
+def test_create_worktree_without_anchor_raises(kanban_home, tmp_path):
+    """A worktree with no path, project, or board default_workdir fails at create."""
+    with kbc.connect() as conn:
+        with pytest.raises(ValueError, match="no default_workdir"):
+            kb.create_task(conn, title="bad worktree", workspace_kind="worktree")
+        assert [t.title for t in kb.list_tasks(conn)] == []
+        kb.write_board_metadata(None, default_workdir=str(tmp_path))
+        tid = kb.create_task(conn, title="anchored", workspace_kind="worktree")
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.workspace_path == str(tmp_path)
+
+
 def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
@@ -1652,19 +1664,6 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
 # After the fix, ``_safe_int`` returns ``None`` on bad input and ``task_age``
 # degrades gracefully (per-field ``None`` rather than a hard crash).
 # ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 # ---------------------------------------------------------------------------
 # Board-level default_workdir

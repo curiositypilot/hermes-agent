@@ -713,6 +713,44 @@ def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple
     return target, branch_name
 
 
+def _resolve_created_workspace_path(
+    board: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+    project_repo: Optional[str],
+) -> Optional[str]:
+    """Path to persist, or raise if a worktree has nothing to anchor on.
+
+    Dir and worktree tasks with no path and no project repo inherit the board
+    ``default_workdir``. Scratch must not: cleanup would then target the user's
+    tree. A blank path counts as missing.
+
+    A worktree that still has no path, no project repo, and no board default
+    cannot be materialized at dispatch. ``create_task`` rejects it here so the
+    dispatcher does not burn spawn retries into ``gave_up``. The spawn-time
+    ``ValueError`` in ``_resolve_worktree_workspace`` stays for rows already
+    stored or written by a direct DB edit.
+    """
+    path = str(workspace_path).strip() if workspace_path is not None else ""
+    if path:
+        return workspace_path
+    board_default = ""
+    if not project_repo and workspace_kind in {"dir", "worktree"}:
+        raw = _kb._board_meta_for(board).get("default_workdir")
+        board_default = str(raw).strip() if raw else ""
+        if board_default:
+            return board_default
+    if workspace_kind == "worktree" and not project_repo:
+        slug = board if board else _kb.get_current_board()
+        raise ValueError(
+            "cannot create a task with workspace_kind=worktree but no "
+            f"workspace_path, and board {slug!r} has no default_workdir set. "
+            "Set a board default workdir (a git repo), link a project, or "
+            "create the task with --workspace worktree:<absolute-repo-path>."
+        )
+    return None
+
+
 def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``. With no
     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
@@ -724,6 +762,8 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         board_slug = board if board else _kb.get_current_board()
         board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
         if not board_default:
+            # create_task rejects this shape. Kept for rows stored before that
+            # check and for a direct DB edit that bypasses it.
             raise ValueError(
                 f"task {task.id} has workspace_kind=worktree but no workspace_path, "
                 f"and board {board_slug!r} has no default_workdir set. Set a board "
