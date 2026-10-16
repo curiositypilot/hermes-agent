@@ -2401,6 +2401,22 @@ def _wake_scheduled(conn: sqlite3.Connection, *, dry_run: bool) -> list[tuple[st
         return []
 
 
+def _wake_quota_parks(
+    conn: sqlite3.Connection, routing: Optional["_kbr.RoutingContext"], *, dry_run: bool,
+) -> list[tuple[str, str]]:
+    """In Anthropic quota mode ``open``, start cards parked for quota (see
+    ``kanban_db_schedule.wake_quota_parks``). A failure is logged, never costs the tick."""
+    if routing is None or not routing.spend_down():
+        return []
+    try:
+        from hermes_cli.kanban_db_schedule import wake_quota_parks
+        return wake_quota_parks(conn, resets_at=routing.quota_mode().resets_at, now=routing.now, dry_run=dry_run)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("kanban dispatcher: quota park wake failed")
+        return []
+
+
 def _tick_spawn_budget(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -2566,6 +2582,9 @@ def _dispatch_once_locked(
     if not may_spawn:
         return result
 
+    routing = _routing_context(conn)
+    # Quota mode open (spend-down): start quota-parked cards before the ready lane is read.
+    result.woke_scheduled.extend(_wake_quota_parks(conn, routing, dry_run=dry_run))
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
@@ -2594,7 +2613,6 @@ def _dispatch_once_locked(
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
     # one slot back.
-    routing = _routing_context(conn)
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
         conn, review_rows,

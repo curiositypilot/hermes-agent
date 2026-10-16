@@ -16,6 +16,12 @@ reason, and a card with no date at all wakes in ask mode after
 
 The dispatcher calls :func:`wake_due_scheduled` once per tick before promotion
 and claiming, so a start-mode card can spawn on the tick it wakes.
+
+Quota parks: in Anthropic quota mode ``open`` (spend-down, see
+``kanban_routing``) the dispatcher also calls :func:`wake_quota_parks`, which
+starts cards parked for quota before their date: the latest ``scheduled``
+reason mentions quota and the wake date is no later than a day after the week
+resets. They wake in ``start`` mode whatever their ``then``.
 """
 from __future__ import annotations
 
@@ -35,6 +41,8 @@ DEFAULT_RECHECK_DAYS = 7
 UNTIL_RE = re.compile(r"\buntil (\d{4}-\d{2}-\d{2})\b")
 _UNTIL_FORMATS = ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d")
 _REASON_CAP = 500
+QUOTA_PARK_RE = re.compile(r"\bquota\b", re.IGNORECASE)
+QUOTA_PARK_SLACK_S = 86400  # a park dated up to a day after the reset still counts as waiting for it
 
 
 def parse_until(value) -> Optional[int]:
@@ -204,7 +212,7 @@ def due_scheduled(
     return due
 
 
-def _wake_one(conn: sqlite3.Connection, s: Schedule) -> Optional[str]:
+def _wake_one(conn: sqlite3.Connection, s: Schedule, *, woke_by: Optional[str] = None) -> Optional[str]:
     """Apply one wake inside the caller's write txn; returns the new status or
     None when the card moved on (no longer scheduled) or must keep waiting."""
     from hermes_cli import kanban_db as kb
@@ -237,9 +245,10 @@ def _wake_one(conn: sqlite3.Connection, s: Schedule) -> Optional[str]:
         return None
     # ``unblocked`` (not a new kind) so every reader that pairs blocked/unblocked
     # events (sticky-block detection, resume status) treats the wake as a release.
-    kb._append_event(conn, s.task_id, "unblocked", {
-        "status": landing, "woke_from": "scheduled", "then": "start", "schedule": s.label,
-    })
+    payload = {"status": landing, "woke_from": "scheduled", "then": "start", "schedule": s.label}
+    if woke_by:
+        payload["woke_by"] = woke_by
+    kb._append_event(conn, s.task_id, "unblocked", payload)
     return landing
 
 
@@ -272,6 +281,49 @@ def wake_due_scheduled(
     with kb.write_txn(conn):
         for s in due:
             status = _wake_one(conn, s)
+            if status:
+                woke.append((s.task_id, status))
+    return woke
+
+
+def quota_parks(
+    conn: sqlite3.Connection, resets_at: Optional[float], now: Optional[float] = None,
+) -> list[Schedule]:
+    """Scheduled cards waiting on quota: future wake no later than ``resets_at`` +
+    ``QUOTA_PARK_SLACK_S`` and a latest ``scheduled`` reason that mentions quota.
+    Undated parks never match (nothing says they wait for this reset)."""
+    now = time.time() if now is None else now
+    if resets_at is None:
+        return []
+    out = []
+    for row in conn.execute(
+        "SELECT id, scheduled_until, scheduled_then FROM tasks WHERE status = 'scheduled' ORDER BY created_at"
+    ).fetchall():
+        s = schedule_for(conn, row["id"], scheduled_until=row["scheduled_until"],
+                         scheduled_then=row["scheduled_then"], recheck_days=0)
+        if (s.wake_at is not None and s.source != "undated" and now < s.wake_at <= resets_at + QUOTA_PARK_SLACK_S
+                and QUOTA_PARK_RE.search(s.reason)):
+            out.append(s)
+    return out
+
+
+def wake_quota_parks(
+    conn: sqlite3.Connection, *, resets_at: Optional[float], now: Optional[float] = None, dry_run: bool = False,
+) -> list[tuple[str, str]]:
+    """Start every quota park now (quota mode ``open``). Returns ``[(task_id, new_status)]``;
+    ``dry_run`` writes nothing. Opens its own IMMEDIATE txn — call OUTSIDE any write txn."""
+    from hermes_cli import kanban_db as kb
+
+    parks = quota_parks(conn, resets_at, now)
+    if dry_run:
+        return [(s.task_id, "ready" if kb._parents_satisfied(conn, s.task_id) else "todo") for s in parks]
+    woke: list[tuple[str, str]] = []
+    if not parks:
+        return woke
+    with kb.write_txn(conn):
+        for s in parks:
+            status = _wake_one(conn, Schedule(s.task_id, s.wake_at, "start", s.source, s.reason),
+                               woke_by="quota mode open")
             if status:
                 woke.append((s.task_id, status))
     return woke
