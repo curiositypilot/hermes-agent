@@ -681,7 +681,8 @@ class _KanbanNotification:
 
         ``gave_up`` is handed to the router (``None`` = send the old ping). ``crashed``/``timed_out``
         are retries in flight: the card's events own them, and a run that keeps failing ends as
-        ``gave_up``, so they are skipped outright while a route is configured.
+        ``gave_up``, so they are skipped outright while a route is configured. Deliveries run in
+        sequence, so a slow router (up to its timeout) delays the tick's later pings; fine at gave_up volume.
         """
         if ev.kind not in _CARD_OWNED_KINDS:
             return False

@@ -806,7 +806,7 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
 # ---------------------------------------------------------------------------
 
 
-def _routed_tick(tmp_path, monkeypatch, events, *, configured=True, router_result=None):
+def _routed_tick(tmp_path, monkeypatch, events, *, configured=True, router_result=None, router=None):
     """One notifier tick over ``events`` [(kind, payload)] with the router patched.
 
     Returns ``(adapter, router_calls, tid, last_event_id, last_ping_event_id)``.
@@ -830,7 +830,7 @@ def _routed_tick(tmp_path, monkeypatch, events, *, configured=True, router_resul
 
     def fake_route_event(payload, cfg=None):
         calls.append(payload)
-        return router_result
+        return router(payload, cfg) if router else router_result
 
     monkeypatch.setattr(failure_route, "route_configured", lambda cfg=None: configured)
     monkeypatch.setattr(failure_route, "route_event", fake_route_event)
@@ -905,3 +905,22 @@ def test_non_error_kinds_ping_unchanged_with_route_configured(tmp_path, monkeypa
     assert calls == []
     assert len(adapter.sent) == 3
     assert "needs a decision" in adapter.sent[1]["text"]
+
+
+def test_gave_up_router_crash_still_sends_old_ping(tmp_path, monkeypatch):
+    """A bug inside the router call must not cost the ping or count as a send failure."""
+    from cron import failure_route
+
+    real_route_event = failure_route.route_event
+
+    def _bug(_cfg):
+        raise KeyError("router bug")
+
+    monkeypatch.setattr(failure_route, "_route_config", _bug)
+    adapter, calls, _tid, last_event_id, last_ping = _routed_tick(
+        tmp_path, monkeypatch, [_GAVE_UP], router=real_route_event)
+
+    assert len(calls) == 1
+    assert len(adapter.sent) == 1
+    assert "is now blocked" in adapter.sent[0]["text"]
+    assert last_ping == last_event_id

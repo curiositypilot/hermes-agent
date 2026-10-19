@@ -36,17 +36,27 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 180
+# What reading config.yaml can raise: unreadable file, InvalidUserConfigError (a RuntimeError).
+_CONFIG_ERRORS = (OSError, RuntimeError, ImportError)
 
 
 def _route_config(cfg: Optional[dict]) -> tuple[list[str], int]:
-    route = ((cfg or {}).get("cron") or {}).get("failure_route") or {}
+    cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+    route = cron_cfg.get("failure_route") if isinstance(cron_cfg, dict) else None
     if isinstance(route, (str, list)):
         route = {"command": route}
     if not isinstance(route, dict) or route.get("enabled") is False:
         return [], DEFAULT_TIMEOUT
     cmd = route.get("command") or []
     if isinstance(cmd, str):
-        cmd = shlex.split(cmd)
+        try:
+            cmd = shlex.split(cmd)
+        except ValueError:
+            logger.warning("cron.failure_route.command is not valid shell syntax: %r", cmd)
+            return [], DEFAULT_TIMEOUT
+    if not isinstance(cmd, list):
+        logger.warning("cron.failure_route.command must be a string or list, got %r", cmd)
+        return [], DEFAULT_TIMEOUT
     try:
         timeout = max(5, int(route.get("timeout") or DEFAULT_TIMEOUT))
     except (TypeError, ValueError):
@@ -74,8 +84,8 @@ def route_configured(cfg: Optional[dict] = None) -> bool:
     """True when a failure route command is set (and not ``enabled: false``). Never raises."""
     try:
         return bool(_route_config(_load_config(cfg))[0])
-    except Exception:
-        logger.debug("failure route config unreadable; treating it as unset", exc_info=True)
+    except _CONFIG_ERRORS:
+        logger.warning("failure route config unreadable; treating it as unset", exc_info=True)
         return False
 
 
@@ -93,9 +103,15 @@ def route_event(payload: dict, cfg: Optional[dict] = None) -> Optional[dict]:
     except subprocess.TimeoutExpired:
         logger.warning("%s: failure router timed out; delivering the notice to chat instead", label)
         return None
-    except Exception:
+    except (*_CONFIG_ERRORS, subprocess.SubprocessError, ValueError, TypeError):
+        # OSError: command missing / not executable; TypeError: payload not JSON-serialisable.
         logger.warning("%s: failure router unavailable; delivering the notice to chat", label,
                        exc_info=True)
+        return None
+    except Exception:
+        # Any other error is a bug here, logged with its traceback. Raising would lose the notice:
+        # the callers (cron delivery, the Kanban notifier tick) treat ``None`` as "send it to chat".
+        logger.exception("%s: failure router crashed; delivering the notice to chat", label)
         return None
     if proc.returncode != 0:
         logger.warning("%s: failure router exit %s (%s); delivering the notice to chat",
