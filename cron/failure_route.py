@@ -1,4 +1,4 @@
-"""Route cron failure notices to a card instead of a chat (``cron.failure_route``).
+"""Route failure notices to a card instead of a chat (``cron.failure_route``).
 
 When ``cron.failure_route.command`` is configured, every failure-category notice that
 ``_deliver_result(for_failure=True)`` would send (run failures, crashed runs, blocked-config and
@@ -10,6 +10,11 @@ Exit 0 means the command took ownership (it filed or updated a card): nothing is
 chat. Any other outcome (not configured, non-zero exit, timeout, crash) returns ``None`` and the
 caller delivers exactly as before, so an error is never dropped without either a card or the old
 chat notice. ``failure_deliver: local`` jobs are routed too: their failures used to vanish.
+
+The same key covers the gateway-side error notices: a Kanban ``gave_up`` ping is routed with
+``source: kanban`` (``route_event``); ``crashed``/``timed_out`` pings (retries in flight) and the
+"cron run interrupted by a restart" notice are skipped when a route is configured
+(``route_configured``), since the card's events and the run record already hold them.
 
 Config (``config.yaml``)::
 
@@ -49,41 +54,52 @@ def _route_config(cfg: Optional[dict]) -> tuple[list[str], int]:
     return [str(c) for c in cmd], timeout
 
 
+def _load_config(cfg: Optional[dict]) -> Optional[dict]:
+    if cfg is not None:
+        return cfg
+    from cron import scheduler as _sched
+    return _sched.load_config()
+
+
 def _latest_output(job_id: str) -> Optional[str]:
     try:
         from cron.jobs import OUTPUT_DIR
         files = sorted(Path(OUTPUT_DIR, job_id).glob("*"), key=lambda p: p.stat().st_mtime)
         return str(files[-1]) if files else None
-    except Exception:
+    except (ImportError, OSError):
         return None
 
 
-def route_failure(job: dict, content: str, cfg: Optional[dict] = None) -> Optional[dict]:
-    """Hand one failure notice to the configured router. Returns its JSON result (truthy) when it
-    took ownership, else ``None`` (caller falls back to chat delivery). Never raises."""
+def route_configured(cfg: Optional[dict] = None) -> bool:
+    """True when a failure route command is set (and not ``enabled: false``). Never raises."""
     try:
-        if cfg is None:
-            from cron import scheduler as _sched
-            cfg = _sched.load_config()
-        cmd, timeout = _route_config(cfg)
-        if not cmd or not (content or "").strip():
+        return bool(_route_config(_load_config(cfg))[0])
+    except Exception:
+        logger.debug("failure route config unreadable; treating it as unset", exc_info=True)
+        return False
+
+
+def route_event(payload: dict, cfg: Optional[dict] = None) -> Optional[dict]:
+    """Hand one notice (``source, job_id, job_name, text, output_file``) to the configured router.
+    Returns its JSON result (truthy) when it took ownership, else ``None`` (caller falls back to
+    its chat delivery). Never raises."""
+    label = f"{payload.get('source') or '?'} '{payload.get('job_id') or '?'}'"
+    try:
+        cmd, timeout = _route_config(_load_config(cfg))
+        if not cmd or not str(payload.get("text") or "").strip():
             return None
-        payload = {"source": "cron", "job_id": str(job.get("id") or ""),
-                   "job_name": str(job.get("name") or job.get("id") or ""),
-                   "text": content, "output_file": _latest_output(str(job.get("id") or ""))}
-        proc = subprocess.run(cmd, input=json.dumps(payload), capture_output=True, text=True,
-                              timeout=timeout)
+        proc = subprocess.run(cmd, input=json.dumps(payload), capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
-        logger.warning("Job '%s': failure router timed out; delivering the notice to chat instead",
-                       job.get("id", "?"))
+        logger.warning("%s: failure router timed out; delivering the notice to chat instead", label)
         return None
-    except Exception as exc:
-        logger.warning("Job '%s': failure router unavailable (%s); delivering the notice to chat",
-                       job.get("id", "?"), exc)
+    except Exception:
+        logger.warning("%s: failure router unavailable; delivering the notice to chat", label,
+                       exc_info=True)
         return None
     if proc.returncode != 0:
-        logger.warning("Job '%s': failure router exit %s (%s); delivering the notice to chat",
-                       job.get("id", "?"), proc.returncode, (proc.stderr or "").strip()[-300:])
+        logger.warning("%s: failure router exit %s (%s); delivering the notice to chat",
+                       label, proc.returncode, (proc.stderr or "").strip()[-300:])
         return None
     result: Any
     try:
@@ -93,6 +109,14 @@ def route_failure(job: dict, content: str, cfg: Optional[dict] = None) -> Option
     if not isinstance(result, dict):
         result = {"raw": str(result)}
     result = result or {"routed": True}
-    logger.info("Job '%s': failure routed to card %s (%s)", job.get("id", "?"),
-                result.get("card", "?"), result.get("action", "routed"))
+    logger.info("%s: failure routed to card %s (%s)", label, result.get("card", "?"),
+                result.get("action", "routed"))
     return result
+
+
+def route_failure(job: dict, content: str, cfg: Optional[dict] = None) -> Optional[dict]:
+    """``route_event`` for one cron job's failure notice (``source: cron``). Never raises."""
+    job_id = str(job.get("id") or "")
+    return route_event({"source": "cron", "job_id": job_id,
+                        "job_name": str(job.get("name") or job.get("id") or ""),
+                        "text": content, "output_file": _latest_output(job_id)}, cfg)

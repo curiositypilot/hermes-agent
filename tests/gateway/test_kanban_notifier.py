@@ -796,3 +796,112 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+
+# ---------------------------------------------------------------------------
+# t_0bb86854 — with ``cron.failure_route`` set, Kanban error events go to a card,
+# not the chat: gave_up is routed (old ping on router failure), crashed/timed_out
+# are skipped; every other kind pings exactly as before.
+# ---------------------------------------------------------------------------
+
+
+def _routed_tick(tmp_path, monkeypatch, events, *, configured=True, router_result=None):
+    """One notifier tick over ``events`` [(kind, payload)] with the router patched.
+
+    Returns ``(adapter, router_calls, tid, last_event_id, last_ping_event_id)``.
+    """
+    from cron import failure_route
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "routed.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="routed errors", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        for kind, payload in events:
+            kb._append_event(conn, tid, kind, payload)
+        last_event_id = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0]
+    finally:
+        conn.close()
+
+    calls = []
+
+    def fake_route_event(payload, cfg=None):
+        calls.append(payload)
+        return router_result
+
+    monkeypatch.setattr(failure_route, "route_configured", lambda cfg=None: configured)
+    monkeypatch.setattr(failure_route, "route_event", fake_route_event)
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    conn = kbc.connect()
+    try:
+        last_ping = kbn.list_notify_subs(conn, tid)[0]["last_ping_event_id"]
+    finally:
+        conn.close()
+    return adapter, calls, tid, last_event_id, last_ping
+
+
+_GAVE_UP = ("gave_up", {"failures": 2, "error": "RuntimeError: provider 500"})
+
+
+def test_gave_up_routed_to_card_sends_no_ping(tmp_path, monkeypatch):
+    adapter, calls, tid, last_event_id, last_ping = _routed_tick(
+        tmp_path, monkeypatch, [_GAVE_UP], router_result={"card": "t_abc", "action": "filed_intake"})
+
+    assert adapter.sent == []
+    assert len(calls) == 1
+    assert calls[0]["source"] == "kanban" and calls[0]["job_id"] == tid
+    assert calls[0]["job_name"] == "routed errors"
+    assert "gave up after 2 attempts" in calls[0]["text"] and "provider 500" in calls[0]["text"]
+    # Recorded as pinged, so the cursor never resends it.
+    assert last_ping == last_event_id
+
+
+def test_gave_up_router_failure_falls_back_to_old_ping(tmp_path, monkeypatch):
+    adapter, calls, _tid, last_event_id, last_ping = _routed_tick(
+        tmp_path, monkeypatch, [_GAVE_UP], router_result=None)
+
+    assert len(calls) == 1
+    assert len(adapter.sent) == 1
+    assert "is now blocked" in adapter.sent[0]["text"]
+    assert last_ping == last_event_id
+
+
+def test_crashed_and_timed_out_skipped_when_route_configured(tmp_path, monkeypatch):
+    events = [("crashed", None), ("timed_out", {"limit_seconds": 600})]
+    adapter, calls, _tid, last_event_id, last_ping = _routed_tick(tmp_path, monkeypatch, events)
+
+    assert adapter.sent == []
+    assert calls == []  # retries in flight: not routed, only skipped
+    assert last_ping == last_event_id
+
+
+def test_crashed_and_timed_out_ping_when_route_not_configured(tmp_path, monkeypatch):
+    events = [("crashed", None), ("timed_out", {"limit_seconds": 600}), _GAVE_UP]
+    adapter, calls, *_ = _routed_tick(tmp_path, monkeypatch, events, configured=False)
+
+    texts = [s["text"].lower() for s in adapter.sent]
+    assert len(texts) == 3
+    assert "stopped unexpectedly" in texts[0]
+    assert "10-minute limit" in texts[1]
+    assert "is now blocked" in texts[2]
+    assert calls == []
+
+
+def test_non_error_kinds_ping_unchanged_with_route_configured(tmp_path, monkeypatch):
+    events = [
+        ("completed", {"summary": "all done"}),
+        ("blocked", {"reason": "needs a decision"}),
+        ("review_requested", {"summary": "please look"}),
+    ]
+    adapter, calls, *_ = _routed_tick(
+        tmp_path, monkeypatch, events, router_result={"card": "t_abc"})
+
+    assert calls == []
+    assert len(adapter.sent) == 3
+    assert "needs a decision" in adapter.sent[1]["text"]
