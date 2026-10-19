@@ -22,7 +22,17 @@ from cron.jobs import (  # noqa: E402
     rearm_oneshot,
     JOBS_FILE,
 )
-from cron.scheduler import tick  # noqa: E402
+
+
+def __getattr__(name):
+    # ``tick`` is lazy (#132732): an eager ``cron.scheduler`` import here made ``-m cron.scheduler``
+    # load the module twice (once as ``cron.scheduler``, again as ``__main__``), splitting its state.
+    if name == "tick":
+        from cron.scheduler import tick
+
+        return tick
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "create_job",
