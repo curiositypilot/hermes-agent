@@ -36,6 +36,12 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Union
 # `hermes update`) otherwise fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# ``-m cron.scheduler`` (the external worker) runs this file as ``__main__``. Alias it as
+# ``cron.scheduler`` before any ``cron.*`` import so the split modules' ``_sched`` binds this copy
+# instead of importing a second one with its own running sets and lock (#132732).
+if __name__ == "__main__":
+    sys.modules.setdefault("cron.scheduler", sys.modules[__name__])
+
 from cron.worker_bootstrap import WORKER_MARKER, finish_worker_boot
 from hermes_constants import get_hermes_home, hermes_home_key
 from hermes_cli.observability.shared_metrics_gateway import note_cron_execution, note_cron_skipped
