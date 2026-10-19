@@ -407,11 +407,44 @@ class TestRunJobScript:
             "pm.environments.selected_venv",
             _broken if broken == "selection_raises" else (lambda repo: tmp_path / "gone-venv"),
         )
+        # Committed: the gone venv is PM's own generation, not "nothing committed".
+        monkeypatch.setattr("pm.environments.committed_venv", lambda repo: tmp_path / "gone-venv")
         (cron_env / "scripts" / "probe.py").write_text('print("ok")\n', encoding="utf-8")
 
         success, output = _run_job_script("probe.py")
         assert success is False
         assert "dependency environment" in output
+
+    @pytest.mark.platforms("posix")
+    @pytest.mark.parametrize("caller", ["venv", "bare"])
+    def test_posix_nothing_committed_venv_caller_runs_on_own_interpreter(
+        self, cron_env, tmp_path, monkeypatch, caller
+    ):
+        """A borrowed HERMES_HOME resolves the owning root's store while nothing is committed
+        under the active root: a venv caller runs the script on its own interpreter (as
+        ``activate_dependencies`` boots it); the bare store Python still fails the run (#123044)."""
+        from cron.scheduler_script import _run_job_script
+
+        monkeypatch.setattr(
+            "hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable)
+        )
+        monkeypatch.setattr("pm.environments.selected_venv", lambda repo: tmp_path / "gone-venv")
+        monkeypatch.setattr("pm.environments.committed_venv", lambda repo: None)
+        if caller == "venv":
+            monkeypatch.setattr(sys, "prefix", str(tmp_path / "some-venv"))
+        else:
+            monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+        (cron_env / "scripts" / "probe.py").write_text(
+            "import sys\nprint(sys.executable)\n", encoding="utf-8"
+        )
+
+        success, output = _run_job_script("probe.py")
+        if caller == "venv":
+            assert success is True, output
+            assert Path(output.strip()).resolve() == Path(sys.executable).resolve()
+        else:
+            assert success is False
+            assert "dependency environment" in output
 
     def test_emoji_stdout_round_trips_through_script_capture(self, cron_env):
         """Emoji in script stdout must reach the caller intact (#42384).

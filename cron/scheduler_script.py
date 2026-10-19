@@ -146,9 +146,14 @@ def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
     extensions (#123440). The venv resolves Hermes from its generation's workspace snapshot,
     rebuilt only on a dependency change, so the bootstrap puts the live checkout first.
     Lazy installs are off for the script's process tree: a script importing ``hermes_bootstrap``
-    could otherwise complete a source update and ``execv`` itself onto the bare store Python."""
+    could otherwise complete a source update and ``execv`` itself onto the bare store Python.
+
+    A store resolving does not make the caller the store Python: a borrowed ``HERMES_HOME``
+    finds the owning root's store (#123238) while dependency state stays per root, so with
+    nothing committed here a venv caller (test env, developer ``.venv``) runs the script on its
+    own interpreter, as ``activate_dependencies`` lets it boot (``_require_own_dependencies``)."""
     from hermes_cli._launchers import resolve_store_python
-    from pm.environments import project_python
+    from pm.environments import committed_venv, project_python
 
     repo = Path(__file__).resolve().parents[1]
     if resolve_store_python(repo) is None:
@@ -157,7 +162,10 @@ def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
     # commit runs on its OWN interpreter here, so there is no ABI mix (#122183).
     python = project_python(repo)
     if not python.is_file():
-        # The caller's interpreter is the bare store Python here — the #123044 failure mode.
+        if committed_venv(repo) is None and sys.prefix != sys.base_prefix:
+            return [sys.executable, str(script)], {}
+        # A committed generation lost its interpreter, or the caller is the bare store Python
+        # with nothing committed — the #123044 failure mode.
         raise RuntimeError(f"dependency environment interpreter is missing: {python}")
     return ([str(python), "-c", _POSIX_SCRIPT_BOOTSTRAP, str(repo), str(script)],
             {"HERMES_DISABLE_LAZY_INSTALLS": "1"})
