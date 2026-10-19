@@ -43,7 +43,10 @@ def final_response_with_side_notices(
         # A failed run's notice is already routed; the footer rides in it.
         raise RuntimeError(f"{exc}\n\n{footer}") from exc
     # The finalizer only stores a footer for a non-empty, uninterrupted response (its own gate).
-    if footer and route_failure(job, footer, signature=f"cron-verifier:{job_id}") is None:
+    # output_file=None on both routes: they fire before this run's report is saved, so the job's
+    # newest file is the PREVIOUS run's report, the wrong evidence for this notice.
+    if footer and route_failure(job, footer, signature=f"cron-verifier:{job_id}",
+                                output_file=None) is None:
         # Not routed: rebuild the response the finalizer would have produced, footer included.
         raw = result.get("final_response") or ""
         final_response = _sched._final_response_from_result(
@@ -51,7 +54,8 @@ def final_response_with_side_notices(
     if (fallback_notice and final_response.strip()
             and not _sched._is_cron_silence_response(final_response)
             and _sched._cron_failure_marker_error(final_response) is None
-            and route_failure(job, fallback_notice, signature=f"cron-provider-fallback:{job_id}") is None):
+            and route_failure(job, fallback_notice, signature=f"cron-provider-fallback:{job_id}",
+                              output_file=None) is None):
         # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
         # agent-declared failure marker keep their first-line/whole-response contract.
         final_response = f"{fallback_notice}\n\n{final_response}"
