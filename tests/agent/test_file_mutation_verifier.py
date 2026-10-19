@@ -250,6 +250,160 @@ class TestRecordFileMutationResult:
         still_failed = agent._file_mutations_still_failed(agent._turn_failed_file_mutations)
         assert list(still_failed) == [str(untouched)]
 
+    def test_retry_same_content_other_name_same_dir_clears(self, tmp_path):
+        agent = _bare_agent()
+        orig = str(tmp_path / "a.md")
+        retry = str(tmp_path / "a_2.md")
+        content = "# title\ncontent"
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": orig, "content": content},
+            json.dumps({"error": "Refusing to overwrite...", "stale_write_blocked": True}),
+            is_error=True,
+        )
+        assert orig in agent._turn_failed_file_mutations
+
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": retry, "content": content},
+            json.dumps({"bytes_written": len(content), "verified": True, "files_modified": [retry]}),
+            is_error=False,
+        )
+        assert agent._turn_failed_file_mutations == {}
+
+    def test_retry_same_dir_different_content_keeps_failure(self, tmp_path):
+        agent = _bare_agent()
+        orig = str(tmp_path / "a.md")
+        retry = str(tmp_path / "a_2.md")
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": orig, "content": "content 1"},
+            json.dumps({"error": "Refusing to overwrite...", "stale_write_blocked": True}),
+            is_error=True,
+        )
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": retry, "content": "content 2"},
+            json.dumps({"bytes_written": 9, "verified": True, "files_modified": [retry]}),
+            is_error=False,
+        )
+        assert orig in agent._turn_failed_file_mutations
+
+    def test_retry_different_dir_same_content_keeps_failure(self, tmp_path):
+        agent = _bare_agent()
+        dir1 = tmp_path / "d1"
+        dir2 = tmp_path / "d2"
+        dir1.mkdir()
+        dir2.mkdir()
+        orig = str(dir1 / "a.md")
+        retry = str(dir2 / "a.md")
+        content = "content"
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": orig, "content": content},
+            json.dumps({"error": "Refusing to overwrite...", "stale_write_blocked": True}),
+            is_error=True,
+        )
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": retry, "content": content},
+            json.dumps({"bytes_written": len(content), "verified": True, "files_modified": [retry]}),
+            is_error=False,
+        )
+        assert orig in agent._turn_failed_file_mutations
+
+    def test_failed_write_landed_patch_another_file_same_dir_keeps_failure(self, tmp_path):
+        agent = _bare_agent()
+        orig = str(tmp_path / "a.md")
+        other = str(tmp_path / "other.md")
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": orig, "content": "content"},
+            json.dumps({"error": "Refusing to overwrite...", "stale_write_blocked": True}),
+            is_error=True,
+        )
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": other, "old_string": "x", "new_string": "y"},
+            json.dumps({"success": True, "files_modified": [other]}),
+            is_error=False,
+        )
+        assert orig in agent._turn_failed_file_mutations
+
+    def test_two_failures_retry_one_clears_only_matching(self, tmp_path):
+        agent = _bare_agent()
+        orig_a = str(tmp_path / "a.md")
+        orig_b = str(tmp_path / "b.md")
+        retry_a = str(tmp_path / "a_2.md")
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": orig_a, "content": "content A"},
+            json.dumps({"error": "Refusing to overwrite...", "stale_write_blocked": True}),
+            is_error=True,
+        )
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": orig_b, "content": "content B"},
+            json.dumps({"error": "Refusing to overwrite...", "stale_write_blocked": True}),
+            is_error=True,
+        )
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": retry_a, "content": "content A"},
+            json.dumps({"bytes_written": 9, "verified": True, "files_modified": [retry_a]}),
+            is_error=False,
+        )
+        assert orig_a not in agent._turn_failed_file_mutations
+        assert orig_b in agent._turn_failed_file_mutations
+
+    def test_failed_patch_landed_write_file_same_dir_keeps_failure(self, tmp_path):
+        agent = _bare_agent()
+        orig = str(tmp_path / "a.md")
+        other = str(tmp_path / "b.md")
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": orig, "old_string": "x", "new_string": "y"},
+            json.dumps({"error": "Could not find old_string"}),
+            is_error=True,
+        )
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": other, "content": "y"},
+            json.dumps({"bytes_written": 1, "verified": True, "files_modified": [other]}),
+            is_error=False,
+        )
+        assert orig in agent._turn_failed_file_mutations
+
+    def test_incident_land_body_retry_clears(self, tmp_path):
+        agent = _bare_agent()
+        land_body = str(tmp_path / "land_body.md")
+        land_body_retry = str(tmp_path / "land_body_eca0.md")
+        content = "x" * 1334
+        refusal = json.dumps({
+            "error": "Refusing to overwrite `/.../land_body.md`: exists but this task has not seen its full current content",
+            "stale_write_blocked": True,
+        })
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": land_body, "content": content},
+            refusal,
+            is_error=True,
+        )
+        assert land_body in agent._turn_failed_file_mutations
+
+        success = json.dumps({
+            "bytes_written": 1334,
+            "verified": True,
+            "files_modified": [land_body_retry],
+        })
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": land_body_retry, "content": content},
+            success,
+            is_error=False,
+        )
+        assert agent._turn_failed_file_mutations == {}
+
 # ---------------------------------------------------------------------------
 # _format_file_mutation_failure_footer
 # ---------------------------------------------------------------------------
