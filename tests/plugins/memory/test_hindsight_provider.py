@@ -538,6 +538,17 @@ class TestToolHandlers:
         assert "event" in props["occurred_at"]["description"].lower()
         assert "occurred_at" not in RETAIN_SCHEMA["parameters"]["required"]
 
+    def test_retain_schema_has_no_context_and_tool_never_sends_it(self, provider):
+        # The server copies an item's context onto every extracted fact, so the tool must
+        # neither invite a per-call label nor forward one a model passes anyway.
+        assert "context" not in RETAIN_SCHEMA["parameters"]["properties"]
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_retain", {"content": "chose Postgres", "context": "project decision"}
+        ))
+        assert result["result"] == "Memory stored successfully."
+        item = provider._client.aretain_batch.call_args.kwargs["items"][0]
+        assert "context" not in item
+
 
     def test_recall_success(self, provider):
         result = json.loads(provider.handle_tool_call(
