@@ -276,7 +276,8 @@ RETAIN_SCHEMA = {
         "type": "object",
         "properties": {
             "content": {"type": "string", "description": "The information to store."},
-            "context": {"type": "string", "description": "Short label (e.g. 'user preference', 'project decision')."},
+            # No "context" property: the server copies an item's context verbatim onto every
+            # fact it extracts, so a per-call label ('project decision') pollutes each one.
             "tags": {"type": "array", "items": {"type": "string"},
                      "description": "Optional per-call tags to merge with configured default retain tags."},
             "occurred_at": {"type": "string", "description": (
@@ -1724,11 +1725,14 @@ class HindsightMemoryProvider(MemoryProvider):
         return [] if self._memory_mode == "context" else [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
 
     def _tool_retain(self, args: dict) -> str:
-        content, context = args["content"], args.get("context")
-        item = self._build_retain_kwargs(content, context=context, tags=args.get("tags"),
+        content = args["content"]
+        # A model on an older cached schema may still pass "context": drop it, never send it
+        # (the server stamps it on every extracted fact; see RETAIN_SCHEMA).
+        if args.get("context"):
+            logger.debug("Tool hindsight_retain: ignoring context=%r", args["context"])
+        item = self._build_retain_kwargs(content, tags=args.get("tags"),
                                          occurred_at=args.get("occurred_at"))
-        logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
-                     self._bank_id, len(content), context)
+        logger.debug("Tool hindsight_retain: bank=%s, content_len=%d", self._bank_id, len(content))
         self._retain_batch(item, bank_id=self._bank_id)
         logger.debug("Tool hindsight_retain: success")
         return "Memory stored successfully."
