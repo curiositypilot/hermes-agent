@@ -2963,10 +2963,13 @@ def _record_fire_ownership_lost(
 def _classify_delivery_outcome(
     *, delivery_error, should_deliver: bool, unresolved_origin: bool,
     normalized_deliver: str, incident_acked: bool, success: bool,
-    delivery_queued=None, notification_suppressed: bool = False,
+    delivery_queued=None, notification_suppressed: bool = False, routed: bool = False,
 ) -> str:
     if delivery_error:
         return "failed"
+    if routed:
+        # cron.failure_route took the failure notice: it became a card, not a chat message.
+        return "routed"
     if should_deliver and delivery_queued:
         return "queued"
     if notification_suppressed:
@@ -3259,8 +3262,9 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         normalized_deliver=_normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)),
         incident_acked=d.incident_acked,
         success=d.success,
+        routed=bool(job.get("_failure_routed")) and not d.success,
     )
-    if delivery_outcome in ("delivered", "not_configured") and not d.success:
+    if delivery_outcome in ("delivered", "not_configured", "routed") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
     finish_execution(
@@ -3300,8 +3304,9 @@ def _deliver_crash_failure(
         delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"),
-        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
-    if delivery_outcome in ("delivered", "not_configured"):
+        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
+        routed=bool(job.get("_failure_routed")))
+    if delivery_outcome in ("delivered", "not_configured", "routed"):
         _mark_incident_alerted(failure_incident_id)
     return delivery_error, delivery_outcome
 
