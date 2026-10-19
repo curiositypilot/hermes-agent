@@ -849,12 +849,36 @@ class RoutingContext:
               profile_home: Optional[str]) -> _Walk:
         """First usable candidate of ``(tier, candidate)`` entries in the given
         order (pace ordering, when on, is applied by ``_tier_entries``). A
-        quota-gated candidate is skipped like an unavailable one; after the
-        first gate skip, pay-as-you-go providers are skipped too."""
+        candidate whose provider is not allowed by the card's data class is
+        skipped. A quota-gated candidate is skipped like an unavailable one;
+        after the first gate skip, pay-as-you-go providers are skipped too."""
         walk = _Walk()
         priority = _task_priority(task)
+        data_class_unresolved = False
+        allowed: list[str] | str = "any"
+        resolved_cls = ""
+        from agent.provider_policy import ProviderDenied
+
+        try:
+            with _home_scope(profile_home):
+                from agent import provider_policy
+                resolved_cls = provider_policy.resolve_data_class(task)
+                allowed = provider_policy.allowed_providers(resolved_cls)
+        except ProviderDenied:
+            data_class_unresolved = True
+
         for tier, cand in entries:
             where = {"tier": tier} if tier else {}
+            if data_class_unresolved:
+                walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
+                                     "reason": "data class unresolved"})
+                continue
+            cand_prov = str(cand.provider or "").strip().lower()
+            if allowed != "any":
+                if not cand_prov or cand_prov not in allowed:
+                    walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
+                                         "reason": f"data class {resolved_cls}: provider not allowed"})
+                    continue
             if walk.gated and self._is_payg(cand.provider):
                 walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
                                      "reason": "quota: no paid fallthrough"})
