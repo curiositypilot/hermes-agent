@@ -227,7 +227,10 @@ def test_delegate_child_kanban_cli_cannot_delete_parent_board(
         monkeypatch,
         tmp_path,
     )
-    kb.create_board("victim")
+    # The operator made the board, outside the worker fence (a fenced worker cannot create one).
+    with monkeypatch.context() as operator:
+        operator.delenv("HERMES_KANBAN_TASK")
+        kb.create_board("victim")
     assert kb.board_exists("victim")
 
     from agent.delegation_context import delegated_child_context

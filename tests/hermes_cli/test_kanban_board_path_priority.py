@@ -193,31 +193,41 @@ def test_cli_board_flag_trumps_worker_env_pin_end_to_end(monkeypatch, tmp_path):
 
 def test_dispatched_worker_board_arg_stays_pinned(monkeypatch, tmp_path):
     """A dispatched worker (HERMES_KANBAN_TASK, the dispatcher's own injection)
-    cannot resolve its way to another board: each env pin wins over board= for
-    its own resolver."""
+    cannot resolve its way to another board: board=<other> raises
+    KanbanBoardFenced (never the pin's data under the other board's name,
+    t_20d642ad), while its own board and no board resolve to the pins."""
     pinned = tmp_path / "worker-pinned.db"
     pinned_workspaces = tmp_path / "worker-pinned-workspaces"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(pinned_workspaces))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "worker-own")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_3f1c63a5")
-    assert kb.kanban_db_path(board="other-board") == pinned
-    assert kb.workspaces_root(board="other-board") == pinned_workspaces
+    for resolver in (kb.kanban_db_path, kb.workspaces_root, kb.attachments_root):
+        with pytest.raises(kb.KanbanBoardFenced, match="outside this worker's kanban fence"):
+            resolver(board="other-board")
+    assert kb.kanban_db_path(board="worker-own") == pinned
+    assert kb.workspaces_root(board="worker-own") == pinned_workspaces
+    assert kb.kanban_db_path() == pinned
+    assert kb.workspaces_root() == pinned_workspaces
 
 
 def test_delegated_child_board_arg_stays_pinned(monkeypatch, tmp_path):
     """A delegated child / spawned descendant (HERMES_DELEGATED_CHILD_CONTEXT
-    marker) passing an explicit board= resolves through the pin, so
-    kanban_path_is_fenced still catches the resolved path."""
+    marker) cannot name another board; its own board resolves through the pin,
+    so kanban_path_is_fenced still catches the resolved path."""
     from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, kanban_path_is_fenced
 
     pinned = tmp_path / "worker-pinned.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "worker-own")
     monkeypatch.setenv(DELEGATED_CHILD_ENV_MARKER, str(tmp_path))  # fenced root
-    path = kb.kanban_db_path(board="other-board")
-    assert path == pinned
-    assert kanban_path_is_fenced(path), (
-        "the explicit board escaped the dispatcher's pin-based fence"
-    )
+    with pytest.raises(kb.KanbanBoardFenced):
+        kb.kanban_db_path(board="other-board")
+    for path in (kb.kanban_db_path(board="worker-own"), kb.kanban_db_path()):
+        assert path == pinned
+        assert kanban_path_is_fenced(path), (
+            "the explicit board escaped the dispatcher's pin-based fence"
+        )
 
 
 def test_pin_first_board_resolution_maps_every_slug_to_the_pin(monkeypatch, tmp_path):

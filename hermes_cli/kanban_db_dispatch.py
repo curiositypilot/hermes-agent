@@ -3096,10 +3096,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         override = _worker_terminal_timeout_env(task.max_runtime_seconds, env.get(var))
         if override is not None:
             env[var] = override
-    # Pin the board DB + workspaces root so the worker's kanban paths still
-    # match after `hermes -p` rewrites HERMES_HOME (symlink / Docker layouts).
-    env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=board))
-    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_kb.workspaces_root(board=board))
+    # Pin board DB + workspaces root so worker paths survive `hermes -p` HERMES_HOME rewrites.
+    with _kb.pin_first_board_resolution():  # the tick's board slug is not caller intent (t_20d642ad)
+        env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=board))
+        env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_kb.workspaces_root(board=board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — defense-in-depth pin if a path is resolved without the
     # DB / workspaces env vars.
