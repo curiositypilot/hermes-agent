@@ -4,7 +4,11 @@ When ``cron.failure_route.command`` is configured, every failure-category notice
 ``_deliver_result(for_failure=True)`` would send (run failures, crashed runs, blocked-config and
 drift alerts) is first handed to that command as JSON on stdin::
 
-    {"source": "cron", "job_id", "job_name", "text", "output_file"}
+    {"source": "cron", "job_id", "job_name", "text", "output_file"[, "signature"]}
+
+Side notices of a SUCCESSFUL run are routed the same way before the report is delivered
+(``cron/scheduler_side_notices.py``): the agent's file-mutation verifier footer and the
+pre-agent provider-fallback line. They carry a per-job ``signature`` so repeats fold into one card.
 
 Exit 0 means the command took ownership (it filed or updated a card): nothing is sent to the
 chat. Any other outcome (not configured, non-zero exit, timeout, crash) returns ``None`` and the
@@ -58,9 +62,12 @@ def _latest_output(job_id: str) -> Optional[str]:
         return None
 
 
-def route_failure(job: dict, content: str, cfg: Optional[dict] = None) -> Optional[dict]:
+def route_failure(job: dict, content: str, cfg: Optional[dict] = None, *,
+                  signature: Optional[str] = None) -> Optional[dict]:
     """Hand one failure notice to the configured router. Returns its JSON result (truthy) when it
-    took ownership, else ``None`` (caller falls back to chat delivery). Never raises."""
+    took ownership, else ``None`` (caller falls back to chat delivery). Never raises.
+    ``signature`` (optional) is the router's dedupe key: repeats of one signature fold into one
+    card instead of one card per distinct text."""
     try:
         if cfg is None:
             from cron import scheduler as _sched
@@ -71,6 +78,8 @@ def route_failure(job: dict, content: str, cfg: Optional[dict] = None) -> Option
         payload = {"source": "cron", "job_id": str(job.get("id") or ""),
                    "job_name": str(job.get("name") or job.get("id") or ""),
                    "text": content, "output_file": _latest_output(str(job.get("id") or ""))}
+        if signature:
+            payload["signature"] = signature
         proc = subprocess.run(cmd, input=json.dumps(payload), capture_output=True, text=True,
                               timeout=timeout)
     except subprocess.TimeoutExpired:

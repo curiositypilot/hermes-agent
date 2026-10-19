@@ -383,7 +383,14 @@ def _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_r
 
 def _append_file_mutation_footer(agent, final_response, logger):
     """Append the verifier advisory when ``write_file`` / ``patch`` calls failed and were
-    never superseded by a successful write to the same path (surfaces over-claiming)."""
+    never superseded by a successful write to the same path (surfaces over-claiming).
+
+    An agent with ``_defer_file_mutation_footer`` set (cron) gets the footer stored on
+    ``_deferred_file_mutation_footer`` instead, so its owner can route it to a card rather than
+    deliver it inside the report."""
+    defer = getattr(agent, "_defer_file_mutation_footer", False) is True
+    if defer:
+        agent._deferred_file_mutation_footer = ""
     try:
         # File-mutation verifier footer. This catches the specific case — reported by Ben Eng
         # (#15524-adjacent) — where a model issues a batch of parallel patches, half of them fail with
@@ -396,7 +403,9 @@ def _append_file_mutation_footer(agent, final_response, logger):
         if _failed and agent._file_mutation_verifier_enabled():
             _failed = agent._file_mutations_still_failed(_failed)
             footer = agent._format_file_mutation_failure_footer(_failed)
-            if footer:
+            if footer and defer:
+                agent._deferred_file_mutation_footer = footer
+            elif footer:
                 final_response = final_response.rstrip() + "\n\n" + footer
     except Exception as _ver_err:
         logger.debug("file-mutation verifier footer failed: %s", _ver_err)
