@@ -288,6 +288,7 @@ def test_relaunch_keeps_invocation_and_checkout_imports(tmp_path, mode):
     root = tmp_path / "source"
     root.mkdir()
     (root / "checkout_only.py").write_text("value = 'from checkout'\n")
+    (root / "hermes_bootstrap.py").write_text("")  # every relaunch root is a Hermes checkout
     script = root / "entry.py"
     script.write_text("import checkout_only, json, sys\nprint(json.dumps([checkout_only.value, sys.argv[1:]]))\n")
     argv = [str(script), "--profile", "name with spaces", "-c", "session"]
@@ -303,6 +304,27 @@ def test_relaunch_keeps_invocation_and_checkout_imports(tmp_path, mode):
     result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == ["from checkout", argv[1:]]
+
+
+def test_relaunched_module_boots_dependencies_before_its_package_runs(tmp_path):
+    """A relaunch lands on an ``-I`` store interpreter whose dependencies only hermes_bootstrap
+    activates; ``runpy.run_module`` executes the parent package first, so a package __init__
+    importing a dependency must find it booted (t_808a54df: ``-m cron.scheduler`` died on ruamel)."""
+    deps = tmp_path / "generation"
+    deps.mkdir()
+    (deps / "third_party.py").write_text("value = 'dependency'\n")
+    root = tmp_path / "source"
+    (root / "pkg").mkdir(parents=True)
+    (root / "hermes_bootstrap.py").write_text(f"import sys\nsys.path.insert(0, {str(deps)!r})\n")
+    (root / "pkg" / "__init__.py").write_text("import third_party\n")
+    (root / "pkg" / "entry.py").write_text(
+        "import hermes_bootstrap, json, sys, third_party\nprint(json.dumps([third_party.value, sys.argv[1:]]))\n")
+    argv = [str(root / "pkg" / "entry.py"), "--external-worker-file", "payload.json"]
+    orig = [sys.executable, "-m", "pkg.entry", *argv[1:]]
+    command = venv_sync.relaunch_command(Path(sys.executable), root, argv, orig, "pkg.entry")
+    result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["dependency", argv[1:]]
 
 
 @pytest.mark.parametrize("owner,argv", [(None, []), ("external", []), ("electron-updater", []), ("self", ["-p", "coder", "pm", "repair"])])

@@ -611,7 +611,11 @@ def relaunch_command(
     if argv[0] == "-c":
         body = f"exec({original[index + 1]!r})"
     elif module and module != "__main__":
-        body = f"runpy.run_module({module!r}, run_name='__main__', alter_sys=True)"
+        # run_module executes the module's parent packages before the module, and an ``-I``
+        # store interpreter has no dependencies until hermes_bootstrap activates them: a
+        # package whose __init__ imports one (``-m cron.scheduler`` -> cron.jobs -> ruamel)
+        # dies before the module's own bootstrap import. Boot first, as runtime_command does.
+        body = f"import hermes_bootstrap; runpy.run_module({module!r}, run_name='__main__', alter_sys=True)"
     else:
         # distlib .exe launchers are executable zip files with __main__, not
         # importable modules named '__main__'. run_path handles both shapes.
