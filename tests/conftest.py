@@ -479,6 +479,33 @@ def _running_checkout_store_follows_the_test_home(monkeypatch):
     monkeypatch.setattr(_launchers, "store_root", store_root)
 
 
+_SESSION_SYS_PREFIX = sys.prefix
+
+
+@pytest.fixture(autouse=True)
+def _running_interpreter_owns_no_other_install(monkeypatch):
+    """Answer ``owning_install_root`` with ``None`` for the interpreter running pytest.
+
+    ``cmd_update`` first asks whether its interpreter is another install's venv. The test
+    interpreter never is, but the real probe stats beside ``sys.prefix``: a PM test environment
+    under a real home (``~/.hermes/installs/<key>/test-environment/gen-*/venv``) trips the home
+    I/O guard, and a checkout's in-tree ``.venv`` would name that checkout as the owner of a
+    test's temporary project root and re-exec the update there. The answer must not depend on
+    the host's store. A test that sets ``sys.prefix`` to build a layout still reaches the real
+    probe.
+    """
+    from hermes_cli import update_owning_install
+
+    real = update_owning_install.owning_install_root
+
+    def owning_install_root(project_root):
+        if sys.prefix == _SESSION_SYS_PREFIX:
+            return None
+        return real(project_root)
+
+    monkeypatch.setattr(update_owning_install, "owning_install_root", owning_install_root)
+
+
 @pytest.fixture(autouse=True)
 def _neutralize_git_safe_directory_read(request, monkeypatch):
     """Skip the ``git config --get-all safe.directory`` pre-read in ``noninteractive_git_env()``.
