@@ -35,6 +35,15 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+def _meta_db_path(slug: str) -> str:
+    """The board's DB path for display. A fenced worker cannot resolve another board
+    (``KanbanBoardFenced``), so metadata shows that board's own path rather than failing."""
+    try:
+        return str(_kb.kanban_db_path(slug))
+    except _kb.KanbanBoardFenced:
+        return str(_kb.natural_board_path(slug, ("kanban.db",), "kanban.db"))
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """``board.json`` merged over defaults, plus ``slug`` and ``db_path``. Never
     raises — a missing/malformed file yields the synthesized entry."""
@@ -62,7 +71,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 meta.update(raw)
     except (OSError, json.JSONDecodeError):
         pass
-    meta["db_path"] = str(_kb.kanban_db_path(slug))
+    meta["db_path"] = _meta_db_path(slug)
     return meta
 
 
@@ -96,7 +105,7 @@ def write_board_metadata(
     path.write_text(
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
     )
-    meta["db_path"] = str(_kb.kanban_db_path(slug))
+    meta["db_path"] = _meta_db_path(slug)
     return meta
 
 
@@ -107,6 +116,7 @@ def create_board(
 ) -> dict:
     """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata)."""
     normed = _kb._require_slug(slug)
+    _kb.kanban_db_path(board=normed)  # a fenced worker gets KanbanBoardFenced before any write
     # Explicit creation clears any archived tombstone at this slug (left by
     # remove_board(archive=True)) — otherwise _kb.init_db() below would rightly
     # refuse to recreate the archived board's DB (#43243).

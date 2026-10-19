@@ -19,17 +19,26 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     handler = _BOARD_HANDLERS.get(sub)
     if handler is None:
         return _err(f"kanban boards: unknown action {sub!r}", 2)
-    return handler(args)
+    try:
+        return handler(args)
+    except kb.KanbanBoardFenced as exc:
+        return _err(f"kanban boards {sub}: {exc}")
 
 
-def _board_task_counts(slug: str) -> dict[str, int]:
-    """``{status: count}`` for a board. Safe to call on an empty DB."""
+_FENCED_LABEL = "(outside worker fence)"
+
+
+def _board_task_counts(slug: str) -> Optional[dict[str, int]]:
+    """``{status: count}`` for a board. Safe to call on an empty DB. ``None`` when the
+    board is outside this worker's kanban fence: its counts are unknown, not empty."""
     try:
         if not kb.kanban_db_path(board=slug).exists():
             return {}
         with kbc.connect_closing(board=slug) as conn:
             rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
+    except kb.KanbanBoardFenced:
+        return None
     except Exception:
         return {}
 
@@ -53,8 +62,9 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     current = kb.get_current_board()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_task_counts(b["slug"])
-        b["total"] = sum(b["counts"].values())
+        counts = _board_task_counts(b["slug"])
+        b["counts"], b["fenced"] = counts, counts is None
+        b["total"] = None if counts is None else sum(counts.values())
     if _json_out(args, boards):
         return 0
     if not boards:
@@ -64,7 +74,8 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     for b in boards:
         marker = "●" if b["is_current"] else " "
         name = (b.get("name") or "") + (" [archived]" if b.get("archived") else "")
-        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {_fmt_counts(b['counts'] or {}, '(empty)')}")
+        shown = _FENCED_LABEL if b["fenced"] else _fmt_counts(b["counts"] or {}, "(empty)")
+        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {shown}")
     print(f"\nCurrent board: {current}")
     if len(boards) > 1:
         print("Switch boards with `hermes kanban boards switch <slug>`.")
@@ -134,8 +145,11 @@ def _cmd_boards_show(args: argparse.Namespace) -> int:
     print(f"Current board: {current}\n  Display name: {meta.get('name', '')}")
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
-    print(f"  DB path:      {meta['db_path']}\n"
-          f"  Tasks:        {sum(counts.values())} total" + (f" ({_fmt_counts(counts)})" if counts else ""))
+    if counts is None:
+        tasks = _FENCED_LABEL
+    else:
+        tasks = f"{sum(counts.values())} total" + (f" ({_fmt_counts(counts)})" if counts else "")
+    print(f"  DB path:      {meta['db_path']}\n  Tasks:        {tasks}")
     return 0
 
 

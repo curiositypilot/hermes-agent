@@ -584,22 +584,19 @@ def _board_path(
 ) -> Path:
     """Shared resolver. An explicit ``board=`` argument — or the scoped
     ``--board`` context (:func:`scoped_current_board`) — outranks the ``env_var``
-    pin ONLY where no fence applies (see :func:`_explicit_board_intent_pinned`):
-    user-facing cross-board intent (CLI ``--board``, a model tool's ``board=``)
-    is honored, but machine flows that enumerate boards (gateway notifier /
-    watcher / dispatcher ticks) and dispatched or delegated workers keep
-    resolving through the pin. Without explicit intent the ``env_var`` override
-    pins the file, else legacy ``<root>/<default_parts>`` for the ``default``
-    board, else ``board_dir(slug)/leaf``."""
+    pin ONLY where no fence applies (see :func:`_explicit_board_intent_pinned`).
+    Machine flows (:func:`pin_first_board_resolution`) map every slug to the pin;
+    a fenced worker / delegated child naming a board other than its pinned one
+    gets :class:`KanbanBoardFenced` instead of the pin's data (t_20d642ad).
+    Without explicit intent the ``env_var`` pin wins, else the board's own path."""
     pin = os.environ.get(env_var, "").strip() if env_var else ""
     slug = _explicit_board_slug(board)
-    if pin and (slug is None or _explicit_board_intent_pinned()):
+    fenced = slug is not None and _explicit_board_intent_pinned()
+    if fenced and slug and env_var and not _PIN_FIRST_BOARD_RESOLUTION.get():
+        assert_board_in_fence(slug)
+    if pin and (slug is None or fenced):
         return checked_pin(env_var, Path(pin).expanduser())
-    if slug is None:
-        slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home().joinpath(*default_parts)
-    return board_dir(slug) / leaf
+    return natural_board_path(slug or get_current_board(), default_parts, leaf)
 
 
 def kanban_db_path(board: Optional[str] = None) -> Path:
@@ -4742,7 +4739,9 @@ from hermes_cli.kanban_db_connect import (  # noqa: E402
     init_db,
     write_txn,
 )
-from hermes_cli.kanban_db_pin_guard import KanbanPathConflict, checked_pin  # noqa: E402,F401
+from hermes_cli.kanban_db_pin_guard import (  # noqa: E402,F401
+    KanbanBoardFenced, KanbanPathConflict, assert_board_in_fence, checked_pin, natural_board_path,
+)
 from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _cleanup_workspace,
     _is_managed_scratch_path,

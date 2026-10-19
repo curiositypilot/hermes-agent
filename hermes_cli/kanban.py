@@ -174,6 +174,12 @@ def kanban_command(args: argparse.Namespace) -> int:
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
             return _err(f"kanban: board {normed!r} does not exist. "
                         f"Create it with `hermes kanban boards create {normed}`.")
+        # A fenced worker naming another board fails here, before any action can report
+        # the pinned board's data as if it were the requested one (t_20d642ad).
+        try:
+            kb.kanban_db_path(board=normed)
+        except kb.KanbanBoardFenced as exc:
+            return _err(f"kanban: {exc}")
         board_scope = kb.scoped_current_board(normed)
 
     with board_scope:
