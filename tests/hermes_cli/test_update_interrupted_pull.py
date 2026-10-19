@@ -9,6 +9,7 @@ checkout import) puts the old tree back so ``hermes update`` can simply run agai
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,15 @@ def _git(root: Path, *args: str) -> str:
 
 
 _MULTI = "top = 1\nx = 0\ny = 0\nz = 0\nend = 1\n"
+
+
+def _host_git_version() -> tuple:
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
+    match = re.search(r"(\d+)\.(\d+)", out)
+    return (int(match[1]), int(match[2])) if match else (0, 0)
+
+
+HOST_GIT_HAS_WRITE_TREE = _host_git_version() >= (2, 38)  # `git merge-tree --write-tree` arrived in 2.38
 
 
 # Runs an entry module with the repair replaced by a probe that lists the checkout modules imported so
@@ -245,9 +255,10 @@ def test_restore_never_touches_user_work_when_git_wrote_nothing(checkout, capsys
     (root / "multi.py").write_text(_MULTI.replace("end = 1", "end = 'mine'"), encoding="utf-8", newline="")
     _git(root, "commit", "-qam", "local work that merges cleanly")
     pre = _git(root, "rev-parse", "HEAD")
-    merged = _git(root, "merge-tree", "--write-tree", pre, b)
-    merged_multi = _git(root, "show", f"{merged}:multi.py") + "\n"
-    assert merged_multi == "top = 2\nx = 0\ny = 0\nz = 0\nend = 'mine'\n"  # neither side's blob
+    merged_multi = "top = 2\nx = 0\ny = 0\nz = 0\nend = 'mine'\n"  # neither side's blob
+    if HOST_GIT_HAS_WRITE_TREE:  # git agrees with the literal; older git exercises the fallback below
+        merged = _git(root, "merge-tree", "--write-tree", pre, b)
+        assert _git(root, "show", f"{merged}:multi.py") + "\n" == merged_multi
     (root / "multi.py").write_text(merged_multi, encoding="utf-8", newline="")
     (root / "utils.py").write_text("NEW = 1\n", encoding="utf-8", newline="")
     (root / "half.py").write_bytes(b"h = 2  # long")
