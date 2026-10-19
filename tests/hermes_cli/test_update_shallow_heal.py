@@ -7,6 +7,7 @@ origin/main so merge-base reports orphan divergence (#123346). Real local git re
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -14,7 +15,18 @@ import os
 
 import pytest
 
+from hermes_cli import gitlock
 from hermes_cli.gitlock import convert_treeless_checkout, heal_shallow_history
+
+
+def _host_git_version() -> tuple:
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
+    match = re.search(r"(\d+)\.(\d+)", out)
+    return (int(match[1]), int(match[2])) if match else (0, 0)
+
+
+HOST_GIT_HAS_REFETCH = _host_git_version() >= (2, 36)  # `git fetch --refetch` arrived in 2.36
+needs_refetch = pytest.mark.skipif(not HOST_GIT_HAS_REFETCH, reason="git fetch --refetch needs git >= 2.36")
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -99,6 +111,7 @@ def _check_out_branch_outside_the_refspec(clone: Path) -> None:
     _git(clone, "checkout", "-q", "side")
 
 
+@needs_refetch
 @pytest.mark.parametrize("ref, check_out, history", [
     ("refs/heads/side", _check_out_main, 5),
     ("refs/tags/v9", _check_out_tag_only_release, 7),
@@ -123,6 +136,7 @@ def test_treeless_checkout_gets_its_whole_history_once_so_walks_stay_offline(tmp
     assert convert_treeless_checkout(clone) is False
 
 
+@needs_refetch
 def test_failed_conversion_keeps_the_checkout_treeless_for_a_retry(tmp_path):
     origin = _origin(tmp_path, 2)
     clone = tmp_path / "clone"
@@ -131,5 +145,16 @@ def test_failed_conversion_keeps_the_checkout_treeless_for_a_retry(tmp_path):
 
     with pytest.raises(subprocess.CalledProcessError):
         convert_treeless_checkout(clone)
+
+    assert _git(clone, "config", "remote.origin.partialclonefilter").stdout.strip() == "tree:0"
+
+
+def test_git_without_refetch_leaves_a_treeless_checkout_alone(tmp_path, monkeypatch):
+    origin = _origin(tmp_path, 2)
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", "--filter=tree:0", f"file://{origin}", str(clone))
+    monkeypatch.setattr(gitlock, "_git_version", lambda **_: (2, 35))
+
+    assert convert_treeless_checkout(clone) is False
 
     assert _git(clone, "config", "remote.origin.partialclonefilter").stdout.strip() == "tree:0"
