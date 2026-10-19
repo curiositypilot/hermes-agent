@@ -231,3 +231,45 @@ def test_hermes_subprocess_env_unengaged_preserves_fallback(monkeypatch):
     # not engaged (autouse fixture leaves _session_context_engaged False)
     env = hermes_subprocess_env()
     assert env.get("HERMES_SESSION_KEY") == "cli-fallback-key"
+
+
+# --------------------------------------------------------------------------- #
+# Kanban board pins must not stick in the session snapshot (intake t_936a2bc2)
+# --------------------------------------------------------------------------- #
+
+def _probe(name: str) -> str:
+    return f'printf "[%s]" "${{{name}:-unset}}"'
+
+
+@pytest.mark.platforms("posix")  # POSIX bash snapshot path
+@pytest.mark.parametrize("name", ["HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB"])
+def test_leaked_kanban_pin_does_not_outlive_the_process_env(tmp_path, monkeypatch, name):
+    """A pin present in os.environ for one spawn (a gateway thread pinning a board
+    mid-tick) must vanish from the next command once the process env drops it."""
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.delenv(name, raising=False)
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        assert "[unset]" in env.execute(_probe(name))["output"]
+        monkeypatch.setenv(name, "yuliia")
+        assert "[yuliia]" in env.execute(_probe(name))["output"]
+        monkeypatch.delenv(name)
+        after = env.execute(_probe(name))["output"]
+        assert "[unset]" in after, f"{name} stuck in the session snapshot: {after!r}"
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.platforms("posix")  # POSIX bash snapshot path
+def test_lookalike_kanban_names_still_persist_in_snapshot(tmp_path):
+    """Only the exact pin names are dropped; a user's own lookalike exports survive."""
+    from tools.environments.local import LocalEnvironment
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        env.execute('export HERMES_KANBANX_FOO=keep1 MY_HERMES_KANBAN_BOARD=keep2')
+        out = env.execute(f'{_probe("HERMES_KANBANX_FOO")}; {_probe("MY_HERMES_KANBAN_BOARD")}')["output"]
+        assert "[keep1][keep2]" in out, out
+    finally:
+        env.cleanup()

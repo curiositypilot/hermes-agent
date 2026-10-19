@@ -8,7 +8,6 @@ the singleton lock and the health telemetry; everything that only needs the
 from __future__ import annotations
 
 import contextlib
-import os
 import sqlite3
 import time
 from dataclasses import asdict, dataclass
@@ -262,11 +261,11 @@ class _KanbanDispatcher:
             for slug in self._board_slugs():
                 if attempted >= auto_decompose_per_tick:
                     break
-                # Pin the board via env for the call: the decomposer connects
-                # with no board kwarg (same pattern as the dashboard specify endpoint).
-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
-                try:
-                    os.environ["HERMES_KANBAN_BOARD"] = slug
+                # The decomposer connects with no board kwarg, so pin the board for
+                # this context only. Never via os.environ: this thread shares the
+                # gateway process with chat turns, and a terminal spawned while the
+                # env pin was live copied it (then the session snapshot kept it).
+                with _kb.scoped_current_board(slug):
                     try:
                         triage_ids = _decomp.list_triage_ids(exclude_finished=True)
                     except Exception as exc:
@@ -277,11 +276,6 @@ class _KanbanDispatcher:
                             break
                         attempted += 1
                         successes += self._decompose_one(_decomp, slug, tid)
-                finally:
-                    if prev_env is None:
-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
-                    else:
-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
         return successes
 
     def auto_label_tick(self) -> int:
