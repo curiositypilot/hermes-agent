@@ -1852,10 +1852,10 @@ DEFAULT_CONFIG = {
         # Wrap delivered cron responses with a task-name header and "The agent cannot see this
         # message" footer. False = clean output.
         "wrap_response": True,
-        # Failure notices (run failed, crashed, blocked-config/drift alerts) go to this command as
-        # JSON on stdin instead of the job's chat; exit 0 = it filed a card, anything else = the
-        # notice is delivered to chat as before. "" = off. See cron/failure_route.py.
-        "failure_route": {"command": "", "timeout": 180},
+        # Failure notices (cron failures, blocked-config/drift alerts, Kanban gave_up pings) go to
+        # this command as JSON on stdin; exit 0 = it filed a card, else chat as before; "" = off.
+        # While set, Kanban crashed/timed_out and cron-interrupted-by-restart notices are skipped.
+        "failure_route": {"command": "", "timeout": 180},  # see cron/failure_route.py
         "delivery": {  # Delivery behaviour for cron output sent through a live gateway adapter.
             # Mark cron deliveries FINAL so the platform pushes them (Telegram's "important" mode
             # otherwise sends with disable_notification=True and briefs look undelivered). False =

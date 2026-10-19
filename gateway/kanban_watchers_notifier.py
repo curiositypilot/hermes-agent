@@ -485,6 +485,9 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "block_loop_detected": _fmt_block_loop_detected,
 }
 
+# Error kinds ``cron.failure_route`` takes from the chat (``_KanbanNotification._card_owns_event``).
+_CARD_OWNED_KINDS = frozenset({"gave_up", "crashed", "timed_out"})
+
 
 # --- Delivery of one claimed batch (one subscription, N events) ---
 
@@ -673,6 +676,29 @@ class _KanbanNotification:
                                notification_category="diagnostic" if self.wake_diagnostic else "result")
         self._log_woke()
 
+    async def _card_owns_event(self, ev: Any) -> bool:
+        """True when ``cron.failure_route`` (subscriber profile's config) takes this error event.
+
+        ``gave_up`` is handed to the router (``None`` = send the old ping). ``crashed``/``timed_out``
+        are retries in flight: the card's events own them, and a run that keeps failing ends as
+        ``gave_up``, so they are skipped outright while a route is configured. Deliveries run in
+        sequence, so a slow router (up to its timeout) delays the tick's later pings; fine at gave_up volume.
+        """
+        if ev.kind not in _CARD_OWNED_KINDS:
+            return False
+        from cron import failure_route
+        from gateway.warning_notifications import effective_user_config
+        cfg = effective_user_config()
+        if not failure_route.route_configured(cfg):
+            return False
+        if ev.kind != "gave_up":
+            logger.debug("kanban notifier: %s event for %s skipped (cron.failure_route set)", ev.kind, self.task_id)
+            return True
+        failures = _payload(ev, "failures") or "?"
+        text = f"{self.task_id} gave up after {failures} attempts: {_payload(ev, 'error') or 'no error recorded'}"
+        payload = {"source": "kanban", "job_id": self.task_id, "job_name": self.title, "text": text}
+        return bool(await asyncio.to_thread(failure_route.route_event, payload, cfg))
+
     async def _send_event(self, ev: Any, msg: str) -> bool:
         """Send one text ping; raises on adapter exception or SendResult(success=False)."""
         from gateway.warning_notifications import present_notification
@@ -731,7 +757,8 @@ class _KanbanNotification:
             if ev.id <= self.sub.get("last_ping_event_id", 0):
                 continue
             try:
-                if await self._send_event(ev, msg) is False:
+                # A card owns it (cron.failure_route) or the ping went out; both settle the cursor.
+                if not (await self._card_owns_event(ev) or await self._send_event(ev, msg)):
                     continue
                 await _to_thread_process_service(partial(
                     self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,

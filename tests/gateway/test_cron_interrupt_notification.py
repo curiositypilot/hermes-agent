@@ -192,6 +192,33 @@ class TestNotifyInterruptedCronJobs:
         assert sent == 1
         assert len(adapter.sent) == 1
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("configured", [True, False])
+    async def test_failure_route_skips_the_chat_notice(self, monkeypatch, configured):
+        """t_0bb86854: with ``cron.failure_route`` set the notice is skipped (the run is recorded
+        interrupted) and NOT routed: no router subprocess runs during shutdown."""
+        import subprocess
+
+        from cron import failure_route
+
+        def _no_subprocess(*_a, **_kw):
+            raise AssertionError("no subprocess may run during shutdown")
+
+        monkeypatch.setattr(subprocess, "run", _no_subprocess)
+        monkeypatch.setattr(failure_route, "route_configured", lambda cfg=None: configured)
+        runner, adapter = make_restart_runner()
+        _bind_notifier(runner)
+        job = _telegram_job()
+
+        with patch("cron.jobs.get_job", return_value=job), \
+             patch("cron.scheduler._resolve_delivery_targets",
+                   return_value=[_telegram_target()]):
+            sent = await runner._notify_interrupted_cron_jobs([job["id"]])
+
+        expected = 0 if configured else 1
+        assert sent == expected
+        assert len(adapter.sent) == expected
+
 class TestShutdownDeliversNoticeBeforeDisconnect:
     @pytest.mark.asyncio
     async def test_notice_is_sent_while_the_adapter_is_still_connected(self, monkeypatch):

@@ -903,27 +903,27 @@ class GatewayShutdownMixin:
     async def _notify_interrupted_cron_jobs(self, job_ids) -> int:
         """Tell the owner of each just-interrupted cron job that its run died; returns notices sent.
 
-        The cron worker can't (its thread reaches ``_deliver_result`` after teardown closed the
-        transport), so this runs post-interrupt while adapters are still connected. Best-effort.
-
-        Its thread reaches ``_deliver_result`` asynchronously, and by then ``_bounded_adapter_teardown`` has
-        closed the transport — so the notice never leaves the process, and ``_consume_interrupted_flag``
-        discards the resulting ``delivery_error`` along with it. The run's only trace is a line in jobs.json
-        nobody reads (#82232).
-        Must therefore be called from the post-interrupt phase, while adapters are still connected — the
-        same window ``_notify_active_sessions_of_shutdown`` relies on for chat sessions, which is blind to
-        cron work because cron runs on the scheduler's own thread pool rather than ``self._running_agents``
-        (#60432).
+        The cron worker can't (its ``_deliver_result`` runs after teardown closed the transport and the
+        ``delivery_error`` is discarded, #82232), so this runs post-interrupt while adapters are connected:
+        the ``_notify_active_sessions_of_shutdown`` window, blind to cron's own pool (#60432). Best-effort.
+        With ``cron.failure_route`` set no notice goes out (the run is recorded interrupted; a restart is
+        not a job defect, so it is not routed to the card router either).
         """
         if not job_ids:
             return 0
         try:
+            from cron.failure_route import route_configured
             from cron.jobs import get_job
             from cron.scheduler import _resolve_delivery_targets
+            from gateway.warning_notifications import effective_user_config
         except Exception as e:
             logger.debug("Cron interrupt notification unavailable: %s", e)
             return 0
         action = t("gateway.shutdown.action_restarting" if self._restart_requested else "gateway.shutdown.action_shutting_down")
+        if route_configured(effective_user_config()):
+            for job_id in job_ids:
+                logger.info("Cron job %s interrupted by %s; run recorded interrupted; chat notice skipped (cron.failure_route)", job_id, action)
+            return 0
         notified: set = set()
         for job_id in job_ids:
             try:
