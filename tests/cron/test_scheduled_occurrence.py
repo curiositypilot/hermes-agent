@@ -47,6 +47,9 @@ def _fire(home, mode):
            and not k.endswith(('_API_KEY', '_TOKEN'))}
     env['HERMES_HOME'] = str(home)
     env['PYTHONPATH'] = str(Path(__file__).resolve().parents[2])
+    # The strip drops conftest's kill switch; without it a checkout an installed root owns makes
+    # the worker child run a real per-root dependency sync for the temp home.
+    env['HERMES_DISABLE_LAZY_INSTALLS'] = '1'
     result = subprocess.run([sys.executable, '-c', _FIRE, mode], env=env,
                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -93,6 +96,7 @@ def test_completed_occurrence_survives_restart_and_prestamp_rollback(tmp_path, m
     store.write_text(pending)
     _fire(home, mode)
     assert len(effect.read_text().splitlines()) == 4
+    assert not (home / 'installs').exists(), 'the test data root received a real dependency install'
 
 
 def test_ledger_migration_and_completion_identity(tmp_path, monkeypatch):
