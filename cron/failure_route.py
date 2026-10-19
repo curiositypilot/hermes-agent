@@ -54,7 +54,7 @@ def _latest_output(job_id: str) -> Optional[str]:
         from cron.jobs import OUTPUT_DIR
         files = sorted(Path(OUTPUT_DIR, job_id).glob("*"), key=lambda p: p.stat().st_mtime)
         return str(files[-1]) if files else None
-    except Exception:
+    except OSError:  # a file pruned between glob() and stat()
         return None
 
 
@@ -71,15 +71,15 @@ def route_failure(job: dict, content: str, cfg: Optional[dict] = None) -> Option
         payload = {"source": "cron", "job_id": str(job.get("id") or ""),
                    "job_name": str(job.get("name") or job.get("id") or ""),
                    "text": content, "output_file": _latest_output(str(job.get("id") or ""))}
-        proc = subprocess.run(cmd, input=json.dumps(payload), capture_output=True, text=True,
-                              timeout=timeout)
+        proc = subprocess.run(cmd, input=json.dumps(payload), capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         logger.warning("Job '%s': failure router timed out; delivering the notice to chat instead",
                        job.get("id", "?"))
         return None
-    except Exception as exc:
+    except Exception as exc:  # boundary: a broken router must never cost the chat notice
         logger.warning("Job '%s': failure router unavailable (%s); delivering the notice to chat",
-                       job.get("id", "?"), exc)
+                       job.get("id", "?"), exc, exc_info=True)
         return None
     if proc.returncode != 0:
         logger.warning("Job '%s': failure router exit %s (%s); delivering the notice to chat",

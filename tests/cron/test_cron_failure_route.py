@@ -12,11 +12,12 @@ import pytest
 
 import cron.scheduler as s
 from cron import failure_route as fr
-from tests.cron.test_cron_failure_deliver import (  # noqa: F401  (fixture re-export)
-    _failing_run_job,
-    _succeeding_run_job,
-    run_env,
-)
+from tests.cron import test_cron_failure_deliver as _deliver
+from tests.cron.test_cron_failure_deliver import _failing_run_job, _succeeding_run_job
+
+# Shared fixture: pytest finds fixtures by module attribute. An assignment, not an import, so the
+# test parameters that request it do not shadow an unused import (F811).
+run_env = _deliver.run_env
 
 
 def _router(tmp_path, *, rc=0, out='{"action": "filed_intake", "card": "t_abc"}', sleep=0):
