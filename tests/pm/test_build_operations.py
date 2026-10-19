@@ -325,12 +325,17 @@ def test_failed_requirement_build_removes_only_its_candidate(tmp_path, build_too
     elif failure == "install":
         wheel.unlink()
     else:
-        # The archive carries an extra distribution invisible to resolution.
-        # pip check must reject its unsatisfied dependency after installation.
-        with zipfile.ZipFile(wheel, "a") as archive:
-            archive.writestr("app_dep-1.0.data/purelib/ghost-1.0.dist-info/METADATA",
-                             "Metadata-Version: 2.1\nName: ghost\nVersion: 1.0\n"
-                             "Requires-Dist: missing-dep==1.0\n")
+        # The wheel carries a well-formed, recorded extra distribution that resolution
+        # does not see; pip check must reject its unsatisfied dependency after installation.
+        record = "app_dep-1.0.dist-info/RECORD"
+        with zipfile.ZipFile(wheel) as archive:
+            entries = {name: archive.read(name) for name in archive.namelist() if name != record}
+        entries["app_dep-1.0.data/purelib/ghost-1.0.dist-info/METADATA"] = (
+            b"Metadata-Version: 2.1\nName: ghost\nVersion: 1.0\nRequires-Dist: missing-dep==1.0\n")
+        entries[record] = "".join(f"{path},,\n" for path in [*entries, record]).encode()
+        with zipfile.ZipFile(wheel, "w") as archive:
+            for path, body in entries.items():
+                archive.writestr(path, body)
     out = tmp_path / "candidate"
     with pytest.raises(InstallError, match="dependency validation" if failure == "check" else None):
         build_requirements_environment(["app-dep==1.0"], out=out, python=python, wheelhouse=wheels,
