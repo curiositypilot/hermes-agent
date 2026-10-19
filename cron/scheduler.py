@@ -552,6 +552,7 @@ from cron.executions import (
     get_execution, mark_execution_handoff_pending, mark_execution_running,
     recover_interrupted_executions, settle_unstarted_execution, terminalize_dead_owner)
 from cron.scheduler_liveness import ExecutionProgressStamper, _inactivity_watchdog_loop
+from cron.scheduler_side_notices import defer_verifier_footer, final_response_with_side_notices
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -2638,17 +2639,14 @@ def run_job(
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
+        defer_verifier_footer(agent)
         _audit = _FireAudit(job, job_id, model)
 
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state, memory_query=_cron_memory_query(job, extra_prompt))
-        final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
-        if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
-                and _cron_failure_marker_error(final_response) is None):
-            # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
-            # agent-declared failure marker keep their first-line/whole-response contract.
-            final_response = f"{setup.fallback_notice}\n\n{final_response}"
+        final_response = final_response_with_side_notices(
+            result, job, job_id, job_name, agent, setup.fallback_notice, AIAgent)
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
         # Text-file reads normalize newlines; count the same characters the
