@@ -51,6 +51,8 @@ def test_failure_goes_to_router_not_chat(run_env, monkeypatch, tmp_path):
     assert len(calls) == 1
     assert calls[0]["source"] == "cron" and calls[0]["job_id"] == "j1" and calls[0]["job_name"] == "scout"
     assert "boom" in calls[0]["text"]
+    outcome = run_env["finished"][-1][1].get("delivery_outcome")
+    assert outcome == "routed"
 
 
 def test_router_failure_falls_back_to_chat(run_env, monkeypatch, tmp_path):
