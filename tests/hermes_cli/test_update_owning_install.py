@@ -26,3 +26,11 @@ def test_pm_generation_venv_is_owned_by_the_checkout_its_install_key_names(tmp_p
 
     record.write_text(str(tmp_path / "elsewhere"), encoding="utf-8")  # not the path the key hashes
     assert owning_install_root(workspace) is None
+
+
+def test_running_test_interpreter_is_not_a_redirected_install(tmp_path):
+    """The interpreter running pytest owns no other install, whatever store the host built it in."""
+    from hermes_cli import update_owning_install
+
+    assert update_owning_install.owning_install_root(tmp_path) is None
+    update_owning_install.retarget_to_owning_install(tmp_path)  # returns; no SystemExit, no re-exec
