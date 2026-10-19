@@ -6,7 +6,8 @@ via the agent's OUT-OF-BAND steer channel — so a user can talk to a running
 task without the block→comment→unblock dance or a restart.
 
 Verifies: no-op off a worker, watermark seeding (history isn't re-injected),
-new comments steer, and own-authored comments are skipped.
+new comments steer, own-authored comments are skipped, and notes stop once the
+worker's own run has ended (its handoff gave the card to the next owner).
 """
 
 from __future__ import annotations
@@ -191,3 +192,65 @@ def test_skips_own_authored_comments_without_env_profile(worker_home, monkeypatc
     _unthrottle()
     assert kt.inject_new_comments_from_env(agent) is False
     assert agent.steers == []
+
+
+def _claimed_worker(monkeypatch, title: str) -> tuple[str, int]:
+    """A claimed task (open run) with this process scoped to it as the worker."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title=title)
+        task = kb.claim_task(conn, tid)
+        assert task is not None and task.current_run_id
+        run_id = int(task.current_run_id)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_PROFILE", "worker-bot")
+    return tid, run_id
+
+
+def _comment(tid: str, author: str, body: str) -> None:
+    conn = kbc.connect()
+    try:
+        kb.add_comment(conn, tid, author=author, body=body)
+    finally:
+        conn.close()
+
+
+def test_no_injection_after_own_run_ended(worker_home, monkeypatch):
+    """After the worker's handoff ends its run, a postflight receipt addressed to the
+    reviewer must not be steered into the still-alive worker as an operator note."""
+    tid, run_id = _claimed_worker(monkeypatch, "handed off")
+    agent = FakeAgent()
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is False  # seed
+
+    conn = kbc.connect()
+    try:
+        assert kb.request_review(conn, tid, summary="implemented", expected_run_id=run_id)
+        ended = kb.get_run(conn, run_id)
+        assert ended is not None and ended.ended_at is not None
+    finally:
+        conn.close()
+    _comment(tid, "postflight_gate", "postflight: pass=25 warn=3 fail=2")
+
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is False
+    _comment(tid, "desktop", "a later note")
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is False
+    assert agent.steers == []
+
+
+def test_injection_while_own_run_open(worker_home, monkeypatch):
+    """An open run (e.g. a refused handoff) still receives the postflight receipt."""
+    tid, _run_id = _claimed_worker(monkeypatch, "still mine")
+    agent = FakeAgent()
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is False  # seed
+
+    _comment(tid, "postflight_gate", "postflight: fail=2 broad-except")
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is True
+    assert "broad-except" in agent.steers[0]

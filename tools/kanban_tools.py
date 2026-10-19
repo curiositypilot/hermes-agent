@@ -649,7 +649,9 @@ _comment_watermark: dict[str, int] = {}
 
 def inject_new_comments_from_env(agent: Any) -> bool:
     """Steer new operator comments on the worker's task into ``agent``; True iff a
-    steer was injected; never raises. Own comments (``_persisted_identity``) are skipped."""
+    steer was injected; never raises. Own comments (``_persisted_identity``) are skipped.
+    Notes are injected only while this worker's run is open; after a handoff they belong
+    to the next owner (a refused handoff leaves the run open, so its receipt still lands)."""
     global _comment_poll_last_attempt
     # Operator notes address the dispatcher-owned worker; a delegate_task child sharing
     # this process must neither receive them nor advance the shared watermark (#112817).
@@ -660,18 +662,24 @@ def inject_new_comments_from_env(agent: Any) -> bool:
         return False
     _comment_poll_last_attempt = now
     seen = _comment_watermark.get(tid)
+    run_id = _worker_run_id(tid)
     try:
         with _board(None, quiet_close=True) as (kb, conn):
             rows = kb.list_comments_after(conn, tid, after_id=seen or 0)
+            run = kb.get_run(conn, run_id) if run_id is not None else None
     except Exception:
         logger.debug("comment-inject: bridge failed", exc_info=True)
         return False
+    # Unknown run id (no HERMES_KANBAN_RUN_ID) keeps the ungated behaviour.
+    run_ended = run_id is not None and (run is None or run.ended_at is not None)
     if seen is None:
         _comment_watermark[tid] = max((c.id for c in rows), default=0)
     if seen is None or not rows:
         return False
     # Advance past everything read (including our own notes) so nothing is re-injected.
     _comment_watermark[tid] = max(c.id for c in rows)
+    if run_ended:
+        return False
     # Same resolution the write side used, so a worker skips its OWN comments even
     # when the dispatcher did not pin HERMES_PROFILE (echoed notes would otherwise
     # re-enter the live turn as fake operator steering).
