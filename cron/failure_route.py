@@ -34,7 +34,6 @@ import json
 import logging
 import shlex
 import subprocess
-from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -76,12 +75,22 @@ def _load_config(cfg: Optional[dict]) -> Optional[dict]:
 
 
 def _latest_output(job_id: str) -> Optional[str]:
+    """Newest saved run report of ``job_id`` in the ACTIVE cron store (``use_cron_store`` / live
+    HERMES_HOME), never the import-time ``OUTPUT_DIR``: under another profile's scope that named
+    the launch profile's file or nothing. Only ``save_job_output``'s ``*.md`` reports count, so a
+    monitor snapshot or an atomic-write temp file in the same dir is never the pointer."""
     try:
-        from cron.jobs import OUTPUT_DIR
-        files = sorted(Path(OUTPUT_DIR, job_id).glob("*"), key=lambda p: p.stat().st_mtime)
-        return str(files[-1]) if files else None
-    except (ImportError, OSError):
+        from cron.jobs import _job_output_dir
+        files = [p for p in _job_output_dir(job_id).glob("*.md")
+                 if p.is_file() and not p.name.startswith(".")]
+        return str(max(files, key=lambda p: p.stat().st_mtime)) if files else None
+    except (ImportError, OSError, ValueError):
+        # ValueError: an id _job_output_dir rejects (empty, path escape) has no output dir.
         return None
+
+
+# ``route_failure``'s default: point at the job's newest saved report.
+_LATEST: Any = object()
 
 
 def route_configured(cfg: Optional[dict] = None) -> bool:
@@ -135,14 +144,19 @@ def route_event(payload: dict, cfg: Optional[dict] = None) -> Optional[dict]:
 
 
 def route_failure(job: dict, content: str, cfg: Optional[dict] = None, *,
-                  signature: Optional[str] = None) -> Optional[dict]:
+                  signature: Optional[str] = None,
+                  output_file: Optional[str] = _LATEST) -> Optional[dict]:
     """``route_event`` for one cron job's failure notice (``source: cron``). Never raises.
     ``signature`` (optional) is the router's dedupe key: repeats of one signature fold into one
-    card instead of one card per distinct text."""
+    card instead of one card per distinct text. ``output_file`` defaults to the job's newest
+    saved report (right for failure notices, delivered after the save); an explicit value,
+    ``None`` included, goes into the payload as given."""
     job_id = str(job.get("id") or "")
+    if output_file is _LATEST:
+        output_file = _latest_output(job_id)
     payload = {"source": "cron", "job_id": job_id,
                "job_name": str(job.get("name") or job.get("id") or ""),
-               "text": content, "output_file": _latest_output(job_id)}
+               "text": content, "output_file": output_file}
     if signature:
         payload["signature"] = signature
     return route_event(payload, cfg)

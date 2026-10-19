@@ -359,3 +359,94 @@ def test_silent_response_footer(monkeypatch, tmp_path):
     assert final == "[SILENT]" and s._is_cron_silence_response(final)
     calls = _calls(log)
     assert len(calls) == 1 and calls[0]["signature"] == "cron-verifier:jv"
+
+
+# --- the card's ``output:`` pointer (t_02774fc4) ----------------------------------------------
+# It must name this job's report in the ACTIVE cron store, never the import-time OUTPUT_DIR (the
+# launch profile's), never a non-report file, and side notices (routed before the save) send none.
+
+
+def _route_payload(tmp_path, job_id, **kw):
+    cmd, log = _router(tmp_path)
+    assert fr.route_failure({"id": job_id, "name": "scout"}, "boom",
+                            {"cron": {"failure_route": {"command": cmd}}}, **kw)
+    (call,) = _calls(log)
+    return call
+
+
+def _age(path, seconds_ago):
+    import os
+    import time
+    t = time.time() - seconds_ago
+    os.utime(path, (t, t))
+
+
+def test_latest_output_follows_use_cron_store(tmp_path):
+    import shutil
+    from cron import jobs
+    job_id = f"jpo-{tmp_path.name}"
+    launch_dir = jobs.OUTPUT_DIR / job_id  # import-time store = the launch profile's
+    launch_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        launch_file = launch_dir / "2099-01-01_00-00-00.md"
+        launch_file.write_text("launch profile's run")
+        with jobs.use_cron_store(tmp_path / "profile-b"):
+            b_file = jobs.save_job_output(job_id, "profile b's run")
+            _age(b_file, 60)  # the launch file is newer: only the store decides
+            call = _route_payload(tmp_path, job_id)
+        assert call["output_file"] == str(b_file)
+        assert call["output_file"] != str(launch_file)
+    finally:
+        shutil.rmtree(launch_dir, ignore_errors=True)
+
+
+def test_latest_output_follows_repointed_hermes_home(monkeypatch, tmp_path):
+    from cron import jobs
+    home = tmp_path / "repointed-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    saved = jobs.save_job_output("jrp", "this home's run")
+    assert str(saved).startswith(str(home.resolve()))
+    assert _route_payload(tmp_path, "jrp")["output_file"] == str(saved)
+
+
+def test_latest_output_ignores_monitor_snapshot(tmp_path):
+    from cron import jobs
+    with jobs.use_cron_store(tmp_path / "store"):
+        report = jobs.save_job_output("jmon", "run report")
+        _age(report, 120)
+        out_dir = report.parent
+        for name in ("monitor_last_output.txt", ".output_abc123.md", ".output_def456.tmp"):
+            (out_dir / name).write_text("not a run report")
+        assert fr._latest_output("jmon") == str(report)
+
+
+@pytest.mark.parametrize("job_id", ["", "..", "a/b"])
+def test_latest_output_rejected_job_id_is_none(job_id, tmp_path):
+    from cron import jobs
+    with jobs.use_cron_store(tmp_path / "store"):
+        assert fr._latest_output(job_id) is None
+
+
+def test_route_failure_explicit_output_file_none(tmp_path):
+    from cron import jobs
+    with jobs.use_cron_store(tmp_path / "store"):
+        report = jobs.save_job_output("jnone", "previous run")
+        assert fr._latest_output("jnone") == str(report)  # the default would point at it
+        call = _route_payload(tmp_path, "jnone", output_file=None)
+    assert "output_file" in call and call["output_file"] is None
+
+
+def test_side_notices_send_no_output_pointer(monkeypatch, tmp_path):
+    from cron import jobs
+    cmd, log = _router(tmp_path)
+    _configure(monkeypatch, cmd)
+    with jobs.use_cron_store(tmp_path / "store"):
+        previous = jobs.save_job_output("jv", "previous run's report")
+        assert fr._latest_output("jv") == str(previous)
+        success, _o, final, _e = _run(tmp_path, "Morning brief: all green.", _FAILED,
+                                      primary_fails=True)
+    assert success and final == "Morning brief: all green."
+    calls = _calls(log)
+    assert sorted(c["signature"] for c in calls) == ["cron-provider-fallback:jv", "cron-verifier:jv"]
+    assert all("output_file" in c and c["output_file"] is None for c in calls)
