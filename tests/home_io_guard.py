@@ -113,6 +113,12 @@ class HomeIOGuard:
             # which is not I/O against the home.
             if metadata and (absolute == "/proc" or absolute.startswith("/proc" + os.sep)):
                 return
+            # The kernel names an unlinked file "<path> (deleted)" in /proc readlinks; psutil's
+            # exe()/open_files() stat that name to decide whether to strip the suffix. A process
+            # still running a replaced PM python/node under ~/.hermes/tools yields one on every
+            # process scan. Probing the name of an unlinked inode reads no Hermes state.
+            if metadata and absolute.endswith(" (deleted)"):
+                return
             resolved = self._refuse_installed_app_change(value, absolute) if destructive else None
             roots = tuple(_normcase(os.fspath(r)) for r in self.roots())
             # Resolving the root itself (get_default_hermes_root's relative_to

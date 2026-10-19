@@ -202,6 +202,50 @@ def test_relative_path_metadata_exemption_tracks_working_directory(protected_hom
         guard.check(target, metadata=True)
 
 
+def test_deleted_exe_name_is_metadata_only(protected_home):
+    """/proc/<pid>/exe of a process whose binary was replaced (a PM python/node upgrade under
+    ~/.hermes/tools) reads ``<exe> (deleted)``; psutil stats that name to decide whether to
+    strip the suffix. Probing it is not I/O against the home; anything else still is."""
+    from tests.home_io_guard import HomeIOGuard
+
+    guard = HomeIOGuard(lambda: [protected_home])
+    deleted = protected_home / "tools/py/bin/python3 (deleted)"
+    guard.check(deleted, metadata=True)
+    refused = [
+        lambda: guard.check(deleted, metadata=False),
+        lambda: guard.check(deleted, destructive=True),
+        lambda: guard.check(protected_home / "state.db", metadata=True),
+        lambda: guard.check(protected_home / "x (deleted).bak", metadata=True),
+        lambda: guard.check(protected_home / "x(deleted)", metadata=True),
+    ]
+    for probe in refused:
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            probe()
+
+
+@pytest.mark.platforms("linux")
+def test_psutil_exe_of_a_process_running_a_deleted_binary_under_the_home(tmp_path, monkeypatch):
+    """Process scans (``_stop_desktop_processes_locking_build``) call psutil exe() on every
+    host process; one still running a replaced PM interpreter must not trip the guard."""
+    import psutil
+
+    from tests.home_io_guard import HomeIOGuard
+
+    home = tmp_path / "home"
+    binary = home / "tools" / "sleep"
+    binary.parent.mkdir(parents=True)
+    shutil.copy2("/bin/sleep", binary)
+    child = subprocess.Popen([str(binary), "60"])
+    try:
+        binary.unlink()
+        with monkeypatch.context() as patcher:
+            HomeIOGuard(lambda: [home]).install(patcher)
+            psutil.Process(child.pid).exe()
+    finally:
+        child.kill()
+        child.wait()
+
+
 def test_checkout_inside_a_guarded_root_is_not_hermes_state():
     """The default install checks the repo out INSIDE the home (install.sh:
     INSTALL_DIR=$HERMES_HOME/hermes-agent): the checkout, its .venv and test
