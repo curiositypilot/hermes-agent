@@ -54,6 +54,12 @@ def marker(tmp_path):
     return tmp_path / ".hermes-update-in-progress"
 
 
+@pytest.fixture(autouse=True)
+def _no_runtime_host_above_us(monkeypatch):
+    """The host's own Hermes gateway may be an ancestor of pytest (a kanban worker); V9 has its own tests."""
+    monkeypatch.setattr(update_lock, "_is_runtime_host", lambda cmdline: False)
+
+
 @pytest.fixture
 def other_pid():
     """A live process that is not us: the stand-in for another updater (our own pid is ours)."""
@@ -644,6 +650,24 @@ class TestHandoffFromOrchestratingUpdater:
         assert marker.exists(), "the parent still needs its marker after our stage ends"
         assert int(marker.read_text(encoding="utf-8-sig").splitlines()[0]) == other_pid
 
+    def test_handoff_partner_is_refused_when_a_runtime_host_sits_above_us(self, marker, monkeypatch, other_pid):
+        """cli §7 V9: an update a gateway/serve/dashboard starts (its agent, `/update`) is independent.
+
+        The host outlives the first update's stages, so a hand-off env inherited through it must
+        not let this update run under that update's claim."""
+        import psutil
+
+        host_cmdline = psutil.Process(os.getppid()).cmdline()
+        monkeypatch.setattr(update_lock, "_is_runtime_host", lambda cmdline: cmdline == host_cmdline)
+        _claim(marker, other_pid)
+        before = marker.read_bytes()
+        monkeypatch.setenv(HANDOFF_PID_ENV, str(other_pid))
+
+        lock = UpdateLock(path=marker)
+        assert lock.acquire() is False, "a runtime host between us and the partner makes this a separate update"
+        assert lock.holder is not None and lock.holder.pid == other_pid
+        assert marker.read_bytes() == before, "a refused claimant never rewrites the owner's marker"
+
     def test_handoff_pid_that_is_not_the_live_holder_grants_nothing(
         self, marker, monkeypatch, other_pid
     ):
@@ -700,6 +724,19 @@ class TestAncestryHandoff:
 
         lock = UpdateLock(path=marker)
         assert lock.acquire() is True, "a live ancestor's claim is the one we run under"
+        assert lock.acquired is False, "the parent's claim is not ours to own"
+
+        lock.release()
+        assert marker.exists(), "the parent still needs its marker after our stage ends"
+
+    def test_runtime_host_above_the_holder_does_not_refuse_adoption(self, marker, monkeypatch):
+        """V9 looks only BELOW the holder: a gateway above the orchestrating update (it started
+        that update) does not make us independent of it, so the walk stops at the holder."""
+        monkeypatch.setattr(update_lock, "_is_runtime_host", lambda cmdline: True)
+        _claim(marker, os.getppid())
+
+        lock = UpdateLock(path=marker)
+        assert lock.acquire() is True, "no host sits between us and our live ancestor's claim"
         assert lock.acquired is False, "the parent's claim is not ours to own"
 
         lock.release()
