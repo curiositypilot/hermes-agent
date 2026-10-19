@@ -317,5 +317,35 @@ class TestVerifierEnabled:
         assert agent._file_mutation_verifier_enabled() is False
 
 # ---------------------------------------------------------------------------
+# _append_file_mutation_footer — opt-in deferral (cron routes the footer to a card)
+# ---------------------------------------------------------------------------
+
+def test_deferred_footer_is_stored_not_appended():
+    import logging
+
+    from agent.i18n import t
+    from agent.turn_finalizer import _append_file_mutation_footer
+
+    def _agent(**attrs):
+        agent = _bare_agent()
+        agent._turn_failed_file_mutations = {
+            "/tmp/a.md": {"tool": "patch", "error_preview": "Could not find old_string"}}
+        agent._file_mutation_verifier_enabled = lambda: True
+        for name, value in attrs.items():
+            setattr(agent, name, value)
+        return agent
+
+    log = logging.getLogger("test")
+    deferring = _agent(_defer_file_mutation_footer=True)
+    assert _append_file_mutation_footer(deferring, "Done.", log) == "Done."
+    footer = deferring._deferred_file_mutation_footer
+    assert footer.startswith(t("explainer.file_mutation.header", count=1)) and "/tmp/a.md" in footer
+
+    # Must not change: an agent that did not opt in still gets the footer in its response.
+    plain = _agent()
+    assert _append_file_mutation_footer(plain, "Done.", log) == "Done.\n\n" + footer
+    assert not hasattr(plain, "_deferred_file_mutation_footer")
+
+# ---------------------------------------------------------------------------
 # Module-level invariants
 # ---------------------------------------------------------------------------
