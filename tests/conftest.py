@@ -451,6 +451,35 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _running_checkout_store_follows_the_test_home(monkeypatch):
+    """Resolve the PM store of the checkout running pytest as an uninstalled tree's: the test home's ``tools/``.
+
+    Code under test asks for the running install's store (``pm.paths.store_root()``,
+    ``_launchers.resolve_store_python(repo_root())``) for env composition, product checks and
+    launcher bodies. On CI that walk finds no install stamp and lands in the temporary home. A
+    checkout installed in a real home (``~/.hermes/hermes-agent``, or a kanban worktree beneath
+    it) instead finds stamps and install facts there, so the same tests read the developer's
+    store, or fail the home I/O guard. ``HERMES_RUNTIME_DIR`` and every other tree still resolve
+    as in production; a test that needs a particular store patches the seam itself.
+    """
+    import pm.environments
+    from hermes_cli import _launchers
+    from hermes_constants import get_default_hermes_root
+
+    real = pm.environments.store_root
+    checkout = PROJECT_ROOT.resolve()
+
+    def store_root(project_root, *, honor_runtime_override=True):
+        if (Path(project_root).resolve() == checkout
+                and not (honor_runtime_override and os.environ.get("HERMES_RUNTIME_DIR"))):
+            return get_default_hermes_root() / "tools"
+        return real(project_root, honor_runtime_override=honor_runtime_override)
+
+    monkeypatch.setattr(pm.environments, "store_root", store_root)
+    monkeypatch.setattr(_launchers, "store_root", store_root)
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_git_safe_directory_read(request, monkeypatch):
     """Skip the ``git config --get-all safe.directory`` pre-read in ``noninteractive_git_env()``.
 
