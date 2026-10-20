@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from hermes_cli.sqlite_util import add_column_if_missing, write_txn
+from hermes_cli.sqlite_util import add_column_if_missing, is_busy_error, write_txn
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
@@ -421,18 +421,19 @@ class SharedMetricsStore:
                 for item in pending:
                     item(connection)
         except sqlite3.OperationalError as exc:
-            busy = "locked" in str(exc) or "busy" in str(exc)
+            busy = is_busy_error(exc)
             with self._deferred_lock:
                 # A failure that is not contention drops only this write: the earlier ones stay queued.
                 self._deferred = [*(pending if busy else pending[:-1]), *self._deferred][-_DEFERRED_WRITES_MAX:]
                 register, self._drain_at_exit = not self._drain_at_exit, True
             if register:
-                atexit.register(self.drain_deferred)
+                atexit.register(self.drain_deferred, at_exit=True)
             if not busy:
                 raise
 
-    def drain_deferred(self, busy_timeout_ms: int = _SCHEMA_BUSY_TIMEOUT_MS) -> None:
-        """Write the deferred writes (process exit / export waits longer than the user's path does)."""
+    def drain_deferred(self, busy_timeout_ms: int = _SCHEMA_BUSY_TIMEOUT_MS, *, at_exit: bool = False) -> None:
+        """Write the deferred writes (process exit / export waits longer than the user's path does).
+        A store still busy keeps them queued for the next write; at process exit nothing is left to retry."""
         with self._deferred_lock:
             pending, self._deferred = self._deferred, []
         if not pending:
@@ -441,21 +442,35 @@ class SharedMetricsStore:
             with self._write(busy_timeout_ms=busy_timeout_ms) as connection:
                 for item in pending:
                     item(connection)
-        except Exception:
-            logger.warning("Unable to write %d deferred shared-metrics updates", len(pending), exc_info=True)
+        except Exception as exc:
+            if at_exit or not is_busy_error(exc):
+                logger.warning("Unable to write %d deferred shared-metrics updates", len(pending), exc_info=True)
+                return
+            with self._deferred_lock:
+                self._deferred = [*pending, *self._deferred][-_DEFERRED_WRITES_MAX:]
+            logger.info("Shared-metrics store busy; keeping %d deferred updates for the next write", len(pending))
 
     def create_and_export_package_if_due(self) -> list[Path]:
         """Create pending packages at most once per UTC day, then export them."""
         self.drain_deferred(_BUSY_TIMEOUT_MS)
-        self._create_pending_packages_if_due()
+        try:
+            self._create_pending_packages_if_due()
+        except sqlite3.OperationalError as exc:
+            if not is_busy_error(exc):
+                raise
+            # The daily gate is unchanged, so the next export retries the packaging.
+            logger.info("Shared-metrics store busy; package creation skipped until the next export")
         return self._export_and_prune()
 
     def _export_and_prune(self) -> list[Path]:
         exported = self._export_pending_packages()
         try:
             self._prune_expired_history()
-        except Exception:
-            logger.warning("Unable to prune expired shared-metrics history", exc_info=True)
+        except Exception as exc:
+            if is_busy_error(exc):
+                logger.info("Shared-metrics store busy; expired history is pruned on a later export")
+            else:
+                logger.warning("Unable to prune expired shared-metrics history", exc_info=True)
         return exported
 
     def counter_snapshot(self) -> list[dict[str, Any]]:
@@ -499,7 +514,26 @@ class SharedMetricsStore:
             with write_txn(connection):
                 yield connection
 
+    def _ensure_journal_mode(self) -> None:
+        """Put the file in WAL once (the mode persists in the file, so ``_connection`` stays a plain connect).
+
+        In rollback-journal mode a committing writer locks every reader out, which with many Hermes processes
+        on one profile turned routine reads into ``database is locked``. Switching needs a moment with no
+        open transaction; when another process holds one the store keeps its mode and the next process start
+        retries. Construction never fails here: the schema transaction that follows reports real damage."""
+        from hermes_state_wal import apply_wal_with_fallback
+
+        try:
+            with self._connection() as connection:
+                apply_wal_with_fallback(connection, db_label="shared_metrics")
+        except sqlite3.Error as exc:
+            if is_busy_error(exc):
+                logger.info("Shared-metrics store busy; journal mode left unchanged until a later start")
+            else:
+                logger.warning("Unable to set the shared-metrics journal mode", exc_info=True)
+
     def _ensure_schema(self) -> None:
+        self._ensure_journal_mode()
         # Serialize first-run creation and upgrades across Hermes processes.
         with self._write(busy_timeout_ms=_SCHEMA_BUSY_TIMEOUT_MS) as connection:
             connection.execute(_CREATE_TELEMETRY_STATE_SQL)

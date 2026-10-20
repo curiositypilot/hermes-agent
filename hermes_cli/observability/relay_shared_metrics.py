@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from agent import relay_runtime
 from agent.portal_tags import get_conversation_context
+from hermes_cli.sqlite_util import is_busy_error
 from hermes_cli.version_info import get_version_info
 
 from .shared_metrics import SharedMetricsStore
@@ -1264,11 +1265,15 @@ class _Runtime:
 
     @staticmethod
     def _guarded(message: str, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Run ``callback``; log-and-swallow any exception, returning None."""
+        """Run ``callback``; log-and-swallow any exception, returning None. A busy store is routine
+        contention between Hermes processes (the next hook retries), so it logs one line, no traceback."""
         try:
             return callback(*args, **kwargs)
-        except Exception:
-            logger.warning(message, exc_info=True)
+        except Exception as exc:
+            if is_busy_error(exc):
+                logger.info("%s: shared-metrics store busy (%s)", message, exc)
+            else:
+                logger.warning(message, exc_info=True)
             return None
 
     @classmethod
@@ -1356,8 +1361,11 @@ def _reconcile_send_consent_once() -> None:
         if not resolved.send and not default_path.exists():
             return
         _reconcile_store_consent(SharedMetricsStore(), resolved.send)
-    except Exception:
-        logger.warning("Unable to reconcile shared-metrics send consent", exc_info=True)
+    except Exception as exc:
+        if is_busy_error(exc):  # every send pass reconciles again before it sends
+            logger.info("Shared-metrics store busy; startup send-consent reconcile skipped")
+        else:
+            logger.warning("Unable to reconcile shared-metrics send consent", exc_info=True)
 
 
 def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:

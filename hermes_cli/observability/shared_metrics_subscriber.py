@@ -9,6 +9,7 @@ from typing import Any
 
 from agent.relay_runtime import RUNTIME_INSTANCE_KEY
 from hermes_cli.config import detect_install_method
+from hermes_cli.sqlite_util import is_busy_error
 from hermes_constants import get_hermes_home
 
 from . import shared_metrics_engagement as engagement
@@ -179,11 +180,15 @@ class SharedMetricsSubscriber:
                     self._persist(metric_name, dimensions, amount)
                     self._record_milestones(metric_name, dimensions)
                     self._record_features(metric_name, dimensions)
-                except Exception:
+                except Exception as exc:
                     saved = False
-                    logger.warning(
-                        "Unable to persist the Hermes shared metric: %s", metric_name, exc_info=True
-                    )
+                    if is_busy_error(exc):
+                        # Contention, not damage: the latch stays unset, so the next qualifying event retries.
+                        logger.info("Shared-metrics store busy; %s not persisted this time", metric_name)
+                    else:
+                        logger.warning(
+                            "Unable to persist the Hermes shared metric: %s", metric_name, exc_info=True
+                        )
         if ticket and saved:
             with self._lock:
                 if self._active:
