@@ -137,18 +137,27 @@ def _deny(provider: str, data_class: str, *, reason: str, phase: str, task_id: s
     raise ProviderDenied(message)
 
 
-def provider_permitted(provider: str | None, data_class: str) -> bool:
-    """Return whether ``provider`` is allowed for ``data_class`` without raising or logging."""
-    try:
-        allowed = allowed_providers(data_class)
-    except ProviderDenied:
-        return False
+def provider_in_allowlist(provider: str | None, allowed: list[str] | str) -> bool:
+    """Pure membership test against an allowlist already resolved by ``allowed_providers``.
+
+    Callers that resolve the list under another profile's home (the kanban router walking
+    candidates for an assignee profile) use this so the check cannot drift to the caller's home.
+    """
     candidate = str(provider or "").strip().lower()
     if allowed == "any":
         return True
     if not candidate:
         return False
     return candidate in allowed
+
+
+def provider_permitted(provider: str | None, data_class: str) -> bool:
+    """Return whether ``provider`` is allowed for ``data_class`` without raising or logging."""
+    try:
+        allowed = allowed_providers(data_class)
+    except ProviderDenied:
+        return False
+    return provider_in_allowlist(provider, allowed)
 
 
 def assert_provider_allowed(provider: str, data_class: str, *, phase: str = "main") -> None:

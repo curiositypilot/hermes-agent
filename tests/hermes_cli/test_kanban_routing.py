@@ -974,6 +974,38 @@ def test_incident_replay_decide_and_review(conn, monkeypatch):
     assert d_review.candidate is None
 
 
+def _write_data_policies(home: Path, confidential: list[str]) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "kanban:\n  data_policies:\n    default: internal\n    classes:\n"
+        "      internal:\n        providers: any\n        fallback: true\n"
+        f"      confidential:\n        providers: {json.dumps(confidential)}\n        fallback: false\n",
+        encoding="utf-8",
+    )
+
+
+def test_allowlist_resolves_under_assignee_profile_home(conn, kanban_home, tmp_path, monkeypatch):
+    """The allowlist comes from the assignee profile's config, not the dispatcher's: the worker
+    runs under the profile home and would deny a provider the dispatcher's policy permits."""
+    _write_data_policies(kanban_home, ["prov-a"])
+    profile_home = tmp_path / "profiles" / "worker"
+    _write_data_policies(profile_home, ["prov-b"])
+
+    cfg = _cfg(tiers={"S": [{"model": "m-a", "provider": "prov-a"}, {"model": "m-b", "provider": "prov-b"}]})
+    ctx = kr.RoutingContext(conn, cfg)
+    _pool(monkeypatch, {})
+
+    task = _task(complexity="S", data_class="confidential")
+    d = ctx.decide(task, profile_home=str(profile_home))
+    assert d.source == "tier"
+    assert d.candidate.provider == "prov-b"
+    assert any(s["provider"] == "prov-a" and "not in allowlist" in s["reason"] for s in d.skipped)
+
+    # Without a profile home the dispatcher's own policy applies.
+    d_default = ctx.decide(task)
+    assert d_default.candidate.provider == "prov-a"
+
+
 # Two real homes (no allowed_providers monkeypatch): the router must read the
 # allowlist under the assignee's home, where the worker enforces it (t_359863a0).
 
@@ -999,19 +1031,6 @@ def homes(kanban_home, tmp_path):
     _policy_home(kanban_home, "prov-a")
     return {"prof": _policy_home(tmp_path / "prof", "prov-b", "m-x/prov-x"),
             "ok": _policy_home(tmp_path / "ok", "prov-b", "m-b/prov-b")}
-
-
-def test_data_class_allowlist_read_under_profile_home(conn, monkeypatch, homes):
-    _pool(monkeypatch)
-    ctx = kr.RoutingContext(conn, _cfg(tiers={"S": [_A, _B]}, on_exhausted="wait"))
-    task = _task(complexity="S", data_class="confidential", priority=1)
-    d = ctx.decide(task, profile_home=homes["prof"])
-    assert (d.source, d.candidate.provider) == ("tier", "prov-b")
-    assert d.skipped == [{"tier": "S", "model": "m-a", "provider": "prov-a",
-                          "reason": "data class confidential: provider not in allowlist"}]
-    # Must-not: without a profile home the dispatcher's own allowlist applies.
-    d = kr.RoutingContext(conn, _cfg(tiers={"S": [_A, _B]}, on_exhausted="wait")).decide(task)
-    assert (d.source, d.candidate.provider) == ("tier", "prov-a")
 
 
 def test_on_exhausted_profile_holds_on_data_class_skip(conn, monkeypatch, homes):

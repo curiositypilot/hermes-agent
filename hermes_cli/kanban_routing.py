@@ -764,25 +764,26 @@ class _ClassCheck:
     the worker enforces the class there at init, so the router must agree."""
     data_class: Optional[str]
     """None = unresolved (every candidate is refused)."""
-    profile_home: Optional[str]
+    allowed: "list[str] | str" = "any"
 
     @classmethod
     def for_task(cls, task: Any, profile_home: Optional[str]) -> "_ClassCheck":
-        from agent.provider_policy import ProviderDenied, resolve_data_class
+        from agent.provider_policy import ProviderDenied, allowed_providers, resolve_data_class
         try:
             with _home_scope(profile_home):
-                return cls(resolve_data_class(task), profile_home)
+                data_class = resolve_data_class(task)
+                return cls(data_class, allowed_providers(data_class))
         except (ProviderDenied, KeyError, TypeError, ValueError, OSError):
-            return cls(None, profile_home)
+            return cls(None)
 
     def refusal(self, provider: Optional[str]) -> Optional[str]:
         """Skip reason for ``provider``, or None when it is permitted."""
         if self.data_class is None:
             return "data class unresolved"
-        from agent.provider_policy import provider_permitted
-        with _home_scope(self.profile_home):
-            permitted = provider_permitted(provider or "", self.data_class)
-        return None if permitted else f"data class {self.data_class}: provider not in allowlist"
+        from agent.provider_policy import provider_in_allowlist
+        if provider_in_allowlist(provider, self.allowed):
+            return None
+        return f"data class {self.data_class}: provider not in allowlist"
 
     @property
     def held_note(self) -> str:
@@ -884,9 +885,12 @@ class RoutingContext:
     def _walk(self, entries: list[tuple[Optional[str], TierCandidate]], task: Any,
               profile_home: Optional[str], check: _ClassCheck) -> _Walk:
         """First usable candidate of ``(tier, candidate)`` entries in the given
-        order (pace ordering, when on, is applied by ``_tier_entries``). A
-        quota-gated candidate is skipped like an unavailable one; after the
-        first gate skip, pay-as-you-go providers are skipped too."""
+        order (pace ordering, when on, is applied by ``_tier_entries``). The
+        card's data class and its provider allowlist are both resolved under
+        the assignee profile's home, so the router never picks a provider the
+        profile's worker then denies. A quota-gated candidate is skipped like
+        an unavailable one; after the first gate skip, pay-as-you-go providers
+        are skipped too."""
         walk = _Walk()
         priority = _task_priority(task)
         for tier, cand in entries:
