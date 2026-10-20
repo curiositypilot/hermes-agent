@@ -3,6 +3,7 @@
 The footer tells the model (and user) when a claimed file mutation did not land; the explainer
 summarises why a turn ended without a final answer. Every method resolves through ``AIAgent``'s MRO.
 """
+import hashlib
 import os
 import re
 from contextlib import suppress
@@ -131,8 +132,12 @@ class TurnExplainersMixin:
         if not targets:
             return
         landed = file_mutation_result_landed(tool_name, result)
+        landed_paths = (
+            _extract_landed_file_mutation_paths(tool_name, args, result)
+            if landed
+            else []
+        )
         if landed:
-            landed_paths = _extract_landed_file_mutation_paths(tool_name, args, result)
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
                 changed.update(landed_paths)
@@ -148,19 +153,47 @@ class TurnExplainersMixin:
         if is_error and not landed:
             # Keep the FIRST error per path unless a later success replaces it.
             preview = _extract_error_preview(result)
+            content_val = args.get("content") if tool_name == "write_file" else None
+            content_sha = (
+                hashlib.sha256(content_val.encode("utf-8")).hexdigest()
+                if isinstance(content_val, str)
+                else None
+            )
             for path in targets:
                 identity = _file_mutation_identity(path, task_id)
-                state.setdefault(path, {
+                entry = {
                     "tool": tool_name, "error_preview": preview,
                     "identity": identity, "stat": _file_stat_signature(identity),
-                })
+                }
+                if content_sha is not None:
+                    entry["content_sha"] = content_sha
+                    entry["dir_identity"] = os.path.dirname(identity)
+                state.setdefault(path, entry)
         else:
             cleared = {
                 _file_mutation_identity(p, task_id)
                 for p in (landed_paths if landed else targets)
             }
+            landed_content_sha = None
+            landed_dir_identity = None
+            if landed and tool_name == "write_file":
+                content_val = args.get("content")
+                if isinstance(content_val, str):
+                    landed_content_sha = hashlib.sha256(content_val.encode("utf-8")).hexdigest()
+                first_landed = landed_paths[0] if landed_paths else None
+                if first_landed:
+                    first_identity = _file_mutation_identity(first_landed, task_id)
+                    landed_dir_identity = os.path.dirname(first_identity)
+
             for path, info in list(state.items()):
                 if info.get("identity", _file_mutation_identity(path, task_id)) in cleared:
+                    state.pop(path, None)
+                elif (
+                    landed_content_sha is not None
+                    and landed_dir_identity is not None
+                    and info.get("content_sha") == landed_content_sha
+                    and info.get("dir_identity") == landed_dir_identity
+                ):
                     state.pop(path, None)
 
     @staticmethod

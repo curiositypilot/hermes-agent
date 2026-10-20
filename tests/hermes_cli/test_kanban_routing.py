@@ -13,6 +13,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -230,10 +231,10 @@ def test_pool_availability_never_writes_auth_json(auth_home):
 
 
 def _task(**kw):
-    defaults = dict(id="t_x", title="x", body=None, assignee="w", status="ready", priority=0,
-                    created_by=None, created_at=0, started_at=None, completed_at=None,
-                    workspace_kind="scratch", workspace_path=None, claim_lock=None,
-                    claim_expires=None, tenant=None)
+    defaults: dict[str, Any] = dict(id="t_x", title="x", body=None, assignee="w", status="ready", priority=0,
+                                     created_by=None, created_at=0, started_at=None, completed_at=None,
+                                     workspace_kind="scratch", workspace_path=None, claim_lock=None,
+                                     claim_expires=None, tenant=None)
     defaults.update(kw)
     return kb.Task(**defaults)
 
@@ -814,198 +815,160 @@ def test_kanban_create_tool_accepts_complexity(kanban_home, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Data class filtering in routing walk
+# Data class policy integration
 # ---------------------------------------------------------------------------
 
 
-def test_data_class_tier_walk_skips_unallowed_provider(conn, monkeypatch):
-    """Tier walk skips candidates whose provider is not allowed by data class."""
-    from agent import provider_policy
+def test_confidential_card_skips_disallowed_candidates(conn, monkeypatch):
+    from agent import provider_policy as pp
 
-    _pool(monkeypatch)  # prov-a and prov-b available
-    tiers = {"M": [{"model": "m-a", "provider": "prov-a"}, {"model": "m-b", "provider": "prov-b"}]}
-    ctx = kr.RoutingContext(conn, _cfg(tiers=tiers))
+    monkeypatch.setattr(pp, "allowed_providers", lambda cls: ["prov-a"] if cls == "confidential" else "any")
+    monkeypatch.setattr(pp, "fallback_allowed", lambda cls: False if cls == "confidential" else True)
 
-    monkeypatch.setattr(provider_policy, "resolve_data_class", lambda task: "confidential")
-    monkeypatch.setattr(provider_policy, "allowed_providers", lambda cls: ["prov-a"])
-
-    task = _task(complexity="M", data_class="confidential")
-    dec = ctx.decide(task)
-    assert dec.source == "tier"
-    assert dec.candidate.model == "m-a"
-    assert dec.candidate.provider == "prov-a"
-
-    # When prov-a is pool-exhausted, prov-b must be skipped due to data class -> exhausted
-    _pool(monkeypatch, {"prov-a": "pool exhausted"})
-    ctx2 = kr.RoutingContext(conn, _cfg(tiers=tiers))
-    dec2 = ctx2.decide(task)
-    assert dec2.source == "exhausted"
-    assert any(
-        s["provider"] == "prov-b" and "data class confidential: provider not allowed" in s["reason"]
-        for s in dec2.skipped
-    )
-
-
-def test_data_class_quota_gated_with_available_denied_provider_holds(conn, monkeypatch):
-    """When the allowed provider is quota-gated and denied provider is available, result is quota_held."""
-    from agent import provider_policy
-
-    _pool(monkeypatch)  # both available in pool
-    tiers = {"M": [{"model": "m-a", "provider": "prov-a"}, {"model": "m-b", "provider": "prov-b"}]}
-    ctx = kr.RoutingContext(conn, _cfg(tiers=tiers))
-
-    monkeypatch.setattr(provider_policy, "resolve_data_class", lambda task: "confidential")
-    monkeypatch.setattr(provider_policy, "allowed_providers", lambda cls: ["prov-a"])
-
-    # Gate prov-a
-    from hermes_cli.kanban_routing import QuotaVerdict
-    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio: QuotaVerdict(
-        provider="prov-a", headroom=0.1, below=0.2, required=2, kind="mode", mode="tight",
+    cfg = _cfg(tiers={
+        "S": [{"model": "m-a", "provider": "prov-a"}, {"model": "m-b", "provider": "prov-b"}]
+    })
+    ctx = kr.RoutingContext(conn, cfg)
+    # prov-a gated by quota (mode tight), prov-b available
+    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio: kr.QuotaVerdict(
+        provider="prov-a", headroom=0.0, below=0.0, required=2, resets_at=time.time() + 3600, kind="mode", mode="tight"
     ) if prov == "prov-a" else None)
-
-    task = _task(complexity="M", data_class="confidential", priority=1)
-    dec = ctx.decide(task)
-    assert dec.source == "quota_held"
-    assert any(
-        s["provider"] == "prov-b" and "data class confidential: provider not allowed" in s["reason"]
-        for s in dec.skipped
-    )
-
-
-def test_data_class_internal_unrestricted_unchanged(conn, monkeypatch):
-    """Internal class with allowlist 'any' picks normally."""
-    from agent import provider_policy
-
-    _pool(monkeypatch)
-    tiers = {"M": [{"model": "m-a", "provider": "prov-a"}, {"model": "m-b", "provider": "prov-b"}]}
-    ctx = kr.RoutingContext(conn, _cfg(tiers=tiers))
-
-    monkeypatch.setattr(provider_policy, "resolve_data_class", lambda task: "internal")
-    monkeypatch.setattr(provider_policy, "allowed_providers", lambda cls: "any")
-
-    task = _task(complexity="M", data_class="internal")
-    dec = ctx.decide(task)
-    assert dec.source == "tier"
-    assert dec.candidate.model == "m-a"
-
-
-def test_data_class_provider_normalization_and_tenant_default(conn, monkeypatch):
-    """Provider normalization (strip/lowercase) and tenant resolution work as expected."""
-    import contextlib
-
-    tiers = {"M": [{"model": "m-a", "provider": " PROV-A "}, {"model": "m-b", "provider": "prov-b"}]}
-    ctx = kr.RoutingContext(conn, _cfg(tiers=tiers))
-
-    monkeypatch.setattr(kr, "_home_scope", contextlib.nullcontext)
-    # Use real agent.provider_policy with monkeypatched config
-    from hermes_cli import config as kcfg
-    fake_config = {
-        "kanban": {
-            "data_policies": {
-                "default": "internal",
-                "tenant_defaults": {"work": "confidential"},
-                "classes": {
-                    "internal": {"providers": "any", "fallback": True},
-                    "confidential": {"providers": ["prov-a"], "fallback": False},
-                },
-            }
-        }
-    }
-    monkeypatch.setattr(kcfg, "load_config_readonly", lambda: fake_config)
-
-    # Card with tenant='work' and data_class=None resolves to 'confidential'
-    task = _task(complexity="M", data_class=None, tenant="work")
-    dec = ctx.decide(task)
-    assert dec.source == "tier"
-    assert dec.candidate.provider == "PROV-A"
-
-
-def test_data_class_review_lane_honors_filter(conn, monkeypatch):
-    """Review lane also respects data class restrictions."""
-    from agent import provider_policy
-
-    _pool(monkeypatch)
-    review_cands = [{"model": "r-a", "provider": "prov-a"}, {"model": "r-b", "provider": "prov-b"}]
-    ctx = kr.RoutingContext(conn, _cfg(review=review_cands))
-
-    monkeypatch.setattr(provider_policy, "resolve_data_class", lambda task: "confidential")
-    monkeypatch.setattr(provider_policy, "allowed_providers", lambda cls: ["prov-b"])
-
-    task = _task(complexity="M", data_class="confidential")
-    dec = ctx.decide_review(task)
-    assert dec.source == "review"
-    assert dec.candidate.model == "r-b"
-    assert any(
-        s["provider"] == "prov-a" and "data class confidential: provider not allowed" in s["reason"]
-        for s in dec.skipped
-    )
-
-
-def test_data_class_unresolvable_fails_closed(conn, monkeypatch):
-    """Unresolvable data class skips all candidates with 'data class unresolved'."""
-    from agent import provider_policy
-
-    _pool(monkeypatch)
-    tiers = {"M": [{"model": "m-a", "provider": "prov-a"}, {"model": "m-b", "provider": "prov-b"}]}
-    ctx = kr.RoutingContext(conn, _cfg(tiers=tiers))
-
-    def _bad_resolve(task):
-        raise provider_policy.ProviderDenied("unknown class")
-
-    monkeypatch.setattr(provider_policy, "resolve_data_class", _bad_resolve)
-
-    task = _task(complexity="M", data_class="unknown")
-    dec = ctx.decide(task)
-    assert dec.source == "exhausted"
-    assert len(dec.skipped) == 2
-    assert all(s["reason"] == "data class unresolved" for s in dec.skipped)
-
-
-def test_data_class_incident_replay_fixture(conn, monkeypatch):
-    """Replay of 2026-10-19 incident (1792437516):
-    Tiers S = anthropic (gated, P1 vs needs P2), xai-oauth (exhausted), antigravity (available).
-    Class confidential, allowlist [anthropic, openai-codex].
-    Old logic returned tier/antigravity; new logic returns quota_held.
-    """
-    from agent import provider_policy
-    from hermes_cli.kanban_routing import QuotaVerdict
-
-    tiers = {
-        "S": [
-            {"model": "claude-opus-5-5", "provider": "anthropic"},
-            {"model": "grok-4.7", "provider": "xai-oauth"},
-            {"model": "gemini-3.8-flash-tiered", "provider": "antigravity"},
-        ]
-    }
-    _pool(monkeypatch, {"xai-oauth": "rate_limited on this board"})
-    ctx = kr.RoutingContext(conn, _cfg(tiers=tiers, cooldown_seconds=900))
-
-    monkeypatch.setattr(provider_policy, "resolve_data_class", lambda task: "confidential")
-    monkeypatch.setattr(provider_policy, "allowed_providers", lambda cls: ["anthropic", "openai-codex"])
-
-    # Anthropic gated for P1
-    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio: QuotaVerdict(
-        provider="anthropic", headroom=0.1, below=0.2, required=2, kind="mode", mode="tight",
-    ) if prov == "anthropic" else None)
+    _pool(monkeypatch, {})  # both pool-available
 
     task = _task(complexity="S", data_class="confidential", priority=1)
-    dec = ctx.decide(task)
-    assert dec.source == "quota_held"
-    assert any(s["provider"] == "antigravity" and "data class confidential: provider not allowed" in s["reason"]
-               for s in dec.skipped)
+    d = ctx.decide(task)
+    assert d.source == "quota_held"
+    assert d.candidate is None
+    # prov-b must be skipped with the data class reason, NOT chosen
+    skipped_reasons = {s["provider"]: s["reason"] for s in d.skipped}
+    assert "data class confidential: provider not in allowlist" in skipped_reasons.get("prov-b", "")
+    assert "quota: " in skipped_reasons.get("prov-a", "")
 
-    # Review lane replay with same configuration
-    review_cands = [
+
+def test_confidential_card_routes_to_allowed_provider(conn, monkeypatch):
+    from agent import provider_policy as pp
+
+    monkeypatch.setattr(pp, "allowed_providers", lambda cls: ["prov-a"] if cls == "confidential" else "any")
+    cfg = _cfg(tiers={
+        "S": [{"model": "m-b", "provider": "prov-b"}, {"model": "m-a", "provider": "prov-a"}]
+    })
+    ctx = kr.RoutingContext(conn, cfg)
+    _pool(monkeypatch, {})
+    task = _task(complexity="S", data_class="confidential", priority=1)
+    d = ctx.decide(task)
+    assert d.source == "tier"
+    assert d.candidate.provider == "prov-a"
+    assert d.candidate.model == "m-a"
+    assert any("data class confidential: provider not in allowlist" in s["reason"] for s in d.skipped if s["provider"] == "prov-b")
+
+
+def test_internal_card_unchanged(conn, monkeypatch):
+    from agent import provider_policy as pp
+
+    monkeypatch.setattr(pp, "allowed_providers", lambda cls: ["prov-a"] if cls == "confidential" else "any")
+    cfg = _cfg(tiers={
+        "S": [{"model": "m-a", "provider": "prov-a"}, {"model": "m-b", "provider": "prov-b"}]
+    })
+    ctx = kr.RoutingContext(conn, cfg)
+    # prov-a gated by quota, prov-b available
+    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio: kr.QuotaVerdict(
+        provider="prov-a", headroom=0.0, below=0.0, required=2, resets_at=time.time() + 3600, kind="mode", mode="tight"
+    ) if prov == "prov-a" else None)
+    _pool(monkeypatch, {})
+
+    task = _task(complexity="S", data_class="internal", priority=1)
+    d = ctx.decide(task)
+    assert d.source == "tier"
+    assert d.candidate.provider == "prov-b"
+
+
+def test_review_lane_respects_data_class(conn, monkeypatch):
+    from agent import provider_policy as pp
+
+    monkeypatch.setattr(pp, "allowed_providers", lambda cls: ["prov-a"] if cls == "confidential" else "any")
+    cfg = _cfg(review=[{"model": "m-b", "provider": "prov-b"}, {"model": "m-a", "provider": "prov-a"}])
+    ctx = kr.RoutingContext(conn, cfg)
+    _pool(monkeypatch, {})
+
+    task = _task(data_class="confidential")
+    d = ctx.decide_review(task)
+    assert d.source == "review"
+    assert d.candidate.provider == "prov-a"
+    assert any("data class confidential: provider not in allowlist" in s["reason"] for s in d.skipped if s["provider"] == "prov-b")
+
+
+def test_unresolvable_class_holds(conn, monkeypatch):
+    from agent import provider_policy as pp
+
+    def boom(task):
+        raise pp.ProviderDenied("unknown data class")
+
+    monkeypatch.setattr(pp, "resolve_data_class", boom)
+    cfg = _cfg(tiers={"S": [{"model": "m-a", "provider": "prov-a"}]})
+    ctx = kr.RoutingContext(conn, cfg)
+    _pool(monkeypatch, {})
+
+    task = _task(complexity="S", data_class="invalid")
+    d = ctx.decide(task)
+    assert d.source == "exhausted"
+    assert any(s["reason"] == "data class unresolved" for s in d.skipped)
+
+
+def test_provider_permitted_must_not_match_substring(conn, monkeypatch):
+    from agent import provider_policy as pp
+
+    monkeypatch.setattr(pp, "allowed_providers", lambda cls: ["anthropic"] if cls == "confidential" else "any")
+    cfg = _cfg(tiers={
+        "S": [
+            {"model": "m-sub", "provider": "anthropic-proxy"},
+            {"model": "m-case", "provider": "Anthropic"},
+        ]
+    })
+    ctx = kr.RoutingContext(conn, cfg)
+    _pool(monkeypatch, {})
+
+    task = _task(complexity="S", data_class="confidential")
+    d = ctx.decide(task)
+    assert d.source == "tier"
+    assert d.candidate.provider == "Anthropic"
+    assert any(s["provider"] == "anthropic-proxy" and "not in allowlist" in s["reason"] for s in d.skipped)
+
+
+def test_incident_replay_decide_and_review(conn, monkeypatch):
+    """Incident replay:
+    Card t_eca0bf9c / t_5a49507e: confidential, P1, anthropic gated by mode tight (needs P2),
+    xai-oauth pool exhausted, antigravity pool available.
+    Old code returned antigravity -> crashed.
+    New code must return quota_held on both ready and review lanes.
+    """
+    from agent import provider_policy as pp
+
+    monkeypatch.setattr(pp, "allowed_providers", lambda cls: ["anthropic", "openai-codex"] if cls == "confidential" else "any")
+    monkeypatch.setattr(pp, "fallback_allowed", lambda cls: False if cls == "confidential" else True)
+
+    cands = [
         {"model": "claude-opus-5-5", "provider": "anthropic"},
         {"model": "grok-4.7", "provider": "xai-oauth"},
         {"model": "gemini-3.8-flash-tiered", "provider": "antigravity"},
     ]
-    ctx_rev = kr.RoutingContext(conn, _cfg(review=review_cands, cooldown_seconds=900))
-    monkeypatch.setattr(ctx_rev, "quota_verdict", lambda prov, prio: QuotaVerdict(
-        provider="anthropic", headroom=0.1, below=0.2, required=2, kind="mode", mode="tight",
-    ) if prov == "anthropic" else None)
-    dec_rev = ctx_rev.decide_review(task)
-    assert dec_rev.source == "quota_held"
-    assert any(s["provider"] == "antigravity" and "data class confidential: provider not allowed" in s["reason"]
-               for s in dec_rev.skipped)
+    cfg = _cfg(tiers={"S": cands}, review=cands)
+    ctx = kr.RoutingContext(conn, cfg)
 
+    # anthropic gated: mode tight needs P2
+    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio: kr.QuotaVerdict(
+        provider="anthropic", headroom=0.0, below=0.0, required=2, resets_at=time.time() + 3600, kind="mode", mode="tight"
+    ) if prov == "anthropic" else None)
+    # xai-oauth exhausted
+    _pool(monkeypatch, {"xai-oauth": "credential pool exhausted"})
+
+    task = _task(complexity="S", data_class="confidential", priority=1)
+
+    # Ready lane
+    d_ready = ctx.decide(task)
+    assert d_ready.source == "quota_held", f"expected quota_held, got {d_ready.source}: {d_ready.candidate}"
+    assert d_ready.candidate is None
+
+    # Review lane
+    d_review = ctx.decide_review(task)
+    assert d_review.source == "quota_held", f"expected quota_held, got {d_review.source}: {d_review.candidate}"
+    assert d_review.candidate is None

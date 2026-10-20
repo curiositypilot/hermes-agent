@@ -137,6 +137,20 @@ def _deny(provider: str, data_class: str, *, reason: str, phase: str, task_id: s
     raise ProviderDenied(message)
 
 
+def provider_permitted(provider: str | None, data_class: str) -> bool:
+    """Return whether ``provider`` is allowed for ``data_class`` without raising or logging."""
+    try:
+        allowed = allowed_providers(data_class)
+    except ProviderDenied:
+        return False
+    candidate = str(provider or "").strip().lower()
+    if allowed == "any":
+        return True
+    if not candidate:
+        return False
+    return candidate in allowed
+
+
 def assert_provider_allowed(provider: str, data_class: str, *, phase: str = "main") -> None:
     """Raise ``ProviderDenied`` unless provider is permitted by the class policy."""
     allowed = allowed_providers(data_class)
