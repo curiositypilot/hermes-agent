@@ -176,7 +176,10 @@ def test_receipt_is_recorded_only_on_a_day_the_sender_can_ever_send(marks, monke
     from hermes_cli.observability.shared_metrics_sender import CONSENT_GATE_SQL, reconcile_send_consent
     from hermes_cli.sqlite_util import write_txn
 
-    t0 = datetime(2026, 10, 6, tzinfo=timezone.utc)
+    # The store clock is patched below, but ``_stale`` reads the wall clock: anchor the receipt day
+    # near today so the receipt never ages past MAX_RECEIPT_AGE_SECONDS as the calendar moves on.
+    t0 = datetime.combine(datetime.now(timezone.utc).date() - timedelta(days=1), datetime.min.time(),
+                          tzinfo=timezone.utc)
     clock = {"now": t0 + timedelta(hours=9)}
     monkeypatch.setattr(store_module, "_utc_now", lambda: clock["now"])
     monkeypatch.setattr("hermes_cli.config.read_raw_config_readonly",
