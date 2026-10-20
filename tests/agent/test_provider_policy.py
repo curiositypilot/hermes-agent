@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.provider_policy import ProviderDenied, assert_provider_allowed, resolve_data_class
+from agent.provider_policy import ProviderDenied, assert_provider_allowed, provider_permitted, resolve_data_class
 
 
 _POLICY_CONFIG = """
@@ -49,10 +49,20 @@ def test_unknown_data_class_fails_closed(policy_home):
 
 
 def test_provider_allowlist_and_any_policy(policy_home):
-    assert_provider_allowed("anthropic", "confidential")
-    assert_provider_allowed("openrouter", "internal")
+    assert assert_provider_allowed("anthropic", "confidential") is None
+    assert assert_provider_allowed("openrouter", "internal") is None
     with pytest.raises(ProviderDenied, match="antigravity"):
         assert_provider_allowed("antigravity", "confidential")
+
+    assert provider_permitted("anthropic", "confidential") is True
+    assert provider_permitted("Anthropic", "confidential") is True
+    assert provider_permitted("openai-codex", "confidential") is True
+    assert provider_permitted("openrouter", "internal") is True
+    assert provider_permitted("antigravity", "confidential") is False
+    assert provider_permitted("anthropic-proxy", "confidential") is False
+    assert provider_permitted("", "confidential") is False
+    assert provider_permitted(None, "confidential") is False
+    assert provider_permitted("anthropic", "unknown_class") is False
 
 
 def test_confidential_task_never_activates_antigravity_fallback(policy_home, monkeypatch):

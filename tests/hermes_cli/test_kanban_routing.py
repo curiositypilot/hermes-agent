@@ -13,6 +13,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -230,10 +231,12 @@ def test_pool_availability_never_writes_auth_json(auth_home):
 
 
 def _task(**kw):
-    return kb.Task(id="t_x", title="x", body=None, assignee="w", status="ready", priority=0,
-                   created_by=None, created_at=0, started_at=None, completed_at=None,
-                   workspace_kind="scratch", workspace_path=None, claim_lock=None,
-                   claim_expires=None, tenant=None, **kw)
+    defaults: dict[str, Any] = dict(id="t_x", title="x", body=None, assignee="w", status="ready", priority=0,
+                                     created_by=None, created_at=0, started_at=None, completed_at=None,
+                                     workspace_kind="scratch", workspace_path=None, claim_lock=None,
+                                     claim_expires=None, tenant=None)
+    defaults.update(kw)
+    return kb.Task(**defaults)
 
 
 def test_decide_precedence_and_walk(conn, monkeypatch):
@@ -809,3 +812,163 @@ def test_kanban_create_tool_accepts_complexity(kanban_home, monkeypatch):
     assert out.get("ok") is not False, out
     with kbc.connect_closing() as c:
         assert kb.get_task(c, out["task_id"]).complexity == "M"
+
+
+# ---------------------------------------------------------------------------
+# Data class policy integration
+# ---------------------------------------------------------------------------
+
+
+def test_confidential_card_skips_disallowed_candidates(conn, monkeypatch):
+    from agent import provider_policy as pp
+
+    monkeypatch.setattr(pp, "allowed_providers", lambda cls: ["prov-a"] if cls == "confidential" else "any")
+    monkeypatch.setattr(pp, "fallback_allowed", lambda cls: False if cls == "confidential" else True)
+
+    cfg = _cfg(tiers={
+        "S": [{"model": "m-a", "provider": "prov-a"}, {"model": "m-b", "provider": "prov-b"}]
+    })
+    ctx = kr.RoutingContext(conn, cfg)
+    # prov-a gated by quota (mode tight), prov-b available
+    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio: kr.QuotaVerdict(
+        provider="prov-a", headroom=0.0, below=0.0, required=2, resets_at=time.time() + 3600, kind="mode", mode="tight"
+    ) if prov == "prov-a" else None)
+    _pool(monkeypatch, {})  # both pool-available
+
+    task = _task(complexity="S", data_class="confidential", priority=1)
+    d = ctx.decide(task)
+    assert d.source == "quota_held"
+    assert d.candidate is None
+    # prov-b must be skipped with the data class reason, NOT chosen
+    skipped_reasons = {s["provider"]: s["reason"] for s in d.skipped}
+    assert "data class confidential: provider not in allowlist" in skipped_reasons.get("prov-b", "")
+    assert "quota: " in skipped_reasons.get("prov-a", "")
+
+
+def test_confidential_card_routes_to_allowed_provider(conn, monkeypatch):
+    from agent import provider_policy as pp
+
+    monkeypatch.setattr(pp, "allowed_providers", lambda cls: ["prov-a"] if cls == "confidential" else "any")
+    cfg = _cfg(tiers={
+        "S": [{"model": "m-b", "provider": "prov-b"}, {"model": "m-a", "provider": "prov-a"}]
+    })
+    ctx = kr.RoutingContext(conn, cfg)
+    _pool(monkeypatch, {})
+    task = _task(complexity="S", data_class="confidential", priority=1)
+    d = ctx.decide(task)
+    assert d.source == "tier"
+    assert d.candidate.provider == "prov-a"
+    assert d.candidate.model == "m-a"
+    assert any("data class confidential: provider not in allowlist" in s["reason"] for s in d.skipped if s["provider"] == "prov-b")
+
+
+def test_internal_card_unchanged(conn, monkeypatch):
+    from agent import provider_policy as pp
+
+    monkeypatch.setattr(pp, "allowed_providers", lambda cls: ["prov-a"] if cls == "confidential" else "any")
+    cfg = _cfg(tiers={
+        "S": [{"model": "m-a", "provider": "prov-a"}, {"model": "m-b", "provider": "prov-b"}]
+    })
+    ctx = kr.RoutingContext(conn, cfg)
+    # prov-a gated by quota, prov-b available
+    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio: kr.QuotaVerdict(
+        provider="prov-a", headroom=0.0, below=0.0, required=2, resets_at=time.time() + 3600, kind="mode", mode="tight"
+    ) if prov == "prov-a" else None)
+    _pool(monkeypatch, {})
+
+    task = _task(complexity="S", data_class="internal", priority=1)
+    d = ctx.decide(task)
+    assert d.source == "tier"
+    assert d.candidate.provider == "prov-b"
+
+
+def test_review_lane_respects_data_class(conn, monkeypatch):
+    from agent import provider_policy as pp
+
+    monkeypatch.setattr(pp, "allowed_providers", lambda cls: ["prov-a"] if cls == "confidential" else "any")
+    cfg = _cfg(review=[{"model": "m-b", "provider": "prov-b"}, {"model": "m-a", "provider": "prov-a"}])
+    ctx = kr.RoutingContext(conn, cfg)
+    _pool(monkeypatch, {})
+
+    task = _task(data_class="confidential")
+    d = ctx.decide_review(task)
+    assert d.source == "review"
+    assert d.candidate.provider == "prov-a"
+    assert any("data class confidential: provider not in allowlist" in s["reason"] for s in d.skipped if s["provider"] == "prov-b")
+
+
+def test_unresolvable_class_holds(conn, monkeypatch):
+    from agent import provider_policy as pp
+
+    def boom(task):
+        raise pp.ProviderDenied("unknown data class")
+
+    monkeypatch.setattr(pp, "resolve_data_class", boom)
+    cfg = _cfg(tiers={"S": [{"model": "m-a", "provider": "prov-a"}]})
+    ctx = kr.RoutingContext(conn, cfg)
+    _pool(monkeypatch, {})
+
+    task = _task(complexity="S", data_class="invalid")
+    d = ctx.decide(task)
+    assert d.source == "exhausted"
+    assert any(s["reason"] == "data class unresolved" for s in d.skipped)
+
+
+def test_provider_permitted_must_not_match_substring(conn, monkeypatch):
+    from agent import provider_policy as pp
+
+    monkeypatch.setattr(pp, "allowed_providers", lambda cls: ["anthropic"] if cls == "confidential" else "any")
+    cfg = _cfg(tiers={
+        "S": [
+            {"model": "m-sub", "provider": "anthropic-proxy"},
+            {"model": "m-case", "provider": "Anthropic"},
+        ]
+    })
+    ctx = kr.RoutingContext(conn, cfg)
+    _pool(monkeypatch, {})
+
+    task = _task(complexity="S", data_class="confidential")
+    d = ctx.decide(task)
+    assert d.source == "tier"
+    assert d.candidate.provider == "Anthropic"
+    assert any(s["provider"] == "anthropic-proxy" and "not in allowlist" in s["reason"] for s in d.skipped)
+
+
+def test_incident_replay_decide_and_review(conn, monkeypatch):
+    """Incident replay:
+    Card t_eca0bf9c / t_5a49507e: confidential, P1, anthropic gated by mode tight (needs P2),
+    xai-oauth pool exhausted, antigravity pool available.
+    Old code returned antigravity -> crashed.
+    New code must return quota_held on both ready and review lanes.
+    """
+    from agent import provider_policy as pp
+
+    monkeypatch.setattr(pp, "allowed_providers", lambda cls: ["anthropic", "openai-codex"] if cls == "confidential" else "any")
+    monkeypatch.setattr(pp, "fallback_allowed", lambda cls: False if cls == "confidential" else True)
+
+    cands = [
+        {"model": "claude-opus-5-5", "provider": "anthropic"},
+        {"model": "grok-4.7", "provider": "xai-oauth"},
+        {"model": "gemini-3.8-flash-tiered", "provider": "antigravity"},
+    ]
+    cfg = _cfg(tiers={"S": cands}, review=cands)
+    ctx = kr.RoutingContext(conn, cfg)
+
+    # anthropic gated: mode tight needs P2
+    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio: kr.QuotaVerdict(
+        provider="anthropic", headroom=0.0, below=0.0, required=2, resets_at=time.time() + 3600, kind="mode", mode="tight"
+    ) if prov == "anthropic" else None)
+    # xai-oauth exhausted
+    _pool(monkeypatch, {"xai-oauth": "credential pool exhausted"})
+
+    task = _task(complexity="S", data_class="confidential", priority=1)
+
+    # Ready lane
+    d_ready = ctx.decide(task)
+    assert d_ready.source == "quota_held", f"expected quota_held, got {d_ready.source}: {d_ready.candidate}"
+    assert d_ready.candidate is None
+
+    # Review lane
+    d_review = ctx.decide_review(task)
+    assert d_review.source == "quota_held", f"expected quota_held, got {d_review.source}: {d_review.candidate}"
+    assert d_review.candidate is None

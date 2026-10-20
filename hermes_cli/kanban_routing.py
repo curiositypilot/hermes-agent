@@ -853,8 +853,26 @@ class RoutingContext:
         first gate skip, pay-as-you-go providers are skipped too."""
         walk = _Walk()
         priority = _task_priority(task)
+        data_class: Optional[str] = None
+        data_class_error: bool = False
+        from agent.provider_policy import ProviderDenied, provider_permitted, resolve_data_class
+
+        try:
+            with _home_scope(profile_home):
+                data_class = resolve_data_class(task)
+        except (ProviderDenied, KeyError, TypeError, ValueError, OSError):
+            data_class_error = True
+
         for tier, cand in entries:
             where = {"tier": tier} if tier else {}
+            if data_class_error:
+                walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
+                                     "reason": "data class unresolved"})
+                continue
+            if data_class and not provider_permitted(cand.provider or "", data_class):
+                walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
+                                     "reason": f"data class {data_class}: provider not in allowlist"})
+                continue
             if walk.gated and self._is_payg(cand.provider):
                 walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
                                      "reason": "quota: no paid fallthrough"})
