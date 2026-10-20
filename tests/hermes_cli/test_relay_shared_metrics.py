@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import multiprocessing as mp
 import os
 import shutil
@@ -1615,3 +1616,191 @@ def test_store_and_export_are_owner_only(tmp_path):
     assert stat.S_IMODE(outbox_directory.stat().st_mode) == 0o700
     assert stat.S_IMODE(database_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(package_path.stat().st_mode) == 0o600
+
+
+# ---- lock contention: WAL journal mode and busy handling (t_ebdafece) ----
+
+
+def _journal_mode(database_path: Path) -> str:
+    with sqlite3.connect(database_path) as connection:
+        return str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+
+
+def _allow_wal(monkeypatch, configured: str = "wal") -> None:
+    import hermes_state_wal
+
+    monkeypatch.setattr(hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda *_a: False)
+    monkeypatch.setattr(hermes_state_wal, "resolve_journal_mode", lambda: configured)
+
+
+def _hold_write_lock(database_path: Path) -> sqlite3.Connection:
+    blocker = sqlite3.connect(database_path, check_same_thread=False)
+    blocker.execute("BEGIN IMMEDIATE")
+    return blocker
+
+
+def _release(blocker: sqlite3.Connection) -> None:
+    blocker.rollback()
+    blocker.close()
+
+
+def _tracebacks(caplog) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.exc_info or record.levelno >= logging.WARNING]
+
+
+def test_store_uses_wal_when_allowed(tmp_path, monkeypatch):
+    _allow_wal(monkeypatch)
+    SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    assert _journal_mode(tmp_path / "metrics.sqlite3") == "wal"
+
+
+def test_store_stays_delete_when_wal_disallowed(tmp_path, monkeypatch):
+    _allow_wal(monkeypatch, configured="delete")
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    store.record_model_call(_dimensions(), _resource())
+    assert _journal_mode(tmp_path / "metrics.sqlite3") == "delete"
+
+
+def test_wal_switch_blocked_does_not_fail_construction(tmp_path, monkeypatch, caplog):
+    """An existing rollback-journal store whose file another writer holds: construction succeeds in the
+    current mode (the schema step waits the writer out) and a later start switches it to WAL."""
+    database_path = tmp_path / "metrics.sqlite3"
+    _allow_wal(monkeypatch, configured="delete")
+    SharedMetricsStore(database_path, tmp_path / "outbox").record_model_call(_dimensions(), _resource())
+    _allow_wal(monkeypatch)
+    blocker = _hold_write_lock(database_path)
+    # Held past the WAL step's short busy timeout, released well inside the schema step's.
+    release = threading.Timer(1.0, _release, args=(blocker,))
+    release.start()
+    try:
+        with caplog.at_level(logging.INFO, logger=shared_metrics_module.__name__):
+            store = SharedMetricsStore(database_path, tmp_path / "outbox")
+    finally:
+        release.join()
+    assert _journal_mode(database_path) == "delete"
+    assert not _tracebacks(caplog)
+    assert store.counter_snapshot()[0]["value"] == 1
+
+    SharedMetricsStore(database_path, tmp_path / "outbox")
+    assert _journal_mode(database_path) == "wal"
+
+
+def test_busy_client_active_logs_no_traceback(tmp_path, caplog):
+    from hermes_cli.observability.shared_metrics_contract import COMMIT_TICKET_KEY
+    from hermes_cli.observability.shared_metrics_subscriber import SharedMetricsSubscriber
+
+    database_path = tmp_path / "metrics.sqlite3"
+    store = SharedMetricsStore(database_path, tmp_path / "outbox")
+    subscriber = SharedMetricsSubscriber(store, "1.0")
+
+    def client_active(ticket: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            kind="mark", category=None, category_profile=None, name="hermes.client.active",
+            scope_category=None, data={},
+            metadata={"hermes.metrics.schema_version": "hermes.metrics.event.v4", COMMIT_TICKET_KEY: ticket},
+        )
+
+    blocker = _hold_write_lock(database_path)
+    try:
+        with caplog.at_level(logging.INFO):
+            subscriber(client_active("busy"))
+    finally:
+        _release(blocker)
+    assert not _tracebacks(caplog)
+    assert subscriber.take_saved("busy") == 0
+    assert store.counter_snapshot() == []
+
+    subscriber(client_active("free"))
+    assert subscriber.take_saved("free") == 1
+    [active] = store.counter_snapshot()
+    assert (active["metric_name"], active["value"]) == (CLIENT_ACTIVE_METRIC, 1)
+
+
+def test_busy_package_creation_is_skipped_then_retried(tmp_path, caplog):
+    database_path = tmp_path / "metrics.sqlite3"
+    store = SharedMetricsStore(database_path, tmp_path / "outbox")
+    store.record_model_call(_dimensions(), _resource())
+
+    blocker = _hold_write_lock(database_path)
+    try:
+        with caplog.at_level(logging.INFO, logger=shared_metrics_module.__name__):
+            assert store.create_and_export_package_if_due() == []
+    finally:
+        _release(blocker)
+    assert not _tracebacks(caplog)
+    assert store.counter_snapshot()[0]["packaged_value"] == 0
+
+    [package_path] = store.create_and_export_package_if_due()
+    assert package_path.exists()
+    assert store.counter_snapshot()[0]["packaged_value"] == 1
+
+
+def test_busy_drain_keeps_deferred_writes(tmp_path, caplog):
+    database_path = tmp_path / "metrics.sqlite3"
+    store = SharedMetricsStore(database_path, tmp_path / "outbox")
+
+    blocker = _hold_write_lock(database_path)
+    try:
+        store.record_model_call(_dimensions(), _resource())  # deferred: the store is busy
+        with caplog.at_level(logging.INFO, logger=shared_metrics_module.__name__):
+            store.drain_deferred(shared_metrics_module._BUSY_TIMEOUT_MS)
+    finally:
+        _release(blocker)
+    assert not _tracebacks(caplog)
+    assert store.counter_snapshot() == []
+
+    store.record_model_call(_dimensions(), _resource())
+    assert store.counter_snapshot()[0]["value"] == 2
+
+
+def test_non_busy_error_still_warns_with_traceback(tmp_path, monkeypatch, caplog):
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+
+    def missing_table(**_kwargs):
+        raise sqlite3.OperationalError("no such table: package_outbox")
+
+    monkeypatch.setattr(store, "_prune_expired_history", missing_table)
+    with caplog.at_level(logging.INFO, logger=shared_metrics_module.__name__):
+        store.create_and_export_package_if_due()
+    [warning] = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert warning.exc_info is not None
+
+
+def test_runtime_guard_logs_a_busy_store_without_traceback(tmp_path, caplog):
+    """The relay guard around store calls (install snapshot, export, consent) treats contention as routine."""
+    from hermes_cli.observability.relay_shared_metrics import _Runtime
+
+    database_path = tmp_path / "metrics.sqlite3"
+    store = SharedMetricsStore(database_path, tmp_path / "outbox")
+    blocker = _hold_write_lock(database_path)
+    try:
+        with caplog.at_level(logging.INFO):
+            assert _Runtime._safe(store.record_client_active, _resource()) is None
+    finally:
+        _release(blocker)
+    assert not _tracebacks(caplog)
+
+    def broken():
+        raise sqlite3.OperationalError("no such table: telemetry_state")
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        assert _Runtime._safe(broken) is None
+    [warning] = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert warning.exc_info is not None
+
+
+@pytest.mark.parametrize(
+    ("error", "busy"),
+    [
+        (sqlite3.OperationalError("database is locked"), True),
+        (sqlite3.OperationalError("database table is locked"), True),
+        (sqlite3.OperationalError("no such table: x"), False),
+        (sqlite3.OperationalError("disk I/O error"), False),
+        (RuntimeError("database is locked"), False),
+    ],
+)
+def test_is_busy_error(error, busy):
+    from hermes_cli.sqlite_util import is_busy_error
+
+    assert is_busy_error(error) is busy

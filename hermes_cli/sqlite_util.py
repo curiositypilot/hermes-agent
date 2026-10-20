@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Callable, Iterator
 
+from hermes_state_errors import is_sqlite_lock_error
+
 
 def open_db(
     path: Path | str,
@@ -93,6 +95,12 @@ def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, ddl
         if "duplicate column name" in str(exc).lower():
             return False
         raise
+
+
+def is_busy_error(exc: BaseException) -> bool:
+    """An ``OperationalError`` for SQLITE_BUSY / SQLITE_LOCKED: another connection holds the store, so the
+    caller may retry later. Any other error (missing table, I/O, corruption) is not contention."""
+    return isinstance(exc, sqlite3.OperationalError) and is_sqlite_lock_error(exc)
 
 
 @contextlib.contextmanager

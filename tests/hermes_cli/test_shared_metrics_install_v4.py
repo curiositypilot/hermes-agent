@@ -131,6 +131,9 @@ def test_in_place_relaunch_is_not_a_startup_but_its_children_are(marks, monkeypa
 
     monkeypatch.setenv(startup.RELAUNCHED_PID_ENV, "")  # restored after relaunch() stamps it
     monkeypatch.setattr(relaunch_mod.sys, "platform", "linux")
+    # Which binary gets exec'd is irrelevant here; the PATH lookup would read the real install's
+    # `hermes` launcher (a real-home I/O the guard refuses) when the gate inherits that PATH.
+    monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: "/usr/bin/hermes")
     monkeypatch.setattr(startup, "process_started_at", lambda: time.time() - 30)
     # The exec'd program keeps this PID and environment and reaches its first prompt.
     monkeypatch.setattr(relaunch_mod.os, "execvp", lambda *_a: startup.record_process_ready("cli"))

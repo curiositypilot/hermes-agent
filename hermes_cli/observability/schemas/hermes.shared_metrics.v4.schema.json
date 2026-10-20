@@ -3588,6 +3588,7 @@
               "enum": [
                 "bot_room",
                 "browser",
+                "browser_vault",
                 "catalog",
                 "clarify",
                 "code_execution",
