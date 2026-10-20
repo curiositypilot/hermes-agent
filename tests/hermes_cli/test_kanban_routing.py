@@ -972,3 +972,35 @@ def test_incident_replay_decide_and_review(conn, monkeypatch):
     d_review = ctx.decide_review(task)
     assert d_review.source == "quota_held", f"expected quota_held, got {d_review.source}: {d_review.candidate}"
     assert d_review.candidate is None
+
+
+def _write_data_policies(home: Path, confidential: list[str]) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "kanban:\n  data_policies:\n    default: internal\n    classes:\n"
+        "      internal:\n        providers: any\n        fallback: true\n"
+        f"      confidential:\n        providers: {json.dumps(confidential)}\n        fallback: false\n",
+        encoding="utf-8",
+    )
+
+
+def test_allowlist_resolves_under_assignee_profile_home(conn, kanban_home, tmp_path, monkeypatch):
+    """The allowlist comes from the assignee profile's config, not the dispatcher's: the worker
+    runs under the profile home and would deny a provider the dispatcher's policy permits."""
+    _write_data_policies(kanban_home, ["prov-a"])
+    profile_home = tmp_path / "profiles" / "worker"
+    _write_data_policies(profile_home, ["prov-b"])
+
+    cfg = _cfg(tiers={"S": [{"model": "m-a", "provider": "prov-a"}, {"model": "m-b", "provider": "prov-b"}]})
+    ctx = kr.RoutingContext(conn, cfg)
+    _pool(monkeypatch, {})
+
+    task = _task(complexity="S", data_class="confidential")
+    d = ctx.decide(task, profile_home=str(profile_home))
+    assert d.source == "tier"
+    assert d.candidate.provider == "prov-b"
+    assert any(s["provider"] == "prov-a" and "not in allowlist" in s["reason"] for s in d.skipped)
+
+    # Without a profile home the dispatcher's own policy applies.
+    d_default = ctx.decide(task)
+    assert d_default.candidate.provider == "prov-a"

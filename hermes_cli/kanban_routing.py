@@ -848,18 +848,25 @@ class RoutingContext:
     def _walk(self, entries: list[tuple[Optional[str], TierCandidate]], task: Any,
               profile_home: Optional[str]) -> _Walk:
         """First usable candidate of ``(tier, candidate)`` entries in the given
-        order (pace ordering, when on, is applied by ``_tier_entries``). A
-        quota-gated candidate is skipped like an unavailable one; after the
-        first gate skip, pay-as-you-go providers are skipped too."""
+        order (pace ordering, when on, is applied by ``_tier_entries``). The
+        card's data class and its provider allowlist are both resolved under
+        the assignee profile's home, so the router never picks a provider the
+        profile's worker then denies. A quota-gated candidate is skipped like
+        an unavailable one; after the first gate skip, pay-as-you-go providers
+        are skipped too."""
         walk = _Walk()
         priority = _task_priority(task)
         data_class: Optional[str] = None
+        allowed: list[str] | str = "any"
         data_class_error: bool = False
-        from agent.provider_policy import ProviderDenied, provider_permitted, resolve_data_class
+        from agent.provider_policy import (
+            ProviderDenied, allowed_providers, provider_in_allowlist, resolve_data_class,
+        )
 
         try:
             with _home_scope(profile_home):
                 data_class = resolve_data_class(task)
+                allowed = allowed_providers(data_class)
         except (ProviderDenied, KeyError, TypeError, ValueError, OSError):
             data_class_error = True
 
@@ -869,7 +876,7 @@ class RoutingContext:
                 walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
                                      "reason": "data class unresolved"})
                 continue
-            if data_class and not provider_permitted(cand.provider or "", data_class):
+            if data_class and not provider_in_allowlist(cand.provider, allowed):
                 walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
                                      "reason": f"data class {data_class}: provider not in allowlist"})
                 continue
