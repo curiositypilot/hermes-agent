@@ -1004,3 +1004,94 @@ def test_allowlist_resolves_under_assignee_profile_home(conn, kanban_home, tmp_p
     # Without a profile home the dispatcher's own policy applies.
     d_default = ctx.decide(task)
     assert d_default.candidate.provider == "prov-a"
+
+
+# Two real homes (no allowed_providers monkeypatch): the router must read the
+# allowlist under the assignee's home, where the worker enforces it (t_359863a0).
+
+_A = {"model": "m-a", "provider": "prov-a"}
+_B = {"model": "m-b", "provider": "prov-b"}
+
+
+def _policy_home(home: Path, allowed: str, model: str | None = None) -> str:
+    home.mkdir(exist_ok=True)
+    model_block = f"model:\n  default: {model.split('/')[0]}\n  provider: {model.split('/')[1]}\n" if model else ""
+    (home / "config.yaml").write_text(
+        model_block
+        + "kanban:\n  data_policies:\n    default: internal\n    classes:\n"
+        "      internal: {providers: any, fallback: true, auxiliary: any}\n"
+        f"      confidential: {{providers: [{allowed}], fallback: false, auxiliary: same_provider_or_fail}}\n")
+    return str(home)
+
+
+@pytest.fixture
+def homes(kanban_home, tmp_path):
+    """Dispatcher home allows prov-a; profile ``prof`` allows prov-b and runs m-x/prov-x
+    (not permitted); profile ``ok`` allows prov-b and runs m-b/prov-b (permitted)."""
+    _policy_home(kanban_home, "prov-a")
+    return {"prof": _policy_home(tmp_path / "prof", "prov-b", "m-x/prov-x"),
+            "ok": _policy_home(tmp_path / "ok", "prov-b", "m-b/prov-b")}
+
+
+def test_on_exhausted_profile_holds_on_data_class_skip(conn, monkeypatch, homes):
+    _pool(monkeypatch)
+    cfg = _cfg(tiers={"S": [_A]}, on_exhausted="profile")
+    task = _task(complexity="S", data_class="confidential", priority=1)
+    d = kr.RoutingContext(conn, cfg).decide(task, profile_home=homes["prof"])
+    assert d.source == "exhausted" and d.candidate is None
+    assert "no permitted candidate" in d.note
+    assert [s["provider"] for s in d.skipped] == ["prov-a", "prov-x"]
+    assert "no permitted candidate" in d.label()
+    # Must-not: a permitted profile model still takes the profile route.
+    d = kr.RoutingContext(conn, cfg).decide(task, profile_home=homes["ok"])
+    assert (d.source, d.candidate.label) == ("profile", "prov-b:m-b")
+    # Must-not: an unrestricted class falls to the profile model unchanged.
+    _pool(monkeypatch, {"prov-a": "credential pool exhausted"})
+    d = kr.RoutingContext(conn, cfg).decide(_task(complexity="S", data_class="internal"),
+                                            profile_home=homes["prof"])
+    assert (d.source, d.candidate.label) == ("profile", "prov-x:m-x")
+
+
+def test_review_on_exhausted_profile_holds_on_data_class_skip(conn, monkeypatch, homes):
+    _pool(monkeypatch)
+    cfg = _cfg(review=[_A], on_exhausted="profile")
+    task = _task(data_class="confidential")
+    d = kr.RoutingContext(conn, cfg).decide_review(task, profile_home=homes["prof"])
+    assert (d.source, d.lane, d.candidate) == ("exhausted", "review", None)
+    assert "no permitted candidate" in d.note and "no permitted candidate" in d.label()
+    assert d.skipped[-1]["provider"] == "prov-x"
+    # Must-not: the permitted profile model keeps the profile run.
+    d = kr.RoutingContext(conn, cfg).decide_review(task, profile_home=homes["ok"])
+    assert (d.source, d.lane) == ("profile", "review")
+    # The card pin is what the review run keeps: a forbidden pin holds even
+    # though the profile model would be permitted, and a permitted pin passes.
+    pinned = _task(data_class="confidential", model_override="m-z", provider_override="prov-z")
+    d = kr.RoutingContext(conn, cfg).decide_review(pinned, profile_home=homes["ok"])
+    assert d.source == "exhausted" and d.skipped[-1]["provider"] == "prov-z"
+    pinned_ok = _task(data_class="confidential", model_override="m-b", provider_override="prov-b")
+    d = kr.RoutingContext(conn, cfg).decide_review(pinned_ok, profile_home=homes["prof"])
+    assert d.source == "profile"
+
+
+def test_unlabeled_profile_route_checks_data_class(conn, monkeypatch, homes):
+    _pool(monkeypatch)
+    task = _task(data_class="confidential")
+    for cfg in (_cfg(), _cfg(tiers={})):  # unlabeled, then no candidates configured
+        d = kr.RoutingContext(conn, cfg).decide(task, profile_home=homes["prof"])
+        assert d.source == "exhausted" and d.candidate is None
+        assert d.note == "data class confidential: no permitted candidate"
+        d = kr.RoutingContext(conn, cfg).decide(task, profile_home=homes["ok"])
+        assert (d.source, d.candidate.label) == ("profile", "prov-b:m-b")
+
+
+def test_unresolved_class_holds_profile_routes(conn, monkeypatch, homes):
+    _pool(monkeypatch, {"prov-a": "credential pool exhausted"})
+    task = _task(complexity="S", data_class="bogus")
+    for d in (kr.RoutingContext(conn, _cfg()).decide(_task(data_class="bogus"), profile_home=homes["ok"]),
+              kr.RoutingContext(conn, _cfg(tiers={"S": [_A]}, on_exhausted="profile")).decide(
+                  task, profile_home=homes["ok"]),
+              kr.RoutingContext(conn, _cfg(review=[_A], on_exhausted="profile")).decide_review(
+                  task, profile_home=homes["ok"])):
+        assert d.source == "exhausted" and d.candidate is None
+        assert d.note == "data class unresolved: no permitted candidate"
+        assert d.skipped[-1]["reason"] == "data class unresolved"

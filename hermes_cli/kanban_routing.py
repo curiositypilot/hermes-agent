@@ -457,6 +457,8 @@ class RouteDecision:
             return f"quota held — {self.note}" if self.note else "quota held"
         if self.source == "review" and self.candidate:
             return f"review -> {self.candidate.label}"
+        if self.source == "exhausted" and (self.note or "").endswith(CLASS_HELD_SUFFIX):
+            return f"{'review' if self.lane == 'review' else 'profile default'}: {self.note}"
         if self.source == "exhausted" and self.lane == "review":
             return "review: no candidate available"
         if self.source == "tier" and self.candidate:
@@ -753,6 +755,41 @@ class _Walk:
     gated: list[QuotaVerdict] = field(default_factory=list)
 
 
+CLASS_HELD_SUFFIX = ": no permitted candidate"
+
+
+@dataclass(frozen=True)
+class _ClassCheck:
+    """The card's data class and allowlist, both read under the assignee's home:
+    the worker enforces the class there at init, so the router must agree."""
+    data_class: Optional[str]
+    """None = unresolved (every candidate is refused)."""
+    allowed: "list[str] | str" = "any"
+
+    @classmethod
+    def for_task(cls, task: Any, profile_home: Optional[str]) -> "_ClassCheck":
+        from agent.provider_policy import ProviderDenied, allowed_providers, resolve_data_class
+        try:
+            with _home_scope(profile_home):
+                data_class = resolve_data_class(task)
+                return cls(data_class, allowed_providers(data_class))
+        except (ProviderDenied, KeyError, TypeError, ValueError, OSError):
+            return cls(None)
+
+    def refusal(self, provider: Optional[str]) -> Optional[str]:
+        """Skip reason for ``provider``, or None when it is permitted."""
+        if self.data_class is None:
+            return "data class unresolved"
+        from agent.provider_policy import provider_in_allowlist
+        if provider_in_allowlist(provider, self.allowed):
+            return None
+        return f"data class {self.data_class}: provider not in allowlist"
+
+    @property
+    def held_note(self) -> str:
+        return f"data class {self.data_class or 'unresolved'}{CLASS_HELD_SUFFIX}"
+
+
 def _task_priority(task: Any) -> int:
     try:
         return int(getattr(task, "priority", 0) or 0)
@@ -846,7 +883,7 @@ class RoutingContext:
         return [(t, c) for t in tiers for c in self.order_tier(self.cfg.tiers.get(t, ()))]
 
     def _walk(self, entries: list[tuple[Optional[str], TierCandidate]], task: Any,
-              profile_home: Optional[str]) -> _Walk:
+              profile_home: Optional[str], check: _ClassCheck) -> _Walk:
         """First usable candidate of ``(tier, candidate)`` entries in the given
         order (pace ordering, when on, is applied by ``_tier_entries``). The
         card's data class and its provider allowlist are both resolved under
@@ -856,29 +893,11 @@ class RoutingContext:
         are skipped too."""
         walk = _Walk()
         priority = _task_priority(task)
-        data_class: Optional[str] = None
-        allowed: list[str] | str = "any"
-        data_class_error: bool = False
-        from agent.provider_policy import (
-            ProviderDenied, allowed_providers, provider_in_allowlist, resolve_data_class,
-        )
-
-        try:
-            with _home_scope(profile_home):
-                data_class = resolve_data_class(task)
-                allowed = allowed_providers(data_class)
-        except (ProviderDenied, KeyError, TypeError, ValueError, OSError):
-            data_class_error = True
-
         for tier, cand in entries:
             where = {"tier": tier} if tier else {}
-            if data_class_error:
-                walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
-                                     "reason": "data class unresolved"})
-                continue
-            if data_class and not provider_in_allowlist(cand.provider, allowed):
-                walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
-                                     "reason": f"data class {data_class}: provider not in allowlist"})
+            refusal = check.refusal(cand.provider)
+            if refusal:
+                walk.skipped.append({**where, "model": cand.model, "provider": cand.provider, "reason": refusal})
                 continue
             if walk.gated and self._is_payg(cand.provider):
                 walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
@@ -920,6 +939,21 @@ class RoutingContext:
                                        "reason": f"quota: {verdict.describe()}"}]
         return self._quota_held(task, [verdict], lane=decision.lane, requested_tier=decision.requested_tier,
                                 skipped=skipped, candidate=cand)
+
+    def _profile_route(self, task: Any, decision: RouteDecision, check: _ClassCheck,
+                       cand: Optional[TierCandidate] = None) -> RouteDecision:
+        """A profile route (or the review lane's pin/profile run, ``cand``) must pass the
+        data class like a tier candidate; a refused one holds the card, never falls
+        through (fail closed). Then, on the ready lane, the quota gate applies as for
+        any fixed route (the review lane's profile run was never gated)."""
+        cand = decision.candidate if cand is None else cand
+        refusal = check.refusal(cand.provider if cand else None)
+        if refusal is None:
+            return decision if decision.lane == "review" else self._gate_fixed(task, decision)
+        skipped = [*decision.skipped, {"model": cand.model if cand else None,
+                                       "provider": cand.provider if cand else None, "reason": refusal}]
+        return RouteDecision("exhausted", lane=decision.lane, requested_tier=decision.requested_tier,
+                             skipped=skipped, note=check.held_note)
 
     def recently_rate_limited(self) -> dict[tuple[str, str], tuple[int, str]]:
         """``(provider, model) -> (latest hit time, source)`` within ``cooldown_seconds``
@@ -1036,15 +1070,16 @@ class RoutingContext:
             return RouteDecision("exhausted", candidate=cand, retry_at=avail.until, note=PINNED_UNAVAILABLE_NOTE,
                                  skipped=[{"model": cand.model, "provider": cand.provider, "reason": avail.reason}])
         requested = self.requested_tier(task)
+        check = _ClassCheck.for_task(task, profile_home)
         if requested is None:
-            return self._gate_fixed(task, RouteDecision("profile", candidate=_profile_model(profile_home),
-                                                        note="unlabeled"))
+            return self._profile_route(task, RouteDecision("profile", candidate=_profile_model(profile_home),
+                                                           note="unlabeled"), check)
         tiers = _tier_walk(requested, self.cfg.escalate)
         if not any(self.cfg.tiers.get(t) for t in tiers):
-            return self._gate_fixed(task, RouteDecision(
+            return self._profile_route(task, RouteDecision(
                 "profile", requested_tier=requested, candidate=_profile_model(profile_home),
-                note=f"no candidates configured for tier {requested}"))
-        walk = self._walk(self._tier_entries(tiers), task, profile_home)
+                note=f"no candidates configured for tier {requested}"), check)
+        walk = self._walk(self._tier_entries(tiers), task, profile_home, check)
         if walk.chosen is not None:
             tier, cand = walk.chosen
             return RouteDecision("tier", requested_tier=requested, tier=tier, candidate=cand, skipped=walk.skipped)
@@ -1052,9 +1087,9 @@ class RoutingContext:
             # Never on_exhausted=profile here: that would spend the gated quota anyway.
             return self._quota_held(task, walk.gated, requested_tier=requested, skipped=walk.skipped)
         if self.cfg.on_exhausted == "profile":
-            return self._gate_fixed(task, RouteDecision(
+            return self._profile_route(task, RouteDecision(
                 "profile", requested_tier=requested, candidate=_profile_model(profile_home),
-                skipped=walk.skipped, note="all tier candidates unavailable"))
+                skipped=walk.skipped, note="all tier candidates unavailable"), check)
         return RouteDecision("exhausted", requested_tier=requested, skipped=walk.skipped,
                              retry_at=min(walk.waits) if walk.waits else None)
 
@@ -1065,14 +1100,20 @@ class RoutingContext:
         implementer's run. The quota gate applies with the card's priority."""
         if not self.cfg.review:
             return None
-        walk = self._walk([(None, c) for c in self.spend_down_order(self.cfg.review)], task, profile_home)
+        check = _ClassCheck.for_task(task, profile_home)
+        walk = self._walk([(None, c) for c in self.spend_down_order(self.cfg.review)], task, profile_home, check)
         if walk.chosen is not None:
             return RouteDecision("review", lane="review", candidate=walk.chosen[1], skipped=walk.skipped)
         if walk.gated:
             return self._quota_held(task, walk.gated, lane="review", skipped=walk.skipped)
         if self.cfg.on_exhausted == "profile":
-            return RouteDecision("profile", lane="review", skipped=walk.skipped,
-                                 note="all review candidates unavailable")
+            # The run keeps the card pin, else the profile model: that is what must pass.
+            pin = getattr(task, "model_override", None)
+            runs_on = (TierCandidate(pin, getattr(task, "provider_override", None)) if pin
+                       else _profile_model(profile_home))
+            return self._profile_route(task, RouteDecision("profile", lane="review", skipped=walk.skipped,
+                                                           note="all review candidates unavailable"),
+                                       check, cand=runs_on)
         return RouteDecision("exhausted", lane="review", skipped=walk.skipped,
                              retry_at=min(walk.waits) if walk.waits else None)
 
