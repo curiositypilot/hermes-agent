@@ -52,6 +52,33 @@ def test_resolve_sandbox_mode(cfg, tenant, expected):
     assert kbs.resolve_sandbox_mode(cfg, tenant) == expected
 
 
+_PILOT = {"sandbox": "bwrap", "sandbox_tenants": ["knowledge-architecture"]}
+
+
+@pytest.mark.parametrize("exempt,skills,expected", [
+    (["hindsight-ops"], ["hindsight-ops"], "off"),
+    (["hindsight-ops"], ["x", "hindsight-ops"], "off"),
+    ("hindsight-ops", ["hindsight-ops"], "off"),  # comma string, parsed like sandbox_tenants
+    (["hindsight-ops"], None, "bwrap"),
+    (["hindsight-ops"], [], "bwrap"),
+    (["hindsight-ops"], ["hindsight-ops-extra"], "bwrap"),  # exact match only
+    (["hindsight-ops"], ["hindsight"], "bwrap"),
+    ([], ["hindsight-ops"], "bwrap"),
+    (None, ["hindsight-ops"], "bwrap"),
+])
+def test_resolve_sandbox_mode_exempt_skills(exempt, skills, expected):
+    cfg = dict(_PILOT)
+    if exempt is not None:
+        cfg["sandbox_exempt_skills"] = exempt
+    assert kbs.resolve_sandbox_mode(cfg, "knowledge-architecture", skills) == expected
+
+
+def test_exempt_skill_never_turns_the_sandbox_on():
+    cfg = {"sandbox": "bwrap", "sandbox_tenants": ["pilot"], "sandbox_exempt_skills": ["hindsight-ops"]}
+    assert kbs.resolve_sandbox_mode(cfg, "other", ["hindsight-ops"]) == "off"
+    assert kbs.resolve_sandbox_mode(cfg, "other", ["x"]) == "off"
+
+
 def test_default_config_keeps_sandbox_off():
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
@@ -287,9 +314,10 @@ def _patch_spawn(monkeypatch, tmp_path, cfg):
     return kbd, captured
 
 
-def _task(tenant):
+def _task(tenant, skills=None):
     return SimpleNamespace(id="t_9", assignee="worker", tenant=tenant, data_class=None, branch_name=None,
-                           current_run_id=3, claim_lock="host:1", goal_mode=False, max_runtime_seconds=None)
+                           current_run_id=3, claim_lock="host:1", goal_mode=False, max_runtime_seconds=None,
+                           skills=skills)
 
 
 def test_spawn_unsandboxed_when_flag_off(monkeypatch, tmp_path):
@@ -317,6 +345,22 @@ def test_spawn_wraps_listed_tenant_between_scope_and_hermes(monkeypatch, tmp_pat
     assert "BINANCE_SECRET" not in captured["env"]
     log = (tmp_path / "logs" / "t_9.log").read_bytes()
     assert b"[kanban sandbox] bwrap argv:" in log
+
+
+def test_exempt_skill_spawns_unsandboxed_and_logs_the_exemption(monkeypatch, tmp_path):
+    host = _fake_host(tmp_path)
+    monkeypatch.setattr(kbs, "build_sandbox", _builder_in(host))
+    cfg = {"sandbox": "bwrap", "sandbox_tenants": ["pilot"], "sandbox_exempt_skills": ["hindsight-ops"]}
+    kbd, captured = _patch_spawn(monkeypatch, tmp_path, cfg)
+    task = _task("pilot", skills=["hindsight-ops"])
+
+    assert kbs.plan_for_task(task, ["hermes", "chat"], {}, str(host.ws), None) is None
+    kbd._default_spawn(task, str(host.ws))
+    assert captured["argv"] == ["systemd-run", "--scope", "hermes", "chat"]
+    assert captured["pass_fds"] == ()
+    log = (tmp_path / "logs" / "t_9.log").read_bytes()
+    assert b"[kanban sandbox] exempt: skill hindsight-ops\n" in log
+    assert b"bwrap argv" not in log
 
 
 def _builder_in(host):
