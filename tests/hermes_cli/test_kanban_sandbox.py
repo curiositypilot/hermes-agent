@@ -2,7 +2,9 @@
 
 The argv builder runs against a fake home tree in tmp_path; the real-bwrap tests (skipped where
 bwrap or unprivileged user namespaces are missing) prove the built argv actually hides what it
-claims to hide, which a string assertion on the argv cannot.
+claims to hide, which a string assertion on the argv cannot. Their fake home lives outside /tmp:
+the sandbox mounts a private `--tmpfs /tmp`, so a home under /tmp (bare pytest's basetemp) would
+be swapped for a writable tmpfs and the masking checks would test that tmpfs instead.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -129,6 +132,34 @@ def _fake_host(tmp_path: Path):
     return SimpleNamespace(home=home, root=root, ws=ws, env=env, socks=socks)
 
 
+def _under_tmp(path: Path) -> bool:
+    resolved = path.resolve()
+    return resolved == Path("/tmp") or Path("/tmp") in resolved.parents
+
+
+@pytest.fixture
+def bwrap_host_dir(tmp_path):
+    """A base dir for a real-bwrap fake host that does not resolve under /tmp."""
+    if not _under_tmp(tmp_path):
+        yield tmp_path
+        return
+    if not os.path.isdir("/var/tmp"):
+        pytest.skip("tmp_path is under /tmp (masked by the sandbox's --tmpfs /tmp) and /var/tmp is missing")
+    base = Path(tempfile.mkdtemp(prefix="hermes-sbx-", dir="/var/tmp"))
+    try:
+        yield base
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def _bwrap_fake_host(base: Path):
+    host = _fake_host(base)
+    assert not _under_tmp(host.home), (
+        f"fake home {host.home} is under /tmp: build_sandbox mounts --tmpfs /tmp, which would replace it "
+        "with a writable tmpfs and make the masking checks vacuous")
+    return host
+
+
 def _pairs(argv, flag):
     return [(argv[i + 1], argv[i + 2]) for i, a in enumerate(argv) if a == flag]
 
@@ -187,8 +218,8 @@ def test_build_sandbox_fails_closed_without_bwrap(tmp_path, monkeypatch):
 
 
 @needs_bwrap
-def test_built_sandbox_hides_what_it_claims(tmp_path):
-    host = _fake_host(tmp_path)
+def test_built_sandbox_hides_what_it_claims(bwrap_host_dir):
+    host = _bwrap_fake_host(bwrap_host_dir)
     script = (
         "import os,socket,sys\n"
         "def rd(p):\n"
@@ -234,8 +265,8 @@ def test_built_sandbox_hides_what_it_claims(tmp_path):
 
 
 @needs_bwrap
-def test_forwarder_relays_sigterm_to_the_worker(tmp_path):
-    host = _fake_host(tmp_path)
+def test_forwarder_relays_sigterm_to_the_worker(bwrap_host_dir):
+    host = _bwrap_fake_host(bwrap_host_dir)
     marker = host.ws / "got-term"
     script = (
         "import signal,sys,time\n"
