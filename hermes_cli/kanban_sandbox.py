@@ -1,7 +1,8 @@
 """Kanban worker sandbox: run a dispatcher-spawned worker inside bubblewrap.
 
 Opt-in per host and tenant (``kanban.sandbox: bwrap`` + ``kanban.sandbox_tenants``); off by
-default. Policy, ported from the 2026-10 sandbox prototype (decision card t_60716020):
+default. A card with a skill in ``kanban.sandbox_exempt_skills`` runs unsandboxed (host-side
+Hindsight docker work). Policy, ported from the 2026-10 sandbox prototype (decision card t_60716020):
 
 - ``/`` read-only; read-write for ``~/.hermes``, ``~/.cache``, ``~/.local/share/uv``, the task
   workspace and, for a git worktree, the repo's common git dir.
@@ -113,13 +114,36 @@ def _tenant_list(raw: Any) -> list[str]:
     return [str(t).strip() for t in items if str(t).strip()]
 
 
-def resolve_sandbox_mode(kanban_cfg: Optional[Mapping[str, Any]], tenant: Optional[str]) -> str:
-    """``bwrap`` when ``kanban.sandbox`` is ``bwrap`` and the tenant is listed in
-    ``kanban.sandbox_tenants`` (an empty list means every tenant); otherwise ``off``.
+def sandbox_exempt_skill(kanban_cfg: Optional[Mapping[str, Any]],
+                         skills: Optional[Iterable[str]]) -> Optional[str]:
+    """The first task skill listed in ``kanban.sandbox_exempt_skills`` (exact match), else None.
+
+    MB 2026-10-21 (t_f94842d1): cards with skill ``hindsight-ops`` run host-side, because the
+    Hindsight DB is reachable only through ``sudo docker exec``, which bwrap cannot grant.
+    """
+    exempt = set(_tenant_list((kanban_cfg or {}).get("sandbox_exempt_skills")))
+    for skill in skills or ():
+        if str(skill).strip() in exempt:
+            return str(skill).strip()
+    return None
+
+
+def resolve_sandbox_mode(kanban_cfg: Optional[Mapping[str, Any]], tenant: Optional[str],
+                         skills: Optional[Iterable[str]] = None) -> str:
+    """``bwrap`` when ``kanban.sandbox`` is ``bwrap``, the tenant is listed in
+    ``kanban.sandbox_tenants`` (an empty list means every tenant) and no task skill is in
+    ``kanban.sandbox_exempt_skills``; otherwise ``off``.
 
     YAML 1.1 reads a bare ``off`` as ``False``, so falsy values are off too. An unknown mode is
     logged and treated as off.
     """
+    mode = _tenant_sandbox_mode(kanban_cfg, tenant)
+    if mode == SANDBOX_BWRAP and sandbox_exempt_skill(kanban_cfg, skills):
+        return SANDBOX_OFF
+    return mode
+
+
+def _tenant_sandbox_mode(kanban_cfg: Optional[Mapping[str, Any]], tenant: Optional[str]) -> str:
     cfg = kanban_cfg or {}
     raw = cfg.get("sandbox")
     mode = "" if raw is None or raw is False else str(raw).strip().lower()
@@ -387,37 +411,50 @@ def _pinned_kanban_vars(task: Any) -> set[str]:
     return pinned
 
 
-def plan_for_task(task: Any, command: Sequence[str], env: Mapping[str, str], workspace: str,
-                  profile_home: Optional[str]) -> Optional[SandboxPlan]:
-    """The :class:`SandboxPlan` for this worker spawn when ``kanban.sandbox`` applies to the task's
-    tenant, else None. Config is read per spawn, so a flip applies at the next spawn with no
-    restart. An unreadable config raises (fail closed: never guess the sandbox is off), and so
-    does :class:`SandboxUnavailable` (the dispatcher defers the spawn, never runs it bare).
-    """
+def _plan_with_note(task: Any, command: Sequence[str], env: Mapping[str, str], workspace: str,
+                    profile_home: Optional[str]) -> tuple[Optional[SandboxPlan], bytes]:
+    """``(plan, worker_log_note)``: the plan as :func:`plan_for_task` returns it, plus the line
+    the dispatcher writes to the worker log when a skill exempts a would-be-sandboxed task (so
+    the pilot gate can count exempt runs apart from sandboxed and out-of-scope ones)."""
     if os.name == "nt":
-        return None
+        return None, b""
     from hermes_cli.config import load_config
 
-    if resolve_sandbox_mode(load_config().get("kanban") or {}, task.tenant) != SANDBOX_BWRAP:
-        return None
+    cfg = load_config().get("kanban") or {}
+    if resolve_sandbox_mode(cfg, task.tenant) != SANDBOX_BWRAP:
+        return None, b""
+    exempt = sandbox_exempt_skill(cfg, getattr(task, "skills", None))
+    if exempt:
+        return None, f"[kanban sandbox] exempt: skill {exempt}\n".encode("utf-8", "replace")
     pinned = _pinned_kanban_vars(task)
     worker_env = {k: v for k, v in env.items() if not k.startswith("HERMES_KANBAN_") or k in pinned}
     run = task.current_run_id if task.current_run_id is not None else "x"
     return build_sandbox(command, worker_env=worker_env, workspace=workspace,
-                         run_key=f"{task.id}-r{run}", assignee_home=profile_home)
+                         run_key=f"{task.id}-r{run}", assignee_home=profile_home), b""
+
+
+def plan_for_task(task: Any, command: Sequence[str], env: Mapping[str, str], workspace: str,
+                  profile_home: Optional[str]) -> Optional[SandboxPlan]:
+    """The :class:`SandboxPlan` for this worker spawn when ``kanban.sandbox`` applies to the task's
+    tenant and no task skill is in ``kanban.sandbox_exempt_skills``, else None. Config is read per
+    spawn, so a flip applies at the next spawn with no restart. An unreadable config raises (fail
+    closed: never guess the sandbox is off), and so does :class:`SandboxUnavailable` (the
+    dispatcher defers the spawn, never runs it bare).
+    """
+    return _plan_with_note(task, command, env, workspace, profile_home)[0]
 
 
 @contextlib.contextmanager
 def worker_sandbox(task: Any, command: Sequence[str], env: dict[str, str], workspace: str,
                    profile_home: Optional[str]):
     """Yield ``(argv, env, pass_fds, log_prefix)`` for the worker spawn: the sandboxed launch
-    when ``kanban.sandbox`` applies, else the inputs unchanged with no fds and an empty prefix.
-    The memfds the sandbox reads its data binds from are closed on exit, once Popen has handed
-    them to the child.
+    when ``kanban.sandbox`` applies, else the inputs unchanged with no fds and a prefix that is
+    empty unless a skill exempted the task. The memfds the sandbox reads its data binds from are
+    closed on exit, once Popen has handed them to the child.
     """
-    plan = plan_for_task(task, command, env, workspace, profile_home)
+    plan, note = _plan_with_note(task, command, env, workspace, profile_home)
     if plan is None:
-        yield list(command), env, (), b""
+        yield list(command), env, (), note
         return
     try:
         yield list(plan.argv), dict(plan.outer_env), plan.pass_fds, plan.log_line()

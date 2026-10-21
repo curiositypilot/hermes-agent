@@ -1949,6 +1949,8 @@ DEFAULT_CONFIG = {
         "sandbox": "off",
         # Tenants the sandbox applies to; empty = every tenant.
         "sandbox_tenants": [],
+        # Cards with any of these skills run unsandboxed (exact name), e.g. hindsight-ops.
+        "sandbox_exempt_skills": [],
         # Profile for the root/orchestration task after Triage decomposition; "" = default profile.
         # Does not control the decomposer LLM path (see auxiliary.kanban_decomposer).
         "orchestrator_profile": "",
