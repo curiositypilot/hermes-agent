@@ -38,6 +38,7 @@ from hermes_cli.cli_commands_session_tools import (  # noqa: F401  moved there (
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL, discover_local_cdp_url, find_free_debug_port, is_browser_debug_ready,
     launch_chrome_debug, local_port_in_use, manual_chrome_debug_command)
+from hermes_cli.cron import _cron_api
 
 
 # Output helpers. Slash-command text is user-visible: every literal below is load-bearing.
@@ -81,7 +82,7 @@ def _ellipsize(text: str, limit: int) -> str:
 
 # /cron flag tables: flag -> opts key. Order-sensitive in _parse_cron_flags: bool flags never
 # consume a value; --repeat is int-validated separately.
-_CRON_BOOL_FLAGS = {"--clear-skills": "clear_skills", "--all": "all"}
+_CRON_BOOL_FLAGS = {"--clear-skills": "clear_skills", "--all": "all", "--inline": "inline"}
 _CRON_LIST_FLAGS = {"--skill": "skills", "--add-skill": "add_skills", "--remove-skill": "remove_skills"}
 _CRON_VALUE_FLAGS = {"--name": "name", "--deliver": "deliver", "--prompt": "prompt", "--schedule": "schedule"}
 # /cron subcommand -> CLICommandsMixin method name.
@@ -178,12 +179,6 @@ def _toggle_target(arg: str, current: bool):
     return None
 
 
-def _cron_api(**kwargs) -> dict:
-    """Call the cronjob model tool and decode its JSON reply."""
-    from tools.cronjob_tools import cronjob as cronjob_tool
-    return json.loads(cronjob_tool(**kwargs))
-
-
 def _normalize_skills(values) -> list:
     """Strip, drop empties, and dedupe (order-preserving)."""
     normalized = []
@@ -199,7 +194,7 @@ def _parse_cron_flags(tokens):
     opts = {
         "name": None, "deliver": None, "repeat": None, "prompt": None, "schedule": None,
         "skills": [], "add_skills": [], "remove_skills": [],
-        "clear_skills": False, "all": False, "positionals": []}
+        "clear_skills": False, "all": False, "inline": False, "positionals": []}
     i = 0
     while i < len(tokens):
         token = tokens[i]
@@ -1487,6 +1482,10 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
             return print(_t("cron.usage_action", subcommand=subcommand))
         job_id = positionals[0]
         action = "remove" if subcommand in {"remove", "rm", "delete"} else subcommand
+        if action == "run":  # same route as `hermes cron run`: a chat-thread run dies with the chat
+            from hermes_cli.cron import chat_run_handoff
+            if chat_run_handoff(job_id, opts["inline"]):
+                return
         result = _cron_api(action=action, job_id=job_id,
                            reason="paused from /cron" if action == "pause" else None)
         if not result.get("success"):

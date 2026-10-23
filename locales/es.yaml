@@ -2865,7 +2865,7 @@ cli:
       available: "Disponibles: list, add, edit, pause, resume, run, remove"
       overview_title: "(^_^) Tareas programadas"
       overview_commands: "Comandos:"
-      overview_usage: "/cron list\n/cron add \"every 2h\" \"Revisar el estado del servidor\" [--skill blogwatcher]\n/cron edit <job_id> --schedule \"every 4h\" --prompt \"Nueva tarea\"\n/cron edit <job_id> --skill blogwatcher --skill maps\n/cron edit <job_id> --remove-skill blogwatcher\n/cron edit <job_id> --clear-skills\n/cron pause <job_id>\n/cron resume <job_id>\n/cron run <job_id>\n/cron remove <job_id>"
+      overview_usage: "/cron list\n/cron add \"every 2h\" \"Revisar el estado del servidor\" [--skill blogwatcher]\n/cron edit <job_id> --schedule \"every 4h\" --prompt \"Nueva tarea\"\n/cron edit <job_id> --skill blogwatcher --skill maps\n/cron edit <job_id> --remove-skill blogwatcher\n/cron edit <job_id> --clear-skills\n/cron pause <job_id>\n/cron resume <job_id>\n/cron run <job_id> [--inline]\n/cron remove <job_id>"
       current_jobs: "Tareas actuales:"
       skills: "Skills: {skills}"
       skills_none: "Skills: ninguna"

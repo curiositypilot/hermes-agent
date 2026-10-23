@@ -2865,7 +2865,7 @@ cli:
       available: "利用可能: list, add, edit, pause, resume, run, remove"
       overview_title: "(^_^) スケジュール済みタスク"
       overview_commands: "コマンド:"
-      overview_usage: "/cron list\n/cron add \"every 2h\" \"Check server status\" [--skill blogwatcher]\n/cron edit <job_id> --schedule \"every 4h\" --prompt \"New task\"\n/cron edit <job_id> --skill blogwatcher --skill maps\n/cron edit <job_id> --remove-skill blogwatcher\n/cron edit <job_id> --clear-skills\n/cron pause <job_id>\n/cron resume <job_id>\n/cron run <job_id>\n/cron remove <job_id>"
+      overview_usage: "/cron list\n/cron add \"every 2h\" \"Check server status\" [--skill blogwatcher]\n/cron edit <job_id> --schedule \"every 4h\" --prompt \"New task\"\n/cron edit <job_id> --skill blogwatcher --skill maps\n/cron edit <job_id> --remove-skill blogwatcher\n/cron edit <job_id> --clear-skills\n/cron pause <job_id>\n/cron resume <job_id>\n/cron run <job_id> [--inline]\n/cron remove <job_id>"
       current_jobs: "現在のジョブ:"
       skills: "スキル: {skills}"
       skills_none: "スキル: なし"

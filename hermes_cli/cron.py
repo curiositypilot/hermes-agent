@@ -900,18 +900,44 @@ def _run_outcome(job: Dict[str, Any]) -> str:
     return job.get("execution_skipped") or "It will run on the next scheduler tick."
 
 
+_NO_LIVE_SCHEDULER_WARNING = ("No live scheduler for this profile; running here. "
+                              "Killing this process leaves the run 'unknown'.")
+
+
+def _cron_run_route(inline: bool) -> str:
+    """Where a manual run executes: ``"queue"`` (the live builtin scheduler's next tick),
+    ``"inline-warn"`` (builtin with no live scheduler: run here, after a warning) or ``"inline"``
+    (``--inline`` or an external provider: run here silently). Shared by ``hermes cron run`` and
+    the chat ``/cron run`` so both entry points route the same way."""
+    if inline or _active_cron_provider_name() != "builtin":
+        return "inline"
+    return "queue" if _builtin_gateway_liveness() is True else "inline-warn"
+
+
 def cron_run(args) -> int:
     """``hermes cron run``: hand the run to the live gateway scheduler so it outlives this
     process; run it here only with ``--inline``, under an external provider, or when no live
     scheduler serves this profile. An in-process run dies with its caller (a ``timeout`` or a
     killed terminal) and leaves the execution ``unknown`` half-done."""
-    if getattr(args, "inline", False) or _active_cron_provider_name() != "builtin":
-        return _job_action("run", args.job_id, "Triggered")
-    if _builtin_gateway_liveness() is not True:
-        print(color("No live scheduler for this profile; running here. "
-                    "Killing this process leaves the run 'unknown'.", Colors.YELLOW))
-        return _job_action("run", args.job_id, "Triggered")
-    return _queue_run_for_scheduler(args.job_id)
+    route = _cron_run_route(getattr(args, "inline", False))
+    if route == "queue":
+        return _queue_run_for_scheduler(args.job_id)
+    if route == "inline-warn":
+        print(color(_NO_LIVE_SCHEDULER_WARNING, Colors.YELLOW))
+    return _job_action("run", args.job_id, "Triggered")
+
+
+def chat_run_handoff(job_ref: str, inline: bool) -> bool:
+    """Chat ``/cron run``: route like ``hermes cron run``. True when the run was handed to the
+    live scheduler (or refused there), so the caller stops; False means run it in-process (after
+    printing the no-scheduler warning when that is the reason)."""
+    route = _cron_run_route(inline)
+    if route == "queue":
+        _queue_run_for_scheduler(job_ref)
+        return True
+    if route == "inline-warn":
+        print(_NO_LIVE_SCHEDULER_WARNING)
+    return False
 
 
 def _queue_run_for_scheduler(job_ref: str) -> int:
