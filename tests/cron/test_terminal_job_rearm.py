@@ -207,6 +207,17 @@ class TestRecurringJobStuckInErrorStateIsRecoverable:
             "recurring job's next_run_at before it fires (crash-safety)"
         )
 
+    def test_trigger_job_queues_error_state(self, tmp_cron_dir):
+        """`hermes cron run` queues through trigger_job; refusing here pointed the user at
+        `resume --run-now`, which rearm_oneshot rejects for recurring jobs."""
+        job = create_job("recurring", "every 5m")
+        self._force_error_state(job["id"])
+
+        triggered = trigger_job(job["id"])
+
+        assert triggered is not None and triggered["state"] == "scheduled"
+        assert triggered["next_run_at"] == triggered["manual_run_at"]
+
     def test_pause_job_now_works_on_error_state(self, tmp_cron_dir):
         from cron.jobs import pause_job
 
@@ -229,6 +240,8 @@ class TestRecurringJobStuckInErrorStateIsRecoverable:
 
         with pytest.raises(ValueError, match="terminal"):
             resume_job(job["id"])
+        with pytest.raises(ValueError, match="terminal"):
+            trigger_job(job["id"])
         assert claim_job_for_fire(job["id"], return_job=True) is False
         assert advance_next_runs([job["id"]]) == 0
         assert get_due_jobs() == []

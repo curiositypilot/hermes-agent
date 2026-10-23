@@ -928,7 +928,7 @@ def _queue_run_for_scheduler(job_ref: str) -> int:
         return 1
     try:
         trigger_job(job["id"])
-    except ValueError as exc:  # terminal one-shot
+    except ValueError as exc:  # genuinely terminal (completed / exhausted); error-state recurring jobs queue
         print(color(f"Failed to run job: {exc}", Colors.RED))
         return 1
     _notify_provider_jobs_changed_safe()

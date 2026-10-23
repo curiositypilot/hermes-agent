@@ -632,6 +632,23 @@ class TestCronRunHandoff:
         assert rc == 1
         assert "not found" in out and wiring["trigger"] == []
 
+    def test_recoverable_error_recurring_job_is_queued(self, wiring, capsys):
+        """Diff-critique verdict t_25e9b675#1: a recurring job in state=error (next-run compute
+        failed) is runnable in-process, so the queue path must not refuse it as terminal."""
+        from unittest import mock
+
+        from cron.jobs import mark_job_run
+
+        job = create_job(prompt="Daily brief", schedule="every 1h", name="Brief")
+        with mock.patch("cron.jobs.compute_next_run", return_value=None):
+            mark_job_run(job["id"], success=True)
+        assert get_job(job["id"])["state"] == "error"
+
+        rc, out = self._run(capsys, job["id"])
+        assert rc == 0, out
+        assert "Queued job" in out and wiring["trigger"] == [job["id"]]
+        assert get_job(job["id"])["state"] == "scheduled"
+
 
 class TestSlashCronListLastStatus:
     """The in-chat ``/cron list`` (cli_commands_mixin) renders every
