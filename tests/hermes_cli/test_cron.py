@@ -426,7 +426,8 @@ class TestCronRunBackgroundDispatch:
     """
 
     def _run_cmd(self, capsys):
-        rc = cron_command(Namespace(cron_command="run", job_id="job-1"))
+        # --inline: these pin the in-process (synchronous / background-dispatch) report shape.
+        rc = cron_command(Namespace(cron_command="run", job_id="job-1", inline=True))
         return rc, capsys.readouterr().out
 
     def test_background_dispatch_with_delegation_id_does_not_report_failed(
@@ -534,6 +535,102 @@ class TestCronRunBackgroundDispatch:
         assert rc == 0
         assert "Running in background (delegation del-xyz)." in out
         assert "failed" not in out.lower()
+
+
+class TestCronRunHandoff:
+    """Regression for intake t_0120e3f5: `hermes cron run` ran the job inside the calling CLI, so
+    a killed caller (`timeout 60 hermes cron run …`) left the execution `unknown` half-done while
+    a live gateway ticker could have owned it. With a live builtin scheduler the CLI queues the
+    run for the ticker; `--inline`, an external provider or no live scheduler keep the
+    in-process run."""
+
+    @pytest.fixture()
+    def wiring(self, tmp_cron_dir, monkeypatch):
+        import cron.jobs as jobs_mod
+
+        calls = {"api": [], "trigger": []}
+        real_trigger = jobs_mod.trigger_job
+
+        def _trigger(job_id, *a, **kw):
+            calls["trigger"].append(job_id)
+            return real_trigger(job_id, *a, **kw)
+
+        def _api(**kwargs):
+            calls["api"].append(kwargs)
+            return {"success": True, "job": {"id": kwargs["job_id"], "name": "Brief",
+                                             "executed": True, "execution_success": True}}
+
+        monkeypatch.setattr(jobs_mod, "trigger_job", _trigger)
+        monkeypatch.setattr(cron_cli, "_cron_api", _api)
+        monkeypatch.setattr("tools.cronjob_tools._notify_provider_jobs_changed_safe", lambda: None)
+        monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+        monkeypatch.setattr(cron_cli, "_builtin_gateway_liveness", lambda: True)
+        return calls
+
+    @staticmethod
+    def _run(capsys, job_ref, inline=False):
+        rc = cron_command(Namespace(cron_command="run", job_id=job_ref, inline=inline))
+        return rc, capsys.readouterr().out
+
+    def test_live_scheduler_queues_instead_of_running(self, wiring, capsys):
+        job = create_job(prompt="Daily brief", schedule="every 1h", name="Brief")
+        rc, out = self._run(capsys, job["id"])
+        assert rc == 0
+        assert wiring["trigger"] == [job["id"]] and wiring["api"] == []
+        assert "Queued job" in out and f"hermes cron runs {job['id']}" in out
+        # The ticker sees it as due now.
+        assert get_job(job["id"])["manual_run_at"]
+
+    def test_inline_flag_runs_in_process_even_with_live_scheduler(self, wiring, capsys):
+        job = create_job(prompt="Daily brief", schedule="every 1h", name="Brief")
+        rc, out = self._run(capsys, job["id"], inline=True)
+        assert rc == 0
+        assert [c["action"] for c in wiring["api"]] == ["run"] and wiring["trigger"] == []
+        assert "Ran now: succeeded." in out
+
+    @pytest.mark.parametrize("liveness", [False, None])
+    def test_no_live_scheduler_runs_in_process_with_warning(
+        self, wiring, capsys, monkeypatch, liveness
+    ):
+        monkeypatch.setattr(cron_cli, "_builtin_gateway_liveness", lambda: liveness)
+        job = create_job(prompt="Daily brief", schedule="every 1h", name="Brief")
+        rc, out = self._run(capsys, job["id"])
+        assert rc == 0
+        assert [c["action"] for c in wiring["api"]] == ["run"] and wiring["trigger"] == []
+        assert "running here" in out
+
+    def test_paused_job_refused_not_resumed(self, wiring, capsys):
+        job = create_job(prompt="Daily brief", schedule="every 1h", name="Brief")
+        pause_job(job["id"])
+        rc, out = self._run(capsys, job["id"])
+        assert rc == 1
+        assert "Job is paused/disabled; resume it before running." in out
+        assert wiring["trigger"] == [] and wiring["api"] == []
+        assert get_job(job["id"])["enabled"] is False
+
+    def test_external_provider_keeps_in_process_path(self, wiring, capsys, monkeypatch):
+        monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "chronos")
+        job = create_job(prompt="Daily brief", schedule="every 1h", name="Brief")
+        rc, out = self._run(capsys, job["id"])
+        assert rc == 0
+        assert [c["action"] for c in wiring["api"]] == ["run"] and wiring["trigger"] == []
+        assert "running here" not in out
+
+    def test_terminal_oneshot_valueerror_reported(self, wiring, capsys, monkeypatch):
+        def _terminal(job_id, *a, **kw):
+            raise ValueError("Cannot run: job 'Brief' is completed (terminal).")
+
+        monkeypatch.setattr("cron.jobs.trigger_job", _terminal)
+        job = create_job(prompt="Daily brief", schedule="every 1h", name="Brief")
+        rc, out = self._run(capsys, job["id"])
+        assert rc == 1
+        assert "Cannot run: job 'Brief' is completed (terminal)." in out
+        assert "Queued job" not in out
+
+    def test_unknown_job_reports_not_found(self, wiring, capsys):
+        rc, out = self._run(capsys, "no-such-job")
+        assert rc == 1
+        assert "not found" in out and wiring["trigger"] == []
 
 
 class TestSlashCronListLastStatus:

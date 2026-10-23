@@ -40,3 +40,9 @@ def test_cron_accept_hooks_flag_on_run_and_tick():
     assert ns.accept_hooks is True
     ns2 = parser.parse_args(["cron", "tick", "--accept-hooks"])
     assert ns2.accept_hooks is True
+
+
+def test_cron_run_inline_flag():
+    parser = _build()
+    assert parser.parse_args(["cron", "run", "x", "--inline"]).inline is True
+    assert parser.parse_args(["cron", "run", "x"]).inline is False

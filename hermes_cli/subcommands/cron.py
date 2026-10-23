@@ -168,8 +168,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_resume.add_argument("--at", dest="run_at", help="Re-arm at an ISO-8601 time")
     _flag(cron_resume, "--run-now", help="Re-arm to run now")
 
-    cron_run = cron_subparsers.add_parser("run", help="Run a job on the next scheduler tick")
+    cron_run = cron_subparsers.add_parser(
+        "run", help="Run a job now: queued for the live gateway scheduler, else run in this "
+            "process (--inline forces in-process)")
     cron_run.add_argument("job_id", help="Job ID to trigger")
+    _flag(cron_run, "--inline",
+          help="Run in this process and wait for the result; killing it leaves the run unknown")
     add_accept_hooks_flag(cron_run)
 
     cron_remove = cron_subparsers.add_parser(

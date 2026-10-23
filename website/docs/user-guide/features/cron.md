@@ -264,7 +264,7 @@ What they do:
 
 - `pause` — keep the job but stop scheduling it
 - `resume` — re-enable the job. A recurring job whose slot came due while it was paused keeps that slot due, so the next tick fires one catch-up run (or logs the skip when `cron.catch_up_missed: false`) instead of silently jumping to the next occurrence; otherwise the next future run is computed
-- `run` — trigger the job on the next scheduler tick
+- `run` — run the job now. With a live gateway scheduler serving the profile, the run is queued for its next tick (within ~60s) and the command returns at once; follow it with `hermes cron runs <job_id>`. With no live scheduler (or an external cron provider) it runs in the calling process and waits. `--inline` forces the in-process run; killing that process mid-run leaves the execution `unknown`
 - `remove` — delete it entirely
 - `edit` — modify schedule, prompt, delivery, etc.
 

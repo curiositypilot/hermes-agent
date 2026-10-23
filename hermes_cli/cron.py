@@ -900,6 +900,44 @@ def _run_outcome(job: Dict[str, Any]) -> str:
     return job.get("execution_skipped") or "It will run on the next scheduler tick."
 
 
+def cron_run(args) -> int:
+    """``hermes cron run``: hand the run to the live gateway scheduler so it outlives this
+    process; run it here only with ``--inline``, under an external provider, or when no live
+    scheduler serves this profile. An in-process run dies with its caller (a ``timeout`` or a
+    killed terminal) and leaves the execution ``unknown`` half-done."""
+    if getattr(args, "inline", False) or _active_cron_provider_name() != "builtin":
+        return _job_action("run", args.job_id, "Triggered")
+    if _builtin_gateway_liveness() is not True:
+        print(color("No live scheduler for this profile; running here. "
+                    "Killing this process leaves the run 'unknown'.", Colors.YELLOW))
+        return _job_action("run", args.job_id, "Triggered")
+    return _queue_run_for_scheduler(args.job_id)
+
+
+def _queue_run_for_scheduler(job_ref: str) -> int:
+    """Mark the job due now for the live ticker (``trigger_job``) instead of running it here."""
+    from cron.jobs import is_job_runnable, trigger_job
+    from tools.cronjob_tools import _notify_provider_jobs_changed_safe, _resolve_job_or_error
+    job, error = _resolve_job_or_error(job_ref)
+    if job is None:
+        print(color(f"Failed to run job: {json.loads(error or '{}').get('error', 'unknown error')}", Colors.RED))
+        return 1
+    if not is_job_runnable(job):
+        # trigger_job would silently resume a paused job; keep the in-process refusal.
+        print(color("Failed to run job: Job is paused/disabled; resume it before running.", Colors.RED))
+        return 1
+    try:
+        trigger_job(job["id"])
+    except ValueError as exc:  # terminal one-shot
+        print(color(f"Failed to run job: {exc}", Colors.RED))
+        return 1
+    _notify_provider_jobs_changed_safe()
+    print(color(f"Queued job: {job.get('name', job['id'])} ({job['id']})", Colors.GREEN))
+    print("  The gateway scheduler runs it on its next tick (within ~60s) and delivers it; "
+          f"this command does not wait. Follow it with: hermes cron runs {job['id']}")
+    return 0
+
+
 def cron_resume(args) -> int:
     """Resume a paused job or explicitly re-arm a completed one-shot."""
     run_at = getattr(args, "run_at", None)
@@ -982,7 +1020,7 @@ _CRON_SUBCOMMANDS = {
     "edit": lambda a: cron_edit(a),
     "pause": lambda a: _job_action("pause", a.job_id, "Paused"),
     "resume": lambda a: cron_resume(a),
-    "run": lambda a: _job_action("run", a.job_id, "Triggered"),
+    "run": lambda a: cron_run(a),
     "remove": lambda a: _job_action("remove", a.job_id, "Removed"),
 }
 _CRON_SUBCOMMANDS["history"] = _CRON_SUBCOMMANDS["runs"]
