@@ -2320,7 +2320,9 @@ def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[Dic
     job = resolve_job_ref(job_id)
     if not job:
         return None
-    if is_terminal_job(job):
+    # A recurring job in state=error still has occurrences (claim_job_for_fire fires it too); the
+    # one-shot re-arm this message points at refuses recurring jobs, so refusing here wedged it.
+    if is_terminal_job(job) and not _is_recoverable_error_job(job):
         name = job.get("name", job_id)
         raise ValueError(
             f"Cannot run: job '{name}' is {job.get('state')} (terminal). "
