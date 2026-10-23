@@ -1,8 +1,10 @@
 """Quota gate in Kanban tier routing (``kanban.routing.quota_gate``).
 
-A provider whose live headroom (the quota-snapshot file) is below a band only
-takes cards whose priority meets the band; others route on or wait as
-``quota_hold`` with no failure counted.
+A provider whose live headroom (the quota-snapshot file) is below a level of
+the fixed ``LEVEL_GATE`` (< 10% needs P2, < 3% needs P3) only takes cards whose
+priority meets it; others route on or wait as ``quota_hold`` with no failure
+counted. The Anthropic quota mode (test_kanban_quota_mode.py) replaces the
+level gate for anthropic while mode.json is fresh; here no mode file exists.
 """
 
 from __future__ import annotations
@@ -43,16 +45,22 @@ def conn(kanban_home):
 def headroom(tmp_path):
     path = tmp_path / "headroom.json"
 
-    def write(providers: dict, *, age: float = 60.0) -> Path:
+    def write(providers: dict, *, age: float = 60.0, fetched_age: float | None = None) -> Path:
+        """``spec``: headroom, ``(headroom, resets_at)`` or None (failed fetch, nothing kept).
+        ``fetched_age``: write every entry as a failed fetch keeping its last reading that old."""
         out = {}
+        now = time.time()
         for name, spec in providers.items():
             if spec is None:
                 out[name] = {"ok": False, "binding": None, "windows": []}
-            else:
-                h, resets = spec if isinstance(spec, tuple) else (spec, None)
-                out[name] = {"ok": True, "binding": {"name": "session", "headroom": h, "resets_at": resets},
-                             "windows": []}
-        path.write_text(json.dumps({"schema": 1, "written_at_epoch": time.time() - age, "providers": out}))
+                continue
+            h, resets = spec if isinstance(spec, tuple) else (spec, None)
+            entry = {"ok": True, "binding": {"name": "session", "headroom": h, "resets_at": resets}, "windows": []}
+            if fetched_age is not None:
+                entry.update(ok=False, error="TimeoutError: no answer within 20s",
+                             fetched_at=time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now - fetched_age)))
+            out[name] = entry
+        path.write_text(json.dumps({"schema": 2, "written_at_epoch": now - age, "providers": out}))
         return path
 
     return write
@@ -63,16 +71,10 @@ TIERS = {
     "M": [{"model": "claude-m", "provider": "anthropic"}, {"model": "or-m", "provider": "openrouter"}],
     "L": [{"model": "claude-l", "provider": "anthropic"}],
 }
-BANDS = {
-    "anthropic": [{"below": 0.35, "min_priority": 1}, {"below": 0.20, "min_priority": 2},
-                  {"below": 0.08, "min_priority": 3}],
-    "default": [{"below": 0.25, "min_priority": 1}, {"below": 0.10, "min_priority": 2},
-                {"below": 0.03, "min_priority": 3}],
-}
 
 
 def _cfg(path, **over) -> kr.RoutingConfig:
-    gate = {"enabled": True, "headroom_file": str(path), "bands": BANDS, **over.pop("gate", {})}
+    gate = {"enabled": True, "headroom_file": str(path), **over.pop("gate", {})}
     return _LOAD({"routing": {"enabled": True, "tiers": TIERS, "escalate": False,
                               "quota_gate": gate, **over}})
 
@@ -108,7 +110,7 @@ def _spawns():
     return seen, fake_spawn
 
 
-# --- config + band math -------------------------------------------------------
+# --- config + level math -------------------------------------------------------
 
 
 def test_config_defaults_and_parse():
@@ -116,14 +118,20 @@ def test_config_defaults_and_parse():
     assert off.quota_gate.enabled is False
     assert off.quota_gate.payg_providers == ("openrouter",)
     assert off.quota_gate.max_age_seconds == 1800
-    assert "default" in off.quota_gate.bands
 
     cfg = _cfg("/x.json", gate={"max_age_seconds": "60", "payg_providers": ["OpenRouter"]})
     gate = cfg.quota_gate
     assert gate.enabled and gate.headroom_file == "/x.json" and gate.max_age_seconds == 60
     assert gate.payg_providers == ("openrouter",)
-    assert gate.bands_for("anthropic")[0] == (0.35, 1)
-    assert gate.bands_for("antigravity") == gate.bands["default"]
+
+
+def test_retired_band_keys_are_ignored():
+    """bands / reserve / pace_order (pre-slice-4 config) parse to the same gate as without them."""
+    raw = {"enabled": True, "bands": {"anthropic": [{"below": 0.5, "min_priority": 3}]},
+           "reserve": {"anthropic": 0.2}}
+    cfg = kr.load_routing_config({"routing": {"quota_gate": raw, "pace_order": True}})
+    assert cfg.quota_gate == kr.load_routing_config({"routing": {"quota_gate": {"enabled": True}}}).quota_gate
+    assert not hasattr(cfg, "pace_order")
 
 
 def test_config_defaults_match_config_defaults_module():
@@ -133,18 +141,17 @@ def test_config_defaults_match_config_defaults_module():
     assert parsed == kr.QuotaGateConfig()
 
 
-def test_band_math():
-    bands = kr.load_routing_config({"routing": {"quota_gate": {"bands": BANDS}}}).quota_gate.bands_for("anthropic")
-    assert kr.required_priority(bands, 0.90) == (0, None)
-    assert kr.required_priority(bands, 0.35) == (0, None)  # strict "below"
-    assert kr.required_priority(bands, 0.30) == (1, 0.35)
-    assert kr.required_priority(bands, 0.12) == (2, 0.20)
-    assert kr.required_priority(bands, 0.05) == (3, 0.08)
-    # max min_priority wins even when bands are listed out of order
-    assert kr.required_priority(((0.08, 3), (0.35, 1)), 0.05) == (3, 0.08)
+def test_level_math():
+    assert kr.required_priority(0.90) == (0, None)
+    assert kr.required_priority(0.10) == (0, None)  # strict "below"
+    assert kr.required_priority(0.05) == (2, 0.10)
+    assert kr.required_priority(0.02) == (3, 0.03)
+    # max min_priority wins even when levels are listed out of order
+    assert kr.required_priority(0.02, ((0.03, 3), (0.10, 2))) == (3, 0.03)
 
 
-@pytest.mark.parametrize("case", ["stale", "ok_false", "missing_provider", "no_file", "garbage", "disabled"])
+@pytest.mark.parametrize("case", ["stale", "ok_false", "old_reading", "missing_provider", "no_file", "garbage",
+                                  "disabled"])
 def test_unknown_headroom_leaves_gate_open(conn, headroom, tmp_path, case):
     path = headroom({"anthropic": 0.01})
     over = {}
@@ -152,6 +159,8 @@ def test_unknown_headroom_leaves_gate_open(conn, headroom, tmp_path, case):
         path = headroom({"anthropic": 0.01}, age=7200)
     elif case == "ok_false":
         path = headroom({"anthropic": None})
+    elif case == "old_reading":  # failed fetches kept a reading, but it is past max_age_seconds
+        path = headroom({"anthropic": 0.01}, fetched_age=7200)
     elif case == "missing_provider":
         path = headroom({"openai-codex": 0.01})
     elif case == "no_file":
@@ -162,6 +171,18 @@ def test_unknown_headroom_leaves_gate_open(conn, headroom, tmp_path, case):
         over = {"gate": {"enabled": False}}
     ctx = kr.RoutingContext(conn, _cfg(path, **over))
     assert ctx.quota_verdict("anthropic", 0) is None
+
+
+def test_failed_fetch_keeps_counting_while_its_reading_is_fresh(conn, headroom):
+    """The snapshot keeps the last reading under its own fetched_at on a failed fetch; the gate
+    reads it by age, not by ``ok`` (design § 4.1)."""
+    ctx = kr.RoutingContext(conn, _cfg(headroom({"anthropic": 0.05}, fetched_age=600)))
+    v = ctx.quota_verdict("anthropic", 0)
+    assert v is not None and v.required == 2
+    assert ctx.quota().unknown == {}
+    old = kr.RoutingContext(conn, _cfg(headroom({"anthropic": 0.05}, fetched_age=7200)))
+    assert old.quota_verdict("anthropic", 0) is None
+    assert "min old" in old.quota().unknown["anthropic"]
 
 
 def test_headroom_read_once_per_context(conn, headroom, monkeypatch):
@@ -180,15 +201,15 @@ def test_headroom_read_once_per_context(conn, headroom, monkeypatch):
 
 def test_p0_skips_gated_anthropic_and_routes_to_codex(conn, headroom, monkeypatch):
     _pool(monkeypatch)
-    ctx = kr.RoutingContext(conn, _cfg(headroom({"anthropic": 0.12, "openai-codex": 0.9})))
+    ctx = kr.RoutingContext(conn, _cfg(headroom({"anthropic": 0.05, "openai-codex": 0.9})))
     d = ctx.decide(_task(complexity="S", priority=0))
     assert d.source == "tier" and d.candidate.provider == "openai-codex"
-    assert d.skipped[0]["reason"] == "quota: anthropic headroom 12% < 20% needs P2"
+    assert d.skipped[0]["reason"] == "quota: anthropic headroom 5% < 10% needs P2"
 
 
 def test_p2_still_gets_anthropic(conn, headroom, monkeypatch):
     _pool(monkeypatch)
-    ctx = kr.RoutingContext(conn, _cfg(headroom({"anthropic": 0.12, "openai-codex": 0.9})))
+    ctx = kr.RoutingContext(conn, _cfg(headroom({"anthropic": 0.05, "openai-codex": 0.9})))
     d = ctx.decide(_task(complexity="S", priority=2))
     assert d.source == "tier" and d.candidate.provider == "anthropic" and d.skipped == []
 
@@ -196,17 +217,17 @@ def test_p2_still_gets_anthropic(conn, headroom, monkeypatch):
 def test_all_gated_is_quota_held_with_retry_and_note(conn, headroom, monkeypatch):
     _pool(monkeypatch)
     reset_a, reset_c = "2026-10-03T14:00:00+00:00", "2026-10-03T12:00:00Z"
-    ctx = kr.RoutingContext(conn, _cfg(headroom({"anthropic": (0.12, reset_a), "openai-codex": (0.05, reset_c)})))
+    ctx = kr.RoutingContext(conn, _cfg(headroom({"anthropic": (0.05, reset_a), "openai-codex": (0.05, reset_c)})))
     d = ctx.decide(_task(complexity="S", priority=1))
     assert d.source == "quota_held"
     assert d.retry_at == kr._parse_iso_epoch(reset_c)
-    assert "anthropic headroom 12% < 20% needs P2" in d.note and "(card P1)" in d.note
+    assert "anthropic headroom 5% < 10% needs P2" in d.note and "(card P1)" in d.note
     assert d.label().startswith("quota held")
 
 
 def test_payg_not_used_after_gate_skip(conn, headroom, monkeypatch):
     _pool(monkeypatch)
-    ctx = kr.RoutingContext(conn, _cfg(headroom({"anthropic": 0.12})))
+    ctx = kr.RoutingContext(conn, _cfg(headroom({"anthropic": 0.05})))
     d = ctx.decide(_task(complexity="M", priority=0))
     assert d.source == "quota_held"
     assert d.skipped[-1] == {"tier": "M", "model": "or-m", "provider": "openrouter",
@@ -222,7 +243,7 @@ def test_payg_used_after_pure_rate_limit_skip(conn, headroom, monkeypatch):
 
 def test_on_exhausted_profile_does_not_bypass_quota_hold(conn, headroom, monkeypatch):
     _pool(monkeypatch)
-    ctx = kr.RoutingContext(conn, _cfg(headroom({"anthropic": 0.12}), on_exhausted="profile"))
+    ctx = kr.RoutingContext(conn, _cfg(headroom({"anthropic": 0.05}), on_exhausted="profile"))
     assert ctx.decide(_task(complexity="L", priority=0)).source == "quota_held"
     # Without a gate skip, on_exhausted: profile still applies.
     _pool(monkeypatch, blocked={"anthropic"})
@@ -232,7 +253,7 @@ def test_on_exhausted_profile_does_not_bypass_quota_hold(conn, headroom, monkeyp
 
 def test_pinned_and_profile_routes_gated_on_own_provider(conn, headroom, monkeypatch):
     _pool(monkeypatch)
-    path = headroom({"anthropic": 0.05, "openai-codex": 0.9})
+    path = headroom({"anthropic": 0.02, "openai-codex": 0.9})
     ctx = kr.RoutingContext(conn, _cfg(path))
     pinned = ctx.decide(_task(model_override="claude-x", provider_override="anthropic", priority=2))
     assert pinned.source == "quota_held" and pinned.candidate.model == "claude-x"
@@ -249,7 +270,7 @@ def test_pinned_and_profile_routes_gated_on_own_provider(conn, headroom, monkeyp
 def test_review_lane_gated(conn, headroom, monkeypatch):
     _pool(monkeypatch)
     review = [{"model": "rev", "provider": "anthropic"}, {"model": "or-rev", "provider": "openrouter"}]
-    ctx = kr.RoutingContext(conn, _cfg(headroom({"anthropic": 0.12}), review=review))
+    ctx = kr.RoutingContext(conn, _cfg(headroom({"anthropic": 0.05}), review=review))
     d = ctx.decide_review(_task(priority=0))
     assert d.source == "quota_held" and d.lane == "review"
     assert d.skipped[-1]["reason"] == "quota: no paid fallthrough"
@@ -260,7 +281,7 @@ def test_review_lane_gated(conn, headroom, monkeypatch):
 
 
 def test_dispatch_quota_hold_one_event_no_failure(conn, headroom, monkeypatch, all_assignees_spawnable):
-    _use(monkeypatch, headroom({"anthropic": (0.12, "2026-10-03T14:00:00+00:00"), "openai-codex": 0.05}))
+    _use(monkeypatch, headroom({"anthropic": (0.05, "2026-10-03T14:00:00+00:00"), "openai-codex": 0.05}))
     _pool(monkeypatch)
     seen, spawn = _spawns()
     held = kb.create_task(conn, title="low", assignee="w", complexity="S", priority=0)
@@ -281,7 +302,7 @@ def test_dispatch_quota_hold_one_event_no_failure(conn, headroom, monkeypatch, a
 
 
 def test_held_card_does_not_consume_spawn_slot(conn, headroom, monkeypatch, all_assignees_spawnable):
-    _use(monkeypatch, headroom({"anthropic": 0.12, "openai-codex": 0.9}),
+    _use(monkeypatch, headroom({"anthropic": 0.05, "openai-codex": 0.9}),
          tiers={"L": [{"model": "claude-l", "provider": "anthropic"}],
                 "S": [{"model": "gpt-s", "provider": "openai-codex"}]})
     _pool(monkeypatch)
@@ -293,7 +314,7 @@ def test_held_card_does_not_consume_spawn_slot(conn, headroom, monkeypatch, all_
 
 
 def test_quota_held_review_does_not_reserve_slot(conn, headroom, monkeypatch, all_assignees_spawnable):
-    _use(monkeypatch, headroom({"anthropic": 0.12, "openai-codex": 0.9}),
+    _use(monkeypatch, headroom({"anthropic": 0.05, "openai-codex": 0.9}),
          review=[{"model": "rev", "provider": "anthropic"}])
     _pool(monkeypatch)
     seen, spawn = _spawns()
@@ -312,7 +333,7 @@ def test_dry_run_prints_held_line(kanban_home, headroom, monkeypatch, capsys, al
     from hermes_cli import kanban as kcli
     from hermes_cli.kanban_parser import build_parser
 
-    _use(monkeypatch, headroom({"anthropic": (0.12, "2026-10-03T14:00:00+00:00"), "openai-codex": 0.05}))
+    _use(monkeypatch, headroom({"anthropic": (0.05, "2026-10-03T14:00:00+00:00"), "openai-codex": 0.05}))
     _pool(monkeypatch)
     with kbc.connect_closing() as c:
         tid = kb.create_task(c, title="low", assignee="w", complexity="S", priority=0)
@@ -325,7 +346,7 @@ def test_dry_run_prints_held_line(kanban_home, headroom, monkeypatch, capsys, al
     assert run("dispatch", "--dry-run") == 0
     out = capsys.readouterr().out
     line = next(ln for ln in out.splitlines() if ln.startswith("Held (quota_hold):"))
-    assert tid in line and "anthropic headroom 12% < 20% needs P2" in line and "(card P0)" in line
+    assert tid in line and "anthropic headroom 5% < 10% needs P2" in line and "(card P0)" in line
     assert "retry ~" in line
     assert f"Guarded (quota_hold): {tid}" not in out
 
@@ -338,10 +359,10 @@ def test_route_cli_shows_quota_gate(kanban_home, headroom, monkeypatch, capsys):
     from hermes_cli import kanban as kcli
     from hermes_cli.kanban_parser import build_parser
 
-    path = headroom({"anthropic": 0.12, "openai-codex": 0.9, "antigravity": None})
+    path = headroom({"anthropic": 0.05, "openai-codex": 0.9, "antigravity": None})
     monkeypatch.setattr(kcli, "_kanban_config", lambda: {"routing": {
         "enabled": True, "tiers": TIERS, "escalate": False,
-        "quota_gate": {"enabled": True, "headroom_file": str(path), "bands": BANDS}}})
+        "quota_gate": {"enabled": True, "headroom_file": str(path)}}})
     _pool(monkeypatch)
     with kbc.connect_closing() as c:
         tid = kb.create_task(c, title="low", assignee="w", complexity="M", priority=0)
@@ -353,7 +374,7 @@ def test_route_cli_shows_quota_gate(kanban_home, headroom, monkeypatch, capsys):
 
     assert run("route", tid) == 0
     out = capsys.readouterr().out
-    assert "Quota gate:" in out and "anthropic: headroom 12% (< 20%) -> needs P2" in out
+    assert "Quota gate:" in out and "anthropic: headroom 5% (< 10%) -> needs P2" in out
     assert "antigravity: unknown" in out
     assert "-> quota held" in out and "no paid fallthrough" in out
 
