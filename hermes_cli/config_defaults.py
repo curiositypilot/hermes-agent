@@ -2009,52 +2009,32 @@ DEFAULT_CONFIG = {
             # cards each tick (one aux call per card, up to auto_label_per_tick).
             "auto_label": False,
             "auto_label_per_tick": 3,
-            # Quota gate: hold low-priority cards off a provider whose live headroom is low. Reads
-            # the quota-snapshot file each tick (no network). For provider p with headroom h, the
-            # card needs priority >= max(min_priority of p's bands with h < below), else that
-            # candidate is skipped and the walk moves on; if nothing is left the card waits as
-            # quota_hold (no failure counted; on_exhausted: profile does not override it). Unknown
-            # headroom (missing/stale/unreadable file, provider absent, ok: false) = gate open.
+            # Quota gate: hold low-priority cards off a provider whose live quota is low. Reads the
+            # quota-snapshot file and the Anthropic quota mode each tick (no network). anthropic:
+            # mode.json's min_priority (closed 4, critical 3, tight 2, normal/open 0); every other
+            # provider, and anthropic without a fresh mode: the fixed level gate (binding headroom
+            # < 10% needs P2, < 3% needs P3; kanban_routing.LEVEL_GATE). A gated candidate is
+            # skipped and the walk moves on; if nothing is left the card waits as quota_hold (no
+            # failure counted; on_exhausted: profile does not override it). Unknown headroom
+            # (missing/stale/unreadable file, provider absent, a kept reading older than
+            # max_age_seconds) = gate open.
             "quota_gate": {
                 "enabled": False,
                 # "" = <HERMES_HOME>/data/quota/headroom.json
                 "headroom_file": "",
-                # Older file = headroom unknown = gate open.
+                # Older file or reading = headroom unknown = gate open; older mode.json = level gate.
                 "max_age_seconds": 1800,
                 # Pay-as-you-go providers a card may NOT fall through to once a gate skip happened
                 # in its walk (a plain rate-limit fallthrough still reaches them).
                 "payg_providers": ["openrouter"],
-                # Per provider name as written in the headroom file; "default" covers the rest.
-                # A band may carry "below" (level headroom) and/or "pace_below" (the file's
-                # pace.pace_headroom minus reserve[provider]; negative = behind the budget line);
-                # the card needs the max min_priority over every matched band of either kind.
-                # Providers without pace data are gated on "below" bands only.
-                "bands": {
-                    "default": [
-                        {"below": 0.25, "min_priority": 1},
-                        {"below": 0.10, "min_priority": 2},
-                        {"below": 0.03, "min_priority": 3},
-                    ],
-                },
-                # Per provider (or "default") fraction held back from pace_headroom before pace
-                # bands and pace_order compare it, e.g. {anthropic: 0.20} keeps 20% for chat.
-                "reserve": {},
                 # Anthropic quota mode written by scripts/quota_mode.py ("" =
-                # <HERMES_HOME>/data/quota/mode.json). While fresh (max_age_seconds) it replaces the
-                # anthropic bands/pace/reserve with one min_priority (closed 4, critical 3, tight 2,
-                # normal/open 0); "open" = Opus first in every tier + review lane and quota-parked
-                # cards woken. Missing/stale/unknown = bands as above.
+                # <HERMES_HOME>/data/quota/mode.json). "open" = Opus first in every tier + review
+                # lane and quota-parked cards woken.
                 "mode_file": "",
             },
             # Force the quota mode until the week resets (closed|critical|tight|normal|open, or
             # null). Read by scripts/quota_mode.py, not by the dispatcher.
             "quota_mode_override": None,
-            # Within each tier, try the candidate whose provider is furthest ahead of its budget
-            # line first (pace_headroom - reserve, descending; unknown pace = 0.0). The configured
-            # order breaks ties; payg_providers always stay last. Tier escalation order, the review
-            # lane and pinned cards unchanged.
-            # Reads the quota_gate headroom file, so it is a no-op while quota_gate is disabled.
-            "pace_order": False,
         },
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.

@@ -1,7 +1,7 @@
 """Anthropic quota mode in Kanban routing (``data/quota/mode.json``, redesign slice 2).
 
 A fresh mode file is the whole gate for ``anthropic`` (one ``min_priority``
-instead of bands/pace/reserve); ``open`` puts Opus first and wakes quota parks.
+instead of the level gate); ``open`` puts Opus first and wakes quota parks.
 """
 
 from __future__ import annotations
@@ -44,7 +44,8 @@ def conn(kanban_home):
 def files(tmp_path):
     headroom = tmp_path / "headroom.json"
     mode_file = tmp_path / "mode.json"
-    # Bands that would hold every P0-P2 anthropic card: the mode must replace them.
+    # A headroom the level gate would hold P0-P1 anthropic cards on (< 10% needs P2): the mode
+    # must replace it.
     headroom.write_text(json.dumps({"schema": 1, "written_at_epoch": time.time() - 60, "providers": {
         "anthropic": {"ok": True, "binding": {"name": "week", "headroom": 0.05, "resets_at": RESET}, "windows": []},
         "openai-codex": {"ok": True, "binding": {"name": "week", "headroom": 0.9, "resets_at": None}, "windows": []},
@@ -66,12 +67,10 @@ TIERS = {
     "L": [{"model": "claude-opus-l", "provider": "anthropic"}],
 }
 REVIEW = [{"model": "gpt-r", "provider": "openai-codex"}, {"model": "claude-opus-r", "provider": "anthropic"}]
-BANDS = {"anthropic": [{"below": 0.10, "min_priority": 3}], "default": []}
 
 
 def _cfg(files, *, enabled=True, **over) -> kr.RoutingConfig:
-    gate = {"enabled": enabled, "headroom_file": str(files.headroom), "mode_file": str(files.mode_file),
-            "bands": BANDS}
+    gate = {"enabled": enabled, "headroom_file": str(files.headroom), "mode_file": str(files.mode_file)}
     return _LOAD({"routing": {"enabled": True, "tiers": TIERS, "review": REVIEW, "escalate": False,
                               "quota_gate": gate, **over}})
 
@@ -127,19 +126,19 @@ def test_mode_min_priority(files, conn, mode, need):
 # --- gate --------------------------------------------------------------------------------------------
 
 
-def test_fresh_mode_replaces_anthropic_bands(files, conn):
-    files("normal")  # bands alone would need P3 at 5% headroom
+def test_fresh_mode_replaces_anthropic_level_gate(files, conn):
+    files("normal")  # the level gate alone would need P2 at 5% headroom
     assert kr.RoutingContext(conn, _cfg(files)).quota_verdict("anthropic", 0) is None
 
 
 @pytest.mark.parametrize("state", ["missing", "stale", "unknown"])
-def test_no_fresh_mode_falls_back_to_bands(files, conn, state):
+def test_no_fresh_mode_falls_back_to_level_gate(files, conn, state):
     if state == "stale":
         files("normal", age=3600)
     elif state == "unknown":
         files("unknown")
     verdict = kr.RoutingContext(conn, _cfg(files)).quota_verdict("anthropic", 0)
-    assert verdict is not None and verdict.kind == "level" and verdict.required == 3
+    assert verdict is not None and verdict.kind == "level" and verdict.required == 2
 
 
 def test_gate_disabled_ignores_mode(files, conn):
@@ -235,8 +234,7 @@ def test_route_cli_prints_mode(files, kanban_home, monkeypatch, capsys):
     files("tight")
     for enabled in (True, False):
         cfg = {"routing": {"enabled": True, "tiers": TIERS, "escalate": False, "quota_gate": {
-            "enabled": enabled, "headroom_file": str(files.headroom), "mode_file": str(files.mode_file),
-            "bands": BANDS}}}
+            "enabled": enabled, "headroom_file": str(files.headroom), "mode_file": str(files.mode_file)}}}
         monkeypatch.setattr(kcli, "_kanban_config", lambda cfg=cfg: cfg)
         with kbc.connect_closing() as c:
             tid = kb.create_task(c, title="low", assignee="w", complexity="L", priority=0)

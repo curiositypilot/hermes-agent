@@ -659,9 +659,8 @@ def _cmd_set_complexity(args: argparse.Namespace) -> int:
 
 
 def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
-    """``kanban.routing.quota_gate`` state for ``route``: file age and, per
-    provider in the headroom file, headroom, pace (minus reserve) and the
-    priority each band kind requires."""
+    """``kanban.routing.quota_gate`` state for ``route``: the mode, file age and, per
+    provider in the headroom file, headroom and the priority the gate requires."""
     from hermes_cli import kanban_routing as kr
 
     gate = cfg.quota_gate
@@ -669,7 +668,7 @@ def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
     mode = ctx.quota_mode()
     providers = []
     for name in sorted(snap.providers):
-        req = kr.gate_requirement(gate, snap, name)
+        req = kr.gate_requirement(snap, name)
         if req is None:  # pragma: no cover - name comes from snap.providers
             continue
         if name == kr.MODE_PROVIDER and mode.active:
@@ -678,11 +677,7 @@ def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
             continue
         providers.append({
             "provider": name, "headroom": req.headroom, "required_priority": req.required,
-            "band_below": req.level_below, "level_required_priority": req.level_required,
-            "pace_headroom": req.pace_raw, "reserve": req.reserve, "pace_effective": req.pace_effective,
-            "pace_below": req.pace_below, "pace_required_priority": req.pace_required,
-            "has_pace_bands": bool(gate.pace_bands_for(name)),
-            "resets_at": int(req.resets_at) if req.resets_at else None})
+            "band_below": req.below, "resets_at": int(req.resets_at) if req.resets_at else None})
     for name, why in sorted(snap.unknown.items()):
         providers.append({"provider": name, "headroom": None, "required_priority": 0,
                           "band_below": None, "resets_at": None, "unknown": why})
@@ -694,7 +689,7 @@ def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
         "enabled": gate.enabled, "file": snap.path, "status": snap.status,
         "age_seconds": int(snap.age_seconds) if snap.age_seconds is not None else None,
         "max_age_seconds": gate.max_age_seconds, "payg_providers": list(gate.payg_providers),
-        "reserve": dict(gate.reserve), "pace_order": cfg.pace_order,
+        "level_gate": [{"below": below, "min_priority": prio} for below, prio in kr.LEVEL_GATE],
         "card_priority": kr._task_priority(task) if task is not None else None,
         "providers": providers,
     }
@@ -712,30 +707,21 @@ def _print_quota_gate(q: dict) -> None:
     age = f", age {q['age_seconds']}s" if q["age_seconds"] is not None else ""
     open_note = "" if q["status"] == "ok" else " — headroom unknown, gate OPEN"
     print(f"\nQuota gate: {q['file']} ({q['status']}{age}, max {q['max_age_seconds']}s){open_note}")
+    print("  level gate: " + ", ".join(f"< {lv['below'] * 100:.0f}% needs P{lv['min_priority']}"
+                                       for lv in q.get("level_gate", [])))
     if q["payg_providers"]:
         print(f"  no paid fallthrough after a gate skip: {', '.join(q['payg_providers'])}")
-    if q.get("reserve"):
-        print("  reserve: " + ", ".join(f"{k} {v:.2f}" for k, v in sorted(q["reserve"].items())))
     for p in q["providers"]:
         if p["headroom"] is None:
             print(f"  ?  {p['provider']}: unknown ({p.get('unknown')}) -> gate open")
             continue
+        mark = "ok " if q["card_priority"] is None or q["card_priority"] >= p["required_priority"] else "-- "
         if p.get("mode"):
-            mark = "ok " if q["card_priority"] is None or q["card_priority"] >= p["required_priority"] else "-- "
             print(f"  {mark}{p['provider']}: headroom {p['headroom'] * 100:.0f}% -> quota mode {p['mode']} "
-                  f"needs P{p['required_priority']} (bands, pace and reserve not used)")
+                  f"needs P{p['required_priority']} (level gate not used)")
             continue
         band = f" (< {p['band_below'] * 100:.0f}%)" if p["band_below"] is not None else ""
-        mark = "ok " if q["card_priority"] is None or q["card_priority"] >= p["required_priority"] else "-- "
-        print(f"  {mark}{p['provider']}: headroom {p['headroom'] * 100:.0f}%{band} "
-              f"-> needs P{p['level_required_priority']}")
-        if p["pace_headroom"] is None:
-            print("       pace unknown -> level bands only")
-            continue
-        pband = f" (< {p['pace_below']:+.2f})" if p["pace_below"] is not None else ""
-        bands_note = "" if p["has_pace_bands"] else " [no pace bands]"
-        print(f"       pace {p['pace_headroom']:+.2f} - reserve {p['reserve']:.2f} = {p['pace_effective']:+.2f}"
-              f"{pband} -> needs P{p['pace_required_priority']}{bands_note}; gate needs P{p['required_priority']}")
+        print(f"  {mark}{p['provider']}: headroom {p['headroom'] * 100:.0f}%{band} -> needs P{p['required_priority']}")
 
 
 def _cmd_route(args: argparse.Namespace) -> int:
@@ -752,12 +738,11 @@ def _cmd_route(args: argparse.Namespace) -> int:
         tiers = []
         for tier in kr.TIER_ORDER:
             rows = []
-            # Effective walk order: pace-sorted when kanban.routing.pace_order is on.
+            # Effective walk order: Opus first in spend-down, else the configured order.
             for cand in ctx.order_tier(cfg.tiers.get(tier, ())):
                 avail = ctx.availability(cand, home)
                 rows.append({**cand.as_dict(), "available": avail.available, "reason": avail.reason,
-                             "until": int(avail.until) if avail.until else None,
-                             "pace": ctx.pace_key(cand.provider) if cfg.pace_order else None})
+                             "until": int(avail.until) if avail.until else None})
             tiers.append({"tier": tier, "candidates": rows})
         review = []
         for cand in ctx.spend_down_order(cfg.review):
@@ -771,7 +756,7 @@ def _cmd_route(args: argparse.Namespace) -> int:
         _print_json({
             "enabled": cfg.enabled, "unlabeled": cfg.unlabeled, "escalate": cfg.escalate,
             "on_exhausted": cfg.on_exhausted, "cooldown_seconds": cfg.cooldown_seconds,
-            "auto_label": cfg.auto_label, "pace_order": cfg.pace_order, "tiers": tiers, "review": review,
+            "auto_label": cfg.auto_label, "tiers": tiers, "review": review,
             "quota_gate": quota,
             "task": None if task is None else {
                 "id": task.id, "complexity": task.complexity, "lane": lane,
@@ -783,20 +768,18 @@ def _cmd_route(args: argparse.Namespace) -> int:
     state = "ENABLED" if cfg.enabled else "disabled (kanban.routing.enabled: false — dispatch ignores tiers)"
     print(f"Routing: {state}")
     print(f"  unlabeled={cfg.unlabeled}  escalate={cfg.escalate}  on_exhausted={cfg.on_exhausted}  "
-          f"cooldown={cfg.cooldown_seconds}s  auto_label={cfg.auto_label}  pace_order={cfg.pace_order}")
+          f"cooldown={cfg.cooldown_seconds}s  auto_label={cfg.auto_label}")
     def _rows(heading: str, cands: list[dict], empty: str) -> None:
         print(f"\n{heading}:" + ("" if cands else f"  ({empty})"))
         for c in cands:
             mark = "ok " if c["available"] else "-- "
             label = f"{c['provider']}:{c['model']}" if c["provider"] else c["model"]
             extra = f" reasoning={c['reasoning']}" if c["reasoning"] else ""
-            pace = f" pace {c['pace']:+.2f}" if c.get("pace") is not None else ""
             until = f" until {_fmt_ts(c['until'])}" if c["until"] else ""
-            print(f"  {mark}{label}{extra}{pace}  [{c['reason']}{until}]")
+            print(f"  {mark}{label}{extra}  [{c['reason']}{until}]")
 
-    order_note = " (pace order)" if cfg.pace_order else ""
     for t in tiers:
-        _rows(f"Tier {t['tier']}{order_note}", t["candidates"], "no candidates")
+        _rows(f"Tier {t['tier']}", t["candidates"], "no candidates")
     _rows("Review lane", review, "not set: reviewers use the card pin / profile model")
     _print_quota_gate(quota)
     if task is not None:

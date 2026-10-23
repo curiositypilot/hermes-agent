@@ -470,7 +470,6 @@ def test_routing_hold_reemits_on_lifecycle_or_new_note(conn, monkeypatch, all_as
     _use_routing(monkeypatch, quota_gate={
         "enabled": True,
         "headroom_file": str(path),
-        "bands": {"default": [{"below": 0.25, "min_priority": 1}]},
     })
     kbd.dispatch_once(conn, spawn_fn=spawn)
     holds = _routing_holds(conn, tid)
