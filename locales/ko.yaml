@@ -2865,7 +2865,7 @@ cli:
       available: "사용 가능: list, add, edit, pause, resume, run, remove"
       overview_title: "(^_^) 예약된 작업"
       overview_commands: "명령:"
-      overview_usage: "/cron list\n/cron add \"every 2h\" \"서버 상태 확인\" [--skill blogwatcher]\n/cron edit <job_id> --schedule \"every 4h\" --prompt \"새 작업\"\n/cron edit <job_id> --skill blogwatcher --skill maps\n/cron edit <job_id> --remove-skill blogwatcher\n/cron edit <job_id> --clear-skills\n/cron pause <job_id>\n/cron resume <job_id>\n/cron run <job_id>\n/cron remove <job_id>"
+      overview_usage: "/cron list\n/cron add \"every 2h\" \"서버 상태 확인\" [--skill blogwatcher]\n/cron edit <job_id> --schedule \"every 4h\" --prompt \"새 작업\"\n/cron edit <job_id> --skill blogwatcher --skill maps\n/cron edit <job_id> --remove-skill blogwatcher\n/cron edit <job_id> --clear-skills\n/cron pause <job_id>\n/cron resume <job_id>\n/cron run <job_id> [--inline]\n/cron remove <job_id>"
       current_jobs: "현재 작업:"
       skills: "스킬: {skills}"
       skills_none: "스킬: 없음"

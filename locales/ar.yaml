@@ -2865,7 +2865,7 @@ cli:
       available: "المتاح: list, add, edit, pause, resume, run, remove"
       overview_title: "(^_^) المهام المجدولة"
       overview_commands: "الأوامر:"
-      overview_usage: "/cron list\n/cron add \"every 2h\" \"تحقّق من حالة الخادم\" [--skill blogwatcher]\n/cron edit <job_id> --schedule \"every 4h\" --prompt \"مهمة جديدة\"\n/cron edit <job_id> --skill blogwatcher --skill maps\n/cron edit <job_id> --remove-skill blogwatcher\n/cron edit <job_id> --clear-skills\n/cron pause <job_id>\n/cron resume <job_id>\n/cron run <job_id>\n/cron remove <job_id>"
+      overview_usage: "/cron list\n/cron add \"every 2h\" \"تحقّق من حالة الخادم\" [--skill blogwatcher]\n/cron edit <job_id> --schedule \"every 4h\" --prompt \"مهمة جديدة\"\n/cron edit <job_id> --skill blogwatcher --skill maps\n/cron edit <job_id> --remove-skill blogwatcher\n/cron edit <job_id> --clear-skills\n/cron pause <job_id>\n/cron resume <job_id>\n/cron run <job_id> [--inline]\n/cron remove <job_id>"
       current_jobs: "المهام الحالية:"
       skills: "المهارات: {skills}"
       skills_none: "المهارات: لا شيء"

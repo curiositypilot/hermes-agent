@@ -2865,7 +2865,7 @@ cli:
       available: "Kullanılabilir: list, add, edit, pause, resume, run, remove"
       overview_title: "(^_^) Zamanlanmış Görevler"
       overview_commands: "Komutlar:"
-      overview_usage: "/cron list\n/cron add \"every 2h\" \"Sunucu durumunu kontrol et\" [--skill blogwatcher]\n/cron edit <job_id> --schedule \"every 4h\" --prompt \"Yeni görev\"\n/cron edit <job_id> --skill blogwatcher --skill maps\n/cron edit <job_id> --remove-skill blogwatcher\n/cron edit <job_id> --clear-skills\n/cron pause <job_id>\n/cron resume <job_id>\n/cron run <job_id>\n/cron remove <job_id>"
+      overview_usage: "/cron list\n/cron add \"every 2h\" \"Sunucu durumunu kontrol et\" [--skill blogwatcher]\n/cron edit <job_id> --schedule \"every 4h\" --prompt \"Yeni görev\"\n/cron edit <job_id> --skill blogwatcher --skill maps\n/cron edit <job_id> --remove-skill blogwatcher\n/cron edit <job_id> --clear-skills\n/cron pause <job_id>\n/cron resume <job_id>\n/cron run <job_id> [--inline]\n/cron remove <job_id>"
       current_jobs: "Mevcut İşler:"
       skills: "Skill'ler: {skills}"
       skills_none: "Skill'ler: yok"

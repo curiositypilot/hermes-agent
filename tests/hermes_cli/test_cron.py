@@ -787,3 +787,84 @@ class TestSlashCronRunSkipped:
         out = capsys.readouterr().out
         assert "Job is paused/disabled; resume it before running." in out
         assert "Triggered" not in out and "next scheduler tick" not in out
+
+
+class TestSlashCronRunHandoff:
+    """Intake t_ca9f6764: the in-chat ``/cron run`` called the cronjob tool directly, so the job
+    ran on the chat thread and a quit chat orphaned it (same failure as `hermes cron run`,
+    t_0120e3f5). It now takes the same route: queue for a live builtin scheduler; ``--inline``,
+    an external provider or no live scheduler keep the in-process run."""
+
+    @pytest.fixture()
+    def wiring(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import get_due_jobs
+
+        executed = []
+
+        def _execute(job, extra_prompt=None):
+            executed.append(job["id"])
+            return {"claimed": True, "success": True}
+
+        monkeypatch.setattr("tools.cronjob_tools._execute_job_now", _execute)
+        monkeypatch.setattr("tools.cronjob_tools._notify_provider_jobs_changed_safe", lambda: None)
+        monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+        monkeypatch.setattr(cron_cli, "_builtin_gateway_liveness", lambda: True)
+        return SimpleNamespace(executed=executed, due=lambda: [j["id"] for j in get_due_jobs()])
+
+    @staticmethod
+    def _slash(capsys, line):
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+        class _Host(CLICommandsMixin):
+            pass
+
+        _Host()._handle_cron_command(line)
+        return capsys.readouterr().out
+
+    @staticmethod
+    def _job():
+        return create_job(prompt="Daily brief", schedule="every 1h", name="Brief")
+
+    def test_live_scheduler_queues_instead_of_running(self, wiring, capsys):
+        job = self._job()
+        out = self._slash(capsys, f"/cron run {job['id']}")
+        assert "Queued job" in out and f"hermes cron runs {job['id']}" in out
+        assert job["id"] in wiring.due()
+        assert wiring.executed == []
+
+    def test_inline_flag_runs_in_process_even_with_live_scheduler(self, wiring, capsys):
+        job = self._job()
+        out = self._slash(capsys, f"/cron run {job['id']} --inline")
+        assert wiring.executed == [job["id"]]
+        assert "Queued job" not in out and "Ran now: succeeded." in out
+
+    @pytest.mark.parametrize("liveness", [False, None])
+    def test_no_live_scheduler_warns_then_runs_in_process(
+        self, wiring, capsys, monkeypatch, liveness
+    ):
+        monkeypatch.setattr(cron_cli, "_builtin_gateway_liveness", lambda: liveness)
+        job = self._job()
+        out = self._slash(capsys, f"/cron run {job['id']}")
+        assert "No live scheduler for this profile; running here." in out
+        assert wiring.executed == [job["id"]] and "Queued job" not in out
+
+    def test_external_provider_runs_in_process_without_warning(self, wiring, capsys, monkeypatch):
+        monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "chronos")
+        job = self._job()
+        out = self._slash(capsys, f"/cron run {job['id']}")
+        assert wiring.executed == [job["id"]]
+        assert "running here" not in out and "Queued job" not in out
+
+    def test_paused_job_refused_not_queued(self, wiring, capsys):
+        job = self._job()
+        pause_job(job["id"])
+        out = self._slash(capsys, f"/cron run {job['id']}")
+        assert "Job is paused/disabled; resume it before running." in out
+        assert get_job(job["id"])["enabled"] is False
+        assert job["id"] not in wiring.due() and wiring.executed == []
+
+    def test_inline_flag_does_not_affect_pause(self, wiring, capsys):
+        job = self._job()
+        self._slash(capsys, f"/cron pause {job['id']} --inline")
+        assert get_job(job["id"])["enabled"] is False
+        assert wiring.executed == []

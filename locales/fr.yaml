@@ -3159,7 +3159,7 @@ cli:
         /cron edit <job_id> --clear-skills
         /cron pause <job_id>
         /cron resume <job_id>
-        /cron run <job_id>
+        /cron run <job_id> [--inline]
         /cron remove <job_id>
       current_jobs: "Tâches actuelles :"
       skills: "Skills : {skills}"
