@@ -433,6 +433,15 @@ def _transcribe_local(
         idle_timeout = _get_idle_unload_seconds(local_cfg)
         if idle_timeout > 0:
             _start_idle_unload_watcher(idle_timeout)
+        # Fork: stt.second_pass re-transcribes off-list languages / repetition loops (Deepgram, then forced local).
+        from tools import transcription_second_pass as second_pass
+        reason = second_pass.second_pass_reason(stt_config, info.language, transcript, bool(normalized_language))
+        if reason:
+            def _rerun_local(lang: str) -> str:
+                segs, _ = model.transcribe(file_path, **{**transcribe_kwargs, "language": lang})
+                return _join_confident_segments(list(segs), local_cfg)
+            return second_pass.run_second_pass(file_path, stt_config, reason, info.language,
+                                               getattr(info, "all_language_probs", None), _rerun_local, transcript)
         return _ok_result(transcript, "local")
     except Exception as e:
         logger.error("Local transcription failed: %s", e, exc_info=True)

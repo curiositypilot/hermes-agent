@@ -1179,6 +1179,18 @@ DEFAULT_CONFIG = {
             "logprob_threshold": -1.0,
             "unload_after_idle_seconds": 0,  # 0 = never; e.g. 300 frees the model after 5min
             "cpu_threads": 0,  # CPU decode threads; 0 = faster-whisper default (4)
+            # Fork: auto-detected languages outside this list (e.g. [en, uk, ru]) trigger stt.second_pass.
+            "allowed_languages": [],
+        },
+        # Fork: re-transcribe local results with an off-list language or a repetition loop; on failure
+        # re-run local forced to the most likely allowed language. provider: "" (off) | deepgram.
+        "second_pass": {
+            "provider": "",
+            "model": "nova-3",
+            "language": "multi",
+            "smart_format": True,
+            "repetition_threshold": 6,  # same 1-3 word chunk repeated this many times in a row
+            "timeout": 60,
         },
         "groq": {
             "model": "whisper-large-v3-turbo",  # whisper-large-v3-turbo, whisper-large-v3
