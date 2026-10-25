@@ -757,6 +757,11 @@ class _ChildRun:
             from tools.terminal_tool import get_session_cwd, record_session_cwd, register_container_alias
             record_session_cwd(self.child_task_id, get_session_cwd(self.parent_task_id))
             register_container_alias(self.child_task_id, self.parent_task_id)
+        # The live manifest keys this child's writes by the task_id its tools run under, so the
+        # foreign-writer git guard can tell the child's own git commands from everyone else's.
+        _live_writer = getattr(self.child, "_live_writer", None)
+        if _live_writer is not None:
+            _live_writer.bind_task(self.child_task_id)
 
         self.worktree_info = _create_isolated_worktree(self.parent_agent, self.parent_task_id, self.subagent_id)
         if self.worktree_info is not None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import os
 import re
 import shlex
@@ -59,10 +60,13 @@ _GIT_GLOBAL_OPTIONS_WITH_ARG = frozenset(
 class _Scope:
     """What one guard protects. ``contains(target)``: a git command run against ``target`` acts
     on a protected checkout. ``is_root(path)``: ``path`` names a protected checkout itself (the
-    `worktree remove|move` victim). ``mutates(subcommand, args)``: the git call rewrites it."""
+    `worktree remove|move` victim). ``mutates(subcommand, args)``: the git call rewrites it.
+    ``operation_at(target, subcommand, args)``: a guard whose verdict depends on the target repo's
+    state (the foreign-writer guard) names the operation it refuses, else None; checked first."""
     contains: Callable[[Path], bool]
     is_root: Callable[[Path], bool]
     mutates: Callable[[str, list[str]], bool]
+    operation_at: Callable[[Path, str, list[str]], str | None] | None = None
 
 
 @dataclass
@@ -481,6 +485,8 @@ def _inspect_git(
         return None
     if subcommand == "worktree":  # names its victim as an argument: the cwd check does not apply
         return _inspect_git_worktree(sub_args, target, scope)
+    if scope.operation_at is not None and (operation := scope.operation_at(target, subcommand, sub_args)):
+        return operation
     if not scope.contains(target):
         return None
     if scope.mutates(subcommand, sub_args):
@@ -628,6 +634,181 @@ def _shared_block_message(operation: str, root: Path) -> str:
         "then `GIT_INDEX_FILE=<tmp>/idx git apply --cached --check <diff>`) to test a patch; or "
         "`git worktree add --detach <dir> <rev>` for a full checkout elsewhere. If a human really "
         "wants this, they run it themselves outside Hermes.")
+
+
+# ── Foreign-writer guard: `git add` / `git commit` of a live delegated worker's files ──────────
+
+_ADD_LONG_WITH_ARG = frozenset({"--chmod", "--pathspec-from-file"})
+_COMMIT_SHORT_WITH_ARG = frozenset("mFCct")
+_COMMIT_LONG_WITH_ARG = frozenset({
+    "--message", "--file", "--reuse-message", "--reedit-message", "--fixup", "--squash", "--author",
+    "--date", "--template", "--cleanup", "--trailer", "--pathspec-from-file"})
+_PATHSPEC_GLOB_CHARS = frozenset("*?[")
+
+
+@dataclass(frozen=True)
+class _ForeignState:
+    """Foreign paths of one checkout by git state (absolute path strings)."""
+    untracked: frozenset[str]
+    modified: frozenset[str]  # tracked, changed in the worktree against the index
+    staged: frozenset[str]  # changed in the index against HEAD
+
+
+def _split_git_args(
+    args: list[str], short_with_arg: frozenset[str], long_with_arg: frozenset[str],
+) -> tuple[set[str], list[str]]:
+    """-> (flags, positionals). ``-am x`` -> {-a, -m}; ``--x=v`` -> {--x}; after ``--`` every word
+    is a positional (pathspec)."""
+    flags: set[str] = set()
+    positionals: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg == "--":
+            positionals.extend(args[index:])
+            break
+        if arg.startswith("--"):
+            name = arg.split("=", 1)[0]
+            flags.add(name)
+            index += 1 if "=" not in arg and name in long_with_arg else 0
+        elif arg.startswith("-") and arg != "-":
+            for position, letter in enumerate(arg[1:], start=1):
+                flags.add("-" + letter)
+                if letter in short_with_arg:  # the rest of the word, or the next word, is its value
+                    index += 1 if position == len(arg) - 1 else 0
+                    break
+        else:
+            positionals.append(arg)
+    return flags, positionals
+
+
+def _foreign_state(toplevel: Path, paths: list[str]) -> _ForeignState:
+    """git state of ``paths`` in ``toplevel``; raises on any git failure (the caller fails open)."""
+    result = subprocess.run(
+        ["git", "--literal-pathspecs", "-C", str(toplevel), "status", "--porcelain=v1", "-z",
+         "--untracked-files=all", "--", *paths],
+        stdin=subprocess.DEVNULL, capture_output=True, timeout=5, check=True)
+    untracked: set[str] = set()
+    modified: set[str] = set()
+    staged: set[str] = set()
+    entries = result.stdout.decode("utf-8", errors="surrogateescape").split("\0")
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        x, y, path = entry[0], entry[1], str(toplevel / entry[3:])
+        if x in "RC":
+            index += 1  # the rename/copy source follows as its own entry
+        if x == "?":
+            untracked.add(path)
+            continue
+        if y != " ":
+            modified.add(path)
+        if x != " ":
+            staged.add(path)
+    return _ForeignState(frozenset(untracked), frozenset(modified), frozenset(staged))
+
+
+def _pathspec_covers(spec: str, path: str, base: Path, toplevel: Path) -> bool:
+    """Whether git pathspec ``spec`` given in ``base`` reaches ``path``. Pathspec magic other
+    than ``:/`` / ``:(top)`` is not evaluated and counts as reaching it."""
+    if spec.startswith(":/"):
+        spec, base = spec[2:], toplevel
+    elif spec.startswith(":(top)"):
+        spec, base = spec[6:], toplevel
+    elif spec.startswith(":"):
+        return True
+    spec = spec or "."
+    if any(char in spec for char in _PATHSPEC_GLOB_CHARS):  # git globs: `*` crosses `/`
+        return fnmatch.fnmatchcase(os.path.relpath(path, base), os.path.normpath(spec))
+    covered = _resolve(spec, base)
+    return _is_within(Path(path), covered)
+
+
+def _add_hits(state: _ForeignState, args: list[str], target: Path, toplevel: Path) -> set[str]:
+    flags, specs = _split_git_args(args, _NO_OPTIONS, _ADD_LONG_WITH_ARG)
+    if flags & {"-n", "--dry-run"}:
+        return set()
+    update = bool(flags & {"-u", "--update"})
+    candidates = state.modified if update else state.modified | state.untracked
+    if "--pathspec-from-file" in flags:
+        return set(candidates)
+    if not specs:  # bare `git add` stages nothing; -A / -u without a pathspec take the whole tree
+        return set(candidates) if update or flags & {"-A", "--all"} else set()
+    return {p for p in candidates if any(_pathspec_covers(s, p, target, toplevel) for s in specs)}
+
+
+def _commit_hits(state: _ForeignState, args: list[str], target: Path, toplevel: Path) -> set[str]:
+    flags, specs = _split_git_args(args, _COMMIT_SHORT_WITH_ARG, _COMMIT_LONG_WITH_ARG)
+    if "--dry-run" in flags:
+        return set()
+    if specs or "--pathspec-from-file" in flags:
+        # `git commit <paths>` commits those paths only (--only); --include adds the index.
+        hits = {p for p in state.modified | state.staged if "--pathspec-from-file" in flags
+                or any(_pathspec_covers(s, p, target, toplevel) for s in specs)}
+        return hits | (set(state.staged) if flags & {"-i", "--include"} else set())
+    return set(state.staged) | (set(state.modified) if flags & {"-a", "--all"} else set())
+
+
+_FOREIGN_HITS: dict[str, Callable[[_ForeignState, list[str], Path, Path], set[str]]] = {
+    "add": _add_hits, "commit": _commit_hits}
+
+
+def detect_foreign_writer_staging(
+    command: str, cwd: str | None, lookup: Callable[[Path], dict[str, dict]],
+) -> tuple[bool, str | None]:
+    """-> (blocked, message): whether a `git add` / `git commit` in ``command`` would stage or
+    commit a file that a still-running delegated worker (not the caller) is writing.
+
+    ``lookup(toplevel)`` returns ``{path: {"delegation_id", "log"}}`` for that checkout
+    (``delegation_live_log.live_foreign_writes``); it runs only for checkouts a git add/commit
+    targets, once each. Only foreign paths git would actually take count: untracked or modified
+    for `add` (tracked only with ``-u``), staged, or modified under ``-a`` / a pathspec, for
+    `commit`. Git aliases are not expanded. git failures raise; the caller fails open.
+    """
+    if not command:
+        return False, None
+    by_toplevel: dict[Path, dict[str, dict]] = {}
+    hits: dict[str, dict] = {}
+
+    def foreign_in(toplevel: Path) -> dict[str, dict]:
+        if toplevel not in by_toplevel:  # paths inside a nested repo/worktree belong to that one
+            by_toplevel[toplevel] = {p: info for p, info in lookup(toplevel).items()
+                                     if _enclosing_toplevel(Path(p).parent) == toplevel}
+        return by_toplevel[toplevel]
+
+    def operation_at(target: Path, subcommand: str, args: list[str]) -> str | None:
+        inspect = _FOREIGN_HITS.get(subcommand)
+        toplevel = _enclosing_toplevel(target) if inspect else None
+        foreign = foreign_in(toplevel) if toplevel is not None else {}
+        if not foreign:
+            return None
+        state = _foreign_state(toplevel, sorted(foreign))
+        found = inspect(state, args, target, toplevel)
+        hits.update({p: foreign[p] for p in found})
+        return f"git {subcommand}" if found else None
+
+    scope = _Scope(contains=lambda _target: False, is_root=lambda _path: False,
+                   mutates=lambda _sub, _args: False, operation_at=operation_at)
+    operation = _find_mutation(command, _resolve(cwd or "/", Path("/")), scope)
+    return (True, _foreign_block_message(operation, hits)) if operation is not None else (False, None)
+
+
+def _foreign_block_message(operation: str, hits: dict[str, dict]) -> str:
+    lines = "\n".join(
+        f"  - {path} (worker {info.get('delegation_id')}, live log: {info.get('log')})"
+        for path, info in sorted(hits.items()))
+    return (
+        f"Blocked: `{operation}` would stage or commit files that a still-running delegated worker "
+        f"is writing:\n{lines}\n"
+        "That worker has not finished, so these files may be half-done and are not yours to ship "
+        "(this applies to the session that delegated it too). Wait for the worker to finish, or "
+        "leave these paths out: name your own files instead of `.`, `-A` or `-a`, and unstage the "
+        "worker's with `git restore --staged <path>`. The block clears by itself when the worker "
+        "ends; there is no override.")
 
 
 def _block_message(operation: str, root: Path) -> str:
