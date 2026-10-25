@@ -2,8 +2,8 @@
 
 Pure functions that decide whether a command may run at all: workdir
 validation, the foreground long-lived/background-operator guidance, the
-supervised-gateway lifecycle block, the Windows self-repo git guard, and the
-shared-checkout git guard.
+supervised-gateway lifecycle block, the Windows self-repo git guard, the
+shared-checkout git guard, and the foreign-writer git guard.
 Each ``*_block`` helper returns a finished JSON error string, or None when
 the command may proceed. Split out of tools/terminal_tool.py; the origin
 module re-imports every public helper so ``tools.terminal_tool.<name>``
@@ -15,6 +15,7 @@ import logging
 import re
 import shlex
 import stat
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
@@ -339,4 +340,44 @@ def shared_checkout_block(
     if not hit:
         return None
     logger.warning("Blocked shared-checkout git mutation (command: %s)", _safe_command_preview(command))
+    return _blocked_json(msg, "blocked")
+
+
+_GIT_WORD_RE = re.compile(r"\bgit\b")
+
+
+def foreign_writer_block(
+    *,
+    command: str,
+    cwd: str,
+    workdir: Optional[str],
+    session_key: str,
+    task_id: Optional[str],
+) -> Optional[str]:
+    """Refuse `git add` / `git commit` that would take files a still-running delegated worker
+    is writing, in any git checkout (local backend only).
+
+    The caller is identified by its terminal ``task_id``: a delegated child's differs from its
+    parent's and from every other session's, while the approval session key is inherited by
+    in-process children. Parents are refused too; no override, the block clears when the worker
+    ends. Advisory hygiene, so it fails OPEN: an unreadable manifest (skipped inside
+    ``live_foreign_writes``) or a failed git status lets the command run, with the exact error
+    logged. Any other exception is a bug and propagates. Returns the JSON error string when blocked.
+    """
+    if not command or not _GIT_WORD_RE.search(command):
+        return None
+    try:
+        from tools.delegation_live_log import live_foreign_writes
+        from tools.self_repo_guard import detect_foreign_writer_staging
+        from tools.terminal_tool import _resolve_command_cwd
+
+        guard_cwd = _resolve_command_cwd(workdir=workdir, default_cwd=cwd, session_key=session_key)
+        hit, msg = detect_foreign_writer_staging(
+            command, guard_cwd, lambda toplevel: live_foreign_writes(toplevel, task_id))
+    except (OSError, subprocess.SubprocessError) as exc:  # git failed or timed out: fail open, loudly
+        logger.warning("foreign-writer guard skipped: git status failed (%s: %s)", type(exc).__name__, exc)
+        return None
+    if not hit:
+        return None
+    logger.warning("Blocked staging a live worker's files (command: %s)", _safe_command_preview(command))
     return _blocked_json(msg, "blocked")

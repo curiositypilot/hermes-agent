@@ -468,3 +468,167 @@ def test_benign_transcript_content_is_untouched():
     assert "src/parser.py" in body
     assert "def parse(x)" in body
     assert "refactor the parser" in body
+
+
+# ---------------------------------------------------------------------------
+# Foreign-writer inputs: pid/start/task_id, files_written, live_foreign_writes
+# ---------------------------------------------------------------------------
+
+
+def _manifest_of(paths):
+    return json.loads((Path(paths[0]).parent / "manifest.json").read_text(encoding="utf-8"))
+
+
+def _bound_writer(tmp_path, task_id="subagent-0-abc"):
+    from tools import file_state
+    file_state.get_registry().clear()
+    deleg_id, writers, paths = create_live_transcripts([{"goal": "write scripts"}], home=tmp_path / "home")
+    writers[0].bind_task(task_id)
+    return writers[0], paths
+
+
+def test_manifest_carries_pid_start_time_and_task_id(tmp_path):
+    from gateway.status import get_process_start_time
+    writer, paths = _bound_writer(tmp_path, "subagent-0-abc")
+    manifest = _manifest_of(paths)
+    assert manifest["pid"] == os.getpid()
+    assert manifest["pid_start"] == get_process_start_time(os.getpid())
+    assert manifest["tasks"][0]["task_id"] == "subagent-0-abc"
+    assert manifest["tasks"][0]["files_written"] == []
+
+
+@pytest.mark.parametrize("tool", ["write_file", "patch", "execute_code"])
+def test_successful_write_lands_in_files_written_once(tmp_path, tool):
+    from tools import file_state
+    writer, paths = _bound_writer(tmp_path)
+    target = tmp_path / "repo" / "scripts" / "onboard.sh"
+    target.parent.mkdir(parents=True)
+    target.write_text("#!/bin/sh\n", encoding="utf-8")
+    file_state.note_write(writer.task_id, str(target.resolve()))
+    cb = wrap_progress_callback(None, writer)
+    cb("tool.completed", tool, None, None, duration=0.1, is_error=False, result="{}")
+    cb("tool.completed", tool, None, None, duration=0.1, is_error=False, result="{}")
+    assert _manifest_of(paths)["tasks"][0]["files_written"] == [str(target.resolve())]
+
+
+def test_refused_write_is_not_recorded(tmp_path):
+    """A stale-write refusal completes with resolved_path but writes nothing (t_f1500e3d#5)."""
+    writer, paths = _bound_writer(tmp_path)
+    refusal = json.dumps({"error": "stale", "stale_write_blocked": True, "resolved_path": str(tmp_path / "x.sh")})
+    wrap_progress_callback(None, writer)("tool.completed", "write_file", None, None, result=refusal)
+    assert _manifest_of(paths)["tasks"][0]["files_written"] == []
+
+
+def test_files_written_is_capped(tmp_path, monkeypatch):
+    from tools import file_state
+    monkeypatch.setattr(dll, "_MAX_FILES_WRITTEN", 3)
+    writer, paths = _bound_writer(tmp_path)
+    for i in range(5):
+        f = tmp_path / f"f{i}.txt"
+        f.write_text("x", encoding="utf-8")
+        file_state.note_write(writer.task_id, str(f.resolve()))
+    writer.sync_files_written()
+    assert len(_manifest_of(paths)["tasks"][0]["files_written"]) == 3
+
+
+def test_concurrent_task_updates_do_not_lose_writes(tmp_path):
+    """Children of one batch update the same manifest at once (t_f1500e3d#2)."""
+    from tools import file_state
+    file_state.get_registry().clear()
+    _, writers, paths = create_live_transcripts([{"goal": f"g{i}"} for i in range(6)], home=tmp_path / "home")
+    for i, w in enumerate(writers):
+        w.bind_task(f"child-{i}")
+        f = tmp_path / f"w{i}.txt"
+        f.write_text("x", encoding="utf-8")
+        file_state.note_write(f"child-{i}", str(f.resolve()))
+    threads = [threading.Thread(target=w.sync_files_written) for w in writers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    tasks = _manifest_of(paths)["tasks"]
+    assert [len(t["files_written"]) for t in tasks] == [1] * 6
+    assert [t["task_id"] for t in tasks] == [f"child-{i}" for i in range(6)]
+
+
+def _live_manifest(root, deleg_id, files, *, task_id="subagent-0-abc", status="running",
+                   completed=None, pid=None, pid_start=None, started=None):
+    from gateway.status import get_process_start_time
+    pid = os.getpid() if pid is None else pid
+    d = root / deleg_id
+    d.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "delegation_id": deleg_id, "started": started or time.strftime("%Y-%m-%d %H:%M:%S"),
+        "pid": pid, "pid_start": get_process_start_time(pid) if pid_start is None else pid_start,
+        "tasks": [{"index": 0, "log": str(d / "task-0.log"), "status": status, "task_id": task_id,
+                   "files_written": [str(f) for f in files]}]}
+    if completed:
+        manifest["completed"] = completed
+    (d / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest
+
+
+def _dead_pid():
+    import subprocess
+    import sys
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+class TestLiveForeignWrites:
+    def test_live_foreign_task_is_reported(self, tmp_path):
+        repo, root = tmp_path / "repo", tmp_path / "live"
+        f = repo / "scripts" / "onboard.sh"
+        _live_manifest(root, "deleg_a", [f])
+        got = dll.live_foreign_writes(repo, "some-other-task", root=root)
+        assert got == {str(f): {"delegation_id": "deleg_a", "log": str(root / "deleg_a" / "task-0.log")}}
+
+    def test_long_running_worker_stays_protected(self, tmp_path):
+        """No age cutoff: pid + start time prove liveness (t_f1500e3d#6)."""
+        repo, root = tmp_path / "repo", tmp_path / "live"
+        _live_manifest(root, "deleg_old", [repo / "a.sh"], started="2020-01-01 00:00:00")
+        assert dll.live_foreign_writes(repo, "x", root=root)
+
+    @pytest.mark.parametrize("variant", [
+        "completed_manifest", "finished_task", "dead_pid", "start_time_mismatch", "own_task",
+        "no_task_id", "outside_checkout", "pre_field_manifest"])
+    def test_excluded(self, tmp_path, variant):
+        repo, root = tmp_path / "repo", tmp_path / "live"
+        f = repo / "a.sh"
+        kwargs = {
+            "completed_manifest": {"completed": "2026-10-25 15:40:33"},
+            "finished_task": {"status": "completed"},
+            "dead_pid": {"pid": _dead_pid() if variant == "dead_pid" else None, "pid_start": 1},
+            "start_time_mismatch": {"pid_start": 1},
+            "own_task": {"task_id": "me"},
+            "no_task_id": {"task_id": None},
+        }.get(variant, {})
+        files = [tmp_path / "elsewhere" / "a.sh"] if variant == "outside_checkout" else [f]
+        manifest = _live_manifest(root, "deleg_x", files, **kwargs)
+        if variant == "pre_field_manifest":
+            del manifest["pid"], manifest["pid_start"]
+            (root / "deleg_x" / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        assert dll.live_foreign_writes(repo, "me", root=root) == {}
+
+    def test_unreadable_manifest_is_skipped(self, tmp_path):
+        repo, root = tmp_path / "repo", tmp_path / "live"
+        (root / "deleg_bad").mkdir(parents=True)
+        (root / "deleg_bad" / "manifest.json").write_text("{not json", encoding="utf-8")
+        _live_manifest(root, "deleg_ok", [repo / "a.sh"])
+        assert list(dll.live_foreign_writes(repo, "me", root=root)) == [str(repo / "a.sh")]
+
+
+def test_child_seed_binds_its_terminal_task_id_to_the_manifest(tmp_path):
+    """The task_id recorded is the one the child's tools run under (_ChildRun.child_task_id),
+    not the approval session key children inherit from the parent (t_f1500e3d#1)."""
+    from types import SimpleNamespace
+
+    from tools.delegate_tool_child_run import _ChildRun
+    _, writers, paths = create_live_transcripts([{"goal": "g"}], home=tmp_path / "home")
+    child = SimpleNamespace(_live_writer=writers[0])
+    parent = SimpleNamespace(_current_task_id="parent-task")
+    run = _ChildRun(child, parent, 0, "g", None, None)
+    run.seed_workspace()
+    assert run.child_task_id and run.child_task_id != "parent-task"
+    assert _manifest_of(paths)["tasks"][0]["task_id"] == run.child_task_id

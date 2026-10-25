@@ -855,7 +855,7 @@ def _command_requires_pipe_stdin(command: str) -> bool:
 
 from tools.terminal_tool_guards import (
     _foreground_background_guidance, _safe_command_preview, _validate_workdir,
-    gateway_lifecycle_block, self_repo_block, shared_checkout_block,
+    foreign_writer_block, gateway_lifecycle_block, self_repo_block, shared_checkout_block,
 )
 from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
 from tools.terminal_tool_result import finalize_foreground_result
@@ -1313,13 +1313,14 @@ _PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
 
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
-    workdir: Optional[str], session_key: str,
+    workdir: Optional[str], session_key: str, task_id: Optional[str],
 ) -> None:
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
     Order matters: gateway lifecycle first (protects the running gateway),
-    then the dangerous-workdir check, then the self-repo and shared-checkout
-    guards (local only).
+    then the dangerous-workdir check, then the self-repo, shared-checkout and
+    foreign-writer guards (local only). ``task_id`` identifies the caller to the
+    foreign-writer guard (a delegated child's own files are not foreign to it).
     """
     blocked = gateway_lifecycle_block(
         command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
@@ -1337,6 +1338,10 @@ def _pre_exec_block(
         if blocked:
             raise _Rejected(blocked)
         blocked = shared_checkout_block(command=command, cwd=cwd, workdir=workdir, session_key=session_key)
+        if blocked:
+            raise _Rejected(blocked)
+        blocked = foreign_writer_block(
+            command=command, cwd=cwd, workdir=workdir, session_key=session_key, task_id=task_id)
         if blocked:
             raise _Rejected(blocked)
 
@@ -1442,6 +1447,7 @@ def terminal_tool(
             bounded_guard = run_bounded_sync(
                 lambda: _pre_exec_block(
                     command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+                    task_id=task_id,
                 ),
                 guard_timeout,
                 label="terminal.pre-exec-guard",

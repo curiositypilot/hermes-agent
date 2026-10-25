@@ -6,12 +6,18 @@ One append-only log per child under ``<hermes_home>/cache/delegation/live/
 ``cache/delegation`` is mounted read-only into remote terminal backends, so
 every line written here must be credential-redacted. Never raises into the
 agent loop; append mode per write (close() is the flush); 7-day retention.
+
+The manifest also answers "is a live worker writing this file?" for the
+terminal's foreign-writer git guard: it records the host pid + start time,
+each task's terminal ``task_id`` and the files the task wrote
+(:func:`live_foreign_writes`).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -35,6 +41,14 @@ _KICKOFF_MAX = 500
 # event type arrives (or on completion); capped so a huge reply can't hold memory.
 _STREAM_BUFFER_FLUSH_CHARS = 4000
 _TIME_FMT = "%Y-%m-%d %H:%M:%S"
+# files_written per manifest task: de-duplicated, capped.
+_MAX_FILES_WRITTEN = 500
+# Tools whose completion may have written files. execute_code counts: write_file / patch called
+# from its scripts emit no tool.completed of their own (t_f1500e3d#10).
+_FILE_WRITING_TOOLS = frozenset({"write_file", "patch", "execute_code"})
+# Every manifest read-modify-write in this process (children of one batch complete
+# concurrently); readers in other processes see whole files via the atomic replace.
+_MANIFEST_LOCK = threading.RLock()
 
 
 def live_transcript_root(home: Optional[Path] = None) -> Path:
@@ -85,7 +99,21 @@ def _joined(*parts: str) -> str:
 
 
 def _dump_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    from utils import atomic_json_write
+    atomic_json_write(path, payload)
+
+
+def _update_manifest(path: Path, mutate) -> None:
+    """Read, ``mutate(manifest)`` and atomically rewrite one manifest under the process lock."""
+    with _MANIFEST_LOCK:
+        manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+        mutate(manifest)
+        _dump_json(path, manifest)
+
+
+def _process_start_time(pid: int) -> Optional[int]:
+    from gateway.status import get_process_start_time
+    return get_process_start_time(pid)
 
 
 class LiveTranscriptWriter:
@@ -101,6 +129,9 @@ class LiveTranscriptWriter:
         self._stream_buf: List[str] = []
         self._stream_len = 0
         self.path: Optional[Path] = None
+        # Terminal task_id the child's tools run under (bind_task); keys its file_state writes.
+        self.task_id: Optional[str] = None
+        self._files_written: List[str] = []
         with _best_effort(f"init ({delegation_id} task {task_index})"):
             goal_line = _one_line(goal, _KICKOFF_MAX)
             d = (root if root is not None else live_transcript_root()) / delegation_id
@@ -172,6 +203,46 @@ class LiveTranscriptWriter:
             text, self._stream_buf, self._stream_len = "".join(self._stream_buf), [], 0
             self.assistant_text(text)
 
+    def bind_task(self, task_id: str) -> None:
+        """Record the child's terminal ``task_id`` on its manifest task. It, not the approval
+        session key (in-process children inherit the parent's), is what tells a writer's own
+        git commands from everyone else's (t_f1500e3d#1)."""
+        if self.path is None or not task_id:
+            return
+        self.task_id = task_id
+        with _best_effort(f"task bind ({self.delegation_id} task {self.task_index})"):
+            _update_manifest(self.path.parent / "manifest.json",
+                             lambda m: self._set_task_field(m, "task_id", task_id))
+
+    def _set_task_field(self, manifest: Dict[str, Any], key: str, value: Any) -> None:
+        for task in manifest.get("tasks", []):
+            if task.get("index") == self.task_index:
+                task[key] = value
+
+    def sync_files_written(self) -> None:
+        """Merge this task's successful writes (file_state's last-writer records, so refused or
+        failed writes never count, t_f1500e3d#5) into the manifest's ``files_written``."""
+        if self.path is None or not self.task_id:
+            return
+        with _best_effort(f"files_written ({self.delegation_id} task {self.task_index})"):
+            from tools import file_state
+            known = set(self._files_written)
+            new = [p for p in sorted(file_state.written_by(self.task_id)) if p not in known]
+            room = _MAX_FILES_WRITTEN - len(self._files_written)
+            if not new or room <= 0:
+                return
+            self._files_written.extend(new[:room])
+            paths = list(self._files_written)
+            _update_manifest(self.path.parent / "manifest.json",
+                             lambda m: self._set_task_field(m, "files_written", paths))
+
+    def _on_tool_completed(self, tool_name, preview, args, kwargs):
+        name = str(tool_name or "")
+        self.tool_result(name, result=kwargs.get("result"), duration=kwargs.get("duration"),
+                         is_error=bool(kwargs.get("is_error")))
+        if name in _FILE_WRITING_TOOLS:
+            self.sync_files_written()
+
     def _on_complete(self, tool_name, preview, args, kwargs):
         dur = kwargs.get("duration_seconds")
         summary = kwargs.get("summary") or preview
@@ -183,9 +254,7 @@ class LiveTranscriptWriter:
     # Event demux (the tool_progress_callback surface): handler(self, tool_name, preview, args, kwargs).
     _OBSERVERS = {
         "tool.started": lambda s, n, p, a, kw: s.tool_start(str(n or ""), p if p else a),
-        "tool.completed": lambda s, n, p, a, kw: s.tool_result(
-            str(n or ""), result=kw.get("result"), duration=kw.get("duration"),
-            is_error=bool(kw.get("is_error"))),
+        "tool.completed": _on_tool_completed,
         # Fired as cb("_thinking", <text>) — text rides in the tool_name slot.
         "_thinking": lambda s, n, p, a, kw: s.thinking(str(n or p or "")),
         # cb("reasoning.available", "_thinking", <text>, None)
@@ -273,15 +342,21 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     paths: List[str], model: Optional[str] = None,
                     provider: Optional[str] = None, home: Optional[Path] = None) -> None:
     with _best_effort("manifest write"):
-        _dump_json(_manifest_path(delegation_id, home), {
+        pid = os.getpid()
+        payload = {
             "delegation_id": delegation_id, "started": time.strftime(_TIME_FMT),
             "task_count": len(task_list), "model": model, "provider": provider,
+            # Host process identity: a manifest whose process died never got `completed`.
+            "pid": pid, "pid_start": _process_start_time(pid),
             "tasks": [{
                 "index": i,
                 # Same mounted dir as the .log files, so the goal needs the same redaction.
                 "goal": _redact(str(t.get("goal", ""))[:500]),
                 "log": paths[i] if i < len(paths) else None,
-                "status": "running"} for i, t in enumerate(task_list)]})
+                "status": "running", "task_id": None, "files_written": []}
+                for i, t in enumerate(task_list)]}
+        with _MANIFEST_LOCK:
+            _dump_json(_manifest_path(delegation_id, home), payload)
 
 
 def update_manifest_statuses(delegation_id: Optional[str],
@@ -290,10 +365,9 @@ def update_manifest_statuses(delegation_id: Optional[str],
     """Best-effort per-task status update once the batch has aggregated."""
     if not delegation_id:
         return
-    with _best_effort("manifest update"):
-        mp = _manifest_path(delegation_id, home)
-        manifest = json.loads(mp.read_text(encoding="utf-8-sig"))
-        by_index = {r.get("task_index"): r for r in results if isinstance(r, dict)}
+    by_index = {r.get("task_index"): r for r in results if isinstance(r, dict)}
+
+    def _mark(manifest: Dict[str, Any]) -> None:
         for task in manifest.get("tasks", []):
             r = by_index.get(task.get("index"))
             if r is not None:
@@ -301,7 +375,53 @@ def update_manifest_statuses(delegation_id: Optional[str],
                 if r.get("exit_reason"):
                     task["exit_reason"] = r["exit_reason"]
         manifest["completed"] = time.strftime(_TIME_FMT)
-        _dump_json(mp, manifest)
+
+    with _best_effort("manifest update"):
+        _update_manifest(_manifest_path(delegation_id, home), _mark)
+
+
+def _host_alive(manifest: Dict[str, Any]) -> bool:
+    """The manifest's host process still runs: pid exists and its start time matches (no PID
+    reuse). A manifest without them predates the fields and proves nothing, so it is not live."""
+    from gateway.status import _pid_exists, start_time_fingerprints_match
+    pid, recorded = manifest.get("pid"), manifest.get("pid_start")
+    if not isinstance(pid, int) or not isinstance(recorded, int) or not _pid_exists(pid):
+        return False
+    current = _process_start_time(pid)
+    return current is not None and start_time_fingerprints_match(recorded, current)
+
+
+def live_foreign_writes(checkout_root: Path | str, caller_task_id: Optional[str],
+                        root: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
+    """``{path: {"delegation_id", "log"}}`` for files under ``checkout_root`` written by a delegated
+    task that is still running in a live process and is not the caller (``caller_task_id`` is the
+    terminal task_id of the asking agent; a parent's differs from its children's).
+
+    Liveness is status ``running``, no ``completed`` on the manifest, and the host pid alive with a
+    matching start time; no age cutoff, so a long worker stays protected (t_f1500e3d#6). Fails
+    open: an unreadable manifest is skipped with a debug log.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    base = Path(checkout_root)
+    root_dir = root if root is not None else live_transcript_root()
+    if not root_dir.is_dir():
+        return out
+    for mp in root_dir.glob("*/manifest.json"):
+        try:
+            manifest = json.loads(mp.read_text(encoding="utf-8-sig"))
+            if manifest.get("completed") or not _host_alive(manifest):
+                continue
+            for task in manifest.get("tasks", []):
+                writer = task.get("task_id")
+                if task.get("status") != "running" or not writer or writer == caller_task_id:
+                    continue
+                for p in task.get("files_written") or []:
+                    if Path(p).is_relative_to(base):
+                        out.setdefault(str(p), {"delegation_id": manifest.get("delegation_id") or mp.parent.name,
+                                                "log": task.get("log")})
+        except (OSError, ValueError, TypeError, AttributeError) as exc:  # unreadable or malformed: fail open
+            logger.debug("live_foreign_writes: skipping %s: %s", mp, exc)
+    return out
 
 
 def prune_stale_live_dirs(max_age_days: int = LIVE_RETENTION_DAYS, root: Optional[Path] = None) -> int:
