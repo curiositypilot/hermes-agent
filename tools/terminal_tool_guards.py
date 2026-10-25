@@ -15,6 +15,7 @@ import logging
 import re
 import shlex
 import stat
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
@@ -359,8 +360,9 @@ def foreign_writer_block(
     The caller is identified by its terminal ``task_id``: a delegated child's differs from its
     parent's and from every other session's, while the approval session key is inherited by
     in-process children. Parents are refused too; no override, the block clears when the worker
-    ends. Advisory hygiene, so it fails OPEN: an unreadable manifest or a git / process-probe
-    error lets the command run (debug-logged). Returns the JSON error string when blocked.
+    ends. Advisory hygiene, so it fails OPEN: an unreadable manifest (skipped inside
+    ``live_foreign_writes``) or a failed git status lets the command run, with the exact error
+    logged. Any other exception is a bug and propagates. Returns the JSON error string when blocked.
     """
     if not command or not _GIT_WORD_RE.search(command):
         return None
@@ -372,8 +374,8 @@ def foreign_writer_block(
         guard_cwd = _resolve_command_cwd(workdir=workdir, default_cwd=cwd, session_key=session_key)
         hit, msg = detect_foreign_writer_staging(
             command, guard_cwd, lambda toplevel: live_foreign_writes(toplevel, task_id))
-    except Exception:  # health: allow BLE001 -- advisory guard fails open by spec; a guard fault must not stop the terminal
-        logger.debug("foreign-writer guard skipped", exc_info=True)
+    except (OSError, subprocess.SubprocessError) as exc:  # git failed or timed out: fail open, loudly
+        logger.warning("foreign-writer guard skipped: git status failed (%s: %s)", type(exc).__name__, exc)
         return None
     if not hit:
         return None
