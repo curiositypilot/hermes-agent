@@ -1,8 +1,10 @@
 """Data-class policy for Kanban workers' main-model provider routes.
 
-This module needs only the standard library plus the repository's config loader
-(PyYAML underneath), so standalone factory scripts can import it with the
-repository on PYTHONPATH.
+This module needs only the standard library plus the repository's config loader,
+which imports ``ruamel.yaml`` (via ``hermes_yaml``). A standalone factory script
+importing it with the repository on PYTHONPATH must have ``ruamel.yaml`` in its
+environment or run under the repository's interpreter. A policy that cannot be
+read or is malformed raises ``PolicyUnavailable``.
 """
 from __future__ import annotations
 
@@ -22,6 +24,15 @@ class ProviderDenied(ValueError):
     """Raised when a provider route is not allowed for a data class."""
 
 
+class PolicyUnavailable(ProviderDenied):
+    """The data-class policy could not be read or is malformed.
+
+    Still a refusal (fail closed): it subclasses ``ProviderDenied`` so every existing
+    ``except ProviderDenied`` keeps refusing, while callers that word their errors can
+    tell "cannot evaluate the policy" from "the policy says no".
+    """
+
+
 def _task_value(task_row: Any, name: str) -> Any:
     if task_row is None:
         return None
@@ -37,29 +48,30 @@ def _load_policies() -> dict[str, Any]:
     """Load the profile-scoped policy through the canonical config loader.
 
     ``load_config_readonly`` deep-merges DEFAULT_CONFIG (spec defaults) with the user file,
-    the managed-scope overlay and ``${VAR}`` expansion. Any read failure fails closed.
+    the managed-scope overlay and ``${VAR}`` expansion. A read failure or a malformed
+    policy raises ``PolicyUnavailable`` (fails closed).
     """
     try:
         from hermes_cli.config import load_config_readonly
 
         config = load_config_readonly()
     except Exception as exc:
-        raise ProviderDenied(f"could not read data-class policy: {exc}") from exc
+        raise PolicyUnavailable(f"could not read data-class policy: {type(exc).__name__}: {exc}") from exc
     kanban = config.get("kanban", {}) or {}
     if not isinstance(kanban, Mapping):
-        raise ProviderDenied("kanban config must be a mapping")
+        raise PolicyUnavailable("kanban config must be a mapping")
     raw = kanban.get("data_policies", _DEFAULT_POLICIES) or {}
     if not isinstance(raw, Mapping):
-        raise ProviderDenied("kanban.data_policies must be a mapping")
+        raise PolicyUnavailable("kanban.data_policies must be a mapping")
     tenant_defaults = raw.get("tenant_defaults", {}) or {}
     if not isinstance(tenant_defaults, Mapping):
-        raise ProviderDenied("kanban.data_policies.tenant_defaults must be a mapping")
+        raise PolicyUnavailable("kanban.data_policies.tenant_defaults must be a mapping")
     classes = raw.get("classes", {}) or {}
     if not isinstance(classes, Mapping):
-        raise ProviderDenied("kanban.data_policies.classes must be a mapping")
+        raise PolicyUnavailable("kanban.data_policies.classes must be a mapping")
     for name, value in classes.items():
         if not isinstance(value, Mapping):
-            raise ProviderDenied(f"policy for data class {name!r} must be a mapping")
+            raise PolicyUnavailable(f"policy for data class {name!r} must be a mapping")
     return {
         "default": raw.get("default"),
         "tenant_defaults": dict(tenant_defaults),

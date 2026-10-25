@@ -5,7 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.provider_policy import ProviderDenied, assert_provider_allowed, provider_permitted, resolve_data_class
+from agent.provider_policy import (
+    PolicyUnavailable,
+    ProviderDenied,
+    assert_provider_allowed,
+    provider_permitted,
+    resolve_data_class,
+)
 
 
 _POLICY_CONFIG = """
@@ -63,6 +69,36 @@ def test_provider_allowlist_and_any_policy(policy_home):
     assert provider_permitted("", "confidential") is False
     assert provider_permitted(None, "confidential") is False
     assert provider_permitted("anthropic", "unknown_class") is False
+
+
+def test_config_read_failure_raises_policy_unavailable(policy_home, monkeypatch):
+    import hermes_cli.config as config_mod
+
+    def _boom():
+        raise ModuleNotFoundError("No module named 'ruamel'")
+
+    monkeypatch.setattr(config_mod, "load_config_readonly", _boom)
+    with pytest.raises(PolicyUnavailable) as caught:
+        assert_provider_allowed("anthropic", "internal")
+    assert isinstance(caught.value, ProviderDenied)
+    message = str(caught.value)
+    assert "could not read data-class policy" in message
+    assert "ModuleNotFoundError" in message
+    assert "ruamel" in message
+    assert provider_permitted("anthropic", "internal") is False
+
+
+def test_malformed_policy_raises_policy_unavailable(policy_home):
+    (policy_home / "config.yaml").write_text("kanban:\n  data_policies: [a]\n", encoding="utf-8")
+    with pytest.raises(PolicyUnavailable):
+        assert_provider_allowed("anthropic", "internal")
+
+
+def test_policy_denials_are_not_policy_unavailable(policy_home):
+    for provider, data_class in (("anthropic", "no-such-class"), ("antigravity", "confidential")):
+        with pytest.raises(ProviderDenied) as caught:
+            assert_provider_allowed(provider, data_class)
+        assert not isinstance(caught.value, PolicyUnavailable)
 
 
 def test_confidential_task_never_activates_antigravity_fallback(policy_home, monkeypatch):
