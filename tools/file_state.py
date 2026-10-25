@@ -189,6 +189,14 @@ class FileStateRegistry:
                     out[writer_tid].append(p)
         return dict(out)
 
+    def written_by(self, task_id: str) -> List[str]:
+        """Resolved paths whose last recorded writer is ``task_id``: the successful write_file /
+        patch writes of that agent, including those made from inside its execute_code scripts."""
+        if _disabled():
+            return []
+        with self._state_lock:
+            return [p for p, (writer_tid, _ts) in self._last_writer.items() if writer_tid == task_id]
+
     def known_reads(self, task_id: str) -> List[str]:
         """Resolved paths this agent has read."""
         if _disabled():
@@ -249,6 +257,10 @@ def known_reads(task_id: str) -> List[str]:
     return _registry.known_reads(task_id)
 
 
+def written_by(task_id: str) -> List[str]:
+    return _registry.written_by(task_id)
+
+
 __all__ = [
     "FileStateRegistry",
     "get_registry",
@@ -257,4 +269,5 @@ __all__ = [
     "check_stale",
     "lock_path",
     "writes_since",
+    "written_by",
     "known_reads"]
