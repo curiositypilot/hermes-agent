@@ -243,6 +243,24 @@
     "kind": "bare_which"
   },
   {
+    "path": "hermes_cli/kanban_db_run_scopes.py",
+    "symbol": "_active_run_scope_units",
+    "kind": "bare_which",
+    "reason": "asks the OS's own systemctl (user manager) for run scopes; absent systemctl means no scopes to reap (same as update_restart_recovery._systemctl_scopes)"
+  },
+  {
+    "path": "hermes_cli/kanban_sandbox.py",
+    "symbol": "_worker_terminal_uv",
+    "kind": "bare_which",
+    "reason": "selftest probe asks for uv on the PATH a worker's terminal tool gets (PATH plus the managed dirs local.py appends)"
+  },
+  {
+    "path": "hermes_cli/kanban_sandbox.py",
+    "symbol": "build_sandbox",
+    "kind": "bare_which",
+    "reason": "bwrap is an OS package (bubblewrap), never Hermes-managed; missing bwrap raises SandboxUnavailable (fail closed)"
+  },
+  {
     "path": "hermes_cli/linux_desktop_entry.py",
     "symbol": "_refresh_hicolor_cache",
     "kind": "bare_which"

@@ -515,6 +515,17 @@ def exec_forwarding(argv: Sequence[str]) -> int:
 # Self-test
 # ---------------------------------------------------------------------------
 
+def _worker_terminal_uv() -> Optional[str]:
+    """uv as a worker's terminal tool would find it: PATH plus the managed dirs local.py
+    appends, so a managed-only uv (``$HERMES_HOME/bin/uv``) is not reported missing."""
+    path = os.environ.get("PATH", "")
+    try:
+        from tools.environments.local import _append_missing_sane_path_entries
+    except ImportError:
+        return shutil.which("uv", path=path)
+    return shutil.which("uv", path=_append_missing_sane_path_entries(path))
+
+
 def _probe(spec: dict) -> list[dict]:
     """Runs INSIDE the sandbox: check each hidden path and each capability a worker needs."""
     results: list[dict] = []
@@ -604,7 +615,7 @@ def _probe(spec: dict) -> list[dict]:
     if rc == 0:
         rc, out = run([*git, "-C", "repo", "worktree", "add", "-q", "../wt", "-b", "probe"], cwd=ws)
     check("git init + commit + worktree add", rc == 0, out)
-    uv = shutil.which("uv")
+    uv = _worker_terminal_uv()
     rc, out = run([uv, "venv", "-q", os.path.join(ws, "venv")], cwd=ws) if uv else (127, "uv not on PATH")
     check("uv venv", rc == 0, out)
     rc, out = run([*spec["hermes_argv"], "kanban", "stats", "--json"], cwd=ws)

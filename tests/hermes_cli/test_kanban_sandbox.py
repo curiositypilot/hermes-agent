@@ -244,6 +244,32 @@ def test_build_sandbox_fails_closed_without_bwrap(tmp_path, monkeypatch):
                           hermes_root=host.root, home=host.home)
 
 
+@pytest.mark.platforms("posix")
+def test_worker_terminal_uv_finds_managed_uv_off_path(tmp_path, monkeypatch):
+    """The selftest's uv check asks what a worker's terminal tool resolves (PATH + local.py's
+    managed dirs), so a managed-only ``$HERMES_HOME/bin/uv`` is found, not reported missing."""
+    import pm
+    from tools.environments import local
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    # Pin the host-dependent PATH sources so only the fake home can supply uv.
+    monkeypatch.setattr(local, "_SANE_PATH", str(empty))
+    monkeypatch.setattr(pm, "env_for", lambda *_a, **_k: {"PATH": ""})
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PATH", str(empty))
+
+    home = tmp_path / "hermes"
+    (home / "bin").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert kbs._worker_terminal_uv() is None
+
+    uv = home / "bin" / "uv"
+    uv.write_text("#!/bin/sh\n")
+    uv.chmod(0o755)
+    assert kbs._worker_terminal_uv() == str(uv)
+
+
 @needs_bwrap
 def test_built_sandbox_hides_what_it_claims(bwrap_host_dir):
     host = _bwrap_fake_host(bwrap_host_dir)

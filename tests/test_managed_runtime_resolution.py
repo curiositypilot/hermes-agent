@@ -98,6 +98,10 @@ _ALLOWED: dict[tuple[str, str], str] = {
         "Plugin workspace installs resolve npm inside the PM runner env that "
         "pm.ensure('npm') just composed."
     ),
+    ("hermes_cli/kanban_sandbox.py", "uv"): (
+        "Selftest probe asks for uv on the PATH a worker's terminal tool gets "
+        "(PATH plus the managed dirs local.py appends)."
+    ),
     ("apps/desktop/electron/fixtures/source-backend.py", "uv"): (
         "Test fixture drives the real uv deliberately placed on the test "
         "runner's PATH; it is not Hermes-owned subprocess resolution."
