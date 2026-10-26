@@ -2534,12 +2534,17 @@ def parked_flush(direct_runtime, monkeypatch):
         "hermes_cli.observability.shared_metrics._utc_now",
         lambda: datetime(2026, 7, 28, 9, tzinfo=timezone.utc),
     )
-    state = SimpleNamespace(attempts=0, entered=threading.Event(), release=threading.Event())
+    state = SimpleNamespace(
+        attempts=0, entered=threading.Event(), release=threading.Event(), timed_out=False
+    )
 
     def parked() -> None:
         state.attempts += 1
         state.entered.set()
-        state.release.wait(3)
+        # The park ends only on the test's release; 30s is a hang guard. A shorter
+        # self-release expires on a loaded runner and splits the coalesced pass.
+        if not state.release.wait(30):
+            state.timed_out = True
 
     direct_runtime.subscribers.flush = parked
     yield state
@@ -2551,7 +2556,7 @@ def test_task_ends_do_not_wait_on_the_process_wide_flush_barrier(parked_flush, t
     _finish_desktop_task("s1", "t1")
 
     # The turn thread is back while the barrier is still parked, so nothing is exported yet.
-    assert parked_flush.entered.wait(3)
+    assert parked_flush.entered.wait(30)
     outbox = tmp_path / "hermes-home" / "telemetry" / "shared_metrics" / "outbox"
     assert list(outbox.glob("*.json")) == []
 
@@ -2560,6 +2565,7 @@ def test_task_ends_do_not_wait_on_the_process_wide_flush_barrier(parked_flush, t
         _finish_desktop_task("s1", task_id)
     parked_flush.release.set()
     _join_export_workers()
+    assert not parked_flush.timed_out
     assert parked_flush.attempts == 2
     assert len(list(outbox.glob("*.json"))) == 1
 
