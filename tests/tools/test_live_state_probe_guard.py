@@ -64,6 +64,12 @@ MUST_BLOCK = [
     # Chained after a probe helper: only the helper's own segment is exempt.
     "python3 -c \"from cron.jobs import create_job\" && ~/.hermes/scripts/home-probe -c 'print(1)'",
     "~/.hermes/scripts/home-probe -c 'print(1)'; python3 -c 'import cron.jobs'",
+    # Code piped into a stdin-reading interpreter from an earlier pipeline segment.
+    "echo 'import cron.jobs' | python3 -",
+    "echo import cron.jobs | python3",
+    "printf 'import os\\nfrom cron.jobs import create_job\\n' | python3 -",
+    "cat <<'EOF' | python3 -\nimport cron.jobs\nEOF",
+    "(echo 'import os'; echo 'import cron.scheduler') | python3 -",
 ]
 
 
@@ -77,6 +83,7 @@ def test_script_argument_is_read(worker, tmp_path):
     assert _refusal("python3 probe.py", tmp_path) is not None
     assert _refusal(f"cd {tmp_path} && python3 probe.py --flag", tmp_path.parent) is not None
     assert _refusal("python3 < probe.py", tmp_path) is not None
+    assert _refusal("cat probe.py | python3 -", tmp_path) is not None
     (tmp_path / "ok.py").write_text("print(1)\n")
     assert _refusal("python3 ok.py", tmp_path) is None
 
@@ -93,6 +100,12 @@ MUST_PASS = [
     "cat ~/.hermes/cron/jobs.json",
     "hermes cron list",
     "echo 'python3 -c \"import cron.jobs\"'",
+    # Piped text that is data, not code: a -c/-m interpreter, a non-interpreter consumer,
+    # or a pipeline the separator already ended.
+    "grep -rn 'import cron.jobs' . | python3 -c 'import sys; print(len(sys.stdin.read()))'",
+    "echo 'import cron.jobs' | grep cron",
+    "echo 'import cron.jobs' && python3 -c 'print(1)'",
+    "cat ~/.hermes/cron/jobs.json | python3 -m json.tool",
 ]
 
 

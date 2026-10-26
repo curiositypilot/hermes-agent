@@ -117,8 +117,9 @@ def _split_heredocs(command: str) -> Tuple[str, List[str]]:
     return "\n".join(out), bodies
 
 
-def _segments(command: str) -> Iterator[Tuple[List[str], List[str], List[str]]]:
-    """Simple commands of *command*: (argv words, stdin texts, stdin file paths)."""
+def _segments(command: str) -> Iterator[Tuple[List[str], List[str], List[str], str]]:
+    """Simple commands of *command*: (argv words, stdin texts, stdin file paths, the
+    separator token that ends the segment, "" at the end)."""
     text, bodies = _split_heredocs(command)
     lex = shlex.shlex(text, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
@@ -129,7 +130,7 @@ def _segments(command: str) -> Iterator[Tuple[List[str], List[str], List[str]]]:
     tokens = iter(lex)
     for tok in tokens:
         if tok and set(tok) <= _SEPARATOR_CHARS:
-            yield words, stdin_texts, stdin_files
+            yield words, stdin_texts, stdin_files, tok
             words, stdin_texts, stdin_files = [], [], []
         elif tok and set(tok) <= _REDIRECT_CHARS and set(tok) & {"<", ">"}:
             operand = next(tokens, "")
@@ -142,7 +143,15 @@ def _segments(command: str) -> Iterator[Tuple[List[str], List[str], List[str]]]:
                 stdin_files.append(operand)
         else:
             words.append(tok)
-    yield words, stdin_texts, stdin_files
+    yield words, stdin_texts, stdin_files, ""
+
+
+def _pipe_state(sep: str) -> str:
+    """How *sep* treats the text piped so far: ``pipe`` feeds it on, ``group`` (a bare
+    subshell paren) keeps it, anything else (``;``, ``&&``, ``||``, newline) drops it."""
+    if "|" in sep and "||" not in sep:
+        return "pipe"
+    return "group" if set(sep) <= {"(", ")"} else "drop"
 
 
 def _strip_prefix(words: List[str]) -> List[str]:
@@ -212,13 +221,52 @@ def _read_local_script(path: str, cwd: str) -> Optional[str]:
     return None if b"\x00" in data else data.decode("utf-8", errors="replace")
 
 
+_Producer = Tuple[str, List[str], List[str], List[str], str]
+
+
+def _produced(prog: str, argv: List[str], stdin_texts: List[str], stdin_files: List[str],
+              cwd: str) -> List[str]:
+    """Text a pipeline producer segment may write to the next one's stdin: its arguments
+    (``echo``/``printf``, escapes expanded), its here-docs and, for ``cat``, its files
+    (read only once a stdin-reading interpreter consumes them)."""
+    texts = [" ".join(argv[1:]).replace("\\n", "\n"), *stdin_texts]
+    if prog == "cat":
+        files = [a for a in argv[1:] if not a.startswith("-")] + stdin_files
+        texts.extend(_read_local_script(f, cwd) or "" for f in files)
+    return texts
+
+
+def _segment_hit(prog: str, argv: List[str], stdin_texts: List[str], stdin_files: List[str],
+                 piped: List[_Producer], cwd: str, depth: int) -> Optional[str]:
+    if prog in _SHELLS and depth < _MAX_SHELL_DEPTH and "-c" in argv[1:-1]:
+        return detect_in_command(argv[argv.index("-c", 1) + 1], cwd, depth + 1)
+    if prog in _PROBE_HELPERS or not _INTERPRETER_RE.match(prog):
+        return None
+    codes, script, reads_stdin = _interpreter_inputs(argv[1:])
+    if script:
+        codes.append(_read_local_script(script, cwd) or "")
+    if reads_stdin:
+        codes.extend(stdin_texts)
+        codes.extend(_read_local_script(f, cwd) or "" for f in stdin_files)
+        if not stdin_texts and not stdin_files:
+            for producer in piped:
+                codes.extend(_produced(*producer))
+    for code in codes:
+        hit = detect_live_state_probe(code)
+        if hit:
+            return hit
+    return None
+
+
 def detect_in_command(command: str, cwd: str, _depth: int = 0) -> Optional[str]:
     """The cron writer module a Python interpreter in *command* would import, or None.
 
     Only interpreter invocations count: their ``-c`` code, here-doc/here-string stdin,
-    ``< file`` stdin or script argument; ``-m`` runs are not inspected. ``home-probe`` /
-    ``kanban-probe`` pass because they are the program of their own segment; a chained
-    bare-interpreter segment is still checked. ``bash -c`` bodies are scanned recursively.
+    ``< file`` stdin, stdin piped from earlier segments of the pipeline (``echo``/``printf``
+    arguments, ``cat`` here-docs and files) or script argument; ``-m`` runs are not
+    inspected. ``home-probe`` / ``kanban-probe`` pass because they are the program of their
+    own segment; a chained bare-interpreter segment is still checked. ``bash -c`` bodies are
+    scanned recursively.
     """
     if not command or not _INTERPRETER_WORD_RE.search(command):
         return None
@@ -226,29 +274,18 @@ def detect_in_command(command: str, cwd: str, _depth: int = 0) -> Optional[str]:
         segments = list(_segments(command))
     except ValueError:  # unbalanced quotes: the shell rejects the command too
         return None
-    for words, stdin_texts, stdin_files in segments:
+    piped: List[_Producer] = []
+    for words, stdin_texts, stdin_files, sep in segments:
         argv = _strip_prefix(words)
-        if not argv:
-            continue
-        prog = os.path.basename(argv[0])
-        if prog == "cd" and len(argv) > 1:
-            cwd = str(Path(cwd) / Path(argv[1]).expanduser())
-            continue
-        if prog in _SHELLS and _depth < _MAX_SHELL_DEPTH and "-c" in argv[1:-1]:
-            hit = detect_in_command(argv[argv.index("-c", 1) + 1], cwd, _depth + 1)
-            if hit:
-                return hit
-            continue
-        if prog in _PROBE_HELPERS or not _INTERPRETER_RE.match(prog):
-            continue
-        codes, script, reads_stdin = _interpreter_inputs(argv[1:])
-        if script:
-            codes.append(_read_local_script(script, cwd) or "")
-        if reads_stdin:
-            codes.extend(stdin_texts)
-            codes.extend(_read_local_script(f, cwd) or "" for f in stdin_files)
-        for code in codes:
-            hit = detect_live_state_probe(code)
-            if hit:
-                return hit
+        produced: List[_Producer] = []
+        if argv:
+            prog = os.path.basename(argv[0])
+            if prog == "cd" and len(argv) > 1:
+                cwd = str(Path(cwd) / Path(argv[1]).expanduser())
+            else:
+                hit = _segment_hit(prog, argv, stdin_texts, stdin_files, piped, cwd, _depth)
+                if hit:
+                    return hit
+                produced = [(prog, argv, stdin_texts, stdin_files, cwd)]
+        piped = [] if _pipe_state(sep) == "drop" else piped + produced
     return None
