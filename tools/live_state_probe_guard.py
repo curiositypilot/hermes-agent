@@ -30,6 +30,17 @@ _FROM_RE = re.compile(r"(?<![\w.])from\s+([A-Za-z_][\w.]*)\s+import\s+(\([^)]*\)
 _IMPORT_RE = re.compile(r"(?<![\w.])import\s+([^;\n]*)")
 _DYNAMIC_RE = re.compile(r"""(?:import_module|__import__)\(\s*['"]([A-Za-z_][\w.]*)['"]""")
 _NAME_RE = re.compile(r"\s*([A-Za-z_][\w.]*)")
+# Package names that re-export a target's writers (cron/__init__.py): ``from cron import
+# create_job`` / ``from cron import *`` / bare ``import cron`` reach them without naming
+# the module. Re-exported readers (get_job, list_jobs, JOBS_FILE) are left out on purpose.
+_REEXPORTS = {
+    "cron": {
+        **dict.fromkeys(("*", "create_job", "remove_job", "update_job", "pause_job",
+                         "resume_job", "trigger_job", "rearm_oneshot"), "cron.jobs"),
+        "tick": "cron.scheduler",
+    },
+}
+_PACKAGE_IMPORTS = {"cron": "cron.jobs"}
 # Cheap prefilter: no target leaf word, no import of one.
 _LEAF_RE = re.compile(r"\b(?:jobs|scheduler|cronjob_tools|cron|cli_commands_mixin)\b")
 
@@ -37,6 +48,7 @@ _INTERPRETER_RE = re.compile(r"^(?:python[\d.]*|pypy[\d.]*|hermes-python)$")
 _INTERPRETER_WORD_RE = re.compile(r"(?:python[\d.]*|pypy[\d.]*|hermes-python)\b")
 _PROBE_HELPERS = frozenset({"home-probe", "kanban-probe"})
 _SHELLS = frozenset({"bash", "sh", "zsh", "dash"})
+_SHELL_C_FLAG_RE = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
 _WRAPPERS = frozenset({"env", "exec", "command", "nice", "nohup", "time", "timeout", "stdbuf", "sudo"})
 _ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=")
 _HEREDOC_OPEN_RE = re.compile(r"(?<!<)<<(-?)\s*(['\"]?)([A-Za-z_][\w.-]*)\2")
@@ -61,27 +73,34 @@ def _hit(module: str) -> Optional[str]:
 def _names(clause: str) -> Iterator[str]:
     for item in clause.strip().strip("()").split(","):
         m = _NAME_RE.match(item)
-        if m:
+        if item.strip() == "*":
+            yield "*"
+        elif m:
             yield m.group(1)
 
 
 def detect_live_state_probe(text: str) -> Optional[str]:
     """The cron writer module *text* imports (``import X [as Y], ...``, ``from X import ...``,
-    ``from pkg import X``, ``import_module("X")``), or None."""
+    ``from pkg import X``, a package re-export such as ``from cron import create_job``,
+    ``import_module("X")``), or None."""
     if not text or not _LEAF_RE.search(text):
         return None
     for m in _FROM_RE.finditer(text):
         base = m.group(1)
-        for candidate in (base, *(f"{base}.{n}" for n in _names(m.group(2)))):
+        names = list(_names(m.group(2)))
+        reexports = _REEXPORTS.get(base, {})
+        for name in names:
+            if name in reexports:
+                return reexports[name]
+        for candidate in (base, *(f"{base}.{n}" for n in names)):
             if _hit(candidate):
                 return _hit(candidate)
-    for m in _IMPORT_RE.finditer(text):
-        for name in _names(m.group(1)):
-            if _hit(name):
-                return _hit(name)
-    for m in _DYNAMIC_RE.finditer(text):
-        if _hit(m.group(1)):
-            return _hit(m.group(1))
+    # A bare package import (`import cron`, `import_module("cron")`) binds the re-exports.
+    imported = [n for m in _IMPORT_RE.finditer(text) for n in _names(m.group(1))]
+    for name in imported + [m.group(1) for m in _DYNAMIC_RE.finditer(text)]:
+        hit = _PACKAGE_IMPORTS.get(name) or _hit(name)
+        if hit:
+            return hit
     return None
 
 
@@ -236,10 +255,19 @@ def _produced(prog: str, argv: List[str], stdin_texts: List[str], stdin_files: L
     return texts
 
 
+def _shell_command_string(args: List[str]) -> Optional[str]:
+    """The ``-c`` command string of a shell's argv tail (``-c``, ``-lc``, ``-ec``...), or None."""
+    for i, a in enumerate(args[:-1]):
+        if _SHELL_C_FLAG_RE.match(a):
+            return args[i + 1]
+    return None
+
+
 def _segment_hit(prog: str, argv: List[str], stdin_texts: List[str], stdin_files: List[str],
                  piped: List[_Producer], cwd: str, depth: int) -> Optional[str]:
-    if prog in _SHELLS and depth < _MAX_SHELL_DEPTH and "-c" in argv[1:-1]:
-        return detect_in_command(argv[argv.index("-c", 1) + 1], cwd, depth + 1)
+    if prog in _SHELLS and depth < _MAX_SHELL_DEPTH:
+        body = _shell_command_string(argv[1:])
+        return None if body is None else detect_in_command(body, cwd, depth + 1)
     if prog in _PROBE_HELPERS or not _INTERPRETER_RE.match(prog):
         return None
     codes, script, reads_stdin = _interpreter_inputs(argv[1:])

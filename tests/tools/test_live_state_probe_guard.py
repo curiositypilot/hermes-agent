@@ -70,6 +70,18 @@ MUST_BLOCK = [
     "printf 'import os\\nfrom cron.jobs import create_job\\n' | python3 -",
     "cat <<'EOF' | python3 -\nimport cron.jobs\nEOF",
     "(echo 'import os'; echo 'import cron.scheduler') | python3 -",
+    # The cron package re-exports the cron.jobs writers and serves tick lazily.
+    "python3 -c \"from cron import create_job; create_job(prompt='x', schedule='every 1h')\"",
+    "python3 -c \"from cron import (get_job, remove_job as rm)\"",
+    "python3 -c \"import cron; cron.create_job(prompt='x', schedule='every 1h')\"",
+    "python3 -c 'import os, cron as c'",
+    "python3 -c 'from cron import *'",
+    "python3 -c 'from cron import tick; tick()'",
+    "python3 -c 'import importlib; importlib.import_module(\"cron\").create_job()'",
+    # Shell -c inside a flag cluster.
+    "bash -lc \"python3 -c 'import cron.jobs'\"",
+    "sh -ec 'python3 -c \"from cron import create_job\"'",
+    "bash -o pipefail -c \"python3 -c 'import cron.jobs'\"",
 ]
 
 
@@ -97,6 +109,9 @@ MUST_PASS = [
     "python3 -c \"import cronjob_helpers\"",
     "python3 -c \"from cron.lifecycle_guard import x\"",
     "python3 -c 'from cron import lifecycle_guard'",
+    "python3 -c 'import cron.lifecycle_guard'",
+    "python3 -c 'from cron import list_jobs; print(list_jobs())'",
+    "bash -lc 'python3 -c \"print(1)\"'",
     "cat ~/.hermes/cron/jobs.json",
     "hermes cron list",
     "echo 'python3 -c \"import cron.jobs\"'",
