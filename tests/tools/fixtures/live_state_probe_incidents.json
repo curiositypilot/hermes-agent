@@ -1,0 +1,32 @@
+[
+ {
+  "message_id": 380740,
+  "ts_utc": "2026-10-23T13:10:27.902621Z",
+  "command": "~/.hermes/scripts/hermes-python -c '\nimport sys, tempfile, os, json\nsys.path.insert(0, \"/home/user/.hermes/hermes-agent\")\n\nfrom cron.jobs import create_job, update_job, trigger_job, rearm_oneshot, is_job_runnable, is_terminal_job, _is_recoverable_error_job\n\njob = create_job(prompt=\"Daily brief\", schedule=\"every 1h\", name=\"ErrJob\")\nupdate_job(job[\"id\"], {\"enabled\": True, \"state\": \"error\", \"next_run_at\": None})\n\nfrom cron.jobs import get_job\nj = get_job(job[\"id\"])\nprint(\"Job after error state:\", j[\"id\"], j[\"state\"], j[\"enabled\"], \"is_job_runnable:\", is_job_runnable(j))\n\ntry:\n    trigger_job(job[\"id\"])\n    print(\"trigger_job succeeded\")\nexcept ValueError as exc:\n    print(\"trigger_job raised ValueError:\", exc)\n\ntry:\n    rearm_oneshot(job[\"id\"], \"2026-10-23T15:00:00\")\n    print(\"rearm_oneshot succeeded\")\nexcept ValueError as exc:\n    print(\"rearm_oneshot raised ValueError:\", exc)\n'"
+ },
+ {
+  "message_id": 380754,
+  "ts_utc": "2026-10-23T13:11:08.487134Z",
+  "command": "~/.hermes/scripts/hermes-python -c '\nimport sys\nsys.path.insert(0, \"/home/user/.hermes/hermes-agent\")\n\nfrom cron.jobs import create_job, update_job, get_job, claim_job_for_fire\nfrom tools.cronjob_tools import _claim_for_manual_run\n\njob = create_job(prompt=\"Daily brief\", schedule=\"every 1h\", name=\"ErrJobPre\")\nupdate_job(job[\"id\"], {\"enabled\": True, \"state\": \"error\", \"next_run_at\": None})\n\nclaimed_job, err = _claim_for_manual_run(job[\"id\"], \"immediate run\")\nprint(\"Claim result err:\", err)\nprint(\"Claimed job state:\", claimed_job.get(\"state\") if claimed_job else None)\nprint(\"Claimed job fire_claim:\", claimed_job.get(\"fire_claim\") if claimed_job else None)\n'"
+ },
+ {
+  "message_id": 380803,
+  "ts_utc": "2026-10-23T13:14:16.042491Z",
+  "command": "~/.hermes/scripts/hermes-python -c '\nimport sys\nsys.path.insert(0, \"/home/user/.hermes/hermes-agent\")\n\nfrom cron.jobs import create_job, update_job, get_job, resume_job\n\njob = create_job(prompt=\"Daily brief\", schedule=\"every 1h\", name=\"ErrJobResume\")\nupdate_job(job[\"id\"], {\"enabled\": True, \"state\": \"error\", \"next_run_at\": None})\n\nprint(\"Job before resume:\", get_job(job[\"id\"])[\"state\"])\nres = resume_job(job[\"id\"])\nprint(\"Job after resume:\", res[\"state\"], \"next_run_at:\", res[\"next_run_at\"])\n'"
+ },
+ {
+  "message_id": 380810,
+  "ts_utc": "2026-10-23T13:15:15.581635Z",
+  "command": "~/.hermes/scripts/hermes-python -c '\nimport sys\nsys.path.insert(0, \"/home/user/.hermes/hermes-agent/.worktrees/t_d673f2f0\")\n\nfrom cron.jobs import create_job, update_job, get_job, claim_job_for_fire, rearm_oneshot\nfrom hermes_cli import cron as cron_cli\nimport argparse\n\n# mock liveness and provider\ncron_cli._builtin_gateway_liveness = lambda: True\ncron_cli._active_cron_provider_name = lambda: \"builtin\"\n\njob = create_job(prompt=\"Daily brief\", schedule=\"every 1h\", name=\"ErrJob\")\nupdate_job(job[\"id\"], {\"enabled\": True, \"state\": \"error\", \"next_run_at\": None})\n\nargs = argparse.Namespace(job_id=job[\"id\"], inline=False)\nrc = cron_cli.cron_run(args)\nprint(\"cron_run rc:\", rc)\n\ntry:\n    rearm_oneshot(job[\"id\"], \"2026-10-23T15:00:00\")\nexcept Exception as e:\n    print(\"rearm_oneshot raised:\", e)\n'"
+ },
+ {
+  "message_id": 450874,
+  "ts_utc": "2026-10-26T06:41:24.931132Z",
+  "command": "PYTHONPATH=/home/user/.hermes/cache/review-bench-blind/v1-tree-1-0088f39cfe4b611d/tree ~/.hermes/scripts/hermes-python -c \"\nfrom hermes_cli.cli_commands_mixin import CLICommandsMixin\nimport hermes_cli.cron as cron_cli\nfrom cron.jobs import create_job\n\nclass _Host(CLICommandsMixin):\n    pass\n\nimport io, sys\njob = create_job(prompt='Daily brief', schedule='every 1h', name='Brief')\ncron_cli._active_cron_provider_name = lambda: 'builtin'\ncron_cli._builtin_gateway_liveness = lambda: True\n\nbuf = io.StringIO()\nold_stdout = sys.stdout\nsys.stdout = buf\ntry:\n    _Host()._handle_cron_command(f'/cron run {job[\\\"id\\\"]} --inline')\nfinally:\n    sys.stdout = old_stdout\nval = buf.getvalue()\nprint('Contains warning?', 'No live scheduler' in val)\nprint('Output:\\n', val)\n\""
+ },
+ {
+  "message_id": 451248,
+  "ts_utc": "2026-10-26T06:44:31.442123Z",
+  "command": "PYTHONPATH=/home/user/.hermes/cache/review-bench-blind/v1-tree-1-0088f39cfe4b611d/tree ~/.hermes/scripts/hermes-python -c \"\nfrom hermes_cli.cli_commands_mixin import CLICommandsMixin\nimport hermes_cli.cron as cron_cli\nimport tools.cronjob_tools as cronjob_tools\nfrom cron.jobs import create_job\nimport io, sys\n\ncronjob_tools._execute_job_now = lambda job, extra_prompt=None: {'claimed': True, 'success': True}\ncronjob_tools._notify_provider_jobs_changed_safe = lambda: None\ncron_cli._active_cron_provider_name = lambda: 'builtin'\ncron_cli._builtin_gateway_liveness = lambda: True\n\nclass _Host(CLICommandsMixin):\n    pass\n\njob = create_job(prompt='Daily brief', schedule='every 1h', name='Brief')\nbuf = io.StringIO()\nsys.stdout = buf\n_Host()._handle_cron_command(f'/cron run {job[\\\"id\\\"]} --inline')\nsys.stdout = sys.__stdout__\nval = buf.getvalue()\nprint('Contains warning?', 'No live scheduler' in val)\nprint('Output:\\n', repr(val))\n\""
+ }
+]

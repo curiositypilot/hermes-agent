@@ -762,6 +762,12 @@ def execute_code(
                 "it could complete (SIGTERM propagates to child processes). "
                 "Run the lifecycle command from a shell outside the gateway."
             )
+    # A kanban worker's probe of a cron writer would write the live cron store (t_90c6fa5e).
+    from tools.live_state_probe_guard import block_message, detect_live_state_probe, guard_active
+    if guard_active():
+        _live_module = detect_live_state_probe(code)
+        if _live_module:
+            return tool_error(block_message(_live_module))
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
