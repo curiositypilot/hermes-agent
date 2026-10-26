@@ -855,7 +855,8 @@ def _command_requires_pipe_stdin(command: str) -> bool:
 
 from tools.terminal_tool_guards import (
     _foreground_background_guidance, _safe_command_preview, _validate_workdir,
-    foreign_writer_block, gateway_lifecycle_block, self_repo_block, shared_checkout_block,
+    foreign_writer_block, gateway_lifecycle_block, live_state_probe_block, self_repo_block,
+    shared_checkout_block,
 )
 from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
 from tools.terminal_tool_result import finalize_foreground_result
@@ -1318,8 +1319,8 @@ def _pre_exec_block(
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
     Order matters: gateway lifecycle first (protects the running gateway),
-    then the dangerous-workdir check, then the self-repo, shared-checkout and
-    foreign-writer guards (local only). ``task_id`` identifies the caller to the
+    then the dangerous-workdir check, then the self-repo, shared-checkout,
+    foreign-writer and live cron-writer probe guards (local only). ``task_id`` identifies the caller to the
     foreign-writer guard (a delegated child's own files are not foreign to it).
     """
     blocked = gateway_lifecycle_block(
@@ -1342,6 +1343,10 @@ def _pre_exec_block(
             raise _Rejected(blocked)
         blocked = foreign_writer_block(
             command=command, cwd=cwd, workdir=workdir, session_key=session_key, task_id=task_id)
+        if blocked:
+            raise _Rejected(blocked)
+        blocked = live_state_probe_block(
+            command=command, cwd=cwd, workdir=workdir, session_key=session_key)
         if blocked:
             raise _Rejected(blocked)
 

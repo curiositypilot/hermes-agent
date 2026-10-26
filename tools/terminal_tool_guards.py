@@ -3,7 +3,8 @@
 Pure functions that decide whether a command may run at all: workdir
 validation, the foreground long-lived/background-operator guidance, the
 supervised-gateway lifecycle block, the Windows self-repo git guard, the
-shared-checkout git guard, and the foreign-writer git guard.
+shared-checkout git guard, the foreign-writer git guard, and the kanban-worker
+live cron-writer probe guard.
 Each ``*_block`` helper returns a finished JSON error string, or None when
 the command may proceed. Split out of tools/terminal_tool.py; the origin
 module re-imports every public helper so ``tools.terminal_tool.<name>``
@@ -381,3 +382,32 @@ def foreign_writer_block(
         return None
     logger.warning("Blocked staging a live worker's files (command: %s)", _safe_command_preview(command))
     return _blocked_json(msg, "blocked")
+
+
+def live_state_probe_block(
+    *,
+    command: str,
+    cwd: str,
+    workdir: Optional[str],
+    session_key: str,
+) -> Optional[str]:
+    """Refuse a kanban worker's Python probe that imports a live cron writer (local backend only).
+
+    ``cron.jobs`` writes ``get_hermes_home()/cron/jobs.json``, so a worker's ad-hoc
+    ``hermes-python -c "create_job(...)"`` lands in the live store and the gateway ticker
+    fires it (t_90c6fa5e). ``home-probe`` runs the same code against a throwaway home.
+    Scripts are read from the host filesystem (local backend only).
+    Returns the JSON error string when blocked, else None.
+    """
+    from tools.live_state_probe_guard import block_message, detect_in_command, guard_active
+
+    if not guard_active():
+        return None
+    from tools.terminal_tool import _resolve_command_cwd
+
+    guard_cwd = _resolve_command_cwd(workdir=workdir, default_cwd=cwd, session_key=session_key)
+    module = detect_in_command(command, guard_cwd)
+    if not module:
+        return None
+    logger.warning("Blocked live cron-writer probe (%s; command: %s)", module, _safe_command_preview(command))
+    return _blocked_json(block_message(module), "blocked")
