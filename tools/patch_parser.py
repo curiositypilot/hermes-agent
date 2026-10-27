@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 if TYPE_CHECKING:  # annotations only; the real import is per-call in apply_v4a_operations
     from tools.file_operations_common import PatchResult
 
-from tools.file_operations_common import PatchResult
+from tools.file_operations_common import PatchResult, display_placeholder_error
 
 
 class OperationType(Enum):
@@ -184,6 +184,7 @@ def _validate_operations(operations: List[PatchOperation], file_ops: Any) -> Lis
         if read_err:
             errors.append(f"{op.file_path}: {read_err}")
             return
+        original = simulated
         for hunk_index, hunk in enumerate(op.hunks, start=1):
             search_lines, replace_lines = _split_hunk(hunk)
             if search_lines == replace_lines:
@@ -213,6 +214,11 @@ def _validate_operations(operations: List[PatchOperation], file_ops: Any) -> Lis
                     f"{op.file_path}: hunk {hunk_index} {label} not found"
                     + (f" — {match_error}" if match_error else "")
                     + _no_match_hint(match_error, search_pattern, simulated))
+        # Context lines count too: a masked context line is written back like a '+' line.
+        replace_text = "\n".join(l for h in op.hunks for l in _split_hunk(h)[1])
+        if placeholder_error := display_placeholder_error(
+                original or "", simulated or "", replace_text, op.file_path):
+            errors.append(placeholder_error)
         pending_content[op.file_path] = simulated
 
     def _remove(path: str) -> None:
