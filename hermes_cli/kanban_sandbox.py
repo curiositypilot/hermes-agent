@@ -241,7 +241,8 @@ def _git_common_dir(workspace: Path) -> Optional[Path]:
     try:
         out = subprocess.run(
             ["git", "-C", str(workspace), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+            stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.SubprocessError):
         return None
