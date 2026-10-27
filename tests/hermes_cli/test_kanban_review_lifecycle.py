@@ -605,6 +605,124 @@ def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
         assert kbd.check_respawn_guard(conn, done_id) == "recent_success"
 
 
+def _park_on_dependency(conn, tid, parent_id, *, pr_comment=None):
+    """Claim ``tid``, link ``parent_id`` from its own run, optionally post the
+    PR comment, then end the run with ``kanban_block(kind="dependency")``.
+    Returns the run's claim so callers can reuse it."""
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    kb.link_tasks(conn, parent_id, tid, expected_child_run_id=claimed.current_run_id)
+    if pr_comment is not None:
+        kb.add_comment(conn, tid, author="dev", body=pr_comment)
+    assert kb.block_task(
+        conn, tid, reason=f"waiting on diff adjudicator {parent_id}",
+        kind="dependency", expected_run_id=claimed.current_run_id,
+    )
+    assert kb.get_task(conn, tid).status == "todo"
+    return claimed
+
+
+def _set_times(conn, tid, *, comments=None, runs=None, events=None):
+    """Pin second-granularity timestamps so the replay order is exact."""
+    with kb.write_txn(conn):
+        for table, col, ts in (
+            ("task_comments", "created_at", comments),
+            ("task_runs", "ended_at", runs),
+            ("task_events", "created_at", events),
+        ):
+            if ts is not None:
+                conn.execute(
+                    f"UPDATE {table} SET {col} = ? WHERE task_id = ? AND {col} IS NOT NULL",
+                    (ts, tid),
+                )
+
+
+def _finish(conn, tid):
+    """Complete a parent card and let the dependency promotion run."""
+    kb.claim_task(conn, tid)
+    assert kb.complete_task(conn, tid, summary="verdicts") is True
+    kb.recompute_ready(conn)
+
+
+def test_active_pr_guard_lifts_for_clean_dependency_park_resume(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An impl that recorded its PR, then blocked on its own diff adjudicator,
+    is resumed by ``promoted`` — that resume is not a duplicate-PR risk.
+
+    Replays t_c7c55ac4 (2026-10-27): PR comment and the blocked run end in the
+    same second, the adjudicator finishes ~320 s later, and the old guard held
+    the card ``active_pr`` for 24 h while its merge child waited on it.
+    """
+    import time
+
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = (
+        "State before diff critique. PR https://github.com/example/repo/pull/61"
+    )
+    with kbc.connect() as conn:
+        now = int(time.time())
+        parked = now - 320
+        tid = kb.create_task(conn, title="impl with PR", assignee="dev")
+        adj = kb.create_task(conn, title="diff adjudicator", assignee="judge")
+        claimed = _park_on_dependency(conn, tid, adj, pr_comment=pr_comment)
+        _set_times(conn, tid, comments=parked, runs=parked, events=parked)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"  # still parked
+
+        _finish(conn, adj)
+        assert kb.get_task(conn, tid).status == "ready"
+        assert _events(conn, tid, "promoted")
+        assert kbd.check_respawn_guard(conn, tid) is None
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert tid in [s[0] for s in res.spawned]
+        assert tid not in dict(res.respawn_guarded)
+
+        # (c) The resumed worker posts a newer PR comment and is reclaimed:
+        # the latest run is no longer a clean park, so the guard holds again.
+        resumed = kb.claim_task(conn, tid)
+        assert resumed is not None and resumed.current_run_id != claimed.current_run_id
+        kb.add_comment(conn, tid, author="dev", body="Pushed to " + pr_comment)
+        assert kb.reclaim_task(conn, tid, reason="worker hung") is True
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_guard_holds_without_a_clean_park_after_the_pr(
+    kanban_home: Path,
+) -> None:
+    """The clean-park lift needs a ``blocked`` run that ended at or after the
+    PR comment, followed by a resume; anything else keeps #111910's guard."""
+    import time
+
+    pr_comment = "Opened https://github.com/example/repo/pull/61 for review."
+    with kbc.connect() as conn:
+        now = int(time.time())
+
+        # (a) PR comment, then the run is reclaimed (crash path): back to
+        # ready with no block, so the worker must not re-spawn against its PR.
+        crashed = kb.create_task(conn, title="crashed after PR", assignee="dev")
+        kb.claim_task(conn, crashed)
+        kb.add_comment(conn, crashed, author="dev", body=pr_comment)
+        assert kb.reclaim_task(conn, crashed, reason="crash") is True
+        assert kb.get_task(conn, crashed).status == "ready"
+        assert kbd.check_respawn_guard(conn, crashed) == "active_pr"
+
+        # (b) The blocked run ended BEFORE the PR comment (a later actor
+        # posted it); the promotion after that is no resume of the PR's author.
+        late = kb.create_task(conn, title="PR posted after park", assignee="dev")
+        adj = kb.create_task(conn, title="adjudicator", assignee="judge")
+        _park_on_dependency(conn, late, adj)
+        _set_times(conn, late, runs=now - 400, events=now - 400)
+        kb.add_comment(conn, late, author="orchestrator", body=pr_comment)
+        _set_times(conn, late, comments=now - 200)
+        _finish(conn, adj)
+        assert kb.get_task(conn, late).status == "ready"
+        assert kbd.check_respawn_guard(conn, late) == "active_pr"
+
+
 def test_dispatch_json_exposes_suppression_reasons(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

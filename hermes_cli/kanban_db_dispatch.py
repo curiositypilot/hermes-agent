@@ -26,6 +26,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.kanban_db_run_scopes import _restart_safe_worker_argv, reap_ended_run_scopes
+from hermes_cli.kanban_db_respawn_pr import _pr_comment_superseded
 from hermes_cli.kanban_sandbox import SandboxUnavailable, worker_sandbox
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli.kanban_db_dispatch_argv import _absolute_hermes_path, _is_windows_batch_shim, _module_hermes_argv
@@ -1584,7 +1585,9 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
+    PR; or the worker parked cleanly after it — run ended ``blocked``, then
+    ``promoted``/``unblocked`` — which is the intended resume on that PR).
+    The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
@@ -1670,6 +1673,9 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    #    Second exception: a clean park — the worker recorded the PR, then
+    #    ended its run with ``kanban_block`` and was resumed by ``promoted`` /
+    #    ``unblocked`` — is the intended resume of that worker on its PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
@@ -1679,34 +1685,11 @@ def check_respawn_guard(
         body = _kb._lossy_text(c["body"])
         if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
             continue
-        events = conn.execute(
-            # Strictly after: a same-second tie stays guarded (fail closed).
-            "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? AND created_at > ? "
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
-            (task_id, int(c["created_at"] or 0)),
-        ).fetchall()
-        if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
+        if _pr_comment_superseded(conn, task_id, int(c["created_at"] or 0), latest_run):
             return None
         return "active_pr"
 
     return None
-
-
-def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
-    """Only an ``assigned`` event that moves the card to a DIFFERENT profile is
-    a handoff. A no-op re-assign (dev→dev via CLI/dashboard/``reassign
-    --reclaim``), an unassign, or the dispatcher's own
-    ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
-    the very implementer that opened the PR. Events without ``from`` (written
-    before it was recorded) are not trusted as handoffs — fail closed."""
-    if kind != "assigned":
-        return True
-    data = _kb._json_or(payload, {})
-    if not isinstance(data, dict) or data.get("source") == "kanban.default_assignee":
-        return False
-    to = data.get("assignee")
-    return bool(to) and "from" in data and data["from"] != to
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
