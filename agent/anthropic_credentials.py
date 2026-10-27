@@ -60,9 +60,14 @@ def _first_env(*names: str) -> str:
     return next((v for v in (_getenv(n).strip() for n in names) if v), "")
 
 
+# Console API-key prefixes: legacy ``sk-ant-api*`` and the newer ``sk-ant-usr-*``. Sending one of these
+# with the Claude Code OAuth betas makes Anthropic answer HTTP 400 "credit balance too low".
+_API_KEY_PREFIXES = ("sk-ant-api", "sk-ant-usr")
+
+
 def _is_oauth_token(key: str) -> bool:
-    """True for Anthropic OAuth/setup tokens (sk-ant-*, eyJ JWTs, cc-); False for sk-ant-api* Console keys."""
-    if not key or key.startswith("sk-ant-api"):
+    """True for Anthropic OAuth/setup tokens (sk-ant-*, eyJ JWTs, cc-); False for Console API keys."""
+    if not key or key.startswith(_API_KEY_PREFIXES):
         return False
     return key.startswith(("sk-ant-", "eyJ", "cc-"))
 
