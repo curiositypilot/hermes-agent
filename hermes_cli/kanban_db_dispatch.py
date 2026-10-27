@@ -30,6 +30,7 @@ from hermes_cli.kanban_sandbox import SandboxUnavailable, worker_sandbox
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli.kanban_db_dispatch_argv import _absolute_hermes_path, _is_windows_batch_shim, _module_hermes_argv
 from hermes_cli.kanban_db_dispatch_argv import _propagate_module_import_root
+from hermes_cli.kanban_db_dispatch_holds import _last_streak_event, _record_routing_hold
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -2132,13 +2133,6 @@ def _routed_guard(
 # Streak ignores noise events; a changed reason, note or requested_tier writes a new hold.
 _ROUTING_HOLD_REASONS = {"exhausted": "tier_exhausted", "quota_held": "quota_hold"}
 
-# Kinds that do not end a hold streak. An unknown future kind is absent on
-# purpose: an allowlist fails safe (an extra row, never a missing hold).
-_HOLD_STREAK_NOISE = frozenset({
-    "commented", "heartbeat", "linked", "unlinked", "attached", "edited",
-    "terminal_worker_reaped",
-})
-
 
 def _record_route(conn: sqlite3.Connection, task: "Task", route: "_kbr.RouteDecision") -> None:
     """``routed`` event on the claimed run: the board-side record of which model
@@ -2151,36 +2145,17 @@ def _record_route(conn: sqlite3.Connection, task: "Task", route: "_kbr.RouteDeci
         _kb._log.debug("kanban routing: could not record route for %s", task.id, exc_info=True)
 
 
-def _record_routing_hold(
-    conn: sqlite3.Connection, task_id: str, route: Optional["_kbr.RouteDecision"],
-    reason: str = "tier_exhausted",
-) -> None:
-    """``routing_held`` once per streak: same reason, note and tier; noise events ignored."""
+def _record_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: str) -> None:
+    """``respawn_guarded`` once per streak (same reason; noise events ignored), so ``tail``
+    shows why the card looks stuck without a row per tick. Read and append share one
+    transaction: two dispatchers on a shared board cannot both open the streak."""
     try:
-        payload: dict[str, Any] = {"reason": reason}
-        if route is not None:
-            payload.update({k: v for k, v in route.event_payload().items()
-                            if k in ("lane", "requested_tier", "skipped", "note")})
-            if route.retry_at:
-                payload["retry_at"] = int(route.retry_at)
-        noise = tuple(sorted(_HOLD_STREAK_NOISE))
-        last = conn.execute(
-            "SELECT kind, payload FROM task_events "
-            f"WHERE task_id = ? AND kind NOT IN ({','.join('?' * len(noise))}) "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id, *noise),
-        ).fetchone()
-        prev = _kb._json_dict(last["payload"]) if last is not None else {}
-        if (
-            last is not None
-            and last["kind"] == "routing_held"
-            and all(prev.get(k) == payload.get(k) for k in ("reason", "note", "requested_tier"))
-        ):
-            return
         with _kb.write_txn(conn):
-            _kb._append_event(conn, task_id, "routing_held", payload)
-    except Exception:
-        _kb._log.debug("kanban routing: could not record hold for %s", task_id, exc_info=True)
+            kind, prev = _last_streak_event(conn, task_id)
+            if kind != "respawn_guarded" or prev.get("reason") != reason:
+                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": reason})
+    except sqlite3.Error:
+        _kb._log.debug("kanban dispatch: could not record guard for %s", task_id, exc_info=True)
 
 
 def _dispatch_lane_task(
@@ -2240,19 +2215,12 @@ def _dispatch_lane_task(
         result.respawn_guarded.append((task_id, guard_reason))
         if guard_reason == "quota_hold" and route is not None:
             result.quota_held.append((task_id, route.note or "", int(route.retry_at) if route.retry_at else None))
-        # Event so ``hermes kanban tail`` shows why the task looks stuck.
-        # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
-        # operator-configured fallback exists, persist the assignment and proceed. This removes the
-        # dashboard footgun where a task created without an assignee parks in 'ready' forever even though
-        # the operator's intent ("default") was perfectly clear (#27145). Mutating the row (not just the
-        # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
-        # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
+        # Event so ``hermes kanban tail`` shows why the task looks stuck, once per streak.
         if not dry_run:
             if guard_reason in _ROUTING_HOLD_REASONS.values():
                 _record_routing_hold(conn, task_id, route, guard_reason)
             else:
-                with _kb.write_txn(conn):
-                    _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+                _record_respawn_guard(conn, task_id, guard_reason)
         return False
 
     def _count_spawn(name: str) -> None:

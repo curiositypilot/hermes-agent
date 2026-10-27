@@ -478,6 +478,45 @@ def test_routing_hold_reemits_on_lifecycle_or_new_note(conn, monkeypatch, all_as
     assert holds[-1].payload.get("note")
 
 
+def _guard_reasons(conn, tid):
+    return [(e.payload or {}).get("reason") for e in kb.list_events(conn, tid) if e.kind == "respawn_guarded"]
+
+
+def test_respawn_guard_event_written_once_per_streak(conn, monkeypatch, all_assignees_spawnable):
+    """A card held by a respawn guard gets one ``respawn_guarded`` row per streak, not
+    one per tick; a comment between ticks does not restart the streak (t_6190ed34)."""
+    seen, spawn = _spawns(monkeypatch)
+    tid = kb.create_task(conn, title="already PRed", assignee="w")
+    kb.add_comment(conn, tid, "w", "Opened https://github.com/example/repo/pull/123")
+
+    for i in range(3):
+        res = kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert (tid, "active_pr") in res.respawn_guarded
+        if i == 0:
+            kb.add_comment(conn, tid, "w", "still waiting on review")
+
+    assert seen == []
+    assert _guard_reasons(conn, tid) == ["active_pr"]
+
+
+def test_respawn_guard_event_reemits_on_new_reason_or_lifecycle(conn, monkeypatch, all_assignees_spawnable):
+    """A changed reason, or a non-noise event between two same-reason ticks, opens a new streak."""
+    reasons = iter(["rate_limit_cooldown", "blocker_auth", "blocker_auth", "blocker_auth"])
+    monkeypatch.setattr(kbd, "check_respawn_guard", lambda conn, task_id, lane="ready": next(reasons))
+    seen, spawn = _spawns(monkeypatch)
+    tid = kb.create_task(conn, title="held", assignee="w")
+
+    for expected in ("rate_limit_cooldown", "blocker_auth", "blocker_auth"):
+        assert (tid, expected) in kbd.dispatch_once(conn, spawn_fn=spawn).respawn_guarded
+    assert _guard_reasons(conn, tid) == ["rate_limit_cooldown", "blocker_auth"]
+
+    with kb.write_txn(conn):
+        kb._append_event(conn, tid, "reclaimed", {"reason": "test"})
+    assert (tid, "blocker_auth") in kbd.dispatch_once(conn, spawn_fn=spawn).respawn_guarded
+    assert _guard_reasons(conn, tid) == ["rate_limit_cooldown", "blocker_auth", "blocker_auth"]
+    assert seen == []
+
+
 def _seed_rate_limited_run(conn, tid, *, model=None, provider=None, ended_at=None):
     kb.claim_task(conn, tid)
     run_id = kb.get_task(conn, tid).current_run_id
