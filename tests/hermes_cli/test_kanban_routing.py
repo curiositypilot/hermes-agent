@@ -478,6 +478,29 @@ def test_routing_hold_reemits_on_lifecycle_or_new_note(conn, monkeypatch, all_as
     assert holds[-1].payload.get("note")
 
 
+def test_routing_hold_swallows_only_sqlite_errors(conn, monkeypatch):
+    """A DB error writing the hold is logged and skipped; any other error is a bug and raises."""
+    import sqlite3
+
+    from hermes_cli import kanban_db_dispatch_holds as holds_mod
+
+    tid = kb.create_task(conn, title="s", assignee="w", complexity="S")
+
+    def db_error(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(kb, "_append_event", db_error)
+    holds_mod._record_routing_hold(conn, tid, None)  # swallowed
+
+    def bug(*_a, **_k):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(kb, "_append_event", bug)
+    with pytest.raises(RuntimeError, match="bug"):
+        holds_mod._record_routing_hold(conn, tid, None)
+    assert _routing_holds(conn, tid) == []
+
+
 def _guard_reasons(conn, tid):
     return [(e.payload or {}).get("reason") for e in kb.list_events(conn, tid) if e.kind == "respawn_guarded"]
 

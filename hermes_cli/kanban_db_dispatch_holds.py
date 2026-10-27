@@ -57,5 +57,5 @@ def _record_routing_hold(
             return
         with _kb.write_txn(conn):
             _kb._append_event(conn, task_id, "routing_held", payload)
-    except Exception:
+    except sqlite3.Error:
         _kb._log.debug("kanban routing: could not record hold for %s", task_id, exc_info=True)
