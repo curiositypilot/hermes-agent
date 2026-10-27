@@ -226,6 +226,53 @@ def _no_card_result(client: Any, action: str, names: List[str], force: bool, ses
     return json.dumps(payload, ensure_ascii=False)
 
 
+_STATUS_HINT = (
+    "connected=false means calls to that connector will return CONNECTION_REQUIRED. "
+    "Use action 'connect' to start an authorization."
+)
+
+
+def _squash(slug: str) -> str:
+    return "".join(ch for ch in slug if ch.isalnum())
+
+
+def _near_misses(wanted: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Slugs that contain, or are contained in, ``wanted`` once separators are ignored
+    (``canva`` -> ``canva_mcp``, ``google-drive`` -> ``googledrive``)."""
+    w = _squash(wanted)
+    near = []
+    for item in items:
+        slug = str(item.get("connector", "")).lower()
+        s = _squash(slug)
+        if w and s and (w in s or s in w):
+            near.append({"connector": slug, "connected": bool(item.get("connected"))})
+    return near
+
+
+def _status_result(items: List[Dict[str, Any]], connectors: List[str]) -> Dict[str, Any]:
+    """The status payload. A wanted slug with no exact row is reported as unmatched with its near
+    misses, so an empty list is never read as "that app is not connected"."""
+    if not connectors:
+        return {"connectors": items, "hint": _STATUS_HINT}
+    items = [i for i in items if isinstance(i, dict)]
+    slugs = {str(i.get("connector", "")).lower() for i in items}
+    wanted = set(connectors)
+    payload: Dict[str, Any] = {"connectors": [i for i in items if str(i.get("connector", "")).lower() in wanted]}
+    unmatched = [{"connector": w, "near": _near_misses(w, items)} for w in dict.fromkeys(connectors) if w not in slugs]
+    hint = _STATUS_HINT
+    if unmatched:
+        payload["unmatched"] = unmatched
+        notes = []
+        for row in unmatched:
+            near = ", ".join(f"{n['connector']} (connected={str(n['connected']).lower()})" for n in row["near"])
+            notes.append(f"'{row['connector']}' is not a hosted connector slug"
+                         + (f"; near matches: {near}" if near else ""))
+        hint = ("; ".join(notes) + ". An unmatched slug says nothing about whether that app is connected: "
+                "re-run status with the exact slug, or with no connectors to list every slug. " + _STATUS_HINT)
+    payload["hint"] = hint
+    return payload
+
+
 def run_managed_action(
     action: str,
     connectors: List[str],
@@ -242,13 +289,7 @@ def run_managed_action(
     try:
         client = (client_factory or managed_client)()
         if action == "status":
-            items = client.list_connectors()
-            if connectors:
-                wanted = set(connectors)
-                items = [i for i in items if str(i.get("connector", "")).lower() in wanted]
-            return json.dumps({"connectors": items, "hint": (
-                "connected=false means calls to that connector will return CONNECTION_REQUIRED. "
-                "Use action 'connect' to start an authorization.")}, ensure_ascii=False)
+            return json.dumps(_status_result(client.list_connectors(), connectors), ensure_ascii=False)
         if not connectors:
             return tool_error(
                 f"'{action}' requires 'connectors': the connector slugs to authorize (e.g. [\"gmail\"]). "
