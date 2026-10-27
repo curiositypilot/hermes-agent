@@ -283,27 +283,35 @@ def _has_bom(text: Optional[str]) -> bool:
 # sentinel ``«redacted:sk-…»``, a bare ``***``, or a head/tail ``sk-ant...ghij``. Redaction is
 # display-only, so a model that copies a masked line into patch would write the mask over the
 # real value; the similarity strategies in fuzzy_match still match the masked block.
-_TOKEN_DELIMS = frozenset("\"'`()[]{}<>,;")
 _TOKEN_CHAR = r"[^\s\"'`()\[\]{}<>,;]"
+_TOKEN_RUN_RE = re.compile(rf"{_TOKEN_CHAR}+")
+# Stage 1 runs on every patch, so it must stay linear: the head/tail ellipsis is found with
+# fixed-width lookarounds (a ``TOK{2,}...TOK{2,}`` form backtracks quadratically on one long
+# token, e.g. a base64 data URI) and the run-widening below builds the token.
 _PLACEHOLDER_RE = re.compile(
-    rf"«redacted[^»]*»|\*{{3}}|{_TOKEN_CHAR}{{2,}}(?:\.\.\.|…){_TOKEN_CHAR}{{2,}}")
-
-
-def _is_token_char(ch: str) -> bool:
-    return not ch.isspace() and ch not in _TOKEN_DELIMS
+    rf"(?P<mask>«redacted[^»]*»|\*{{3}})|(?<={_TOKEN_CHAR}{{2}})(?:\.\.\.|…)(?={_TOKEN_CHAR}{{2}})")
 
 
 def _placeholder_candidates(text: str) -> set:
-    """Mask-shaped tokens in ``text``: each match, plus the match widened to its run of
-    non-delimiter chars (the ``***`` in ``KEY=***`` also yields ``KEY=***``)."""
-    tokens = set()
+    """Mask-shaped tokens in ``text``: each sentinel/``***`` match, plus every match widened to
+    its run of non-delimiter chars (the ``***`` in ``KEY=***`` also yields ``KEY=***``; a
+    head/tail ellipsis yields only its widened token, never a bare ``...``)."""
+    from bisect import bisect_right
+    runs = [m.span() for m in _TOKEN_RUN_RE.finditer(text)]
+    run_starts = [s for s, _ in runs]
+
+    def run_at(pos: int) -> Optional[Tuple[int, int]]:
+        i = bisect_right(run_starts, pos) - 1
+        return runs[i] if i >= 0 and pos < runs[i][1] else None
+
+    tokens, spans = set(), set()
     for m in _PLACEHOLDER_RE.finditer(text):
         start, end = m.start(), m.end()
-        while start > 0 and _is_token_char(text[start - 1]):
-            start -= 1
-        while end < len(text) and _is_token_char(text[end]):
-            end += 1
-        tokens.update((m.group(0), text[start:end]))
+        left, right = run_at(start - 1) if start else None, run_at(end)
+        spans.add((left[0] if left else start, right[1] if right else end))
+        if m.group("mask"):
+            tokens.add(m.group("mask"))
+    tokens.update(text[s:e] for s, e in spans)
     return tokens
 
 

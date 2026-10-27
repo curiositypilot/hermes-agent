@@ -149,3 +149,28 @@ class TestAllowsLegitimateEdits:
         assert result.get("success"), result
         text = victim.read_text()
         assert KEY in text and "def test_next_renamed():" in text
+
+
+class TestScanCost:
+    """The mask scan runs on every patch, so one long unbroken token (a base64 data URI, a
+    minified line, a lockfile hash) must not stall it: the old head/tail pattern backtracked
+    quadratically (~23 s for 50k chars)."""
+
+    @pytest.mark.parametrize("token", [
+        "A" * 50_000,
+        "data:image/png;base64," + "QUJD" * 12_500,
+        "ab..." * 10_000,
+    ], ids=["plain-run", "data-uri", "many-ellipses"])
+    def test_long_single_token_scans_fast(self, token):
+        import time
+        from tools.file_operations_common import display_placeholder_error
+        original = f'x = 1\nblob = "{"B" * 10}"\n'
+        new_content = f'x = 1\nblob = "{token}"\n'
+        started = time.monotonic()
+        display_placeholder_error(original, new_content, f'blob = "{token}"', "/w/blob.py")
+        assert time.monotonic() - started < 2.0
+
+    def test_head_tail_mask_yields_its_whole_token_not_a_bare_ellipsis(self):
+        from tools.file_operations_common import _placeholder_candidates
+        # prose trailing "..." (no token after it) is not a head/tail mask
+        assert _placeholder_candidates('k = "sk-ant...ghij" # see docs...') == {"sk-ant...ghij"}
