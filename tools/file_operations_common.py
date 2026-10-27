@@ -276,6 +276,105 @@ def _has_bom(text: Optional[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Display-placeholder write-back guard (patch replace + V4A update)
+# ---------------------------------------------------------------------------
+
+# read_file/search_files and tool results show secrets masked (agent/redact.py): the file-read
+# sentinel ``«redacted:sk-…»``, a bare ``***``, or a head/tail ``sk-ant...ghij``. Redaction is
+# display-only, so a model that copies a masked line into patch would write the mask over the
+# real value; the similarity strategies in fuzzy_match still match the masked block.
+_TOKEN_DELIMS = frozenset("\"'`()[]{}<>,;")
+_TOKEN_CHAR = r"[^\s\"'`()\[\]{}<>,;]"
+_PLACEHOLDER_RE = re.compile(
+    rf"«redacted[^»]*»|\*{{3}}|{_TOKEN_CHAR}{{2,}}(?:\.\.\.|…){_TOKEN_CHAR}{{2,}}")
+
+
+def _is_token_char(ch: str) -> bool:
+    return not ch.isspace() and ch not in _TOKEN_DELIMS
+
+
+def _placeholder_candidates(text: str) -> set:
+    """Mask-shaped tokens in ``text``: each match, plus the match widened to its run of
+    non-delimiter chars (the ``***`` in ``KEY=***`` also yields ``KEY=***``)."""
+    tokens = set()
+    for m in _PLACEHOLDER_RE.finditer(text):
+        start, end = m.start(), m.end()
+        while start > 0 and _is_token_char(text[start - 1]):
+            start -= 1
+        while end < len(text) and _is_token_char(text[end]):
+            end += 1
+        tokens.update((m.group(0), text[start:end]))
+    return tokens
+
+
+def _changed_lines(original: str, new_content: str) -> Tuple[List[int], str]:
+    """(indices of ``original`` lines the edit replaced or deleted, text of the lines it
+    inserted). Unchanged lines are excluded, so a secret line the edit left alone never counts."""
+    import difflib
+    old, new = original.split("\n"), new_content.split("\n")
+    lo = 0
+    while lo < min(len(old), len(new)) and old[lo] == new[lo]:
+        lo += 1
+    hi_old, hi_new = len(old), len(new)
+    while hi_old > lo and hi_new > lo and old[hi_old - 1] == new[hi_new - 1]:
+        hi_old, hi_new = hi_old - 1, hi_new - 1
+    removed: List[int] = []
+    inserted: List[str] = []
+    matcher = difflib.SequenceMatcher(None, old[lo:hi_old], new[lo:hi_new], autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "equal":
+            removed.extend(range(lo + i1, lo + i2))
+            inserted.extend(new[lo + j1:lo + j2])
+    return removed, "\n".join(inserted)
+
+
+def _removed_views(original: str, removed: List[int], path: str) -> Tuple[str, List[str]]:
+    """(raw text of the removed lines, those lines as the model could have seen them): the
+    read_file/search_files view and the tool-result/diff view, each cut from the whole-file view
+    (the context the model read), or redacted as a block when that view changed the line count."""
+    from agent.redact import _is_secret_file_arg, redact_sensitive_text
+    old = original.split("\n")
+    removed_text = "\n".join(old[i] for i in removed)
+    views = []
+    for kwargs in ({"file_read": True, "secret_file": _is_secret_file_arg(path)}, {}):
+        full = redact_sensitive_text(original, **kwargs).split("\n")
+        if len(full) == len(old):
+            views.append("\n".join(full[i] for i in removed))
+        else:
+            views.append(redact_sensitive_text(removed_text, **kwargs))
+    return removed_text, views
+
+
+def display_placeholder_error(original: str, new_content: str, new_text: str,
+                              path: str) -> Optional[str]:
+    """Error string when an edit of ``original`` into ``new_content`` writes a display mask over
+    the real value it replaced, else None. ``new_text`` is the model's replacement text (the cheap
+    pre-filter). A token is refused when the edit's inserted lines carry more copies of it than
+    the lines it replaced, and those replaced lines hold it only in a redacted view — i.e. the
+    model copied a masked line from this file. Literal sentinels/``***`` already in the file and
+    masks added away from the replaced secret line pass. With redaction off, views equal the
+    raw text and nothing is refused."""
+    candidates = _placeholder_candidates(new_text)
+    if not candidates:
+        return None
+    removed, inserted = _changed_lines(original, new_content)
+    if not removed or not inserted:
+        return None
+    removed_text, views = _removed_views(original, removed, path)
+    for token in sorted(candidates, key=lambda t: (-len(t), t)):
+        raw = removed_text.count(token)
+        if inserted.count(token) > raw and any(v.count(token) > raw for v in views):
+            return (
+                f"Refused to patch {path}: the new text writes {token!r}, which is how the read "
+                f"view masks a secret on a line this edit replaces. The file holds the real "
+                f"value; patch will not write the mask over it. No changes were written. To keep "
+                f"the real value, leave its line out of the edit's old and new text (anchor the "
+                f"edit around it). To change the value itself, edit it with a terminal script that "
+                f"does not print or copy the masked text.")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Pagination clamps
 # ---------------------------------------------------------------------------
 

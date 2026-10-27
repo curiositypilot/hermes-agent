@@ -27,7 +27,8 @@ from agent.file_safety import get_write_denied_error
 from tools.file_operations_common import (
     ExecuteResult, PatchResult, ReadResult, SearchResult, WriteResult,
     _UTF8_BOM, _detect_line_ending, _has_bom, _normalize_line_endings, _strip_bom,
-    _strip_terminal_fence_leaks, normalize_read_pagination, normalize_search_pagination)
+    _strip_terminal_fence_leaks, display_placeholder_error, normalize_read_pagination,
+    normalize_search_pagination)
 from tools.file_operations_lint import LINTERS_INPROC, LintMixin, _FAIL_CLOSED_INPROC_EXTS
 from tools.file_operations_search import SearchMixin
 
@@ -1629,6 +1630,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         file_ending = _detect_line_ending(content)
         if file_ending:
             new_content = _normalize_line_endings(new_content, file_ending)
+        placeholder_error = display_placeholder_error(content, new_content, new_string, path)
+        if placeholder_error:
+            return PatchResult(error=placeholder_error)
         write_result = self.write_file(path, new_content, pre_content=raw_content)
         if write_result.error:
             return PatchResult(error=f"Failed to write changes: {write_result.error}")
