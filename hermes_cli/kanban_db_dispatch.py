@@ -1583,7 +1583,9 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
+    PR; or the worker parked cleanly after it — run ended ``blocked``, then
+    ``promoted``/``unblocked`` — which is the intended resume on that PR).
+    The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
@@ -1669,6 +1671,9 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    #    Second exception: a clean park — the worker recorded the PR, then
+    #    ended its run with ``kanban_block`` and was resumed by ``promoted`` /
+    #    ``unblocked`` — is the intended resume of that worker on its PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
@@ -1678,18 +1683,44 @@ def check_respawn_guard(
         body = _kb._lossy_text(c["body"])
         if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
             continue
-        events = conn.execute(
-            # Strictly after: a same-second tie stays guarded (fail closed).
-            "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? AND created_at > ? "
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
-            (task_id, int(c["created_at"] or 0)),
-        ).fetchall()
-        if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
+        if _pr_comment_superseded(conn, task_id, int(c["created_at"] or 0), latest_run):
             return None
         return "active_pr"
 
     return None
+
+
+def _pr_comment_superseded(
+    conn: sqlite3.Connection, task_id: str, comment_at: int,
+    latest_run: Optional[sqlite3.Row],
+) -> bool:
+    """Whether the newest PR comment no longer means "do not re-spawn".
+
+    True on a handoff after the comment (see :func:`_is_handoff_event`), or on
+    a clean park: the latest ended run is ``blocked``, ended no earlier than
+    the comment (same second counts: a worker comments, then blocks), and a
+    ``promoted``/``unblocked`` event followed that run. A crash, reclaim,
+    timeout or spawn failure is never ``blocked``, so it stays guarded.
+    """
+    events = conn.execute(
+        # Strictly after: a same-second tie stays guarded (fail closed).
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND created_at > ? "
+        "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
+        (task_id, comment_at),
+    ).fetchall()
+    if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
+        return True
+    if latest_run is None or latest_run["outcome"] != "blocked":
+        return False
+    parked_at = int(latest_run["ended_at"] or 0)
+    if parked_at < comment_at:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND created_at >= ? "
+        "AND kind IN ('promoted', 'unblocked') LIMIT 1",
+        (task_id, parked_at),
+    ).fetchone() is not None
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
