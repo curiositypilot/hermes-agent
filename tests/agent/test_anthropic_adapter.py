@@ -28,6 +28,12 @@ class TestIsOAuthToken:
     def test_api_key(self):
         assert _is_oauth_token("sk-ant-api03-abcdef1234567890") is False
 
+    def test_usr_console_api_key_is_not_oauth(self):
+        """sk-ant-usr-* Console keys must go out as x-api-key, never with the OAuth betas."""
+        key = "sk-ant-" + "usr-01-" + "x" * 40
+        assert _is_oauth_token(key) is False
+        assert build_anthropic_client(key).api_key == key
+
 
 def test_missing_sdk_error_reports_why_the_lazy_install_did_not_land(monkeypatch):
     """A completed install that needs a restart must not tell the user to install it again."""
