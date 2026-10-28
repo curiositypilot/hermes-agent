@@ -7,6 +7,7 @@ monkeypatch points authoritative.
 
 import json
 import logging
+import re
 import sys
 from typing import Any, List, Optional
 
@@ -53,6 +54,26 @@ _ASYNC_UNSUPPORTED_NOTE = (
     'job, a Kanban worker, or a stateless HTTP endpoint). The process is running in the '
     "background; retrieve its result with process(action='poll') or process(action='wait')."
 )
+
+# The dispatcher's run-scope reaper stops a finished Kanban run's scope, persisted jobs
+# included (hermes_cli/kanban_db_run_scopes.py), so persist_on_release only covers in-run
+# cleanup there.
+_KANBAN_RUN_SCOPE_RE = re.compile(r"hermes-worker-kanban-t_[0-9a-f]+-run-[0-9]+\.scope")
+_KANBAN_PERSIST_NOTE = (
+    "persist_on_release keeps this job alive across in-run cleanup only: this Kanban run's scope, and every "
+    "process in it, is stopped minutes after the run ends. For work that must outlive the run use "
+    "`systemd-run --user --unit=hermes-<task id>-<name> --collect <cmd>`."
+)
+
+
+def _in_kanban_run_scope(cgroup_path: str = "/proc/self/cgroup") -> bool:
+    """True when this process runs inside a Kanban worker run scope; unreadable = False."""
+    try:
+        with open(cgroup_path, encoding="utf-8") as fh:
+            return any(_KANBAN_RUN_SCOPE_RE.search(line) for line in fh)
+    except OSError:
+        return False
+
 
 # proc_session attribute -> HERMES_SESSION_* env var carrying it.
 _ROUTING_FIELDS = (
@@ -174,6 +195,8 @@ def spawn_background_process(
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
         if persist_on_release:
             result_data["persist_on_release"] = True
+            if env_type == "local" and _in_kanban_run_scope():
+                result_data["persist_note"] = _KANBAN_PERSIST_NOTE
         if approval_note:
             result_data["approval"] = approval_note
         if pty_disabled_reason:

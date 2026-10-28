@@ -109,6 +109,15 @@ def test_kanban_guidance_fallback_requires_owned_worker_task(monkeypatch, task_i
         assert (_tool_guidance_block(agent) == KANBAN_GUIDANCE) is expected
 
 
+def test_kanban_guidance_says_background_work_ends_with_the_run():
+    """The run-scope reaper kills persisted jobs too; workers must be told the
+    sanctioned escape (intake t_1af94ae5)."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "systemd-run --user" in KANBAN_GUIDANCE
+    assert "persist_on_release" in KANBAN_GUIDANCE
+
+
 @pytest.mark.parametrize("stores", [(True, True), (False, True), (True, False), (False, False)])
 @pytest.mark.parametrize("names", [
     set(), {"memory"}, {"memory", "skill_view", "skills_list"},
