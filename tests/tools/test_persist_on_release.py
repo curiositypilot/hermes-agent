@@ -152,3 +152,65 @@ def test_checkpoint_carries_persist_on_release():
     """A crash-recovery checkpoint must carry the flag, or a persisted job
     resurrects as killable by the next session's release sweep (#41225)."""
     assert "persist_on_release" in _CHECKPOINT_FIELDS
+
+
+# The dispatcher reaps a finished Kanban run's scope, persisted jobs included
+# (intake t_1af94ae5): a persisted spawn inside a run scope must say so.
+
+def _spawn_result(monkeypatch, *, persist, in_scope, env_type="local"):
+    import json
+
+    import tools.terminal_tool as tt
+    import tools.terminal_tool_background as bg
+
+    class _Session:
+        id = "proc_bg"
+        pid = 4242
+
+    monkeypatch.setattr(bg, "_spawn", lambda *a, **k: _Session())
+    monkeypatch.setattr(bg, "_in_kanban_run_scope", lambda: in_scope)
+    monkeypatch.setattr(tt, "_resolve_command_cwd", lambda **k: "/tmp")
+    return json.loads(bg.spawn_background_process(
+        command="sleep 60", env=None, env_type=env_type, effective_task_id="t1", task_id="t1",
+        session_key="", workdir=None, cwd="/tmp", effective_pty=False, notify_on_complete=False,
+        watch_patterns=None, approval_note=None, pty_disabled_reason=None,
+        persist_on_release=persist))
+
+
+def test_persist_note_in_kanban_run_scope(monkeypatch):
+    result = _spawn_result(monkeypatch, persist=True, in_scope=True)
+    assert result["persist_on_release"] is True
+    assert "systemd-run" in result["persist_note"]
+
+
+@pytest.mark.parametrize("persist,in_scope,env_type", [
+    (True, False, "local"),   # persisted, but not a Kanban worker
+    (False, True, "local"),   # Kanban worker, nothing persisted
+    (True, True, "docker"),   # process lives in the container, not the run scope
+])
+def test_no_persist_note_outside_the_case(monkeypatch, persist, in_scope, env_type):
+    result = _spawn_result(monkeypatch, persist=persist, in_scope=in_scope, env_type=env_type)
+    assert "error" not in result or result["error"] is None
+    assert "persist_note" not in result
+
+
+@pytest.mark.parametrize("line,expected", [
+    ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/"
+     "hermes-worker-kanban-t_8ca578ee-run-6604.scope\n", True),
+    ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/probe-x.service\n", False),
+    ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/"
+     "hermes-worker-kanban-t_8ca578ee-run-missing.scope\n", False),
+    ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/hermes-gateway.service\n", False),
+])
+def test_in_kanban_run_scope_matches_cgroup(tmp_path, line, expected):
+    from tools.terminal_tool_background import _in_kanban_run_scope
+
+    cgroup = tmp_path / "cgroup"
+    cgroup.write_text(line)
+    assert _in_kanban_run_scope(str(cgroup)) is expected
+
+
+def test_in_kanban_run_scope_missing_file_is_false(tmp_path):
+    from tools.terminal_tool_background import _in_kanban_run_scope
+
+    assert _in_kanban_run_scope(str(tmp_path / "absent")) is False
