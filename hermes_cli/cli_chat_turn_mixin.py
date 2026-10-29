@@ -36,6 +36,9 @@ class CLIChatTurnMixin:
         per-turn, fail-closed contract as the Desktop/TUI and messaging gateways: a torn config.yaml
         keeps the last known-good chain instead of reading as "chain removed"."""
         from cli import logger
+        from hermes_cli.fallback_config import fallback_disabled
+        if fallback_disabled():  # --no-fallback: keep the empty chain cli_init gave this run
+            return
         try:
             from gateway.run import GatewayRunner
             from hermes_cli.config_effective import load_user_config_effective

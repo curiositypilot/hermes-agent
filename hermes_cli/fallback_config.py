@@ -126,6 +126,18 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
 _NON_CHAT_PLATFORMS = frozenset({"cron", "subagent"})
 
 
+def fallback_disabled() -> bool:
+    """True when this process runs with ``--no-fallback`` (``HERMES_NO_FALLBACK=1``): the operator
+    pinned a route and wants a failure, not an answer from another model.
+
+    The single reader of the switch. ``get_fallback_chain`` deliberately ignores it: the
+    ``hermes fallback`` edit commands persist through that function and would write an empty chain.
+    """
+    import os
+
+    return os.environ.get("HERMES_NO_FALLBACK") == "1"  # health: allow HX002 -- per-run bridge of the --no-fallback CLI flag (like HERMES_IGNORE_USER_CONFIG), not a config setting; relaunched/child processes inherit it
+
+
 def is_background_context(platform: str | None = None) -> bool:
     """True for unattended work: cron runs, delegated children, Kanban workers (and anything they spawn).
 

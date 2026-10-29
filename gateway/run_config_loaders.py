@@ -560,8 +560,9 @@ class GatewayConfigLoadersMixin:
             return
         # A pinned Kanban route keeps the empty chain ``_init_fallback_chain`` gave it: the
         # per-turn config sync (CLI ``-q`` workers, TUI, gateway) must not re-arm the global
-        # chain and let a pinned critic answer on another vendor (t_4b722398).
-        if getattr(agent, "_kanban_pinned_route", False):
+        # chain and let a pinned critic answer on another vendor (t_4b722398). ``--no-fallback``
+        # (``_fallback_disabled``) is kept empty the same way.
+        if getattr(agent, "_fallback_disabled", False) or getattr(agent, "_kanban_pinned_route", False):
             return
         from hermes_cli.fallback_config import drop_chat_only_entries
         new_chain = drop_chat_only_entries(chain, platform=getattr(agent, "platform", None))

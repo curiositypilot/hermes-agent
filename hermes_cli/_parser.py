@@ -87,6 +87,11 @@ def _inherited_flag(parser, *args, **kwargs):
     return action
 
 
+_NO_FALLBACK_HELP = (
+    "Never switch to fallback_providers for this run: a rate limit or auth failure on the chosen "
+    "provider fails the run instead of answering on another model. Same as HERMES_NO_FALLBACK=1.")
+
+
 _EPILOGUE = """
 Examples:
     hermes                        Start interactive chat
@@ -199,6 +204,7 @@ def _add_top_level_flags(parser: argparse.ArgumentParser) -> None:
               help="Include the session ID in the agent's system prompt")
     inherited(parser, "--ignore-user-config", action="store_true", default=False,
               help=f"Ignore {_cfg_path()} and fall back to built-in defaults (credentials in .env are still loaded)")
+    inherited(parser, "--no-fallback", action="store_true", default=False, help=_NO_FALLBACK_HELP)
     inherited(parser, "--ignore-rules", action="store_true", default=False,
               help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills")
     inherited(parser, "--safe-mode", action="store_true", default=False,
@@ -302,6 +308,7 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
               help="Include the session ID in the agent's system prompt")
     inherited(chat_parser, "--ignore-user-config", action="store_true", default=SUPPRESS,
               help=f"Ignore {_cfg_path()} and fall back to built-in defaults (credentials in .env are still loaded). Useful for isolated CI runs, reproduction, and third-party integrations.")
+    inherited(chat_parser, "--no-fallback", action="store_true", default=SUPPRESS, help=_NO_FALLBACK_HELP)
     inherited(chat_parser, "--ignore-rules", action="store_true", default=SUPPRESS,
               help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills. Combine with --ignore-user-config for a fully isolated run.")
     inherited(chat_parser, "--safe-mode", action="store_true", default=SUPPRESS,
