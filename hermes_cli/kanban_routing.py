@@ -62,11 +62,12 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -442,6 +443,64 @@ class QuotaSnapshot:
     providers: dict[str, tuple[float, Optional[float]]] = field(default_factory=dict)
     """provider -> ``(headroom 0..1, resets_at epoch or None)``."""
     unknown: dict[str, str] = field(default_factory=dict)
+    windows: dict[str, list["QuotaWindow"]] = field(default_factory=dict)
+    """provider -> its windows that carry a ``match`` (per-model gating); only for
+    providers in ``providers``. Absent = every model is gated on the binding."""
+
+
+class QuotaWindow(NamedTuple):
+    """One headroom-file window a model can be gated on. ``match`` is a tuple of
+    lower-cased model-id prefixes, or ``"*"`` (every model no prefix claims)."""
+    name: str
+    match: "tuple[str, ...] | str"
+    headroom: float
+    resets_at: Optional[float]
+
+
+def _parse_match(raw: Any) -> "tuple[str, ...] | str | None":
+    """A window's ``match``: ``"*"`` or a non-empty list of non-empty strings; None = malformed."""
+    if raw == "*":
+        return "*"
+    if not isinstance(raw, list) or not raw:
+        return None
+    if not all(isinstance(p, str) and p.strip() for p in raw):
+        return None
+    return tuple(p.strip().lower() for p in raw)
+
+
+def _match_windows(entry: dict) -> list[QuotaWindow]:
+    """The ``match`` windows of one headroom-file entry. Any malformed one (bad
+    ``match``, no numeric headroom, a second ``"*"``) drops them all, so every
+    model falls back to the binding: a broken file must never open the gate."""
+    out: list[QuotaWindow] = []
+    raw = entry.get("windows")
+    for w in raw if isinstance(raw, list) else ():
+        if not isinstance(w, dict) or "match" not in w:
+            continue
+        match = _parse_match(w.get("match"))
+        raw_headroom = w.get("headroom")
+        # bool is an int subclass: JSON ``true`` would read as headroom 1.0 and open the gate
+        if match is None or isinstance(raw_headroom, bool) or not isinstance(raw_headroom, (int, float)):
+            return []
+        headroom = float(raw_headroom)
+        if not math.isfinite(headroom):
+            return []
+        out.append(QuotaWindow(str(w.get("name") or "?"), match, headroom, _parse_iso_epoch(w.get("resets_at"))))
+    if sum(1 for w in out if w.match == "*") > 1:
+        return []
+    return out
+
+
+def _window_for(windows: list[QuotaWindow], model: str) -> Optional[QuotaWindow]:
+    """The window gating ``model``: the first window, in file order, with a prefix
+    the id starts with (case-insensitive), else the ``"*"`` window, else None
+    (binding). File order is the producer's (scripts/quota_snapshot.py's pool rule
+    is first-match too), so a narrower pool must be written before a broader one."""
+    mid = model.strip().lower()
+    for w in windows:
+        if w.match != "*" and any(mid.startswith(prefix) for prefix in w.match):
+            return w
+    return next((w for w in windows if w.match == "*"), None)
 
 
 def default_headroom_path() -> str:
@@ -493,6 +552,9 @@ def read_headroom(gate: QuotaGateConfig, *, now: Optional[float] = None) -> Quot
             snap.unknown[name] = f"last reading {int((now - fetched) // 60)} min old ({entry.get('error')})"
             continue
         snap.providers[name.strip().lower()] = (headroom, _parse_iso_epoch(binding.get("resets_at")))
+        windows = _match_windows(entry)
+        if windows:
+            snap.windows[name.strip().lower()] = windows
     return snap
 
 
@@ -590,11 +652,14 @@ class QuotaVerdict:
     resets_at: Optional[float] = None
     kind: str = "level"
     mode: Optional[str] = None
+    window: Optional[str] = None
+    """The headroom-file window that gated the model; None = the binding."""
 
     def describe(self) -> str:
         if self.kind == "mode":
             return f"{self.provider} quota mode {self.mode} needs P{self.required}"
-        return f"{self.provider} headroom {_pct(self.headroom)} < {_pct(self.below)} needs P{self.required}"
+        pool = f" {self.window}" if self.window else ""
+        return f"{self.provider}{pool} headroom {_pct(self.headroom)} < {_pct(self.below)} needs P{self.required}"
 
 
 @dataclass
@@ -605,20 +670,28 @@ class GateRequirement:
     resets_at: Optional[float]
     required: int
     below: Optional[float]
+    window: Optional[str] = None
+    """The window it was read from; None = the binding."""
 
     def verdict(self, priority: int) -> Optional[QuotaVerdict]:
         if priority >= self.required or self.required <= 0:
             return None
         return QuotaVerdict(self.provider, self.headroom, self.below if self.below is not None else 0.0,
-                            self.required, self.resets_at)
+                            self.required, self.resets_at, window=self.window)
 
 
-def gate_requirement(snap: QuotaSnapshot, provider: str) -> Optional[GateRequirement]:
-    """Level requirement for ``provider``, or None when its headroom is unknown."""
+def gate_requirement(snap: QuotaSnapshot, provider: str, model: Optional[str] = None) -> Optional[GateRequirement]:
+    """Level requirement for ``provider`` (for ``model`` when given), or None when
+    its headroom is unknown. With a model and ``match`` windows, the model's own
+    window gates it (``_window_for``); otherwise the binding, as before."""
     key = provider.strip().lower()
     known = snap.providers.get(key)
     if known is None:
         return None
+    window = _window_for(snap.windows.get(key, []), model) if model else None
+    if window is not None:
+        required, below = required_priority(window.headroom)
+        return GateRequirement(key, window.headroom, window.resets_at, required, below, window.name)
     headroom, resets_at = known
     required, below = required_priority(headroom)
     return GateRequirement(key, headroom, resets_at, required, below)
@@ -707,11 +780,13 @@ class RoutingContext:
             self._quota = read_headroom(self.cfg.quota_gate, now=self.now)
         return self._quota
 
-    def quota_verdict(self, provider: Optional[str], priority: int) -> Optional[QuotaVerdict]:
-        """The gate's refusal of ``provider`` for a card of ``priority``, or None
-        (gate off, headroom unknown, or the card's priority meets the requirement).
-        ``anthropic`` is gated by the quota mode while it is fresh; everything else,
-        and anthropic without a fresh mode, by the level gate."""
+    def quota_verdict(self, provider: Optional[str], priority: int, model: Optional[str] = None) -> Optional[QuotaVerdict]:
+        """The gate's refusal of ``provider`` (running ``model``, when given) for a
+        card of ``priority``, or None (gate off, headroom unknown, or the card's
+        priority meets the requirement). ``anthropic`` is gated by the quota mode
+        while it is fresh (``model`` ignored); everything else, and anthropic
+        without a fresh mode, by the level gate on the model's window
+        (``gate_requirement``)."""
         gate = self.cfg.quota_gate
         if not gate.enabled or not provider:
             return None
@@ -725,7 +800,7 @@ class RoutingContext:
         snap = self.quota()
         if snap.status != "ok":
             return None
-        req = gate_requirement(snap, provider)
+        req = gate_requirement(snap, provider, model)
         return None if req is None else req.verdict(priority)
 
     def order_tier(self, cands: "tuple[TierCandidate, ...] | list[TierCandidate]") -> list[TierCandidate]:
@@ -767,7 +842,7 @@ class RoutingContext:
                 walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
                                      "reason": "quota: no paid fallthrough"})
                 continue
-            verdict = self.quota_verdict(cand.provider, priority)
+            verdict = self.quota_verdict(cand.provider, priority, model=cand.model)
             if verdict is not None:
                 walk.gated.append(verdict)
                 walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
@@ -785,9 +860,9 @@ class RoutingContext:
     def _quota_held(self, task: Any, gated: list[QuotaVerdict], *, lane: str = "ready",
                     requested_tier: Optional[str] = None, skipped: Optional[list[dict]] = None,
                     candidate: Optional[TierCandidate] = None) -> RouteDecision:
-        seen: dict[str, QuotaVerdict] = {}
+        seen: dict[tuple[str, Optional[str]], QuotaVerdict] = {}
         for v in gated:
-            seen.setdefault(v.provider, v)
+            seen.setdefault((v.provider, v.window), v)
         resets = [v.resets_at for v in seen.values() if v.resets_at]
         note = "; ".join(v.describe() for v in seen.values()) + f" (card P{_task_priority(task)})"
         return RouteDecision("quota_held", lane=lane, requested_tier=requested_tier, candidate=candidate,
@@ -796,7 +871,8 @@ class RoutingContext:
     def _gate_fixed(self, task: Any, decision: RouteDecision) -> RouteDecision:
         """Pinned / profile routes have no alternative: a gated provider holds the card."""
         cand = decision.candidate
-        verdict = self.quota_verdict(cand.provider if cand else None, _task_priority(task))
+        verdict = self.quota_verdict(cand.provider if cand else None, _task_priority(task),
+                                     model=cand.model if cand else None)
         if verdict is None:
             return decision
         skipped = [*decision.skipped, {"model": cand.model, "provider": cand.provider,
