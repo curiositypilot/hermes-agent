@@ -14,7 +14,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -677,7 +677,8 @@ def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
             continue
         providers.append({
             "provider": name, "headroom": req.headroom, "required_priority": req.required,
-            "band_below": req.below, "resets_at": int(req.resets_at) if req.resets_at else None})
+            "band_below": req.below, "resets_at": int(req.resets_at) if req.resets_at else None,
+            **_quota_windows_view(snap, name)})
     for name, why in sorted(snap.unknown.items()):
         providers.append({"provider": name, "headroom": None, "required_priority": 0,
                           "band_below": None, "resets_at": None, "unknown": why})
@@ -693,6 +694,20 @@ def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
         "card_priority": kr._task_priority(task) if task is not None else None,
         "providers": providers,
     }
+
+
+def _quota_windows_view(snap: Any, provider: str) -> dict:
+    """``{"windows": [...]}`` for a provider whose headroom file carries ``match``
+    windows (each gates its own models), else ``{}``."""
+    from hermes_cli import kanban_routing as kr
+
+    rows = []
+    for w in snap.windows.get(provider, []):
+        required, below = kr.required_priority(w.headroom)
+        rows.append({"name": w.name, "match": w.match if w.match == "*" else list(w.match),
+                     "headroom": w.headroom, "required_priority": required, "band_below": below,
+                     "resets_at": int(w.resets_at) if w.resets_at else None})
+    return {"windows": rows} if rows else {}
 
 
 def _print_quota_gate(q: dict) -> None:
@@ -722,6 +737,12 @@ def _print_quota_gate(q: dict) -> None:
             continue
         band = f" (< {p['band_below'] * 100:.0f}%)" if p["band_below"] is not None else ""
         print(f"  {mark}{p['provider']}: headroom {p['headroom'] * 100:.0f}%{band} -> needs P{p['required_priority']}")
+        for w in p.get("windows", []):
+            wmark = "ok " if q["card_priority"] is None or q["card_priority"] >= w["required_priority"] else "-- "
+            wband = f" (< {w['band_below'] * 100:.0f}%)" if w["band_below"] is not None else ""
+            match = w["match"] if w["match"] == "*" else ", ".join(f"{m}*" for m in w["match"])
+            print(f"      {wmark}{w['name']} [{match}]: headroom {w['headroom'] * 100:.0f}%{wband} "
+                  f"-> needs P{w['required_priority']}")
 
 
 def _cmd_route(args: argparse.Namespace) -> int:

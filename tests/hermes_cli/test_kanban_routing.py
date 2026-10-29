@@ -891,7 +891,7 @@ def test_confidential_card_skips_disallowed_candidates(conn, monkeypatch):
     })
     ctx = kr.RoutingContext(conn, cfg)
     # prov-a gated by quota (mode tight), prov-b available
-    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio: kr.QuotaVerdict(
+    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio, model=None: kr.QuotaVerdict(
         provider="prov-a", headroom=0.0, below=0.0, required=2, resets_at=time.time() + 3600, kind="mode", mode="tight"
     ) if prov == "prov-a" else None)
     _pool(monkeypatch, {})  # both pool-available
@@ -932,7 +932,7 @@ def test_internal_card_unchanged(conn, monkeypatch):
     })
     ctx = kr.RoutingContext(conn, cfg)
     # prov-a gated by quota, prov-b available
-    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio: kr.QuotaVerdict(
+    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio, model=None: kr.QuotaVerdict(
         provider="prov-a", headroom=0.0, below=0.0, required=2, resets_at=time.time() + 3600, kind="mode", mode="tight"
     ) if prov == "prov-a" else None)
     _pool(monkeypatch, {})
@@ -1016,7 +1016,7 @@ def test_incident_replay_decide_and_review(conn, monkeypatch):
     ctx = kr.RoutingContext(conn, cfg)
 
     # anthropic gated: mode tight needs P2
-    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio: kr.QuotaVerdict(
+    monkeypatch.setattr(ctx, "quota_verdict", lambda prov, prio, model=None: kr.QuotaVerdict(
         provider="anthropic", headroom=0.0, below=0.0, required=2, resets_at=time.time() + 3600, kind="mode", mode="tight"
     ) if prov == "anthropic" else None)
     # xai-oauth exhausted

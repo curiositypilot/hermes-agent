@@ -383,3 +383,168 @@ def test_route_cli_shows_quota_gate(kanban_home, headroom, monkeypatch, capsys):
     assert data["task"]["source"] == "quota_held"
     by = {p["provider"]: p for p in data["quota_gate"]["providers"]}
     assert by["anthropic"]["required_priority"] == 2 and by["openai-codex"]["required_priority"] == 0
+
+
+# --- per-model windows (``match``) ----------------------------------------------
+# The 2026-10-29 16:47 headroom.json: antigravity gemini pool out, claude-gptoss pool
+# full, binding = gemini. ``match`` is the model -> window contract the snapshot writes.
+
+GEMINI = "gemini-3.8-flash-tiered"
+CLAUDE = "claude-opus-5-5-high"
+
+
+def _ag_window(name, headroom, match=None, resets="2026-11-01T13:08:20Z"):
+    w = {"name": name, "label": f"{name} pool", "used_pct": (1 - headroom) * 100, "headroom": headroom,
+         "resets_at": resets}
+    if match is not None:
+        w["match"] = match
+    return w
+
+
+def _write_ag(path, windows, *, binding_headroom=0.0, extra=None):
+    providers = {"antigravity": {
+        "ok": True, "fetched_at": "2026-10-29T16:47:00+00:00", "error": None, "windows": windows,
+        "binding": {"name": "gemini", "headroom": binding_headroom, "resets_at": "2026-11-01T13:08:20Z"}},
+        **(extra or {})}
+    path.write_text(json.dumps({"schema": 2, "written_at_epoch": time.time() - 60, "providers": providers}))
+    return path
+
+
+@pytest.fixture
+def ag(tmp_path):
+    """``ag(windows=None)``: the 16:47 file; ``windows`` overrides the antigravity windows."""
+    def write(windows=None, **kw):
+        if windows is None:
+            windows = [_ag_window("gemini", 0.0, ["gemini"]), _ag_window("claude-gptoss", 1.0, "*")]
+        return _write_ag(tmp_path / "headroom.json", windows, **kw)
+    return write
+
+
+def test_model_gated_on_its_own_window(conn, ag):
+    ctx = kr.RoutingContext(conn, _cfg(ag()))
+    assert ctx.quota_verdict("antigravity", 1, model=CLAUDE) is None
+    v = ctx.quota_verdict("antigravity", 1, model=GEMINI)
+    assert v is not None and v.required == 3 and v.window == "gemini"
+    assert v.describe() == "antigravity gemini headroom 0% < 3% needs P3"
+    binding = ctx.quota_verdict("antigravity", 1)
+    assert binding is not None and binding.window is None and binding.required == 3
+    assert binding.describe() == "antigravity headroom 0% < 3% needs P3"  # today's text, byte-for-byte
+
+
+def test_match_is_a_case_insensitive_prefix(conn, ag):
+    ctx = kr.RoutingContext(conn, _cfg(ag()))
+    assert ctx.quota_verdict("antigravity", 1, model="claude-gemini-x") is None  # not a prefix: falls to "*"
+    v = ctx.quota_verdict("antigravity", 1, model="Gemini-3-flash")
+    assert v is not None and v.window == "gemini"
+
+
+def test_file_without_match_keeps_binding_for_every_model(conn, ag):
+    ctx = kr.RoutingContext(conn, _cfg(ag([_ag_window("gemini", 0.0), _ag_window("claude-gptoss", 1.0)])))
+    for model in (CLAUDE, GEMINI, None):
+        v = ctx.quota_verdict("antigravity", 1, model=model)
+        assert v is not None and v.window is None and v.required == 3
+
+
+@pytest.mark.parametrize("bad", [
+    pytest.param({"gemini": "gemini"}, id="string-not-list"),
+    pytest.param({"gemini": []}, id="empty-list"),
+    pytest.param({"gemini": [""]}, id="empty-prefix"),
+    pytest.param({"gemini": [1]}, id="non-string"),
+    pytest.param({"gemini": None}, id="null"),
+    pytest.param({"gemini": ["gemini"], "headroom": None}, id="no-headroom"),
+    pytest.param({"gemini": "*"}, id="two-catch-alls"),
+])
+def test_malformed_match_fails_closed_to_the_binding(conn, ag, bad):
+    """A broken gemini window must never let a gemini model through on the "*" window."""
+    gemini = _ag_window("gemini", 0.0)
+    gemini["match"] = bad["gemini"]
+    if "headroom" in bad:
+        gemini["headroom"] = bad["headroom"]
+    ctx = kr.RoutingContext(conn, _cfg(ag([gemini, _ag_window("claude-gptoss", 1.0, "*")])))
+    assert ctx.quota().windows == {}
+    for model in (GEMINI, CLAUDE):
+        v = ctx.quota_verdict("antigravity", 1, model=model)
+        assert v is not None and v.window is None and v.required == 3
+
+
+@pytest.mark.parametrize("argon_first", [False, True])
+def test_longest_prefix_wins_regardless_of_order(conn, ag, argon_first):
+    """A narrower pool (the proxy's argon) beside the broad gemini prefix gates its own models."""
+    gemini = _ag_window("gemini", 1.0, ["gemini"])
+    argon = _ag_window("argon", 0.0, ["gemini-4-argon"])
+    windows = [argon, gemini] if argon_first else [gemini, argon]
+    ctx = kr.RoutingContext(conn, _cfg(ag([*windows, _ag_window("claude-gptoss", 1.0, "*")], binding_headroom=1.0)))
+    v = ctx.quota_verdict("antigravity", 1, model="gemini-4-argon-high")
+    assert v is not None and v.window == "argon"
+    assert ctx.quota_verdict("antigravity", 1, model=GEMINI) is None
+    assert ctx.quota_verdict("antigravity", 1, model=CLAUDE) is None
+
+
+def test_no_catch_all_falls_back_to_binding(conn, ag):
+    ctx = kr.RoutingContext(conn, _cfg(ag([_ag_window("gemini", 1.0, ["gemini"])], binding_headroom=0.0)))
+    assert ctx.quota_verdict("antigravity", 1, model=GEMINI) is None
+    v = ctx.quota_verdict("antigravity", 1, model=CLAUDE)
+    assert v is not None and v.window is None
+
+
+def test_tier_walk_skips_gemini_and_takes_antigravity_claude(conn, ag, monkeypatch):
+    _pool(monkeypatch)
+    tiers = {"S": [{"model": GEMINI, "provider": "antigravity"},
+                   {"model": "claude-sonnet-4-6", "provider": "antigravity"}]}
+    ctx = kr.RoutingContext(conn, _cfg(ag(), tiers=tiers))
+    d = ctx.decide(_task(complexity="S", priority=1))
+    assert d.source == "tier" and d.candidate.model == "claude-sonnet-4-6"
+    assert d.skipped == [{"tier": "S", "model": GEMINI, "provider": "antigravity",
+                          "reason": "quota: antigravity gemini headroom 0% < 3% needs P3"}]
+
+
+def test_pinned_route_gated_on_its_models_window(conn, ag, monkeypatch):
+    _pool(monkeypatch)
+    ctx = kr.RoutingContext(conn, _cfg(ag()))
+    assert ctx.decide(_task(model_override=CLAUDE, provider_override="antigravity", priority=1)).source == "pinned"
+    held = ctx.decide(_task(model_override=GEMINI, provider_override="antigravity", priority=1))
+    assert held.source == "quota_held" and "antigravity gemini headroom 0%" in held.note
+
+
+def test_incident_replay_2026_10_29(conn, ag):
+    """history.jsonl ts 1793272613: gemini used 97.2% (headroom 0.028 < 3%); claude-gptoss full."""
+    ctx = kr.RoutingContext(conn, _cfg(ag([_ag_window("gemini", 0.028, ["gemini"]),
+                                           _ag_window("claude-gptoss", 1.0, "*")], binding_headroom=0.028)))
+    v = ctx.quota_verdict("antigravity", 1, model=GEMINI)
+    assert v is not None and v.required == 3 and v.window == "gemini"
+    assert ctx.quota_verdict("antigravity", 1, model=CLAUDE) is None
+
+
+def test_anthropic_mode_ignores_model(conn, ag, tmp_path):
+    mode = tmp_path / "mode.json"
+    mode.write_text(json.dumps({"mode": "critical", "written_at_epoch": time.time() - 60, "reason": "test"}))
+    anthropic = {"anthropic": {"ok": True, "windows": [{"name": "session", "headroom": 1.0, "match": "*"}],
+                               "binding": {"name": "session", "headroom": 1.0}}}
+    ctx = kr.RoutingContext(conn, _cfg(ag(extra=anthropic), gate={"mode_file": str(mode)}))
+    v = ctx.quota_verdict("anthropic", 1, model="claude-opus-5-5")
+    assert v is not None and v.kind == "mode" and v.required == 3
+
+
+def test_route_cli_lists_windows(kanban_home, ag, monkeypatch, capsys):
+    from hermes_cli import kanban as kcli
+    from hermes_cli.kanban_parser import build_parser
+
+    path = ag()
+    monkeypatch.setattr(kcli, "_kanban_config", lambda: {"routing": {
+        "enabled": True, "tiers": TIERS, "escalate": False,
+        "quota_gate": {"enabled": True, "headroom_file": str(path)}}})
+    _pool(monkeypatch)
+    with kbc.connect_closing() as c:
+        tid = kb.create_task(c, title="p1", assignee="w", complexity="S", priority=1)
+    parser = argparse.ArgumentParser()
+    build_parser(parser.add_subparsers(dest="cmd"))
+    assert kcli.kanban_command(parser.parse_args(["kanban", "route", tid])) == 0
+    out = capsys.readouterr().out
+    assert "antigravity: headroom 0% (< 3%) -> needs P3" in out  # provider line unchanged
+    assert "-- gemini [gemini*]: headroom 0% (< 3%) -> needs P3" in out
+    assert "ok claude-gptoss [*]: headroom 100% -> needs P0" in out
+
+    assert kcli.kanban_command(parser.parse_args(["kanban", "route", tid, "--json"])) == 0
+    by = {p["provider"]: p for p in json.loads(capsys.readouterr().out)["quota_gate"]["providers"]}
+    assert [(w["name"], w["required_priority"]) for w in by["antigravity"]["windows"]] == [
+        ("gemini", 3), ("claude-gptoss", 0)]
