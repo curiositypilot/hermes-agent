@@ -1122,7 +1122,10 @@ def resolve_runtime_with_fallback(config: Optional[Dict[str, Any]], *, requested
                                         explicit_base_url=explicit_base_url, explicit_api_key=explicit_api_key), None
     except AuthError as primary_exc:
         from hermes_cli.fallback_config import (
-            drop_chat_only_entries, effective_runtime_provider, get_fallback_chain, resolve_entry_api_key)
+            drop_chat_only_entries, effective_runtime_provider, fallback_disabled, get_fallback_chain,
+            resolve_entry_api_key)
+        if fallback_disabled():  # --no-fallback: the pinned route fails instead of switching models
+            raise
         for entry in drop_chat_only_entries(get_fallback_chain(config)):
             provider = (entry.get("provider") or "").strip().lower()
             model = (entry.get("model") or "").strip()

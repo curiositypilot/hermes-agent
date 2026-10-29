@@ -57,8 +57,15 @@ def _init_fallback_chain(agent, fallback_model):
     # owned_kanban_task() is "" inside in-process delegate children, so their own chains
     # (inherited or declared) are untouched; same-provider pool rotation is unaffected.
     agent._kanban_pinned_route = _kanban_pinned_route()
+    # --no-fallback (HERMES_NO_FALLBACK=1) drops the chain the same way, but is not a Kanban pin:
+    # the 429 fast-fail that requeues a card (turn_api_error) keys on _kanban_pinned_route only.
+    from hermes_cli.fallback_config import fallback_disabled
+    agent._fallback_disabled = agent._kanban_pinned_route or fallback_disabled()
     if agent._kanban_pinned_route:
         logger.info("kanban pinned route: fallback disabled (%d entries dropped)", len(chain))
+        chain = []
+    elif agent._fallback_disabled:
+        logger.info("fallback disabled (--no-fallback): %d entries dropped", len(chain))
         chain = []
     agent._fallback_chain = chain
     agent._fallback_index = 0

@@ -2474,7 +2474,6 @@ def cmd_update(args):
         _finalize_update_output(_update_io_state)
 
 
-
 def _coalesce_session_name_args(argv: list) -> list:
     """Join unquoted multi-word session names after -c/--continue and -r/--resume.
 
@@ -3023,9 +3022,10 @@ def _apply_safe_mode(args) -> None:
 
 
 def _apply_user_config_bypass(args) -> None:
-    """Apply the explicit config bypass before any startup config reads."""
-    if getattr(args, "ignore_user_config", False):
-        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+    """Apply the explicit config bypass and ``--no-fallback`` before any startup config reads."""
+    for flag, env in (("ignore_user_config", "HERMES_IGNORE_USER_CONFIG"), ("no_fallback", "HERMES_NO_FALLBACK")):
+        if getattr(args, flag, False):
+            os.environ[env] = "1"
 
 
 def _guard_noninteractive_user_config(args) -> None:
