@@ -452,6 +452,8 @@ def test_file_without_match_keeps_binding_for_every_model(conn, ag):
     pytest.param({"gemini": [1]}, id="non-string"),
     pytest.param({"gemini": None}, id="null"),
     pytest.param({"gemini": ["gemini"], "headroom": None}, id="no-headroom"),
+    pytest.param({"gemini": ["gemini"], "headroom": True}, id="bool-headroom"),
+    pytest.param({"gemini": ["gemini"], "headroom": "0.5"}, id="string-headroom"),
     pytest.param({"gemini": "*"}, id="two-catch-alls"),
 ])
 def test_malformed_match_fails_closed_to_the_binding(conn, ag, bad):
@@ -467,16 +469,21 @@ def test_malformed_match_fails_closed_to_the_binding(conn, ag, bad):
         assert v is not None and v.window is None and v.required == 3
 
 
-@pytest.mark.parametrize("argon_first", [False, True])
-def test_longest_prefix_wins_regardless_of_order(conn, ag, argon_first):
-    """A narrower pool (the proxy's argon) beside the broad gemini prefix gates its own models."""
-    gemini = _ag_window("gemini", 1.0, ["gemini"])
-    argon = _ag_window("argon", 0.0, ["gemini-4-argon"])
+@pytest.mark.parametrize(("argon_first", "window"), [(True, "argon"), (False, "gemini")])
+def test_first_matching_window_in_file_order_wins(conn, ag, argon_first, window):
+    """Overlapping prefixes: the first window in file order gates the model (the producer's
+    first-match rule), so a narrower pool gates its models only when written first."""
+    gemini = _ag_window("gemini", 0.0, ["gemini"])
+    argon = _ag_window("argon", 1.0, ["gemini-4-argon"])
     windows = [argon, gemini] if argon_first else [gemini, argon]
-    ctx = kr.RoutingContext(conn, _cfg(ag([*windows, _ag_window("claude-gptoss", 1.0, "*")], binding_headroom=1.0)))
+    ctx = kr.RoutingContext(conn, _cfg(ag([*windows, _ag_window("claude-gptoss", 1.0, "*")], binding_headroom=0.0)))
     v = ctx.quota_verdict("antigravity", 1, model="gemini-4-argon-high")
-    assert v is not None and v.window == "argon"
-    assert ctx.quota_verdict("antigravity", 1, model=GEMINI) is None
+    if window == "argon":
+        assert v is None
+    else:
+        assert v is not None and v.window == "gemini" and v.required == 3
+    held = ctx.quota_verdict("antigravity", 1, model=GEMINI)
+    assert held is not None and held.window == "gemini"
     assert ctx.quota_verdict("antigravity", 1, model=CLAUDE) is None
 
 

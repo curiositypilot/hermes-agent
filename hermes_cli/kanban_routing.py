@@ -478,11 +478,12 @@ def _match_windows(entry: dict) -> list[QuotaWindow]:
         if not isinstance(w, dict) or "match" not in w:
             continue
         match = _parse_match(w.get("match"))
-        try:
-            headroom = float(w["headroom"])
-        except (TypeError, KeyError, ValueError):
+        raw_headroom = w.get("headroom")
+        # bool is an int subclass: JSON ``true`` would read as headroom 1.0 and open the gate
+        if match is None or isinstance(raw_headroom, bool) or not isinstance(raw_headroom, (int, float)):
             return []
-        if match is None or not math.isfinite(headroom):
+        headroom = float(raw_headroom)
+        if not math.isfinite(headroom):
             return []
         out.append(QuotaWindow(str(w.get("name") or "?"), match, headroom, _parse_iso_epoch(w.get("resets_at"))))
     if sum(1 for w in out if w.match == "*") > 1:
@@ -491,19 +492,14 @@ def _match_windows(entry: dict) -> list[QuotaWindow]:
 
 
 def _window_for(windows: list[QuotaWindow], model: str) -> Optional[QuotaWindow]:
-    """The window gating ``model``: the longest matching prefix (case-insensitive),
-    else the ``"*"`` window, else None (binding). Longest-first lets a narrower
-    pool (e.g. ``gemini-4-argon``) sit beside a broader one (``gemini``)."""
+    """The window gating ``model``: the first window, in file order, with a prefix
+    the id starts with (case-insensitive), else the ``"*"`` window, else None
+    (binding). File order is the producer's (scripts/quota_snapshot.py's pool rule
+    is first-match too), so a narrower pool must be written before a broader one."""
     mid = model.strip().lower()
-    best: Optional[tuple[int, QuotaWindow]] = None
     for w in windows:
-        if w.match == "*":
-            continue
-        for prefix in w.match:
-            if mid.startswith(prefix) and (best is None or len(prefix) > best[0]):
-                best = (len(prefix), w)
-    if best is not None:
-        return best[1]
+        if w.match != "*" and any(mid.startswith(prefix) for prefix in w.match):
+            return w
     return next((w for w in windows if w.match == "*"), None)
 
 
