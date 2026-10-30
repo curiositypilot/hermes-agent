@@ -53,7 +53,7 @@ def format_findings(findings: list[Finding]) -> str:
         if f.allowed_reason is not None:
             continue
         tag = "" if f.blocking else " (advisory)"
-        out.append(f"{f.path}:{f.line}  {f.rule}{tag}  {f.scope}")
+        out.append(f"{f.path}:{f.line}  {f.rule}{tag}  in {f.scope}")
         out.append(f"    {f.detail}")
         out.append(f"    fix: {_fix_text(f.rule)}")
     allowed = [f for f in findings if f.allowed_reason is not None]
@@ -61,7 +61,7 @@ def format_findings(findings: list[Finding]) -> str:
         out.append("")
         out.append("Allowed by comment (reviewers: check the reasons):")
         for f in allowed:
-            out.append(f"  {f.path}:{f.line}  {f.rule}  {f.scope}  -- {f.allowed_reason}")
+            out.append(f"  {f.path}:{f.line}  {f.rule}  in {f.scope}  -- {f.allowed_reason}")
     return "\n".join(out)
 
 

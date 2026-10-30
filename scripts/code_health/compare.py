@@ -380,13 +380,16 @@ def _split_hits(hf: FileMeasure, kept: set[int], unchanged_scopes: set[str]) -> 
     return split
 
 
-def _hit_findings(path: str, split: Split, credit: Counter[Hit]) -> list[Finding]:
+def _hit_findings(path: str, split: Split, credit: Counter[Hit],
+                  hit_notes: dict[tuple[str, int], str]) -> list[Finding]:
     findings: list[Finding] = []
     for hit, (old, fresh) in sorted(split.items(), key=lambda kv: min(kv[1][0] + kv[1][1], default=0)):
         extra = max(0, len(old) - credit.get(hit, 0))
         rule = RULES_BY_ID[hit.rule]
         for line in sorted(fresh + old[len(old) - extra:]):
-            findings.append(Finding(path, hit.rule, hit.scope, line, rule.title,
+            note = hit_notes.get((hit.rule, line))
+            detail = f"{rule.title}: {note}" if note else rule.title
+            findings.append(Finding(path, hit.rule, hit.scope, line, detail,
                                     blocking=rule.blocking))
     return findings
 
@@ -438,5 +441,5 @@ def compare(base: dict[str, FileMeasure], head: dict[str, FileMeasure],
         bpath = base_of.get(path, path)
         findings += _file_findings(path, hf, base.get(bpath) if bpath else None)
         findings += _unit_findings(path, hf, match)
-        findings += _hit_findings(path, splits[path], owned.get(path, Counter()))
+        findings += _hit_findings(path, splits[path], owned.get(path, Counter()), hf.hit_notes)
     return findings

@@ -160,9 +160,9 @@ class Measurer:
             fm.error = "ruff could not measure it: " + "; ".join((ruff_file.errors if ruff_file else ["no result"])[:3])
         else:
             _own_complexity(fm, ruff_file.cc_by_line)
-            for code, row in ruff_file.hits:
+            for code, row, message in ruff_file.hits:
                 if code in RULES_BY_ID and rule_applies(RULES_BY_ID[code], fm.path):
-                    fm.add_hit(code, scopes.scope(row), row)
+                    fm.add_hit(code, scopes.scope(row), row, message)
         for rule_id, checker in py_rules.CHECKERS.items():
             if rule_applies(RULES_BY_ID[rule_id], fm.path):
                 for row in sorted(set(checker(rules_tree, self.ctx))):
