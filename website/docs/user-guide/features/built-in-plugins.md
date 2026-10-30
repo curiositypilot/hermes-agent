@@ -76,13 +76,13 @@ Auto-tracks and removes ephemeral files created during sessions — test scripts
 | Hook | Behaviour |
 |---|---|
 | `post_tool_call` | When `write_file` / `terminal` / `patch` creates a file matching `test_*`, `tmp_*`, or `*.test.*` inside `HERMES_HOME` or `/tmp/hermes-*`, track it silently as `test` / `temp` / `cron-output`. | <!-- no-tmp: ok — documents the plugin's scope guard -->
-| `on_session_end` | If any test files were auto-tracked during the turn, run the safe `quick` cleanup and log a one-line summary. Stays silent otherwise. |
+| `on_session_end` | If the turn auto-tracked test files, run the safe `quick` cleanup, delete only the test files that turn created, and log a one-line summary. A test file another run tracked stays until it is more than 7 days old. Stays silent otherwise. |
 
 **Deletion rules:**
 
 | Category | Threshold | Confirmation |
 |---|---|---|
-| `test` | every session end | Never |
+| `test` | end of the turn that created it; another run's file after 7 days | Never |
 | `temp` | >7 days since tracked | Never |
 | `cron-output` | >14 days since tracked | Never |
 | empty dirs under HERMES_HOME | always | Never |
