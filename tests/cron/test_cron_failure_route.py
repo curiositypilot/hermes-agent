@@ -270,7 +270,8 @@ def _job_runtime(tmp_path, agent, *, primary_fails=False):
          patch("hermes_cli.env_loader.load_hermes_dotenv"), \
          patch("hermes_cli.env_loader.reset_secret_source_cache"), \
          patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=_resolve), \
-         patch("run_agent.AIAgent", return_value=agent):
+         patch("run_agent.AIAgent", return_value=agent), \
+         patch("cron.scheduler._cron_preflight_enabled", return_value=False):
         yield
 
 

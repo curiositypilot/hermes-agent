@@ -13,7 +13,13 @@ import pytest
 # flags); without it the probe cannot prove the client never opens state.db writable.
 @pytest.mark.platforms('linux')
 @pytest.mark.skipif(shutil.which('strace') is None, reason='requires strace on PATH')
-@pytest.mark.parametrize('mode', ['custom', 'cross_profile', 'restart'])
+# Fork: the HERMES_KANBAN_HOME vs outside-pin guard (kanban_db_pin_guard.KanbanPathConflict, t_29de271a)
+# refuses the 'custom' layout on purpose; see fork-patches.md.
+_FORK_PIN_GUARD = pytest.mark.xfail(reason='fork pin guard refuses HERMES_KANBAN_DB outside HERMES_KANBAN_HOME',
+                                    strict=True)
+
+
+@pytest.mark.parametrize('mode', [pytest.param('custom', marks=_FORK_PIN_GUARD), 'cross_profile', 'restart'])
 def test_owner_board_recovery(tmp_path, mode):
     repo = Path(__file__).resolve().parents[2]
     env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}

@@ -570,6 +570,7 @@ def test_day_two_reprobe_delivers_its_alert_through_the_tick(tmp_path, day_clock
     job is parked again each time. The shrinking ``retry after <N>s`` does NOT mint a new incident
     (durations are masked out of the signature, cron/incidents.py #129587), so the day-2 alert is
     the same incident's repeat alert: the cooldown is pinned below the 24 h cap so it has lapsed."""
+    monkeypatch.setattr(sched, "_cron_preflight_enabled", lambda _cfg: False)  # no gateway creds here
     monkeypatch.setattr(sched, "_failure_repeat_alert_hours", lambda: 12.0)
     with cron_jobs.use_cron_store(tmp_path):
         job = create_job("probe", "every 15m", deliver="telegram:123")
@@ -593,6 +594,7 @@ def test_day_two_reprobe_alert_is_withheld_inside_the_incident_cooldown(
         tmp_path, day_clock, monkeypatch, cron_owner):
     """A provider that repeats the same hint, with a cooldown longer than the hold, gets no day-2
     alert (normal failure-incident rules) but the job is still parked again."""
+    monkeypatch.setattr(sched, "_cron_preflight_enabled", lambda _cfg: False)  # no gateway creds here
     monkeypatch.setattr(sched, "_failure_repeat_alert_hours", lambda: 48.0)
     with cron_jobs.use_cron_store(tmp_path):
         job = create_job("probe", "every 15m", deliver="telegram:123")
