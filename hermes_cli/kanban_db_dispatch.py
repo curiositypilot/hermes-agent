@@ -2963,8 +2963,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
-    # A pinned route is an explicit model choice: the worker must not walk the
-    # global fallback chain onto another vendor (agent_init._init_fallback_chain).
+    # A pinned route drops the fallback chain; this copy reaches only the thin client, the agent
+    # gets it from gateway/session_kanban.bind_worker_context (kanban_json route_pinned).
     if getattr(task, "route_pinned", False):
         env["HERMES_KANBAN_PINNED"] = "1"
     else:

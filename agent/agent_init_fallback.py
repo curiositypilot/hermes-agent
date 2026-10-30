@@ -22,7 +22,8 @@ def _fallback_entries(fallback_model) -> list[dict[str, Any]]:
 
 def _kanban_pinned_route() -> bool:
     """True for the dispatcher-owned worker of a card whose route is pinned
-    (``HERMES_KANBAN_PINNED=1`` set by ``kanban_db_dispatch._default_spawn``)."""
+    (``HERMES_KANBAN_PINNED=1``; under owner-run the managed worker's
+    ``gateway/session_kanban.bind_worker_context`` sets it from ``kanban_json``)."""
     from agent.delegation_context import owned_kanban_task
     return bool(owned_kanban_task()) and os.environ.get("HERMES_KANBAN_PINNED") == "1"
 

@@ -43,6 +43,7 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
     assert context['board'] == 'owned' and context['claim_lock'] == task.claim_lock
     assert context['skills'] == ['owned-skill'] and context['goal_mode'] and context['goal_max_turns'] == 3
     assert context['accept_hooks'] is True and 'Goal criteria' in context['goal_text']
+    assert context['route_pinned'] is True  # card model_override, no routed event: the card pin drives -m
     for changed in ({'run_id': task.current_run_id + 1}, {'board': 'foreign'}, {'claim_lock': 'forged'}, {'cwd': '/tmp'}):
         with pytest.raises(RuntimeStoreError):
             build_kanban_policy(connection, params | changed, config)
@@ -147,3 +148,85 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
     assert calls == []
     with closing(connect(board='owned')) as conn:
         assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='owner_admitted'", (task_id,)).fetchone()[0] == 0
+
+
+def _claimed_policy(tmp_path, monkeypatch, routed=None, **task_kw):
+    """A real claimed board task (optionally with a ``routed`` event for its run) and its frozen policy."""
+    from contextlib import closing
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from gateway.session_contract import Principal
+    from gateway.session_kanban import build_kanban_policy
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HOME', str(tmp_path / 'home'))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    monkeypatch.delenv('HERMES_DELEGATED_CHILD', raising=False)
+    monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env', lambda name: str(tmp_path) if name == 'default' else str(tmp_path / name))
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    kb.create_board('owned')
+    with closing(connect(board='owned')) as conn:
+        task_id = kb.create_task(conn, title='Pinned route', assignee='default', workspace_kind='dir',
+                                 workspace_path=str(workspace), **task_kw)
+        kb.recompute_ready(conn)
+        task = kb.claim_task(conn, task_id)
+        if routed is not None:
+            with kb.write_txn(conn):
+                kb._append_event(conn, task.id, 'routed', routed, run_id=task.current_run_id)
+    actor = Principal('owner', str(tmp_path), frozenset({'session:create'}), 'transport')
+    connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(tmp_path)), actor=actor, native_owner=True)
+    params = dict(board='owned', task_id=task.id, run_id=task.current_run_id, claim_lock=task.claim_lock)
+    config = {'model': {'default': 'loop-model', 'provider': 'custom'}, 'platform_toolsets': {'cli': ['terminal']}}
+    policy, _secrets = build_kanban_policy(connection, params, config)
+    return policy
+
+
+@pytest.mark.parametrize('routed, pinned', [
+    # Incident replay (runs 7273/7274): critics pinned off the author's vendor.
+    ({'source': 'pinned', 'model': 'grok-4.7', 'provider': 'xai-oauth'}, True),
+    ({'source': 'tier', 'requested_tier': 'M', 'tier': 'M', 'model': 'm', 'provider': 'p'}, False),
+    ({'source': 'review', 'lane': 'review', 'model': 'r', 'provider': 'p'}, False),
+])
+def test_kanban_policy_carries_route_pin(tmp_path, monkeypatch, routed, pinned):
+    policy = _claimed_policy(tmp_path, monkeypatch, routed=routed)
+    assert json.loads(policy.kanban_json)['route_pinned'] is pinned
+
+
+@pytest.fixture
+def _restore_environ(monkeypatch):
+    """bind_worker_context writes os.environ and chdirs: put both back after the test."""
+    import os
+    saved = dict(os.environ)
+    monkeypatch.chdir(os.getcwd())
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+
+
+@pytest.mark.parametrize('case', ['pinned', 'tier', 'legacy_policy'])
+def test_bind_worker_context_sets_and_clears_pin(tmp_path, monkeypatch, _restore_environ, case):
+    """The managed worker builds the agent, so the pin must land in ITS environment; an inherited
+    HERMES_KANBAN_PINNED never pins a tier route (nor a policy frozen before the key existed)."""
+    import os
+    from gateway import session_kanban
+    from agent.agent_init_fallback import _kanban_pinned_route
+    routed = ({'source': 'pinned', 'model': 'grok-4.7', 'provider': 'xai-oauth'} if case == 'pinned'
+              else {'source': 'tier', 'tier': 'M', 'model': 'm', 'provider': 'p'})
+    policy = _claimed_policy(tmp_path, monkeypatch, routed=routed)
+    context = json.loads(policy.kanban_json)
+    if case == 'legacy_policy':
+        context.pop('route_pinned')
+    if case == 'pinned':
+        os.environ.pop('HERMES_KANBAN_PINNED', None)
+    else:
+        os.environ['HERMES_KANBAN_PINNED'] = '1'  # inherited from the launching process
+    monkeypatch.setattr(session_kanban, '_watch_submitter', lambda db, run_id: None)
+    session_kanban.bind_worker_context({'policy': {'source': 'kanban', 'kanban_json': json.dumps(context)}})
+    assert os.environ['HERMES_KANBAN_TASK'] == context['task_id']
+    if case == 'pinned':
+        assert os.environ['HERMES_KANBAN_PINNED'] == '1'
+        assert _kanban_pinned_route() is True
+    else:
+        assert 'HERMES_KANBAN_PINNED' not in os.environ
+        assert _kanban_pinned_route() is False
