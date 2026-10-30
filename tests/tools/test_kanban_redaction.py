@@ -149,3 +149,77 @@ def test_kanban_complete_result_field_scrubbed(worker_env):
     assert run.outcome == "completed"
     stored = run.summary or ""
     assert secret not in stored
+
+
+# ---------------------------------------------------------------------------
+# Metadata redaction runs per entry, never across the serialized JSON
+# (intake t_550f2a2f: ``KEY=\S+`` ate the closing quote, the re-parse failed
+# and kanban_complete stored the raw dict).
+# ---------------------------------------------------------------------------
+
+_GHP = "ghp_" + "B" * 36
+_ENV_REVERT = "cp a back; or env HINDSIGHT_LOCAL_LLM_AUTH_SKIP=0"
+
+
+def test_redact_metadata_env_assign_keeps_json():
+    from tools import kanban_tools as kt
+    assert kt._redact_metadata({"revert": _ENV_REVERT}) == {
+        "revert": "cp a back; or env HINDSIGHT_LOCAL_LLM_AUTH_SKIP=***"}
+
+
+def test_kanban_complete_metadata_no_fail_open(worker_env):
+    import json
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    metadata = {"revert": "env HINDSIGHT_LOCAL_LLM_AUTH_SKIP=0", "note": f"token {_GHP}"}
+    out = json.loads(kt._handle_complete({"summary": "done", "metadata": metadata}))
+    assert out.get("ok") is True, out
+    conn = kbc.connect()
+    try:
+        stored = json.dumps(kb.latest_run(conn, worker_env).metadata)
+    finally:
+        conn.close()
+    assert _GHP not in stored
+    assert "AUTH_SKIP=0" not in stored
+
+
+def test_redact_metadata_key_policy_and_nesting():
+    from tools import kanban_tools as kt
+    out = kt._redact_metadata({
+        "password": "hunter2xyz",
+        "nested": {"api_key": "abcdefgh12345678"},
+        "items": [_GHP],
+    })
+    assert out["password"] == "***"
+    assert out["nested"]["api_key"] == "***"
+    assert _GHP not in out["items"][0]
+
+
+def test_redact_metadata_leaves_plain_values_unchanged():
+    from tools import kanban_tools as kt
+    plain = {
+        "t1": "cd ~/x && sha256sum -c f.sha256",
+        "n": 3,
+        "ok": True,
+        "none": None,
+        "sha": "bb25523dfebb0f38226d4a9786a17cb9d5afe9c8b300e1756c61d611b01ffe07",
+    }
+    assert kt._redact_metadata(plain) == plain
+
+
+def test_kanban_request_review_metadata_env_assign(worker_env):
+    import json
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    out = json.loads(kt._handle_request_review(
+        {"summary": "ready", "metadata": {"revert": _ENV_REVERT}}))
+    assert out.get("ok") is True, out
+    conn = kbc.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "review"
+        stored = kb.latest_run(conn, worker_env).metadata
+    finally:
+        conn.close()
+    assert stored["revert"] == "cp a back; or env HINDSIGHT_LOCAL_LLM_AUTH_SKIP=***"

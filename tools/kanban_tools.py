@@ -384,12 +384,42 @@ def _redact_opt(value: Any) -> Any:
     return _redact(value) if value else value
 
 
-def _redact_metadata(metadata: dict) -> Optional[dict]:
-    """Redact via a JSON round-trip; None if the result can't be re-parsed."""
+def _redact_pair(key: str, value: str) -> tuple:
+    """Redact one key/value pair as its own JSON text so key-name policies
+    (``"password": ...``) still fire, without a pattern ever spanning JSON
+    syntax of a neighbouring entry. A mangled pair falls back to per-string."""
     try:
-        return json.loads(redact_sensitive_text(json.dumps(metadata), force=True))
+        redacted = json.loads(redact_sensitive_text(json.dumps({key: value}), force=True))
     except json.JSONDecodeError:
-        return None
+        redacted = None
+    if isinstance(redacted, dict) and len(redacted) == 1:
+        return next(iter(redacted.items()))
+    return _redact(key), _redact(value)
+
+
+def _redact_metadata_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _redact_metadata(value)
+    if isinstance(value, (list, tuple)):
+        return [_redact_metadata_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact(value)
+    return value
+
+
+def _redact_metadata(metadata: dict) -> dict:
+    """Redact every string in ``metadata`` per entry, never across the
+    serialized document (a value regex such as ``KEY=\\S+`` would eat JSON
+    closing quotes and break the re-parse)."""
+    out: dict = {}
+    for key, value in metadata.items():
+        if isinstance(key, str) and isinstance(value, str):
+            key, value = _redact_pair(key, value)
+        else:
+            key = _redact(key) if isinstance(key, str) else key
+            value = _redact_metadata_value(value)
+        out[key] = value
+    return out
 
 
 def _coerce_str_list(value: Any, name: str, what: str, *, strip: bool = False):
@@ -774,8 +804,7 @@ def _handle_complete(args: dict, **kw) -> str:
     result = _redact_opt(args.get("result"))
     metadata = args.get("metadata")
     if isinstance(metadata, dict):
-        # Keep the unredacted dict if the redacted JSON cannot be re-parsed.
-        metadata = _redact_metadata(metadata) or metadata
+        metadata = _redact_metadata(metadata)
     created_cards = _coerce_str_list(
         args.get("created_cards"), "created_cards", "task ids", strip=True)
     artifacts = _coerce_str_list(args.get("artifacts"), "artifacts", "file paths", strip=True)
@@ -938,7 +967,6 @@ def _handle_request_review(args: dict, **kw) -> str:
     _require_dict_metadata(metadata)
     if metadata is not None:
         metadata = _redact_metadata(metadata)
-        _check(metadata is not None, "metadata could not be safely serialized")
     artifacts = _coerce_str_list(args.get("artifacts"), "artifacts", "file paths", strip=True)
     if artifacts:
         metadata = _merge_artifacts(metadata, artifacts)
