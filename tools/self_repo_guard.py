@@ -8,6 +8,8 @@ import os
 import re
 import shlex
 import subprocess
+from collections import ChainMap
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -54,6 +56,30 @@ _MAX_RECURSION = 4
 # git global options that consume the next argument (-C/--work-tree/-c are acted on).
 _GIT_GLOBAL_OPTIONS_WITH_ARG = frozenset(
     {"-C", "-c", "--work-tree", "--git-dir", "--namespace", "--exec-path"})
+# Builtins whose ``NAME=value`` operands set variables in the current shell.
+_DECLARATION_BUILTINS = frozenset({"export", "declare", "typeset", "local", "readonly"})
+# A `cd` or assignment reaches the next command only through these (not `|`, `&`, `||`).
+_SEQUENTIAL_OPERATORS = frozenset({"&&", ";", "\n"})
+# ``$NAME`` / ``${NAME}`` (groups 1/2), or a form the guard does not evaluate: ``$(``, a non-simple
+# ``${...}``, a positional or special parameter, a backtick.
+_EXPANSION_RE = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)|\$[({0-9@*#?$!-]|`")
+
+
+@dataclass(frozen=True)
+class _Unresolved:
+    """A target the guard cannot name: ``word`` still holds an unknown ``$NAME``, ``$(...)`` or a
+    backtick after expansion (or relies on a variable whose value did)."""
+    word: str
+
+
+_Target = Path | _Unresolved
+
+
+class _Operation(str):
+    """An operation name; ``unresolved`` is the target word the guard could not name when that is
+    why it refuses the operation."""
+    unresolved: str | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +93,12 @@ class _Scope:
     is_root: Callable[[Path], bool]
     mutates: Callable[[str, list[str]], bool]
     operation_at: Callable[[Path, str, list[str]], str | None] | None = None
+    # Variables exported in earlier calls (the session snapshot); looked up after the command's
+    # own assignments and before ``os.environ``.
+    base_vars: Mapping[str, str] | None = None
+    # An unresolved target is ``_Unresolved`` (mutating git there is refused) instead of a
+    # literal joined onto the cwd.
+    fail_closed: bool = False
 
 
 @dataclass
@@ -93,15 +125,69 @@ def get_running_source_root() -> Path | None:
     return root if (root / ".git").exists() else None
 
 
-def _resolve(path_str: str, base: Path) -> Path:
-    # The shell expands ``$VAR`` before ``cd``/``git -C`` see the word; left literal, ``$TMPDIR/x``
-    # joins onto ``base`` and the verdict follows the cwd instead of the target. Unknown names stay
-    # literal, so an unresolvable word keeps the cwd-relative fallback. ``/`` keeps an absolute
-    # right operand.
-    path = base / Path(os.path.expanduser(os.path.expandvars(path_str)))
+def _expand_word(word: str, lookup: Callable[[str], str | None]) -> tuple[str, bool]:
+    """Expand ``$NAME`` / ``${NAME}`` through ``lookup``, then a leading ``~`` -> (text, resolved).
+    The shell expands these before ``cd``/``git -C`` see the word; left literal, ``$TMPDIR/x`` would
+    join onto the cwd. A name ``lookup`` cannot answer, and every form not evaluated here, stays
+    literal and clears ``resolved``."""
+    resolved = True
+
+    def substitute(match: re.Match[str]) -> str:
+        nonlocal resolved
+        name = match.group(1) or match.group(2)
+        value = lookup(name) if name else None
+        if value is None:
+            resolved = False
+            return match.group(0)
+        return value
+
+    return os.path.expanduser(_EXPANSION_RE.sub(substitute, word)), resolved
+
+
+def _absolute(text: str, base: Path) -> Path:
+    path = base / Path(text)  # ``/`` keeps an absolute right operand
     with contextlib.suppress(OSError, RuntimeError, ValueError):
         return path.resolve()
     return path
+
+
+def _resolve(path_str: str, base: Path) -> Path:
+    """``path_str`` expanded from ``os.environ`` and resolved against ``base``; an unknown name
+    stays literal (cwd-relative fallback)."""
+    return _absolute(_expand_word(path_str, os.environ.get)[0], base)
+
+
+def _lookup_in(
+    shell_vars: Mapping[str, str | None], base_vars: Mapping[str, str] | None,
+) -> Callable[[str], str | None]:
+    """Variable lookup: the command's own assignments (None = value unknown), then the session
+    snapshot, then ``os.environ``."""
+    def lookup(name: str) -> str | None:
+        if name in shell_vars:
+            return shell_vars[name]
+        if base_vars is not None and name in base_vars:
+            return base_vars[name]
+        return os.environ.get(name)
+    return lookup
+
+
+def _target(
+    word: str, base: _Target, shell_vars: Mapping[str, str | None], scope: _Scope,
+) -> _Target:
+    """Directory ``word`` names, run from ``base``. Only a fail-closed scope sees ``_Unresolved``;
+    the others keep the literal, cwd-relative fallback."""
+    text, resolved = _expand_word(word, _lookup_in(shell_vars, scope.base_vars))
+    if scope.fail_closed and not resolved:
+        return _Unresolved(word)
+    if isinstance(base, _Unresolved):  # only an absolute word escapes an unresolved cwd
+        return _absolute(text, Path("/")) if os.path.isabs(text) else base
+    return _absolute(text, base)
+
+
+def _unresolved_operation(name: str, target: _Unresolved) -> _Operation:
+    operation = _Operation(name)
+    operation.unresolved = target.word
+    return operation
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -206,15 +292,63 @@ def _operator_before(command: str, start: int) -> str | None:
     return "\n" if "\n" in command[len(head):start] else None
 
 
-def _cd_target(executable: str, args: list[str], cwd: Path) -> Path | None:
-    """Directory a ``cd``/``pushd`` would land in (existing dirs only), else None."""
+def _cd_target(
+    executable: str, args: list[str], cwd: _Target, shell_vars: Mapping[str, str | None],
+    scope: _Scope,
+) -> _Target | None:
+    """Directory a ``cd``/``pushd`` would land in (existing dirs, or ``_Unresolved``), else None."""
     if _executable_name(executable) not in {"cd", "pushd"}:
         return None
     index = _consume_options(args, 0)
     if index >= len(args) or args[index] == "-":
         return None
-    target = _resolve(args[index], cwd)
-    return target if target.is_dir() else None
+    target = _target(args[index], cwd, shell_vars, scope)
+    return target if isinstance(target, _Unresolved) or target.is_dir() else None
+
+
+def _shell_assignments(
+    env: dict[str, str], executable: str | None, args: list[str],
+) -> list[tuple[str, str | None]]:
+    """``(name, raw value)`` pairs a command sets in the current shell: a bare assignment list, a
+    declaration builtin's ``NAME=value`` operands, or ``unset`` (value None). Prefix assignments
+    (``R=x git ...``) only reach that command's environment, so they are not listed."""
+    if executable is None:
+        return list(env.items())
+    name = _executable_name(executable)
+    if name == "unset":
+        return [(arg, None) for arg in args if not arg.startswith("-")]
+    if name not in _DECLARATION_BUILTINS:
+        return []
+    return [(arg.split("=", 1)[0], arg.split("=", 1)[1]) for arg in args
+            if _ASSIGNMENT_RE.fullmatch(arg)]
+
+
+@dataclass
+class _ShellState:
+    """cwd and shell variables of one subshell scope, plus the `cd` / assignments waiting for the
+    next command's operator. A variable whose value is unknown maps to None."""
+    cwd: _Target
+    variables: dict[str, str | None]
+    pending_cd: _Target | None = None
+    pending_vars: dict[str, str | None] | None = None
+
+    def settle(self, operator: str | None) -> None:
+        if operator in _SEQUENTIAL_OPERATORS:
+            if self.pending_cd is not None:
+                self.cwd = self.pending_cd
+            self.variables.update(self.pending_vars or {})
+        self.pending_cd = self.pending_vars = None
+
+    def assign(self, pairs: list[tuple[str, str | None]], scope: _Scope) -> None:
+        """Queue assignments, each value expanded when assigned (left to right, like bash)."""
+        if not pairs:
+            return
+        pending: dict[str, str | None] = {}
+        lookup = _lookup_in(ChainMap(pending, self.variables), scope.base_vars)
+        for name, raw in pairs:
+            text, resolved = _expand_word(raw, lookup) if raw is not None else ("", False)
+            pending[name] = text if resolved else None
+        self.pending_vars = pending
 
 
 def _shell_script_arg(args: list[str]) -> str | None:
@@ -391,8 +525,9 @@ def _record_alias(config: str, aliases: dict[str, str]) -> None:
 
 
 def _git_target_and_subcommand(
-    args: list[str], current_dir: Path, env: dict[str, str],
-) -> tuple[Path, str | None, list[str], dict[str, str]]:
+    args: list[str], current_dir: _Target, env: dict[str, str],
+    shell_vars: Mapping[str, str | None], scope: _Scope,
+) -> tuple[_Target, str | None, list[str], dict[str, str]]:
     """Parse git's global options -> (target dir, subcommand, sub args, inline aliases)."""
     target = current_dir
     work_tree: str | None = None
@@ -414,14 +549,14 @@ def _git_target_and_subcommand(
                                   if arg.startswith(o) and len(arg) > len(o)), (None, None))
             index += 1
         if option == "-C" and value is not None:
-            target = _resolve(value, target)
+            target = _target(value, target, shell_vars, scope)
         elif option and option.startswith("--work-tree") and value is not None:
             work_tree = value
         elif option == "-c" and value is not None:
             _record_alias(value, aliases)  # only alias.* overrides matter; others are ignored
     explicit_work_tree = work_tree or env.get("GIT_WORK_TREE")
     if explicit_work_tree:
-        target = _resolve(explicit_work_tree, target)
+        target = _target(explicit_work_tree, target, shell_vars, scope)
     return target, args[index].lower() if index < len(args) else None, args[index + 1 :], aliases
 
 
@@ -459,15 +594,18 @@ def _mutates_shared_checkout(subcommand: str, args: list[str]) -> bool:
     return _mutates_worktree(subcommand, args)
 
 
-def _inspect_git_worktree(args: list[str], cwd: Path, scope: _Scope) -> str | None:
-    """Block `worktree remove|move` aimed at a protected root, from any directory."""
+def _inspect_git_worktree(
+    args: list[str], cwd: _Target, scope: _Scope, shell_vars: Mapping[str, str | None],
+) -> str | None:
+    """Block `worktree remove|move` aimed at a protected root, from any directory. An unresolved
+    victim passes: git refuses to remove or move a main working tree, which every root is."""
     action_index = _consume_options(args, 0)
     action = args[action_index].lower() if action_index < len(args) else None
     target_index = _consume_options(args, action_index + 1)
-    if (action in _WORKTREE_TARGET_ACTIONS and target_index < len(args)
-            and scope.is_root(_resolve(args[target_index], cwd))):
-        return f"git worktree {action}"
-    return None
+    if action not in _WORKTREE_TARGET_ACTIONS or target_index >= len(args):
+        return None
+    victim = _target(args[target_index], cwd, shell_vars, scope)
+    return f"git worktree {action}" if isinstance(victim, Path) and scope.is_root(victim) else None
 
 
 def _read_git_alias(executable: str, target: Path, alias: str) -> str | None:
@@ -480,63 +618,77 @@ def _read_git_alias(executable: str, target: Path, alias: str) -> str | None:
 
 
 def _inspect_git(
-    executable: str, args: list[str], current_dir: Path, env: dict[str, str], scope: _Scope,
-    depth: int,
+    executable: str, args: list[str], current_dir: _Target, env: dict[str, str], scope: _Scope,
+    depth: int, shell_vars: Mapping[str, str | None],
 ) -> str | None:
     target, subcommand, sub_args, inline_aliases = _git_target_and_subcommand(
-        args, current_dir, env)
+        args, current_dir, env, shell_vars, scope)
     if subcommand is None:
         return None
     if subcommand == "worktree":  # names its victim as an argument: the cwd check does not apply
-        return _inspect_git_worktree(sub_args, target, scope)
-    if scope.operation_at is not None and (operation := scope.operation_at(target, subcommand, sub_args)):
+        return _inspect_git_worktree(sub_args, target, scope, shell_vars)
+    if isinstance(target, _Unresolved):  # fail closed: the target may be a protected checkout
+        if scope.mutates(subcommand, sub_args):
+            return _unresolved_operation(f"git {subcommand}", target)
+    elif scope.operation_at is not None and (
+            operation := scope.operation_at(target, subcommand, sub_args)):
         return operation
-    if not scope.contains(target):
+    elif not scope.contains(target):
         return None
-    if scope.mutates(subcommand, sub_args):
+    elif scope.mutates(subcommand, sub_args):
         return f"git {subcommand}"
     if subcommand in _KNOWN_GIT_BUILTINS or depth >= _MAX_RECURSION:
         return None
-    alias = (inline_aliases[subcommand] if subcommand in inline_aliases
-             else _read_git_alias(executable, target, subcommand))
+    if subcommand in inline_aliases:
+        alias = inline_aliases[subcommand]
+    else:  # config aliases of an unresolved target cannot be read
+        alias = None if isinstance(target, _Unresolved) else _read_git_alias(
+            executable, target, subcommand)
     if not alias:
         return None
     if alias.startswith("!"):  # shell alias: scan it as a command
-        return _find_mutation(alias[1:], target, scope, depth + 1)
+        return _find_mutation(alias[1:], target, scope, depth + 1, shell_vars)
     try:
         alias_args = shlex.split(alias, posix=True)
     except ValueError:
         return None
-    return _inspect_git(executable, [*alias_args, *sub_args], target, {}, scope, depth + 1)
+    return _inspect_git(
+        executable, [*alias_args, *sub_args], target, {}, scope, depth + 1, shell_vars)
 
 
 def _inspect_github_cli(
-    executable: str, args: list[str], current_dir: Path, env: dict[str, str], scope: _Scope,
-    depth: int,
+    executable: str, args: list[str], current_dir: _Target, env: dict[str, str], scope: _Scope,
+    depth: int, shell_vars: Mapping[str, str | None],
 ) -> str | None:
-    if not scope.contains(current_dir):
-        return None
     index = _consume_options(args, 0, frozenset({"-R", "--repo", "--hostname"}))
-    is_checkout = args[index : index + 2] == ["pr", "checkout"]
-    return f"{_executable_name(executable)} pr checkout" if is_checkout else None
+    if args[index : index + 2] != ["pr", "checkout"]:
+        return None
+    operation = f"{_executable_name(executable)} pr checkout"
+    if isinstance(current_dir, _Unresolved):
+        return _unresolved_operation(operation, current_dir)
+    return operation if scope.contains(current_dir) else None
 
 
 def _inspect_shell(
-    executable: str, args: list[str], current_dir: Path, env: dict[str, str], scope: _Scope,
-    depth: int,
+    executable: str, args: list[str], current_dir: _Target, env: dict[str, str], scope: _Scope,
+    depth: int, shell_vars: Mapping[str, str | None],
 ) -> str | None:
     script = _shell_script_arg(args)
-    return _find_mutation(script, current_dir, scope, depth + 1) if script else None
+    return _find_mutation(script, current_dir, scope, depth + 1, shell_vars) if script else None
 
 
-# executable name -> inspector(executable, args, current_dir, env, scope, depth)
+# executable name -> inspector(executable, args, current_dir, env, scope, depth, shell_vars)
 _INSPECTORS: dict[str, Callable[..., str | None]] = {
     "git": _inspect_git, "gh": _inspect_github_cli, "hub": _inspect_github_cli,
     **{shell: _inspect_shell for shell in _SHELL_EXECUTABLES}}
 
 
-def _find_mutation(command: str, cwd: Path, scope: _Scope, depth: int = 0) -> str | None:
-    """Name of the first command in ``command`` that would rewrite a checkout ``scope`` protects."""
+def _find_mutation(
+    command: str, cwd: _Target, scope: _Scope, depth: int = 0,
+    shell_vars: Mapping[str, str | None] | None = None,
+) -> str | None:
+    """Name of the first command in ``command`` that would rewrite a checkout ``scope`` protects.
+    ``shell_vars``: variables already set in the shell that runs ``command``."""
     if depth > _MAX_RECURSION:
         return None
     masked_command, heredocs = _mask_heredocs(command)
@@ -545,27 +697,33 @@ def _find_mutation(command: str, cwd: Path, scope: _Scope, depth: int = 0) -> st
     # Bodies a bare shell reads (`bash <<EOF`, `cat <<EOF | bash`) are scripts: scan them.
     for heredoc in heredocs:
         if _shell_consumes_heredoc(masked_command, starts, scopes, heredoc.opener) and (
-                operation := _find_mutation("".join(heredoc.body), cwd, scope, depth + 1)):
+                operation := _find_mutation("".join(heredoc.body), cwd, scope, depth + 1, shell_vars)):
             return operation
-    # cwd per subshell scope; `cd` applies to the NEXT command only via `&&`, `;`, newline.
-    cwd_by_scope: dict[tuple[int, ...], Path] = {(): cwd}
-    pending_cd: dict[tuple[int, ...], Path] = {}
+    # cwd and variables per subshell scope, inherited from the enclosing scope on first sight; a
+    # `cd` or assignment applies to the NEXT command only via `&&`, `;`, newline.
+    states: dict[tuple[int, ...], _ShellState] = {(): _ShellState(cwd, dict(shell_vars or {}))}
     for start in starts:
-        shell_scope = scopes[start]
-        cwd_by_scope.setdefault(shell_scope, cwd_by_scope.get(shell_scope[:-1], cwd))
-        pending = pending_cd.pop(shell_scope, None)
-        if pending is not None and _operator_before(masked_command, start) in {"&&", ";", "\n"}:
-            cwd_by_scope[shell_scope] = pending
+        state = _scope_state(states, scopes[start])
+        state.settle(_operator_before(masked_command, start))
         env, executable, args = _command_parts(_shell_words_at(masked_command, start))
+        state.assign(_shell_assignments(env, executable, args), scope)
         if executable is None:
             continue
-        current_dir = cwd_by_scope[shell_scope]
-        if (cd_target := _cd_target(executable, args, current_dir)) is not None:
-            pending_cd[shell_scope] = cd_target
-        elif (inspect := _INSPECTORS.get(_executable_name(executable))) and (
-                operation := inspect(executable, args, current_dir, env, scope, depth)):
+        if (cd_target := _cd_target(executable, args, state.cwd, state.variables, scope)) is not None:
+            state.pending_cd = cd_target
+        elif (inspect := _INSPECTORS.get(_executable_name(executable))) and (operation := inspect(
+                executable, args, state.cwd, env, scope, depth, state.variables)):
             return operation
     return None
+
+
+def _scope_state(
+    states: dict[tuple[int, ...], _ShellState], shell_scope: tuple[int, ...],
+) -> _ShellState:
+    if shell_scope not in states:
+        parent = _scope_state(states, shell_scope[:-1])
+        states[shell_scope] = _ShellState(parent.cwd, dict(parent.variables))
+    return states[shell_scope]
 
 
 def guard_active() -> bool:
@@ -611,10 +769,16 @@ def protected_checkout_roots(configured: object, hermes_home: Path) -> list[Path
 
 
 def detect_shared_checkout_git_mutation(
-    command: str, cwd: str | None, protected_roots: list[Path]) -> tuple[bool, str | None]:
+    command: str, cwd: str | None, protected_roots: list[Path],
+    base_vars: Mapping[str, str] | None = None,
+) -> tuple[bool, str | None]:
     """-> (blocked, message): whether a command would rewrite (or drop the stashes of) a shared
     checkout that holds other agents' uncommitted work. A target counts only when its nearest
-    enclosing repo toplevel IS a protected root, so nested repos and worktrees stay free."""
+    enclosing repo toplevel IS a protected root, so nested repos and worktrees stay free.
+
+    ``$NAME`` in a target resolves from the command's own assignments, then ``base_vars`` (the
+    session's exported variables), then ``os.environ``. A target that still cannot be resolved
+    (unknown name, ``$(...)``, backtick) fails closed: a mutating git command there is refused."""
     if not command or not protected_roots:
         return False, None
     current_dir = _resolve(cwd or "/", Path("/"))
@@ -622,7 +786,7 @@ def detect_shared_checkout_git_mutation(
         root = _resolve(str(configured_root), Path("/"))
         scope = _Scope(contains=lambda target, root=root: _enclosing_toplevel(target) == root,
                        is_root=lambda path, root=root: path == root,
-                       mutates=_mutates_shared_checkout)
+                       mutates=_mutates_shared_checkout, base_vars=base_vars, fail_closed=True)
         operation = _find_mutation(command, current_dir, scope)
         if operation is not None:
             return True, _shared_block_message(operation, root)
@@ -630,6 +794,14 @@ def detect_shared_checkout_git_mutation(
 
 
 def _shared_block_message(operation: str, root: Path) -> str:
+    unresolved = getattr(operation, "unresolved", None)
+    if unresolved is not None:
+        return (
+            f"Blocked: `{operation}` runs against a directory the guard cannot resolve: "
+            f"`{unresolved}` (an unknown variable, command substitution or backtick). It may be the "
+            f"shared checkout {root}, where this would overwrite or discard other agents' "
+            "uncommitted work. Rerun with a literal absolute path (`cd /abs/dir && git ...` or "
+            "`git -C /abs/dir ...`). Read-only git (status, log, diff) is not affected.")
     return (
         f"Blocked: `{operation}` would overwrite or discard uncommitted work in the shared checkout "
         f"{root}. Other agents keep their uncommitted edits in this tree; git cannot bring them "

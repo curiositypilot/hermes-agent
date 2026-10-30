@@ -169,16 +169,163 @@ class TestEnvVarTargets:
         root, _, outside = env
         assert _blocked(command, outside, [root]), command
 
-    def test_unknown_var_keeps_cwd_relative_fallback(self, env):
-        """Residual: an unset name stays literal, so the verdict still follows the cwd."""
+    def test_unknown_var_fails_closed_for_mutating_git(self, env):
+        """An unset name cannot be resolved, so a mutating git there is refused from any cwd."""
         root, _, outside = env
         command = "cd $NOPE_UNSET/x && git checkout -- ."
         assert _blocked(command, root, [root])
-        assert not _blocked(command, outside, [root])
+        assert _blocked(command, outside, [root])
 
     def test_read_only_via_var_not_blocked(self, env):
         root, _, outside = env
         assert not _blocked("git -C $ROOTVAR status", outside, [root])
+
+
+class TestShellVariables:
+    """Variables the shell knows but the guard process does not (intake t_b4c67044): assigned in
+    the same command, or exported in an earlier call (the session snapshot, ``base_vars``)."""
+
+    @pytest.fixture
+    def env(self, shared, tmp_path, monkeypatch):
+        root, _, _ = shared
+        scratch = root / "cache" / "scratch"
+        scratch.mkdir(parents=True)
+        repo = scratch / "repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+        worktree = (scratch / "wt").resolve()
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "--detach",
+                        str(worktree)], check=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        monkeypatch.setenv("HOME", str(tmp_path))  # $HOME/home and ~/home name the root
+        for name in ("R", "WT", "NOPE_UNSET"):
+            monkeypatch.delenv(name, raising=False)
+        return root, worktree, outside
+
+    @pytest.mark.parametrize("command", [
+        "R=$HOME/home; cd $R && git checkout -- .",
+        "R=~/home && git -C $R reset --hard",
+        'export R=$HOME/home; cd "$R" && git checkout -- .',
+        'declare -x R={root}; git -C "$R" restore .',
+        "R={root}; (cd $R && git checkout -- .)",
+        "A=$HOME B=$A/home; cd $B && git stash",
+        "cd $R && git checkout -- .",  # R exported in an earlier call, no snapshot: unknown
+        "cd $(git rev-parse --show-toplevel) && git reset --hard",
+        'R="$(pwd)"; git -C "$R" checkout -- .',
+    ])
+    def test_blocked_from_outside(self, env, command):
+        root, _, outside = env
+        assert _blocked(command.format(root=root), outside, [root]), command
+
+    def test_snapshot_export_names_root(self, env):
+        root, _, outside = env
+        hit, msg = detect_shared_checkout_git_mutation(
+            "cd $R && git checkout -- .", str(outside), [root], base_vars={"R": str(root)})
+        assert hit and msg is not None and "cannot resolve" not in msg
+
+    def test_own_assignment_beats_snapshot(self, env):
+        root, worktree, _ = env
+        command = f"R={worktree}; cd $R && git checkout -q -- ."
+        hit, _ = detect_shared_checkout_git_mutation(
+            command, str(root), [root], base_vars={"R": str(root)})
+        assert not hit
+
+    @pytest.mark.parametrize("command, cwd", [
+        ("WT={wt}; cd $WT && git checkout -q -- .", "root"),
+        ("( R={root} ); cd $R && git status", "outside"),
+        ("R={wt}; ( R={root} ); cd $R && git checkout -q -- .", "root"),
+        ("R={root} true; git -C $R status", "outside"),
+        ("R={wt}; R={root} | true; cd $R && git checkout -q -- .", "root"),  # pipeline subshell
+        ("cd $NOPE_UNSET/x && git log", "outside"),
+        ("R={root} git -C {wt} checkout -- .", "outside"),
+        ("cd $(git rev-parse --show-toplevel) && git diff", "outside"),
+    ])
+    def test_not_blocked(self, env, command, cwd):
+        root, worktree, outside = env
+        where = {"root": root, "outside": outside}[cwd]
+        assert not _blocked(command.format(root=root, wt=worktree), where, [root]), command
+
+    def test_unknown_target_message_names_the_word(self, env):
+        root, _, outside = env
+        hit, msg = detect_shared_checkout_git_mutation(
+            "cd $NOPE_UNSET && git checkout -- .", str(outside), [root])
+        assert hit and msg is not None and "$NOPE_UNSET" in msg and "literal absolute path" in msg
+
+    def test_unset_drops_snapshot_value(self, env):
+        root, worktree, _ = env
+        hit, msg = detect_shared_checkout_git_mutation(
+            "unset R; cd $R && git checkout -- .", str(worktree), [root],
+            base_vars={"R": str(worktree)})
+        assert hit and msg is not None and "$R" in msg
+
+    @pytest.mark.parametrize("command", [
+        "cd $NOPE_UNSET && git -C {outside} status",
+        "cd $NOPE_UNSET && cd {outside} && git checkout -- .",
+        "cd $NOPE_UNSET && cd {wt} && git checkout -q -- .",
+    ])
+    def test_absolute_target_escapes_unresolved_cwd(self, env, command):
+        """An absolute cd / -C word after an unresolved cwd resolves from ``/`` (no TypeError)."""
+        root, worktree, outside = env
+        command = command.format(outside=outside, wt=worktree)
+        assert not _blocked(command, outside, [root]), command
+
+    def test_absolute_root_after_unresolved_cwd_blocked(self, env):
+        root, _, outside = env
+        assert _blocked(f"cd $NOPE_UNSET && git -C {root} checkout -- .", outside, [root])
+
+
+class TestSnapshotWiring:
+    """``shared_checkout_block`` reads exports from the session snapshot (``env._snapshot_path``)."""
+
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        home.mkdir()
+        subprocess.run(["git", "init", "-q", str(home)], check=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("R", raising=False)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        return home.resolve(), outside
+
+    @staticmethod
+    def _block(command, outside, snapshot):
+        from types import SimpleNamespace
+
+        from tools.terminal_tool_guards import shared_checkout_block
+
+        env = SimpleNamespace(_snapshot_ready=True, _snapshot_path=str(snapshot))
+        return shared_checkout_block(command=command, cwd=str(outside), workdir=str(outside),
+                                     session_key="snapshot-test", env=env)
+
+    def test_snapshot_export_blocks(self, home, tmp_path):
+        root, outside = home
+        snapshot = tmp_path / "hermes-snap-x.sh"
+        snapshot.write_text(f'declare -x OTHER="a\\$b"\ndeclare -x R="{root}"\ndeclare -x EMPTY\n')
+        blocked = self._block("cd $R && git checkout -- .", outside, snapshot)
+        assert blocked and json.loads(blocked)["status"] == "blocked"
+        assert "cannot resolve" not in json.loads(blocked)["error"]
+
+    def test_missing_snapshot_still_fails_closed(self, home, tmp_path):
+        _, outside = home
+        missing = tmp_path / "absent.sh"
+        blocked = self._block("cd $R && git checkout -- .", outside, missing)
+        assert blocked and "$R" in json.loads(blocked)["error"]
+        assert self._block("cd $R && git status", outside, missing) is None
+
+    def test_snapshot_parser_unescapes_values(self, tmp_path):
+        from types import SimpleNamespace
+
+        from tools.terminal_tool_guards import _snapshot_exports
+
+        snapshot = tmp_path / "snap.sh"
+        snapshot.write_text('declare -x A="x\\$y\\"z"\ndeclare -x B="multi\nline"\n'
+                            'declare -rx C="/c"\nexport D="/d"\nnot a line\n')
+        exports = _snapshot_exports(SimpleNamespace(_snapshot_ready=True, _snapshot_path=str(snapshot)))
+        assert exports == {"A": 'x$y"z', "C": "/c", "D": "/d"}
+        assert _snapshot_exports(SimpleNamespace(_snapshot_ready=False, _snapshot_path=str(snapshot))) is None
 
 
 class TestProtectedRootsConfig:

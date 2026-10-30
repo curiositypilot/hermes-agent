@@ -1407,7 +1407,8 @@ def _pre_exec_block(
         blocked = self_repo_block(command=command, cwd=cwd, workdir=workdir, session_key=session_key)
         if blocked:
             raise _Rejected(blocked)
-        blocked = shared_checkout_block(command=command, cwd=cwd, workdir=workdir, session_key=session_key)
+        blocked = shared_checkout_block(
+            command=command, cwd=cwd, workdir=workdir, session_key=session_key, env=env)
         if blocked:
             raise _Rejected(blocked)
         blocked = foreign_writer_block(
