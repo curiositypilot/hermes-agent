@@ -147,7 +147,7 @@ def _clamp_remainder_recipe(path: str, line: int, width: int, encoding: str | No
             "python3 -c \"import os, sys; print(open(os.path.expanduser(sys.argv[1]), encoding='utf-8-sig', "
             f"errors='replace', newline='').read().split('\\\\n'){idx})\" {shlex.quote(path)}")
     return (
-        "python3 -c \"import os, sys; t = open(os.path.expanduser(sys.argv[1]), 'rb').read()"
+        "python3 -c \"import os, sys; t = open(os.path.expanduser(sys.argv[1]), 'rb').read()"  # windows-footgun: ok — binary mode inside a remote shell command string
         ".decode(sys.argv[2], 'replace'); t = t[1:] if t[:1] == chr(0xfeff) else t; "
         f"print(t.replace(chr(13) + chr(10), chr(10)).split(chr(10)){idx})\" "
         f"{shlex.quote(path)} {shlex.quote(encoding)}")
