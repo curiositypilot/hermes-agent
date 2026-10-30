@@ -64,7 +64,7 @@ def agent():
         patch("agent.process_bootstrap.OpenAI"),
     ):
         a = AIAgent(
-            api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+            api_key="test-key", base_url="https://openrouter.ai/api/v1",
             quiet_mode=True, skip_context_files=True, skip_memory=True,
         )
     a.provider, a.api_mode, a.model = "anthropic", "anthropic_messages", "claude-opus-5-5"
