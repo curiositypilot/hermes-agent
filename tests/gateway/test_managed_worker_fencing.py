@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
+from agent.managed_worker import adoption_scope
 from hermes_cli.process_identity import worker_birth
 from hermes_state import SessionDB
 from hermes_state_runtime import admit_session_input, begin_runtime_epoch, claim_session_input
@@ -70,7 +71,7 @@ async def test_late_bootstrap_handshake_cannot_rearm_a_recovered_admission(tmp_p
             rt.recover_session_inputs(db, epoch=restarted)
             owner = SimpleNamespace(db=db, epoch=restarted, profile_id=str(tmp_path), _require_admission_open=lambda: None)
             actor = SimpleNamespace(subject='human', profile_id=str(tmp_path), capabilities={'worker:adopt'})
-            identity = {k: v for k, v in scope.items() if k != 'epoch'}
+            identity = adoption_scope({k: v for k, v in scope.items() if k != 'epoch'})
             with pytest.raises(rt.RuntimeStoreError, match='stale_epoch'):
                 await worker_request(SimpleNamespace(authority=owner, actor=actor), None, identity, operation='adopt')
             assert db._read_one('SELECT status,owner_epoch FROM session_admissions WHERE admission_id=?',

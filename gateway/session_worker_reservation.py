@@ -22,6 +22,8 @@ def verify_worker_identity(process, hello):
     ``Popen.pid`` may be a launcher trampoline, so the worker reports its own pid and
     birth in a ``hello`` frame; the OWNER proves that pid is alive, carries that birth,
     and descends from (or is) the reserved handle. The worker never decides equality.
+    A worker in its own pid namespace (bwrap) reports its inner pid; the owner maps it to the
+    host pid of the one matching descendant, and the host pid is what it returns.
     """
     import psutil
     if not isinstance(process, subprocess.Popen) or process.poll() is not None:
@@ -37,6 +39,23 @@ def verify_worker_identity(process, hello):
         handle = psutil.Process(process.pid)
         if handle.ppid() != os.getpid() or handle.status() == psutil.STATUS_ZOMBIE:
             raise RuntimeStoreError('permission_denied')
+    except psutil.Error as exc:
+        raise RuntimeStoreError('worker_not_live') from exc
+    try:
+        return _host_worker(process, hello)
+    except RuntimeStoreError:
+        # Only when the direct check fails, so the unsandboxed path stays exactly as it was.
+        namespaced = _namespaced_worker(handle, hello)
+        if namespaced is None:
+            raise
+        return namespaced
+
+
+def _host_worker(process, hello):
+    """``hello['pid']`` read as a host pid: the handle itself or a host descendant of it."""
+    import psutil
+    pid = hello['pid']
+    try:
         worker = psutil.Process(pid)
         from hermes_cli.process_identity import worker_birth
         birth = worker_birth(worker)  # kernel start: stable across clock steps (#140580) and btime re-anchors
@@ -49,6 +68,53 @@ def verify_worker_identity(process, hello):
     if pid != process.pid and process.pid not in chain:
         raise RuntimeStoreError('permission_denied')
     return pid, birth
+
+
+def _ns_pid(pid):
+    """The pid ``pid`` has in its innermost pid namespace (last ``NSpid:`` field); None off Linux."""
+    try:
+        with open(f'/proc/{pid}/status', encoding='ascii') as status:
+            for line in status:
+                if line.startswith('NSpid:'):
+                    return int(line.split()[-1])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _namespaced_worker(handle, hello):
+    """Host ``(pid, birth)`` of the one descendant of ``handle`` that reported ``hello`` from inside
+    its own pid namespace (bwrap ``--unshare-pid``: the worker sees itself as pid 2), else None.
+
+    Only the handle's own subtree, at most ``MAX_LAUNCHER_HOPS`` deep, is searched; the candidate
+    must carry the reported pid as its innermost ``NSpid`` and the reported birth. Two matches are
+    ambiguous and refused rather than guessed.
+    """
+    import psutil
+    from hermes_cli.process_identity import worker_birth
+    matches, level = [], [handle]
+    for _ in range(MAX_LAUNCHER_HOPS):
+        children = []
+        for parent in level:
+            try:
+                children.extend(parent.children())
+            except psutil.Error:
+                continue
+        for child in children:
+            if _ns_pid(child.pid) != hello['pid']:
+                continue
+            try:
+                birth = worker_birth(child)
+                if birth == hello['birth'] and child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+                    matches.append((child.pid, birth))
+            except psutil.Error:
+                continue
+        level = children
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise RuntimeStoreError('permission_denied')
+    return matches[0]
 
 
 def owner_worker_subject():
@@ -105,7 +171,9 @@ def reserve_admission_worker(authority, *, admission_id, process, principal_id, 
         conn.execute("INSERT INTO worker_executions(execution_id,session_id,kind,owner_epoch,generation,status,adoption_digest) "
                      "VALUES(?,?,'compute',?,?,'registered',?)",
                      (execution_id, sid, authority.epoch, generation, _secret_digest(claim)))
-        return scope | {'epoch': authority.epoch}
+        # ``ns_pid`` (the pid the worker sees for itself) is bootstrap-only: the worker checks it
+        # against getpid() and strips it, so the adopt claim and the worker.* wire keep the host pid.
+        return scope | {'ns_pid': hello['pid'], 'epoch': authority.epoch}
 
     return authority.db._execute_write(write)
 

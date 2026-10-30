@@ -37,7 +37,7 @@ def test_bypass_policy_routes_to_managed_worker_and_bootstrap_carries_flags(tmp_
     monkeypatch.setattr('gateway.session_policy.launch_key', lambda authority, policy: None)
     row = {'payload': {'text': 'SAFE_PROBE'}}
     scope = {'profile_id': str(tmp_path), 'session_id': 'sid', 'execution_id': 'x', 'generation': 1,
-             'pid': os.getpid(), 'birth': 0, 'secret': 's', 'epoch': 1}
+             'pid': os.getpid(), 'ns_pid': os.getpid(), 'birth': 0, 'secret': 's', 'epoch': 1}
     frame = smw._bootstrap(authority, ref, row, safe, scope)
     assert frame['safe_mode'] is True and frame['ignore_user_config'] is True
     assert isinstance(frame['policy']['config_json'], str)

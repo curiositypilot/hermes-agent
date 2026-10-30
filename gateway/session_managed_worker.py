@@ -683,7 +683,7 @@ async def execute_managed(authority, ref, row, policy):
             if frame == {'type': 'error', 'reason': 'managed_worker_failed'}:
                 raise RuntimeStoreError('managed_worker_failed')
             kind = frame.get('type')
-            if kind == 'ready' and set(frame) == {'type', 'pid'} and frame['pid'] == scope['pid']:
+            if kind == 'ready' and set(frame) == {'type', 'pid'} and frame['pid'] == scope['ns_pid']:
                 continue
             if kind == 'delta' and set(frame) == {'type', 'text'} and isinstance(frame['text'], str):
                 authority.publish_execution(ref.session_id, row['generation'], 'message.delta', {'text': frame['text']})

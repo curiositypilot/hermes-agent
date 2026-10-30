@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
+from agent.managed_worker import adoption_scope
 from hermes_state import SessionDB
 from hermes_state_runtime import (admit_session_input, begin_runtime_epoch, claim_session_input,
                                   register_worker_execution, settle_session_input)
@@ -72,12 +73,12 @@ async def test_reserved_process_uses_existing_authenticated_adoption_and_persist
         scope = reserve_admission_worker(authority, admission_id=admitted['admission_id'], process=process, principal_id='human', hello=hello(process))
         actor = SimpleNamespace(subject='human', profile_id=str(tmp_path), capabilities={'worker:adopt'})
         connection = SimpleNamespace(authority=authority, actor=actor)
-        identity = {k: v for k, v in scope.items() if k != 'epoch'}
+        identity = adoption_scope({k: v for k, v in scope.items() if k != 'epoch'})
         with pytest.raises(Exception, match='permission_denied'):
             await worker_request(connection, None, identity | {'secret': 'wrong-secret-for-reservation'}, operation='adopt')
         receipt = await worker_request(connection, None, identity, operation='adopt')
         assert receipt['execution_id'] == scope['execution_id']
-        params = scope | {'sequence': 1, 'operation': 'execution.finish', 'payload': {}}
+        params = adoption_scope(scope) | {'sequence': 1, 'operation': 'execution.finish', 'payload': {}}
         result = await worker_request(connection, None, params, operation='persist')
         assert result['status'] == 'terminal'
         with pytest.raises(Exception, match='stale_generation'):

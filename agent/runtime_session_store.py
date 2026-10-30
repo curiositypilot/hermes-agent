@@ -33,6 +33,20 @@ def is_worker_process():
     return _worker_process
 
 
+_owner_view_pid = None
+
+
+def owner_view_pid():
+    """This interpreter's pid as its owner sees it. Inside a pid namespace (bwrap) getpid() is the
+    inner pid; the managed worker binds the host pid its owner-verified scope carries."""
+    return os.getpid() if _owner_view_pid is None else _owner_view_pid
+
+
+def bind_owner_view_pid(pid):
+    global _owner_view_pid
+    _owner_view_pid = pid
+
+
 
 def apply_row_annotations(messages, annotations):
     """Mirror the owner's in-place row stamps onto the worker's dicts (None = the owner popped it)."""
@@ -148,7 +162,7 @@ class WorkerRPC:
         from hermes_cli.gateway_runtime import control_home_for
         endpoint = self.endpoint
         descriptor = query_identify(control_home_for(self.home, endpoint), timeout=5)
-        if descriptor.get('pid') == os.getpid():
+        if descriptor.get('pid') == owner_view_pid():
             raise WorkerPersistenceError('synchronous_self_rpc')
         ticket = _session_ticket(self.home, endpoint, purpose='worker-adoption')
         url, protocols = gateway_ws_target(endpoint, ticket)
@@ -201,7 +215,7 @@ class WorkerRPC:
                 raise
             if 'error' in response:
                 raise WorkerPersistenceError(response['error'].get('message', 'persistence_failed'))
-            if method in ('worker.register', 'worker.adopt') and params.get('pid') == os.getpid():
+            if method in ('worker.register', 'worker.adopt') and params.get('pid') == owner_view_pid():
                 global _worker_process
                 _worker_process = True
             return response['result']
