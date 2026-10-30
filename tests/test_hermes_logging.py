@@ -719,21 +719,67 @@ class TestWindowsConcurrentLogLockTimeout:
 class TestReadLoggingConfig:
     """_read_logging_config() reads from config.yaml."""
 
+    _ALL_NONE = {
+        "level": None, "max_size_mb": None, "backup_count": None,
+        "errors_max_size_mb": None, "errors_backup_count": None,
+    }
+
     def test_returns_none_when_no_config(self, hermes_home):
-        level, max_size, backup = hermes_logging._read_logging_config()
-        assert level is None
-        assert max_size is None
-        assert backup is None
+        assert hermes_logging._read_logging_config() == self._ALL_NONE
+
+    def test_non_dict_logging_section_returns_none(self, hermes_home):
+        import hermes_yaml as yaml
+        (hermes_home / "config.yaml").write_text(yaml.safe_dump({"logging": "verbose"}), encoding="utf-8")
+
+        assert hermes_logging._read_logging_config() == self._ALL_NONE
 
     def test_reads_logging_section(self, hermes_home):
         import hermes_yaml as yaml
-        config = {"logging": {"level": "DEBUG", "max_size_mb": 10, "backup_count": 5}}
+        config = {"logging": {
+            "level": "DEBUG", "max_size_mb": 10, "backup_count": 5,
+            "errors_max_size_mb": 7, "errors_backup_count": 4,
+        }}
         (hermes_home / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
 
-        level, max_size, backup = hermes_logging._read_logging_config()
-        assert level == "DEBUG"
-        assert max_size == 10
-        assert backup == 5
+        assert hermes_logging._read_logging_config() == {
+            "level": "DEBUG", "max_size_mb": 10, "backup_count": 5,
+            "errors_max_size_mb": 7, "errors_backup_count": 4,
+        }
+
+
+def _file_handler(name: str):
+    return next(
+        h for h in hermes_logging._queued_file_handlers
+        if isinstance(h, RotatingFileHandler) and Path(h.baseFilename).name == name
+    )
+
+
+def test_errors_log_rotation_from_config(hermes_home):
+    """logging.errors_* size errors.log; agent.log keeps following max_size_mb/backup_count."""
+    import hermes_yaml as yaml
+    config = {"logging": {"max_size_mb": 11, "backup_count": 6, "errors_max_size_mb": 7, "errors_backup_count": 4}}
+    (hermes_home / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    hermes_logging.setup_logging(hermes_home=hermes_home)
+
+    errors = _file_handler("errors.log")
+    assert (errors.maxBytes, errors.backupCount) == (7 * 1024 * 1024, 4)
+    agent = _file_handler("agent.log")
+    assert (agent.maxBytes, agent.backupCount) == (11 * 1024 * 1024, 6)
+
+
+def test_errors_log_rotation_default_unchanged(hermes_home):
+    """Without errors_* keys errors.log stays 2 MB x 2: the agent.log keys never leak into it."""
+    import hermes_yaml as yaml
+    config = {"logging": {"max_size_mb": 20, "backup_count": 20}}
+    (hermes_home / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    hermes_logging.setup_logging(hermes_home=hermes_home)
+
+    errors = _file_handler("errors.log")
+    assert (errors.maxBytes, errors.backupCount) == (2 * 1024 * 1024, 2)
+    agent = _file_handler("agent.log")
+    assert (agent.maxBytes, agent.backupCount) == (20 * 1024 * 1024, 20)
 
 
 

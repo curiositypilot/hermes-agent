@@ -381,11 +381,14 @@ def setup_logging(
     # an existing router.
     if _adopt_secondary_home(home):
         return log_dir
-    cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
-    level_name = (log_level or cfg_level or "INFO").upper()
+    cfg = _read_logging_config()
+    level_name = (log_level or cfg["level"] or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    max_bytes = (max_size_mb or cfg_max_size or 5) * 1024 * 1024
-    backups = backup_count or cfg_backup or 3
+    max_bytes = (max_size_mb or cfg["max_size_mb"] or 5) * 1024 * 1024
+    backups = backup_count or cfg["backup_count"] or 3
+    # errors.log has its own budget: one retry storm must not rotate its history away with agent.log's.
+    errors_max_bytes = (cfg["errors_max_size_mb"] or 2) * 1024 * 1024
+    errors_backups = cfg["errors_backup_count"] or 2
 
     from agent.redact import RedactingFormatter  # lazy: circular at module load
 
@@ -395,7 +398,7 @@ def setup_logging(
     # the file on ``mode`` and restricts it to that component's logger prefixes.
     handler_specs = (
         ("agent.log", level, max_bytes, backups, None),
-        ("errors.log", logging.WARNING, 2 * 1024 * 1024, 2, None),
+        ("errors.log", logging.WARNING, errors_max_bytes, errors_backups, None),
         ("gateway.log", logging.INFO, 5 * 1024 * 1024, 3, "gateway"),
         ("gui.log", logging.INFO, 10 * 1024 * 1024, 5, "gui"),
     )
@@ -1020,8 +1023,12 @@ def _add_rotating_handler(
     _register_queued_handler(handler)
 
 
-def _read_logging_config():
-    """Best-effort read of ``logging.*`` from config.yaml."""
+_LOGGING_CONFIG_KEYS = ("level", "max_size_mb", "backup_count", "errors_max_size_mb", "errors_backup_count")
+
+
+def _read_logging_config() -> dict:
+    """Best-effort read of ``logging.*`` from config.yaml: every key in ``_LOGGING_CONFIG_KEYS``, None when unset."""
+    empty = dict.fromkeys(_LOGGING_CONFIG_KEYS)
     try:
         # Prefer the shared effective-config cache (managed overlay included, so an administrator
         # can pin logging.*) so this reuses hermes_cli.main's early parse (one config.yaml parse
@@ -1034,10 +1041,10 @@ def _read_logging_config():
             config_path = get_config_path()
             cfg = (read_config_doc(config_path) or {}) if config_exists(config_path) else {}
         if not cfg:
-            return (None, None, None)
+            return empty
         log_cfg = cfg.get("logging", {})
         if isinstance(log_cfg, dict):
-            return (log_cfg.get("level"), log_cfg.get("max_size_mb"), log_cfg.get("backup_count"))
+            return {key: log_cfg.get(key) for key in _LOGGING_CONFIG_KEYS}
     except Exception:
         pass
-    return (None, None, None)
+    return empty
