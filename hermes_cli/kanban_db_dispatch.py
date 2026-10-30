@@ -176,16 +176,11 @@ class DispatchResult:
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
-    ``active_pr (1), recent_success (2), rate_limited (1), skipped_locked (1),
-    memory_pressure (critical)`` — the respawn-guard reasons counted per task
-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
-    CLI daemon and the embedded gateway dispatcher, which otherwise report a
-    bare zero-spawn count while ``hermes kanban tail`` is the only place the
-    guard reason is written (#111910).
-
-    No ``reason=value`` shape: the log redactor reads ``<word>_auth=<value>``
-    as an env secret, so ``blocker_auth=1,`` reached the log as
-    ``blocker_auth=***``.
+    ``active_pr (1), rate_limited (1), memory_pressure (critical)``: respawn-guard
+    reasons counted per task plus tick-level holds, for the "dispatcher stuck"
+    warnings of the CLI daemon and embedded gateway dispatcher (#111910). Never
+    ``reason=value``: the log redactor reads ``<word>_auth=<v>`` as a secret, so
+    ``blocker_auth=1,`` reached the log as ``blocker_auth=***``.
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
