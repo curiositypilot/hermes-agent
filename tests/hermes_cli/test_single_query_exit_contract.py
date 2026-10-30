@@ -14,6 +14,7 @@ import pytest
 
 import cli
 from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE, KANBAN_TERMINAL_PROVIDER_EXIT_CODE
+from hermes_cli.turn_exit import TRANSIENT_PROVIDER_REASONS, turn_exit_code
 
 
 @pytest.fixture(autouse=True)
@@ -107,3 +108,21 @@ def test_quiet_kanban_worker_exits_tempfail_when_credentials_are_rate_limited(mo
     with pytest.raises(SystemExit) as exc:
         cli._run_single_query_mode(stub, "do the thing", None, True, True)
     assert exc.value.code == expected
+
+
+@pytest.mark.parametrize("primary_reason", sorted(TRANSIENT_PROVIDER_REASONS))
+def test_fallback_only_terminal_error_behind_rate_limited_primary_requeues(primary_reason):
+    """Incident t_4307f589 (intake t_88508d36): anthropic 429 -> antigravity 429 -> gemini 401. The
+    next spawn starts on the primary again, so the worker requeues (75) instead of parking (78)."""
+    incident = {"failed": True, "failure_reason": "auth", "primary_failure_reason": primary_reason}
+    assert turn_exit_code(incident, kanban_worker=True) == KANBAN_RATE_LIMIT_EXIT_CODE
+    no_fallback = {"failed": True, "failure_reason": "auth"}
+    assert turn_exit_code(no_fallback, kanban_worker=True) == KANBAN_TERMINAL_PROVIDER_EXIT_CODE
+
+
+@pytest.mark.parametrize("primary_reason", ["auth", "model_not_found", None, "unknown"])
+def test_terminal_error_with_a_non_transient_primary_still_parks(primary_reason):
+    """The primary itself rejected (or no transient wall opened the fallback): an operator must act."""
+    result = {"failed": True, "failure_reason": "auth", "primary_failure_reason": primary_reason}
+    assert turn_exit_code(result, kanban_worker=True) == KANBAN_TERMINAL_PROVIDER_EXIT_CODE
+    assert turn_exit_code(result, kanban_worker=False) == 1

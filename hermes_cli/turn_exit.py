@@ -33,7 +33,10 @@ def turn_exit_code(
         return 0
     if kanban_worker:
         reason = result.get("failure_reason")
-        if reason in transient_reasons:
+        # A terminal error from a fallback opened by a transient primary wall still requeues: the
+        # next spawn starts on the primary again, so parking the card would idle it for nothing.
+        if reason in transient_reasons or (
+                reason in terminal_reasons and result.get("primary_failure_reason") in transient_reasons):
             from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
             return KANBAN_RATE_LIMIT_EXIT_CODE
         if reason in terminal_reasons:

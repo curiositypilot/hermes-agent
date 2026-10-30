@@ -2054,7 +2054,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
-    from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown, mark_provider_fallback_active, switch_deferred_by_reset
     from agent.provider_policy import (
         ProviderDenied, assert_fallback_allowed, assert_provider_allowed, current_data_class,
     )
@@ -2101,7 +2101,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             _buffer_fallback_notice(agent, notice)
             # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
             # provenance so the restore path only emits a recovery notice after a real fallback.
-            agent._provider_fallback_active = True
+            mark_provider_fallback_active(agent, reason)
             agent._provider_fallback_route = (str(fb_model), str(fb_provider))
             _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider)
             if os.environ.get("HERMES_KANBAN_TASK"):
