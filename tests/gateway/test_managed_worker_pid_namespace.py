@@ -181,9 +181,23 @@ def test_bootstrap_checks_ns_pid_against_getpid_not_the_host_pid(tmp_path, monke
     assert adoption_scope(wire['scope']) == {k: v for k, v in scope.items() if k != 'ns_pid'}
     with pytest.raises(ValueError):
         validate_bootstrap(_frame(tmp_path, monkeypatch, scope | {'ns_pid': os.getpid() + 1}))
-    no_ns_pid = {k: v for k, v in scope.items() if k != 'ns_pid'} | {'pid': os.getpid()}
-    with pytest.raises(ValueError):
-        validate_bootstrap(_frame(tmp_path, monkeypatch, no_ns_pid))
+
+
+def test_bootstrap_accepts_pre_restart_owner_scope(tmp_path, monkeypatch):
+    # A gateway still running pre-ns_pid code mints no ns_pid; its pid is then ours (landing t_43b88c98).
+    from agent.managed_worker import validate_bootstrap
+    old = {'profile_id': str(tmp_path), 'session_id': 'sid', 'execution_id': 'x', 'generation': 1,
+           'pid': os.getpid(), 'birth': 0, 'secret': 's', 'epoch': 1}
+    wire = _frame(tmp_path, monkeypatch, old)
+    assert validate_bootstrap(wire) is wire
+    rejected = [old | {'pid': os.getpid() + 1},
+                old | {'ns_pid': os.getpid(), 'extra': 1},
+                {k: v for k, v in old.items() if k != 'birth'}]
+    for scope in rejected:
+        with pytest.raises(ValueError):
+            validate_bootstrap(_frame(tmp_path, monkeypatch, scope))
+    new = old | {'pid': os.getpid() + 100000, 'ns_pid': os.getpid()}
+    assert validate_bootstrap(_frame(tmp_path, monkeypatch, new))['scope'] == new
 
 
 def test_adopted_worker_in_a_pid_namespace_binds_its_delegation_ledger(tmp_path, monkeypatch):
