@@ -21,7 +21,7 @@ def test_bootstrap_frame_carries_the_admitted_author(tmp_path, monkeypatch):
     authority = SimpleNamespace(sessions={'sid': live}, runner=None, profile_id=str(tmp_path))
     ref = SimpleNamespace(session_id='sid')
     scope = {'profile_id': str(tmp_path), 'session_id': 'sid', 'execution_id': 'x', 'generation': 1,
-             'pid': os.getpid(), 'birth': 0, 'secret': 's', 'epoch': 1}
+             'pid': os.getpid(), 'ns_pid': os.getpid(), 'birth': 0, 'secret': 's', 'epoch': 1}
     author = {'id': 'bot-7', 'name': 'Seven', 'is_bot': True}
     row = {'payload': {'text': 'hi', 'local_automation_v1': {'turn_author': author}}}
     frame = smw._bootstrap(authority, ref, row, _policy(tmp_path), scope)

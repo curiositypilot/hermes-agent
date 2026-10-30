@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.managed_worker import adoption_scope
+
 
 @pytest.mark.asyncio
 async def test_reserved_worker_persists_while_runtime_drains(tmp_path):
@@ -28,12 +30,12 @@ async def test_reserved_worker_persists_while_runtime_drains(tmp_path):
                                          principal_id='human', hello=hello(process))
         actor = SimpleNamespace(subject='human', profile_id=str(tmp_path), capabilities={'worker:adopt'})
         connection = SimpleNamespace(authority=authority, actor=actor)
-        identity = {k: v for k, v in scope.items() if k != 'epoch'}
+        identity = adoption_scope({k: v for k, v in scope.items() if k != 'epoch'})
         await worker_request(connection, None, identity, operation='adopt')
         def draining():
             raise RuntimeStoreError('runtime_draining')
         authority._require_admission_open = draining
-        await worker_request(connection, None, scope | {
+        await worker_request(connection, None, adoption_scope(scope) | {
             'sequence': 1, 'operation': 'session.prompt', 'payload': {'system_prompt': 'settled while draining'}}, operation='persist')
         assert db.get_session('owned')['system_prompt'] == 'settled while draining'
         with pytest.raises(RuntimeStoreError, match='runtime_draining'):
