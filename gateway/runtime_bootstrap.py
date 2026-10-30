@@ -25,6 +25,9 @@ _SCOPES = frozenset({'profile', 'host'})
 class TicketStore:
     TTL_SECONDS = 30
     MAX_ENTRIES = 1024
+    # Outstanding tickets one sandboxed worker may hold: its WorkerRPC redeems each at once, so a
+    # handful covers redials; the cap keeps it from filling the shared store (every other mint fails).
+    MAX_PER_WORKER = 4
 
     def __init__(self, instance_id: str, profile_ids: frozenset[str]):
         if not instance_id or not profile_ids:
@@ -34,25 +37,35 @@ class TicketStore:
         self._entries: dict[str, tuple[float, dict]] = {}
         self._lock = threading.Lock()
 
-    def mint(self, *, profile_id, subject, purpose, scope='profile', refuse_restart_wait=False) -> str:
+    def mint(self, *, profile_id, subject, purpose, scope='profile', refuse_restart_wait=False,
+             worker_binding=None) -> str:
         """``scope='host'`` lets an interactive connection select every profile this process
         serves (the Desktop's one shared socket); the default binds exactly ``profile_id``.
         ``refuse_restart_wait``: the socket redeeming it is refused while a restart's after-turn
-        wait is open, however long after the mint that wait began (a machine poller, never a human)."""
+        wait is open, however long after the mint that wait began (a machine poller, never a human).
+        ``worker_binding``: the host ``(pid, birth)`` of the sandboxed managed worker the ticket is
+        minted for; the redeemed connection may then claim only that process (session_worker._claim)."""
         if (profile_id not in self.profile_ids or purpose not in _PURPOSE_CAPABILITIES or not subject
-                or scope not in _SCOPES or (scope == 'host' and purpose != 'interactive')):
+                or scope not in _SCOPES or (scope == 'host' and purpose != 'interactive')
+                or (worker_binding is not None and purpose != 'worker-adoption')):
             raise PermissionError('bootstrap binding rejected')
+        binding = None if worker_binding is None else tuple(worker_binding)
         with self._lock:
             now = time.monotonic()
             self._entries = {k: v for k, v in self._entries.items() if v[0] > now}
             if len(self._entries) >= self.MAX_ENTRIES:
                 raise PermissionError('bootstrap capacity exhausted')
+            if binding is not None and sum(
+                    grant.get('worker_binding') == binding for _expires, grant in self._entries.values()
+            ) >= self.MAX_PER_WORKER:
+                raise PermissionError('bootstrap capacity exhausted for this worker')
             ticket = secrets.token_urlsafe(32)
-            self._entries[hashlib.sha256(ticket.encode()).hexdigest()] = (
-                now + self.TTL_SECONDS,
-                {'instance_id': self.instance_id, 'profile_id': profile_id, 'subject': subject,
-                 'purpose': purpose, 'capabilities': _PURPOSE_CAPABILITIES[purpose], 'scope': scope,
-                 'refuse_restart_wait': bool(refuse_restart_wait)})
+            grant = {'instance_id': self.instance_id, 'profile_id': profile_id, 'subject': subject,
+                     'purpose': purpose, 'capabilities': _PURPOSE_CAPABILITIES[purpose], 'scope': scope,
+                     'refuse_restart_wait': bool(refuse_restart_wait)}
+            if binding is not None:
+                grant['worker_binding'] = binding
+            self._entries[hashlib.sha256(ticket.encode()).hexdigest()] = (now + self.TTL_SECONDS, grant)
             return ticket
 
     def redeem(self, ticket, *, profile_id, purpose) -> dict:

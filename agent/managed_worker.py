@@ -111,9 +111,12 @@ def validate_bootstrap(frame):
         raise ValueError('invalid_managed_worker_bootstrap')
     scope = frame['scope']
     # ``pid`` is the owner's (host) view of this process; ``ns_pid`` is ours, and differs from it
-    # only inside a pid namespace (bwrap --unshare-pid).
-    fields = {'profile_id', 'session_id', 'execution_id', 'generation', 'pid', 'ns_pid', 'birth', 'secret', 'epoch'}
-    if (not isinstance(scope, dict) or set(scope) != fields or scope['ns_pid'] != os.getpid()
+    # only inside a pid namespace (bwrap --unshare-pid). An owner that predates ``ns_pid`` sends
+    # no such field: owner code stays in gateway memory until a restart, while workers load the
+    # checkout at spawn. Without ``ns_pid`` the owner's ``pid`` must be our own getpid().
+    fields = {'profile_id', 'session_id', 'execution_id', 'generation', 'pid', 'birth', 'secret', 'epoch'}
+    if (not isinstance(scope, dict) or set(scope) - {'ns_pid'} != fields
+            or scope.get('ns_pid', scope['pid']) != os.getpid()
             or scope['profile_id'] != frame['home'] or not Path(frame['home']).is_absolute()
             or not isinstance(frame['policy'], dict)
             or any(not isinstance(frame[k], str) for k in ('text', 'route', 'user_id', 'chat_id'))

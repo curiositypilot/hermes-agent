@@ -199,31 +199,49 @@ def build_status_payload() -> dict[str, Any]:
             "answered_at": time.time(), "answering_pid": os.getpid()}
 
 
-def peer_shares_user_namespace(sock: Any) -> bool:
-    """Linux: False when the connecting process lives in another user namespace.
+def classify_peer(sock: Any) -> tuple[str, Optional[int]]:
+    """Linux: ``('worker', pid)`` when the connecting process lives in another user namespace,
+    ``('same', None)`` for every peer the namespace rule does not concern, ``('refuse', None)`` when
+    a foreign-namespace peer carries no usable pid.
 
     Sandboxed Kanban workers (``kanban.sandbox: bwrap``) run in their own user namespace with
     ``gateway.sock`` masked at spawn, but a gateway restart mid-run binds a fresh socket inode at
     the same path, which the worker's mount namespace then sees. Same UID, so the 0600 mode does
-    not stop it; the namespace check does. Non-Linux, or no peer credentials: True (unchanged).
+    not stop it; the namespace check does. ``pid`` is the SO_PEERCRED pid, which the kernel reports
+    in this process's pid namespace: the host pid the caller matches against a managed worker.
+    Non-Linux, or no peer credentials: ``same`` (unchanged).
     """
     if not sys.platform.startswith("linux") or sock is None or not hasattr(socket, "SO_PEERCRED"):
-        return True
+        return "same", None
     try:
         own = os.readlink("/proc/self/ns/user")
     except OSError:
-        return True
+        return "same", None
     try:
         import struct
         creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
         pid, uid, _gid = struct.unpack("3i", creds)
         if uid != os.geteuid():  # windows-footgun: ok — Linux-only (early return above)
-            return True  # another account (e.g. root CLI): the socket mode already decided; not a worker
+            return "same", None  # another account (e.g. root CLI): the socket mode already decided; not a worker
         if pid <= 0:
-            return False
-        return os.readlink(f"/proc/{pid}/ns/user") == own
+            return "refuse", None
+        return ("same", None) if os.readlink(f"/proc/{pid}/ns/user") == own else ("worker", pid)
     except OSError:
-        return False
+        return "refuse", None
+
+
+# What a sandboxed managed worker may ask: discovery and its own worker-adoption ticket. Any other
+# verb, or ticket purpose, would let the sandboxed agent act on the owner outside its sandbox.
+_WORKER_PEER_VERBS = frozenset({"identify", "session-ticket"})
+
+
+def _live_worker_birth(pid: int) -> Optional[float]:
+    import psutil
+    from hermes_cli.process_identity import worker_birth
+    try:
+        return worker_birth(psutil.Process(pid))
+    except psutil.Error:
+        return None
 
 
 class GatewayControlServer:
@@ -241,6 +259,9 @@ class GatewayControlServer:
         self._home = Path(home).resolve()
         self.ticket_store = None
         self.private_handlers = {}
+        # ``pid -> (profile_id, (pid, birth)) | None``: the live managed worker behind a peer from
+        # another user namespace (run_bootstrap wires find_managed_worker). None refuses them all.
+        self.managed_worker_lookup: Optional[Callable[[int], Any]] = None
         self._server: Optional[asyncio.AbstractServer] = None
         self._pipe_server: Any = None  # Windows proactor pipe server
         self._bind_path: Optional[Path] = None
@@ -347,14 +368,19 @@ class GatewayControlServer:
                 self._fallback_root.rmdir()
             self._fallback_root = None
 
-    def handle_request_line(self, raw: bytes, peer_subject: Optional[str] = None) -> bytes:
-        """One JSON request line -> one JSON response line. Never raises (shared by POSIX + pipe)."""
+    def handle_request_line(self, raw: bytes, peer_subject: Optional[str] = None,
+                            worker_peer: Optional[dict[str, Any]] = None) -> bytes:
+        """One JSON request line -> one JSON response line. Never raises (shared by POSIX + pipe).
+        ``worker_peer`` (``{profile_id, pid, birth}``) marks an admitted sandboxed managed worker:
+        it may only ``identify`` and mint its own worker-adoption ticket."""
         request_id: Any = None
         try:
             request = json.loads(raw.decode("utf-8"))
             if not isinstance(request, dict):
                 raise ValueError("request must be a JSON object")
             request_id, verb = request.get("id"), request.get("verb")
+            if worker_peer is not None and (verb not in _WORKER_PEER_VERBS or verb in self.private_handlers):
+                raise PermissionError("sandboxed worker: verb refused")
             handler = self._handlers.get(verb) if isinstance(verb, str) else None
             if isinstance(verb, str) and verb in self.private_handlers:
                 if (not peer_subject or request.get("protocol") != 1
@@ -365,7 +391,7 @@ class GatewayControlServer:
                             "result": self.private_handlers[verb](request["params"], peer_subject)}
             elif verb == "session-ticket":
                 response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION,
-                            "result": self._session_ticket(request, peer_subject)}
+                            "result": self._session_ticket(request, peer_subject, worker_peer)}
             elif handler is None:
                 response: dict[str, Any] = {"ok": False, "error": f"unknown verb: {verb!r}",
                                             "protocol": CONTROL_PROTOCOL_VERSION, "supported_verbs": sorted(self._handlers)}
@@ -393,7 +419,8 @@ class GatewayControlServer:
             encoded = json.dumps(too_large).encode("utf-8")
         return encoded + b"\n"
 
-    def _session_ticket(self, request: dict, peer_subject: Optional[str]) -> dict:
+    def _session_ticket(self, request: dict, peer_subject: Optional[str],
+                        worker_peer: Optional[dict[str, Any]] = None) -> dict:
         if not peer_subject or self.ticket_store is None:
             raise PermissionError("authenticated runtime bootstrap unavailable")
         if set(request) - {"protocol", "verb", "id", "params"} or request.get("protocol") != 1:
@@ -405,6 +432,14 @@ class GatewayControlServer:
             raise PermissionError("invalid bootstrap parameters")
         if params["instance_id"] != self.ticket_store.instance_id:
             raise PermissionError("stale runtime instance")
+        binding = None
+        if worker_peer is not None:
+            # A sandboxed worker adopts only its own reservation: any other purpose drives an
+            # unsandboxed turn, and an unbound adoption grant could register into another session.
+            if (params["purpose"] != "worker-adoption" or params["profile_id"] != worker_peer["profile_id"]
+                    or "subject" in params or params.get("scope", "profile") != "profile"):
+                raise PermissionError("sandboxed worker: ticket refused")
+            binding = (worker_peer["pid"], worker_peer["birth"])
         # A verified same-user peer may name the principal it acts for (a standalone dashboard
         # forwarding a mutation for its authenticated user, #138915): the socket's peer gate
         # stays the trust boundary — the forwarded subject only relabels who that same peer is,
@@ -418,7 +453,7 @@ class GatewayControlServer:
             raise PermissionError("invalid bootstrap subject")
         ticket = self.ticket_store.mint(profile_id=params["profile_id"], subject=subject,
                                        purpose=params["purpose"], scope=params.get("scope", "profile"),
-                                       refuse_restart_wait="restart_wait" in params)
+                                       refuse_restart_wait="restart_wait" in params, worker_binding=binding)
         return {"ticket": ticket, "expires_in_seconds": 30,
                 "instance_id": self.ticket_store.instance_id,
                 "profile_id": params["profile_id"], "runtime_protocol": 1}
@@ -439,18 +474,34 @@ class GatewayControlServer:
         except OSError:
             return None
 
+    async def _admit_worker_peer(self, pid: int) -> Optional[dict[str, Any]]:
+        """``{profile_id, pid, birth}`` when ``pid`` (a foreign-namespace peer) is a live managed
+        worker of this owner with its reserved birth, else None. The lookup reads loop-owned state."""
+        found = self.managed_worker_lookup(pid) if self.managed_worker_lookup is not None else None
+        if found is None:
+            return None
+        profile_id, (_pid, birth) = found
+        live = await asyncio.get_running_loop().run_in_executor(None, _live_worker_birth, pid)
+        if live is None or live != birth:
+            return None
+        return {"profile_id": profile_id, "pid": pid, "birth": birth}
+
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            if not peer_shares_user_namespace(writer.get_extra_info("socket")):
-                logger.info("Gateway control socket: refused a peer from another user namespace (sandboxed worker)")
-                return
+            worker_peer = None
+            kind, pid = classify_peer(writer.get_extra_info("socket"))
+            if kind != "same":
+                worker_peer = await self._admit_worker_peer(pid) if kind == "worker" and pid else None
+                if worker_peer is None:
+                    logger.info("Gateway control socket: refused a peer from another user namespace (sandboxed worker)")
+                    return
             raw = await asyncio.wait_for(reader.readline(), timeout=_DEFAULT_CLIENT_TIMEOUT)
             if not raw or len(raw) > _MAX_REQUEST_BYTES:
                 return
             # Handlers read disk; keep that off the loop that drives every platform
             # adapter so a fast-polling consumer can't stall heartbeats.
             response = await asyncio.get_running_loop().run_in_executor(
-                None, self.handle_request_line, raw.rstrip(b"\n"), self._posix_peer_subject(writer))
+                None, self.handle_request_line, raw.rstrip(b"\n"), self._posix_peer_subject(writer), worker_peer)
             writer.write(response)
             await asyncio.wait_for(writer.drain(), timeout=_DEFAULT_CLIENT_TIMEOUT)
         except (TimeoutError, ConnectionError, OSError):
