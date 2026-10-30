@@ -226,6 +226,7 @@ def worker_claim_is_live(
     task_id = _resolve_task_id(task_id)
     if task_id is None:
         return False
+    from agent.runtime_session_store import owner_view_pid  # the host pid, also inside a pid namespace
     db_path = _kanban_db_path() if db_path is None else (db_path.strip() or None)
     if not db_path or not Path(db_path).exists():
         logger.warning("kanban claim check: pinned board db %r not found — not retrying in place", db_path)
@@ -253,7 +254,7 @@ def worker_claim_is_live(
             if (row["status"] or "") != "running":
                 return False
             worker_pid = row["worker_pid"]
-            if verify_pid and worker_pid is not None and int(worker_pid) != os.getpid():
+            if verify_pid and worker_pid is not None and int(worker_pid) != owner_view_pid():
                 return False
             # A running task with no run pointer is not proof of a live run: the
             # dispatcher writes it on claim and clears it on release/end.
@@ -275,7 +276,7 @@ def worker_claim_is_live(
             if run["ended_at"] is not None:
                 return False
             run_pid = run["worker_pid"]
-            if verify_pid and run_pid is not None and int(run_pid) != os.getpid():
+            if verify_pid and run_pid is not None and int(run_pid) != owner_view_pid():
                 return False
             if run["claim_expires"] is None or int(run["claim_expires"]) < now:
                 return False

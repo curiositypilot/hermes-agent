@@ -61,6 +61,15 @@ def _redact(line, scrub):
     return redact_sensitive_text(line, force=True)
 
 
+def append_worker_note(path, pid, text):
+    """One owner-written line about this worker (its Kanban sandbox launch or exemption), in the
+    worker's own ``[pid N]`` form and redacted like its output. Never raises: the worker exists."""
+    try:
+        _append(path, f'[pid {pid}] ' + _redact(text if text.endswith('\n') else text + '\n', list))
+    except (OSError, ValueError) as exc:
+        logger.warning('managed worker log %s not written (%s)', path, type(exc).__name__)
+
+
 def drain_worker_stderr(stream, path, pid, scrub):
     """Thread body: read ``stream`` to EOF; ``scrub()`` returns this worker's exact secrets
     (launch key, assignment secret) known so far. Never stops reading on a write failure."""

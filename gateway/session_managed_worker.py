@@ -595,31 +595,108 @@ async def _settle_lost(authority, row, scope, recording):
         await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
 
 
-async def _spawn_registered_worker(authority, ref, row):
+def _owner_control_socket():
+    """The control socket this gateway answers on (``GatewayControlServer`` binds the process
+    home): the one a sandboxed managed worker of any profile it serves dials for discovery and its
+    adoption ticket. None when no socket exists right now."""
+    from gateway.control_socket import resolve_client_socket_path
+    from gateway.status import _get_process_hermes_home
+    return resolve_client_socket_path(Path(_get_process_hermes_home()).resolve())
+
+
+async def _kanban_sandbox(authority, policy, command, env, cwd):
+    """``(plan, note)`` for a Kanban card's worker under ``kanban.sandbox`` (read per spawn, in this
+    process). The plan wraps ``command`` in the forwarder + bwrap launch; ``--chdir <workspace>``
+    moves the cwd off the tree, so the tree is pinned on PYTHONPATH first. A sandbox that applies
+    but cannot be built, or an unreadable config, fails the admission closed before any process
+    exists: ``RuntimeStoreError('sandbox_unavailable')``, never a bare spawn."""
+    from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+    from hermes_cli.kanban_sandbox import plan_for_managed_worker
+
+    def build():
+        worker_env = pin_hermes_tree_on_pythonpath(dict(os.environ if env is None else env), cwd)
+        return plan_for_managed_worker(json.loads(policy.kanban_json), command, worker_env=worker_env,
+                                       profile_home=Path(str(authority.profile_id)),
+                                       allow_control_socket=_owner_control_socket())
+    try:
+        return await asyncio.to_thread(build)
+    except (Exception, ConfigBackendUnavailable) as exc:  # ConfigBackendUnavailable is a SystemExit
+        import logging
+        logging.getLogger(__name__).warning('Kanban sandbox unavailable, worker not spawned: %s', exc)
+        raise RuntimeStoreError('sandbox_unavailable') from exc
+
+
+def _popen_closing(plan):
+    """``subprocess.Popen`` that closes the plan's memfds once the child holds them (in the spawn
+    thread, so a cancelled spawn never closes them under a fork still in progress)."""
+    def spawn(*args, **kwargs):
+        try:
+            return subprocess.Popen(*args, pass_fds=plan.pass_fds, **kwargs)
+        finally:
+            plan.close()
+    return spawn
+
+
+def _kill_worker(worker):
+    """Hard-kill a sandboxed worker and its forwarder's group: the owner-side twin of the
+    in-worker ``os._exit(1)`` when the card's submitter dies (``session_kanban._watch_submitter``)."""
+    worker._signal_worker(kill=True)
+    worker._signal_group(kill=True)
+
+
+async def _spawn_registered_worker(authority, ref, row, policy=None):
     """Spawn the turn's child and register it for Stops: ``(worker, process)``, or None when the spawn was cancelled (the
-    interrupted result is already recorded). The generation stays marked spawning until registration."""
+    interrupted result is already recorded). The generation stays marked spawning until registration.
+
+    A Kanban card in a sandboxed tenant (``kanban.sandbox``) spawns inside bwrap; every other spawn
+    (chat, cron, unsandboxed cards) is the plain interpreter, unchanged."""
     spawning = _mark_spawning(authority, ref, row)
     generation = row.get('generation')
+    plan = None
     try:
         env = await asyncio.to_thread(_worker_env, authority)
         cwd = (await asyncio.to_thread(Path(__file__).resolve)).parents[1]
         from gateway.session_worker_spawn import acquire_process
-        from gateway.session_managed_worker_log import worker_log_path
+        from gateway.session_managed_worker_log import append_worker_note, worker_log_path
         log_path = worker_log_path(authority.profile_id)
-        process = await acquire_process(subprocess.Popen, [sys.executable, '-m', 'agent.managed_worker'],
-            cwd=cwd, stdin=subprocess.PIPE, env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE, **WORKER_POPEN)
+        command = [sys.executable, '-m', 'agent.managed_worker']
+        note = b''
+        if getattr(policy, 'kanban_json', None):
+            plan, note = await _kanban_sandbox(authority, policy, command, env, cwd)
+        if plan is None:
+            process = await acquire_process(subprocess.Popen, command,
+                cwd=cwd, stdin=subprocess.PIPE, env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE, **WORKER_POPEN)
+        else:
+            note = plan.log_line()
+            process = await acquire_process(_popen_closing(plan), list(plan.argv),
+                cwd=cwd, stdin=subprocess.PIPE, env=dict(plan.outer_env), stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE, **WORKER_POPEN)
     except asyncio.CancelledError:
         # acquire_process owns late-child cleanup; no bootstrap or reservation was sent.
         spawning.pop(ref.session_id, None)
         _interrupted_before_bootstrap(authority, row, _latched_stop_cause(authority, ref.session_id, generation))
         return None
+    except RuntimeStoreError as exc:
+        spawning.pop(ref.session_id, None)
+        if exc.reason == 'sandbox_unavailable':
+            # Nothing ran and nothing was reserved: the card's run learns why from the board note.
+            _record_lost_attempt(authority, policy, exc, exc.reason, None)
+        raise
     except BaseException:
         spawning.pop(ref.session_id, None)
         raise
     worker = ManagedWorker(process)
     if log_path is not None:
+        if note:
+            await asyncio.to_thread(append_worker_note, log_path, process.pid, note.decode('utf-8', 'replace'))
         worker.drain_stderr(log_path)
+    if plan is not None:
+        # Inside its pid namespace the worker cannot see the card's submitter (a host pid); this
+        # owner can, and ends the worker when it dies, as the unsandboxed worker does itself.
+        from gateway.session_kanban import watch_submitter_from_owner
+        watch_submitter_from_owner(json.loads(policy.kanban_json), worker.closed, partial(_kill_worker, worker))
     workers = getattr(authority, '_managed_workers', None)
     if workers is None:
         workers = authority._managed_workers = {}
@@ -657,7 +734,7 @@ async def execute_managed(authority, ref, row, policy):
         return refusal
     if _stopped_before_spawn(authority, ref, row):
         return ''
-    spawned = await _spawn_registered_worker(authority, ref, row)
+    spawned = await _spawn_registered_worker(authority, ref, row, policy)
     if spawned is None:
         return ''
     worker, process = spawned

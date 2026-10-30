@@ -381,56 +381,76 @@ def test_spawn_unsandboxed_when_flag_off(monkeypatch, tmp_path):
     kbd, captured = _patch_spawn(monkeypatch, tmp_path, {"sandbox": "off", "sandbox_tenants": ["pilot"]})
     assert kbd._default_spawn(_task("pilot"), str(tmp_path)) == 4242
     assert captured["argv"] == ["systemd-run", "--scope", "hermes", "chat"]
-    assert captured["pass_fds"] == ()
+    assert "pass_fds" not in captured
 
 
-def test_spawn_wraps_listed_tenant_between_scope_and_hermes(monkeypatch, tmp_path):
+def test_thin_client_is_never_wrapped_for_a_sandboxed_tenant(monkeypatch, tmp_path):
+    """The agent runs in the gateway's managed worker, which the gateway sandboxes; the thin client
+    only dials gateway.sock, so the dispatcher spawns it bare even for a listed tenant."""
     host = _fake_host(tmp_path)
-    monkeypatch.setattr(kbs, "build_sandbox", _builder_in(host))
+    monkeypatch.setattr(kbs.shutil, "which", lambda _n: "/usr/bin/bwrap")
     kbd, captured = _patch_spawn(monkeypatch, tmp_path, {"sandbox": "bwrap", "sandbox_tenants": ["pilot"]})
-
-    kbd._default_spawn(_task("other"), str(host.ws))
-    assert "exec" not in captured["argv"]
 
     kbd._default_spawn(_task("pilot"), str(host.ws))
     argv = captured["argv"]
-    assert argv[:2] == ["systemd-run", "--scope"] and argv[-2:] == ["hermes", "chat"]
-    assert argv.index("exec") < argv.index("--clearenv") < argv.index("hermes")
-    setenv = dict(_pairs(argv, "--setenv"))
-    # The worker's own pins win; a parent worker's leftover branch pin is stripped.
-    assert setenv["HERMES_KANBAN_TASK"] == "t_9" and "HERMES_KANBAN_BRANCH" not in setenv
-    assert "BINANCE_SECRET" not in captured["env"]
+    assert argv == ["systemd-run", "--scope", "hermes", "chat"]
+    assert "exec" not in argv and "--clearenv" not in argv and "pass_fds" not in captured
     log = (tmp_path / "logs" / "t_9.log").read_bytes()
-    assert b"[kanban sandbox] bwrap argv:" in log
+    assert b"[kanban sandbox]" not in log
 
 
-def test_exempt_skill_spawns_unsandboxed_and_logs_the_exemption(monkeypatch, tmp_path):
+def test_exempt_skill_logs_the_exemption_in_the_dispatcher_log(monkeypatch, tmp_path):
     host = _fake_host(tmp_path)
-    monkeypatch.setattr(kbs, "build_sandbox", _builder_in(host))
     cfg = {"sandbox": "bwrap", "sandbox_tenants": ["pilot"], "sandbox_exempt_skills": ["hindsight-ops"]}
     kbd, captured = _patch_spawn(monkeypatch, tmp_path, cfg)
+    monkeypatch.setattr(kbs.shutil, "which", lambda _n: None)  # an exempt card never needs bwrap
     task = _task("pilot", skills=["hindsight-ops"])
 
-    assert kbs.plan_for_task(task, ["hermes", "chat"], {}, str(host.ws), None) is None
     kbd._default_spawn(task, str(host.ws))
     assert captured["argv"] == ["systemd-run", "--scope", "hermes", "chat"]
-    assert captured["pass_fds"] == ()
     log = (tmp_path / "logs" / "t_9.log").read_bytes()
     assert b"[kanban sandbox] exempt: skill hindsight-ops\n" in log
     assert b"bwrap argv" not in log
 
 
-def _builder_in(host):
-    real = kbs.build_sandbox
-
-    def build(command, **kw):
-        kw.update(hermes_root=host.root, home=host.home, bwrap="/usr/bin/bwrap")
-        return real(command, **kw)
-    return build
-
-
 def test_unbuildable_sandbox_is_an_infrastructure_deferral(monkeypatch, tmp_path):
-    kbd, _captured = _patch_spawn(monkeypatch, tmp_path, {"sandbox": "bwrap"})
+    kbd, captured = _patch_spawn(monkeypatch, tmp_path, {"sandbox": "bwrap"})
     monkeypatch.setattr(kbs.shutil, "which", lambda _n: None)
     with pytest.raises(kbs.SandboxUnavailable):
         kbd._default_spawn(_task("any"), str(tmp_path))
+    assert "argv" not in captured  # never spawned bare
+
+
+def test_missing_bwrap_defers_the_card_without_charging_it(tmp_path, monkeypatch, all_assignees_spawnable):
+    """Through the real dispatcher accounting: the preflight's SandboxUnavailable is an
+    infrastructure refusal (#114720), so the card stays ready, spends no failure budget and its
+    run is tagged ``infrastructure``."""
+    import json
+
+    from hermes_cli import config
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    kb.init_db()
+    monkeypatch.setattr(config, "load_config", lambda: {"kanban": {"sandbox": "bwrap", "sandbox_tenants": ["pilot"]}})
+    monkeypatch.setattr(kbs.shutil, "which", lambda _n: None)
+
+    def spawn_via_preflight(task, workspace, board=None):
+        kbs.thin_client_preflight(task)
+        raise AssertionError("unreachable: the preflight refuses")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="no bwrap on host", assignee="a", tenant="pilot")
+        for _ in range(3):
+            assert kbd.dispatch_once(conn, spawn_fn=spawn_via_preflight, failure_limit=2).auto_blocked == []
+        row = conn.execute("SELECT status, consecutive_failures FROM tasks WHERE id = ?", (tid,)).fetchone()
+        assert (row["status"], row["consecutive_failures"]) == ("ready", 0)
+        runs = conn.execute("SELECT outcome, metadata FROM task_runs WHERE task_id = ?", (tid,)).fetchall()
+        assert runs and all(r["outcome"] == "spawn_failed" for r in runs)
+        assert all(json.loads(r["metadata"])["infrastructure"] is True for r in runs)

@@ -195,8 +195,13 @@ def bind_worker_context(frame):
             # kills target it; ``_watch_submitter`` ties this interpreter's life to it). The bound
             # interpreter is recorded beside it so a sweep can tell when the attempt is truly gone.
             from hermes_cli.kanban_db_dispatch import UNVERIFIED_WORKER_FINGERPRINT, _process_fingerprint
-            fingerprint = _process_fingerprint(os.getpid()) or UNVERIFIED_WORKER_FINGERPRINT
-            kb._append_event(conn, task.id, 'worker_bound', {'pid': os.getpid(), 'claim_lock': context['claim_lock'],
+            from agent.runtime_session_store import owner_view_pid
+            # The host's view of this interpreter: inside its own pid namespace (the Kanban sandbox)
+            # getpid() is the namespace pid and the host's /proc entry is unreadable, so the bound
+            # pid is the owner-verified host pid and its fingerprint UNVERIFIED (held, never signalled).
+            pid = owner_view_pid()
+            fingerprint = (_process_fingerprint(pid) if pid == os.getpid() else None) or UNVERIFIED_WORKER_FINGERPRINT
+            kb._append_event(conn, task.id, 'worker_bound', {'pid': pid, 'claim_lock': context['claim_lock'],
                              'started_at': fingerprint}, run_id=context['run_id'])
             claimed = conn.execute("SELECT payload, created_at FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",
                                    (task.id, context['run_id'])).fetchone()
@@ -217,9 +222,14 @@ def _watch_submitter(db, run_id):
     """The dispatcher's spawned worker is this attempt's handle: killing it (an operator, a
     timeout, an OOM kill) must end the attempt, as it did when the worker ran the agent itself.
     Exiting hard leaves no ``worker_result``, so the dead-worker sweep books this run's crash.
-    The run row is re-read each tick: the dispatcher records the pid only after its spawn returns."""
+    The run row is re-read each tick: the dispatcher records the pid only after its spawn returns.
+    A worker in its own pid namespace (the Kanban sandbox) cannot see that host pid; its owner
+    watches instead (:func:`watch_submitter_from_owner`)."""
     import os
+    from agent.runtime_session_store import owner_view_pid
     from hermes_cli.kanban_db_dispatch import _worker_alive
+    if owner_view_pid() != os.getpid():
+        return
 
     def watch():
         with closing(sqlite3.connect(db.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
@@ -231,6 +241,34 @@ def _watch_submitter(db, run_id):
                 if row and row[0] and row[0] != os.getpid() and not _worker_alive(row[0], row[1]):
                     os._exit(1)
     threading.Thread(target=watch, name='kanban-submitter-watch', daemon=True).start()
+
+
+def watch_submitter_from_owner(context, closed, kill):
+    """Owner side of :func:`_watch_submitter` for a sandboxed managed worker: the gateway sees the
+    card's submitter (the dispatcher's spawned thin client, a host pid) that the worker's pid
+    namespace hides, and calls ``kill()`` once it is dead or recycled. Ends when ``closed`` is set
+    (the owner closed the worker) or after the kill."""
+    from hermes_cli.kanban_db_dispatch import _worker_alive
+    db, run_id = Path(context['db']), context['run_id']
+
+    def watch():
+        try:
+            conn = sqlite3.connect(db.resolve().as_uri() + '?mode=ro', uri=True)
+        except (OSError, sqlite3.Error):
+            return
+        with closing(conn):
+            while not closed.wait(1.0):
+                try:
+                    row = conn.execute('SELECT worker_pid, worker_started_at FROM task_runs WHERE id=?', (run_id,)).fetchone()
+                except sqlite3.Error:
+                    continue
+                if row and row[0] and not _worker_alive(row[0], row[1]):
+                    kill()
+                    return
+    from agent.memory_provider import spawn_context_thread
+    thread = spawn_context_thread(watch, name='kanban-submitter-owner-watch')
+    thread.start()
+    return thread
 
 
 def run_worker_turns(agent, frame, history):
@@ -308,7 +346,7 @@ def record_start_failure(frame, exc):
 
 def _record_worker_result(context, code, last_output):
     _TURNS_DONE.set()
-    import os
+    from agent.runtime_session_store import owner_view_pid
     from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli import kanban_db as kb
     with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
@@ -316,7 +354,7 @@ def _record_worker_result(context, code, last_output):
             # Closing a run clears its claim/PID and replaces metadata; keep the
             # result in the immutable attempt event stream instead.
             kb._append_event(conn, context['task_id'], 'worker_result',
-                {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
+                {'pid': owner_view_pid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
                  'last_output': last_output}, run_id=context['run_id'])
 
 
@@ -348,11 +386,11 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False):
 
 
 def _bound_worker_matches(conn, context):
-    import os
+    from agent.runtime_session_store import owner_view_pid
     row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_bound' ORDER BY id DESC LIMIT 1",
         (context['task_id'], context['run_id'])).fetchone()
     bound = json.loads(row[0]) if row else {}
-    return (bound.get('pid'), bound.get('claim_lock')) == (os.getpid(), context['claim_lock'])
+    return (bound.get('pid'), bound.get('claim_lock')) == (owner_view_pid(), context['claim_lock'])
 
 
 def _bound_claim_is_live(context):

@@ -1,4 +1,10 @@
-"""Kanban worker sandbox: run a dispatcher-spawned worker inside bubblewrap.
+"""Kanban worker sandbox: run a Kanban card's agent inside bubblewrap.
+
+The agent runs in the gateway's managed worker (``python -m agent.managed_worker``, spawned by
+``gateway/session_managed_worker.py``); :func:`plan_for_managed_worker` wraps that spawn. The
+dispatcher's thin client (``hermes_cli.kanban_worker_client``) holds no agent and only dials
+``gateway.sock``, so it stays unwrapped (:func:`thin_client_preflight` only defers a spawn the
+gateway could not sandbox).
 
 Opt-in per host and tenant (``kanban.sandbox: bwrap`` + ``kanban.sandbox_tenants``); off by
 default. A card with a skill in ``kanban.sandbox_exempt_skills`` runs unsandboxed (host-side
@@ -14,7 +20,8 @@ Hindsight docker work). Policy, ported from the 2026-10 sandbox prototype (decis
   $XDG_RUNTIME_DIR`` (the last hides the systemd user bus, which can run commands on the host).
 - ``/dev/null`` over wallets, the Telegram user session, ``.anthropic_oauth.json``, project
   ``.env`` files holding bank/transcription keys, ``.env`` backups, other profiles' ``.env`` /
-  ``auth.json``, and every gateway control / loop-tick socket present at spawn.
+  ``auth.json``, and every gateway control / loop-tick socket present at spawn, except the one
+  control socket the managed worker's owner answers on (``allow_control_socket``).
 - ``~/.hermes/.env`` (and the assignee profile's ``.env``) replaced by a Tier-1-only copy fed
   through a memfd, so no filtered secret file ever lands on disk.
 - ``--clearenv`` plus an allow-list (POSIX basics, ``HERMES_*`` / ``TERMINAL_*`` minus secrets);
@@ -30,7 +37,6 @@ Only stdlib imports at module level: the forwarder and the in-sandbox probe run 
 
 from __future__ import annotations
 
-import contextlib
 import glob
 import json
 import logging
@@ -41,6 +47,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -268,8 +275,13 @@ def _existing(paths: Iterable[Path], *, kind: str) -> list[Path]:
 
 
 def masked_paths(hermes_root: Path, home: Path, *, runtime_dir: Optional[str],
-                 assignee_home: Optional[Path] = None) -> tuple[list[Path], list[Path]]:
-    """``(dirs_for_tmpfs, files_for_dev_null)`` present on this host right now."""
+                 assignee_home: Optional[Path] = None,
+                 allow_control_socket: Optional[Path] = None) -> tuple[list[Path], list[Path]]:
+    """``(dirs_for_tmpfs, files_for_dev_null)`` present on this host right now.
+
+    ``allow_control_socket`` (resolved-path equality) is left out of the ``/dev/null`` list: the
+    managed worker's owner socket. Every other ``gateway.sock`` and ``state/*.sock`` stays masked.
+    """
     dirs = [home / d for d in MASKED_HOME_DIRS] + [hermes_root / d for d in MASKED_HERMES_DIRS]
     if runtime_dir:
         dirs.append(Path(runtime_dir))
@@ -281,7 +293,25 @@ def masked_paths(hermes_root: Path, home: Path, *, runtime_dir: Optional[str],
         if own is not None and prof.resolve() == own:
             continue
         files.extend((prof / ".env", prof / "auth.json"))
+    if allow_control_socket is not None:
+        allowed = _resolved(allow_control_socket)
+        files = [f for f in files if _resolved(f) != allowed]
     return _existing(dirs, kind="dir"), _existing(dict.fromkeys(files), kind="file")
+
+
+def _resolved(path: Path) -> Path:
+    try:
+        return Path(path).resolve()
+    except OSError:
+        return Path(path).absolute()
+
+
+def _control_socket_dir_bind(socket_path: Optional[Path], hermes_root: Path) -> list[str]:
+    """The ``--bind`` back for a control socket outside the hermes root (pointer fallback), else []."""
+    if socket_path is None or _is_under(Path(socket_path), hermes_root):
+        return []
+    parent = _resolved(Path(socket_path)).parent
+    return ["--bind", str(parent), str(parent)] if parent.is_dir() else []
 
 
 def build_sandbox(
@@ -295,9 +325,17 @@ def build_sandbox(
     assignee_home: Optional[str | Path] = None,
     bwrap: Optional[str] = None,
     python: Optional[str] = None,
+    allow_control_socket: Optional[Path] = None,
 ) -> SandboxPlan:
     """Build the forwarder + bwrap argv around ``command``. Raises :class:`SandboxUnavailable`
-    when bwrap is not installed (fail closed: never fall back to an unsandboxed worker)."""
+    when bwrap is not installed (fail closed: never fall back to an unsandboxed worker).
+
+    ``allow_control_socket`` is the one gateway control socket the sandboxed managed worker must
+    reach. Under the hermes root it is simply left unmasked (the root's rw bind shows it, and a
+    gateway restart's fresh inode with it). Anywhere else (the ``gateway.sock.path`` pointer's
+    temp-dir target) its PARENT dir is bound back after the ``/tmp`` and ``$XDG_RUNTIME_DIR``
+    masks, so a restarted gateway's new socket inode shows through too.
+    """
     bwrap = bwrap or shutil.which("bwrap")
     if not bwrap:
         raise SandboxUnavailable("kanban.sandbox=bwrap but `bwrap` is not on PATH (apt install bubblewrap)")
@@ -335,7 +373,8 @@ def build_sandbox(
             a += ["--bind", str(p), str(p)]
 
     runtime_dir = worker_env.get("XDG_RUNTIME_DIR") or os.environ.get("XDG_RUNTIME_DIR")
-    mask_dirs, mask_files = masked_paths(hermes_root, home, runtime_dir=runtime_dir, assignee_home=own_home)
+    mask_dirs, mask_files = masked_paths(hermes_root, home, runtime_dir=runtime_dir, assignee_home=own_home,
+                                         allow_control_socket=allow_control_socket)
     for d in mask_dirs:
         a += ["--tmpfs", str(d)]
     for f in mask_files:
@@ -345,6 +384,7 @@ def build_sandbox(
     if shared_scratch.is_dir():
         a += ["--tmpfs", str(shared_scratch)]
     a += ["--bind", str(scratch), str(scratch)]
+    a += _control_socket_dir_bind(allow_control_socket, hermes_root)
 
     # Tier-1-only .env copies, fed via memfd (bwrap copies the fd's content at setup).
     fds: list[int] = []
@@ -385,81 +425,74 @@ def build_sandbox(
 
 
 # ---------------------------------------------------------------------------
-# Dispatcher seam
+# Spawn seams: the gateway's managed worker (sandboxed) and the dispatcher's thin client (not)
 # ---------------------------------------------------------------------------
 
-# Per-task Kanban vars a spawn pins for itself; anything else HERMES_KANBAN_* in the worker env
-# was inherited from a parent worker (nested dispatch) and must not cross into this sandbox.
-_HOST_KANBAN_VARS = frozenset({
-    "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
-    "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_HOME", "HERMES_KANBAN_ROOT",
-    "HERMES_KANBAN_ATTACHMENTS_ROOT", "HERMES_KANBAN_LOGS_ROOT",
-})
-
-
-def _pinned_kanban_vars(task: Any) -> set[str]:
-    pinned = set(_HOST_KANBAN_VARS)
-    optional = (
-        ("HERMES_KANBAN_BRANCH", task.branch_name),
-        ("HERMES_KANBAN_RUN_ID", task.current_run_id is not None),
-        ("HERMES_KANBAN_CLAIM_LOCK", task.claim_lock),
-        ("HERMES_KANBAN_PINNED", getattr(task, "route_pinned", False)),
-        ("HERMES_KANBAN_GOAL_MODE", task.goal_mode),
-        ("HERMES_KANBAN_GOAL_MAX_TURNS", task.goal_mode),
-    )
-    pinned.update(name for name, applies in optional if applies)
-    return pinned
-
-
-def _plan_with_note(task: Any, command: Sequence[str], env: Mapping[str, str], workspace: str,
-                    profile_home: Optional[str]) -> tuple[Optional[SandboxPlan], bytes]:
-    """``(plan, worker_log_note)``: the plan as :func:`plan_for_task` returns it, plus the line
-    the dispatcher writes to the worker log when a skill exempts a would-be-sandboxed task (so
-    the pilot gate can count exempt runs apart from sandboxed and out-of-scope ones)."""
-    if os.name == "nt":
-        return None, b""
+def _kanban_config() -> Mapping[str, Any]:
+    """``kanban`` config, read per spawn so a flip applies at the next spawn with no restart. An
+    unreadable config raises (fail closed: never guess the sandbox is off)."""
     from hermes_cli.config import load_config
 
-    cfg = load_config().get("kanban") or {}
-    if resolve_sandbox_mode(cfg, task.tenant) != SANDBOX_BWRAP:
+    return load_config().get("kanban") or {}
+
+
+def _exempt_note(skill: str) -> bytes:
+    return f"[kanban sandbox] exempt: skill {skill}\n".encode("utf-8", "replace")
+
+
+def plan_for_managed_worker(policy_kanban: Mapping[str, Any], command: Sequence[str], *,
+                            worker_env: Mapping[str, str], profile_home: Optional[str | Path],
+                            allow_control_socket: Optional[Path] = None,
+                            ) -> tuple[Optional[SandboxPlan], bytes]:
+    """``(plan, log_note)`` for a Kanban card's managed-worker spawn.
+
+    ``policy_kanban`` is the session policy's ``kanban_json`` context (tenant, skills, workspace,
+    task and run ids). No plan when ``kanban.sandbox`` does not apply to the tenant; no plan plus
+    the exempt note when a task skill is in ``kanban.sandbox_exempt_skills`` (the note lets the
+    pilot gate count exempt runs apart from sandboxed and out-of-scope ones). Every
+    ``HERMES_KANBAN_*`` var is dropped from ``worker_env``: the managed worker binds its card from
+    the bootstrap frame, never from the spawn env. Raises :class:`SandboxUnavailable` when the
+    sandbox applies but cannot be built (no bwrap, no absolute workspace); the caller fails the
+    admission closed, never spawns bare.
+    """
+    if os.name == "nt":
         return None, b""
+    cfg = _kanban_config()
+    if _tenant_sandbox_mode(cfg, policy_kanban.get("tenant")) != SANDBOX_BWRAP:
+        return None, b""
+    exempt = sandbox_exempt_skill(cfg, policy_kanban.get("skills"))
+    if exempt:
+        return None, _exempt_note(exempt)
+    workspace = policy_kanban.get("workspace")
+    if not isinstance(workspace, str) or not os.path.isabs(workspace):
+        raise SandboxUnavailable(f"kanban.sandbox=bwrap but the card has no absolute workspace ({workspace!r})")
+    env = {k: v for k, v in worker_env.items() if not k.startswith("HERMES_KANBAN_")}
+    run = policy_kanban.get("run_id")
+    run_key = f"{policy_kanban.get('task_id') or 'task'}-r{run if run is not None else 'x'}"
+    return build_sandbox(command, worker_env=env, workspace=workspace, run_key=run_key,
+                         assignee_home=profile_home, allow_control_socket=allow_control_socket), b""
+
+
+def thin_client_preflight(task: Any) -> bytes:
+    """Dispatcher side, before it spawns the thin client: the worker-log note.
+
+    The thin client is never wrapped (it holds no agent and must reach ``gateway.sock``). When the
+    sandbox applies to the task and ``bwrap`` is missing, raise :class:`SandboxUnavailable` here,
+    so the dispatcher defers the spawn as an infrastructure refusal (the card keeps its retry
+    budget) instead of the gateway losing the attempt. A skill exemption returns the exempt note
+    the dispatcher writes to the card's worker log, as before the agent moved into the gateway.
+    """
+    if os.name == "nt":
+        return b""
+    cfg = _kanban_config()
+    if _tenant_sandbox_mode(cfg, task.tenant) != SANDBOX_BWRAP:
+        return b""
     exempt = sandbox_exempt_skill(cfg, getattr(task, "skills", None))
     if exempt:
-        return None, f"[kanban sandbox] exempt: skill {exempt}\n".encode("utf-8", "replace")
-    pinned = _pinned_kanban_vars(task)
-    worker_env = {k: v for k, v in env.items() if not k.startswith("HERMES_KANBAN_") or k in pinned}
-    run = task.current_run_id if task.current_run_id is not None else "x"
-    return build_sandbox(command, worker_env=worker_env, workspace=workspace,
-                         run_key=f"{task.id}-r{run}", assignee_home=profile_home), b""
-
-
-def plan_for_task(task: Any, command: Sequence[str], env: Mapping[str, str], workspace: str,
-                  profile_home: Optional[str]) -> Optional[SandboxPlan]:
-    """The :class:`SandboxPlan` for this worker spawn when ``kanban.sandbox`` applies to the task's
-    tenant and no task skill is in ``kanban.sandbox_exempt_skills``, else None. Config is read per
-    spawn, so a flip applies at the next spawn with no restart. An unreadable config raises (fail
-    closed: never guess the sandbox is off), and so does :class:`SandboxUnavailable` (the
-    dispatcher defers the spawn, never runs it bare).
-    """
-    return _plan_with_note(task, command, env, workspace, profile_home)[0]
-
-
-@contextlib.contextmanager
-def worker_sandbox(task: Any, command: Sequence[str], env: dict[str, str], workspace: str,
-                   profile_home: Optional[str]):
-    """Yield ``(argv, env, pass_fds, log_prefix)`` for the worker spawn: the sandboxed launch
-    when ``kanban.sandbox`` applies, else the inputs unchanged with no fds and a prefix that is
-    empty unless a skill exempted the task. The memfds the sandbox reads its data binds from are
-    closed on exit, once Popen has handed them to the child.
-    """
-    plan, note = _plan_with_note(task, command, env, workspace, profile_home)
-    if plan is None:
-        yield list(command), env, (), note
-        return
-    try:
-        yield list(plan.argv), dict(plan.outer_env), plan.pass_fds, plan.log_line()
-    finally:
-        plan.close()
+        return _exempt_note(exempt)
+    if not shutil.which("bwrap"):
+        raise SandboxUnavailable("kanban.sandbox=bwrap but `bwrap` is not on PATH (apt install bubblewrap)")
+    return b""
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +589,13 @@ def _probe(spec: dict) -> list[dict]:
         except OSError as exc:
             entries, path = [], f"{path} ({type(exc).__name__})"
         check(f"hidden dir {path}", not entries, f"{len(entries)} entries" if entries else "empty")
+    control = spec.get("control_socket")
+    try:
+        is_sock = bool(control) and stat.S_ISSOCK(os.stat(control).st_mode)
+        detail = "socket" if is_sock else ("no control socket on the host at spawn" if not control else "not a socket")
+    except OSError as exc:
+        is_sock, detail = False, type(exc).__name__
+    check(f"owner control socket {control} reachable", is_sock, detail)
     for path in spec["sockets"]:
         s = socket.socket(socket.AF_UNIX)
         s.settimeout(1)
@@ -633,10 +673,12 @@ def _probe(spec: dict) -> list[dict]:
 
 def run_selftest(*, hermes_root: Optional[Path] = None, as_json: bool = False,
                  stream=None) -> int:
-    """``hermes kanban sandbox-selftest``: build the worker sandbox exactly as the dispatcher
-    would, run the probe inside it, print the checks, return 0 only when every check passes."""
+    """``hermes kanban sandbox-selftest``: build the worker sandbox exactly as the gateway's
+    managed-worker spawn would (the root profile's own control socket left reachable), run the
+    probe inside it, print the checks, return 0 only when every check passes."""
     import tempfile
 
+    from gateway.control_socket import resolve_client_socket_path
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_dispatch import _resolve_hermes_argv
     from hermes_constants import get_default_hermes_root
@@ -652,7 +694,9 @@ def run_selftest(*, hermes_root: Optional[Path] = None, as_json: bool = False,
     worker_env["HERMES_KANBAN_DB"] = str(kb.kanban_db_path())
     worker_env["HERMES_KANBAN_WORKSPACE"] = str(ws)
     runtime_dir = worker_env.get("XDG_RUNTIME_DIR")
-    mask_dirs, mask_files = masked_paths(root, home, runtime_dir=runtime_dir, assignee_home=root)
+    control = resolve_client_socket_path(root)
+    mask_dirs, mask_files = masked_paths(root, home, runtime_dir=runtime_dir, assignee_home=root,
+                                         allow_control_socket=control)
     shared = root / "cache" / "scratch"
     try:
         shared_entries = sorted(e for e in os.listdir(shared) if not e.startswith(f"kanban-{run_key}"))
@@ -663,7 +707,7 @@ def run_selftest(*, hermes_root: Optional[Path] = None, as_json: bool = False,
         hermes_argv = _resolve_hermes_argv()
         spec_holder: dict[str, Any] = {}
         plan = build_sandbox(["true"], worker_env=worker_env, workspace=ws, run_key=run_key,
-                             hermes_root=root, home=home, assignee_home=root)
+                             hermes_root=root, home=home, assignee_home=root, allow_control_socket=control)
         spec_holder.update({
             "hidden_files": [str(f) for f in mask_files if not f.is_socket()],
             "sockets": [str(f) for f in mask_files if f.is_socket()],
@@ -675,6 +719,7 @@ def run_selftest(*, hermes_root: Optional[Path] = None, as_json: bool = False,
             "env_files": [str(root / ".env")] if (root / ".env").is_file() else [],
             "tier1": sorted(TIER1_ENV_KEYS), "scratch": str(plan.scratch_dir), "home": str(home),
             "workspace": str(ws), "hermes_argv": hermes_argv, "kanban_db": worker_env["HERMES_KANBAN_DB"],
+            "control_socket": str(control) if control is not None else None,
         })
         probe_cmd = [*forwarder_argv(), "probe", json.dumps(spec_holder)]
         argv = [*plan.argv[:-1], *probe_cmd]  # swap the placeholder command for the probe
