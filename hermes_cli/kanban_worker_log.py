@@ -1,13 +1,36 @@
-"""Per-task worker log rotation, split out of ``hermes_cli.kanban_db_dispatch``."""
+"""Per-task worker log rotation and run boundaries, split out of ``hermes_cli.kanban_db_dispatch``."""
 
 from __future__ import annotations
 
 import contextlib
+import re
 from pathlib import Path
 from typing import Optional
 
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
+
+# Written by ``_default_spawn`` at the start of every run. The log is append-mode across
+# re-runs, so without it a tail reader cannot tell the current run's lines from an older
+# run's (#88456): a run that died before its exit summary / exit trailer was booked with the
+# previous run's text and rc. Same marker as upstream PR #126604.
+KANBAN_WORKER_SPAWN_MARKER = "[kanban-worker-spawn] run="
+_SPAWN_LINE_RE = re.compile(r"^" + re.escape(KANBAN_WORKER_SPAWN_MARKER) + r".*$", re.MULTILINE)
+
+
+def spawn_marker_line(run_id: Optional[int]) -> bytes:
+    """The run-boundary line. Leading newline: a run that died mid-line still leaves the
+    marker on a line of its own."""
+    return f"\n{KANBAN_WORKER_SPAWN_MARKER}{run_id if run_id is not None else '?'}\n".encode()
+
+
+def current_run_section(raw: str) -> str:
+    """Text after the last spawn-marker line of ``raw``; ``raw`` unchanged when it holds no
+    marker (legacy log, or a current run whose output outgrew the tail window)."""
+    last = None
+    for last in _SPAWN_LINE_RE.finditer(raw):
+        pass
+    return raw if last is None else raw[last.end() + 1:]
 
 
 def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:
