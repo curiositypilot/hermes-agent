@@ -346,6 +346,19 @@ class ManagedWorker:
             self.process.stderr.close()
 
 
+def find_managed_worker(runner, pid):
+    """``(profile_id, (pid, birth))`` of the live managed worker whose verified host pid is ``pid``,
+    else None. The control socket admits a peer from another user namespace (a bwrap-sandboxed
+    worker) only through this. ``worker`` is set once the reservation commits, so a child still
+    saying hello, or one that has closed, is never found. Reads only; call it on the owner loop."""
+    from gateway.session_authorities import all_authorities
+    for authority in all_authorities(runner):
+        for worker in list(getattr(authority, '_managed_workers', {}).values()):
+            if worker.worker is not None and worker.worker[0] == pid and not worker.closed.is_set():
+                return authority.profile_id, tuple(worker.worker)
+    return None
+
+
 def interrupt_managed(authority, actor, ref, generation):
     worker = getattr(authority, '_managed_workers', {}).get(ref.session_id)
     if worker is None:

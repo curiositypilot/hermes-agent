@@ -1,6 +1,7 @@
 """Process startup phases; diagnostics remain in the gateway facade."""
 from __future__ import annotations
 
+import functools
 import logging
 import threading
 import time
@@ -364,6 +365,9 @@ async def _start_gateway_start_control_socket(runner):
                            # live adapters' handlers (#87770); tools/prompt still wait for the next session.
                            "reload-plugins": reload_plugins_verb(runner, _main_loop)})
         _control_server.ticket_store = runner.session_ticket_store
+        # A bwrap-sandboxed managed worker (own user namespace) is admitted only as itself.
+        from gateway.session_managed_worker import find_managed_worker
+        _control_server.managed_worker_lookup = functools.partial(find_managed_worker, runner)
         # The Webapp's verbs answer from the socket's first moment ("starting" until the listener
         # settles): a client polling a restarting gateway must never read "unknown verb" as a failure.
         from gateway.webapp_listener import register_control_verbs

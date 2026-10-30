@@ -170,6 +170,12 @@ class AuthorityConnection:
         every profile this process serves; any other grant is bound to its own profile."""
         return self._identity.get('profile_scope') == 'host'
 
+    @property
+    def worker_binding(self):
+        """Host ``(pid, birth)`` a sandboxed managed worker's ticket was minted for, else None:
+        ``session_worker`` then admits only that process's own claims."""
+        return self._identity.get('worker_binding')
+
     def _sibling_for(self, profile):
         """Connection bound to the sibling authority a ``profile`` param names, or None for our own
         home. Only a host-scoped grant (the Desktop's shared-primary socket, the dashboard gate)
