@@ -184,3 +184,22 @@ def test_bootstrap_checks_ns_pid_against_getpid_not_the_host_pid(tmp_path, monke
     no_ns_pid = {k: v for k, v in scope.items() if k != 'ns_pid'} | {'pid': os.getpid()}
     with pytest.raises(ValueError):
         validate_bootstrap(_frame(tmp_path, monkeypatch, no_ns_pid))
+
+
+def test_adopted_worker_in_a_pid_namespace_binds_its_delegation_ledger(tmp_path, monkeypatch):
+    # After adopt, a namespaced worker's scope carries its host pid, which getpid() never returns.
+    from agent import runtime_session_store
+    from agent.runtime_session_store import RuntimeSessionStore
+    from tools import async_delegation_worker as worker
+    host_pid = os.getpid() + 100000
+    monkeypatch.setattr(runtime_session_store, '_owner_view_pid', None)
+    runtime_session_store.bind_owner_view_pid(host_pid)
+    monkeypatch.setattr(runtime_session_store, '_worker_process', True)
+    monkeypatch.setattr(worker, '_store', None)
+    scope = {'profile_id': str(tmp_path), 'session_id': 'sid', 'execution_id': 'x', 'generation': 1,
+             'pid': host_pid, 'birth': 0, 'secret': 's', 'epoch': 1}
+    store = RuntimeSessionStore(lambda method, **params: pytest.fail(method), scope, tmp_path / 'outbox')
+    try:
+        assert worker.worker_ledger().store is store
+    finally:
+        store._outbox_owner.close()
