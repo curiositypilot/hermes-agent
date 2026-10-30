@@ -89,7 +89,7 @@ def _kanban_loss_recorder(monkeypatch, policy, started, release, write_s):
     monkeypatch.setattr(session_kanban, 'record_worker_loss', record)
     monkeypatch.setattr(session_worker_reservation, 'lose_admission_worker',
                         lambda *a, **kw: (order.append('settled'), settle(*a, **kw))[1])
-    return dataclasses.replace(policy, kanban_json='{"task_id": "t"}'), order
+    return dataclasses.replace(policy, kanban_json='{"task_id": "t", "run_id": 1}'), order
 
 
 @pytest.mark.platforms("linux")
