@@ -1239,6 +1239,8 @@ View, tail, and filter Hermes log files. All logs are stored in `~/.hermes/logs/
 | `update` | `update.log` | Full stdout/stderr mirror of `hermes update` runs (append-only) — the root cause of update/dependency failures |
 | `handoff` | `desktop-update-handoff.log` | Desktop-driven update hand-off stages, including the Desktop rebuild retry output |
 
+Rotation is size-based. `agent.log` follows `logging.max_size_mb` / `logging.backup_count` (default 5 MB x 3); `errors.log` has its own budget, `logging.errors_max_size_mb` / `logging.errors_backup_count` (default 2 MB x 2). A burst of repeated tracebacks can fill a small budget within minutes, so raise both if you need logs from several days back. Running processes read these keys at startup.
+
 ### Options
 
 | Option | Description |
