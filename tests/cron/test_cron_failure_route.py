@@ -289,8 +289,10 @@ def test_verifier_footer_routed_not_delivered(run_env, monkeypatch, tmp_path):
     cmd, log = _router(tmp_path)
     _configure(monkeypatch, cmd)
 
+    agent = _cron_agent(_BRIEF, _FAILED)  # built once: the owner seam re-enters s.run_job under the AIAgent patch
+
     def _run_job(job, **kw):
-        with _job_runtime(tmp_path, _cron_agent(_BRIEF, _FAILED)):
+        with _job_runtime(tmp_path, agent):
             return _REAL_RUN_JOB(job, **kw)
     monkeypatch.setattr(s, "run_job", _run_job)
 
