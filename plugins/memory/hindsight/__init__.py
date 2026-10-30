@@ -43,6 +43,7 @@ from .embedded import (
     _export_port_health_grace_timeout, _load_simple_env, _local_runtime_hint, _materialize_embedded_profile_env,
     _may_rewrite_profile_env,
 )
+from . import state_lines
 from .recall_log import log_recalled
 from .settings import (
     _DEFAULT_API_URL, _DEFAULT_IDLE_TIMEOUT, _DEFAULT_LOCAL_URL, _DEFAULT_REFLECT_TIMEOUT, _DEFAULT_RETAIN_SOURCE,
@@ -716,6 +717,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_delegate_max_items", "description": "Maximum recalled memories handed to each delegate_task child (0 = none)", "default": 8},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
             {"key": "recall_show_dates", "description": "Prefix each recalled memory with the date it was recorded ('- [YYYY-MM-DD] text', or 'N. [YYYY-MM-DD] text' in hindsight_recall tool output; from mentioned_at only, a memory without it stays undated) and add one line telling the model the newer of two conflicting facts supersedes the older. Applies to auto-recall, delegate_task children and the hindsight_recall tool", "default": False},
+            {"key": "recall_state_lines", "description": "Latest-status lines from the memory-system entity-state index (data/memory-system/entity-state/index.sqlite under the default Hermes root) for auto-recall, the Kanban first-turn recall and the hindsight_recall tool. 'on' puts up to 3 status lines above the hits and marks older hits '[older than <key> status YYYY-MM-DD]'; 'shadow' serves the block unchanged and logs what 'on' would add to data/memory-system/state_lines.jsonl ('on' logs too). A missing, foreign-schema or >6 h old index adds nothing", "default": "off", "choices": ["off", "shadow", "on"]},
             {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
             {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
@@ -1146,6 +1148,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_indicator = bool(cfg.get("recall_indicator", True))
         # Opt-in: prefix each auto-recalled fact with its date plus one "newer supersedes older" line.
         self._recall_show_dates = _parse_bool_setting(cfg.get("recall_show_dates"), False)
+        self._recall_state_lines = state_lines.parse_mode(cfg.get("recall_state_lines"))  # off|shadow|on
         # Auto-recall abstention: a server-side reranker floor (min_scores.reranker) so an
         # off-topic turn injects nothing instead of the top-N zero-score results. None = no floor.
         self._recall_min_reranker = _parse_score_floor(cfg.get("recall_min_reranker"))
@@ -1366,7 +1369,7 @@ class HindsightMemoryProvider(MemoryProvider):
             # hung request would otherwise hold the slot for the full API timeout (120 s).
             self._call_timeout.value = self._recall_kanban_recall_timeout_s or None
             try:
-                return self._do_recall(query)
+                return self._do_recall(query, "kanban_first")
             finally:
                 self._call_timeout.value = None
 
@@ -1424,9 +1427,10 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return resp.text
 
-    def _do_recall(self, query: str) -> tuple[str, int]:
+    def _do_recall(self, query: str, where: str = "auto") -> tuple[str, int]:
         """One recall/reflect for *query* (background prefetch and ``recall_sync`` paths)
-        -> (text, memory count); the count is 0 for reflect (synthesis) and on error."""
+        -> (text, memory count); the count is 0 for reflect (synthesis) and on error.
+        *where* labels the block for ``recall_state_lines`` (auto | kanban_first)."""
         # A Kanban worker's turns all serve one card; its title/body is the topic.
         query = self._kanban_recall_context()[0] or query
         if self._recall_max_input_chars:
@@ -1439,7 +1443,10 @@ class HindsightMemoryProvider(MemoryProvider):
                          self._bank_id, len(query), self._budget)
             results = self._recall(query, auto=True)
             logger.debug("Recall: returned %d results", len(results))
-            return self._render_recall_lines(_format_recall_lines(results, self._recall_show_dates)), len(results)
+            served = [r for r in results if getattr(r, "text", None)]
+            text = state_lines.decorate(self._recall_state_lines, where, query, served, lambda marks: (
+                self._render_recall_lines(_format_recall_lines(served, self._recall_show_dates, marks))))
+            return text, len(results)
         except Exception as e:
             # INFO (not debug): a turn with no memory block needs a logged cause at the default level.
             logger.info("Hindsight recall failed: %s", e)
@@ -1815,7 +1822,8 @@ class HindsightMemoryProvider(MemoryProvider):
         kept = results
         if self._recall_tool_relative_floor and self._recall_min_relative_reranker:
             kept = self._apply_relative_floor(results, self._recall_min_relative_reranker)
-        text = _format_tool_recall(kept, self._recall_show_dates, len(results) - len(kept))
+        text = state_lines.decorate(self._recall_state_lines, "tool", query, kept, lambda marks: (
+            _format_tool_recall(kept, self._recall_show_dates, len(results) - len(kept), marks)))
         return "\n".join([*notes, text])
 
     def _tool_reflect(self, args: dict) -> str:

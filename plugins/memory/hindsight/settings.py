@@ -148,26 +148,31 @@ def _recall_date(result: Any) -> str:
     return m.group(0) if m else ""
 
 
-def _format_recall_lines(results: list, show_dates: bool = False) -> list[str]:
+def _format_recall_lines(results: list, show_dates: bool = False, prefixes: dict | None = None) -> list[str]:
     """Bullet lines for injected recall results: ``- text``, or ``- [YYYY-MM-DD] text`` with
-    ``show_dates`` (undated results keep the plain form). Results without text are skipped."""
+    ``show_dates`` (undated results keep the plain form). Results without text are skipped.
+    *prefixes* maps a line's position to its state-lines mark, placed after the date."""
     lines = []
     for r in results:
         text = getattr(r, "text", None)
         if not text:
             continue
         date = _recall_date(r) if show_dates else ""
+        text = (prefixes or {}).get(len(lines), "") + text
         lines.append(f"- [{date}] {text}" if date else f"- {text}")
     return lines
 
 
-def _format_tool_recall(results: list, show_dates: bool, dropped: int = 0) -> str:
+def _format_tool_recall(results: list, show_dates: bool, dropped: int = 0, prefixes: dict | None = None) -> str:
     """hindsight_recall tool body: numbered ``N. text`` lines, ``N. [YYYY-MM-DD] text`` plus the
     dated-facts header on top with *show_dates* (undated rows stay plain). With no rows it is the
-    fallback line alone; *dropped* > 0 (relative floor) appends one note line in both cases."""
+    fallback line alone; *dropped* > 0 (relative floor) appends one note line in both cases.
+    *prefixes* maps a row's 0-based position to its state-lines mark, placed after the date."""
     if results:
         dated = (_recall_date(r) if show_dates else "" for r in results)
-        lines = [f"{i}. [{d}] {r.text}" if d else f"{i}. {r.text}" for i, (r, d) in enumerate(zip(results, dated), 1)]
+        marks = prefixes or {}
+        lines = [f"{i}. [{d}] {marks.get(i - 1, '')}{r.text}" if d else f"{i}. {marks.get(i - 1, '')}{r.text}"
+                 for i, (r, d) in enumerate(zip(results, dated), 1)]
         if show_dates:
             lines.insert(0, _DATED_RECALL_HEADER)
     else:
