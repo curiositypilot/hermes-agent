@@ -12,7 +12,7 @@ import sys
 import pytest
 
 from pm.package import InstallError
-from tests.pm._fixtures import client, isolated_python, worker_toolchain
+from tests.pm._fixtures import client as client, isolated_python as isolated_python, worker_toolchain  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
 
 # Spawns children with a home it builds itself; the parent's must stay real.
 pytestmark = pytest.mark.real_machine_home
@@ -44,7 +44,7 @@ def test_env_disable_beats_an_allowing_override(no_override, monkeypatch):
 
 @pytest.mark.parametrize("allowed", [True, False])
 def test_request_carries_the_client_policy(no_override, monkeypatch, allowed):
-    from pm import client
+    from pm import client as pm_client
 
     sent = []
 
@@ -72,11 +72,11 @@ def test_request_carries_the_client_policy(no_override, monkeypatch, allowed):
             return 0
 
     monkeypatch.setattr(no_override, "lazy_installs_allowed", lambda: allowed)
-    monkeypatch.setattr(client, "runtime_environment", dict)
-    monkeypatch.setattr(client, "_worker_command", lambda *a, **kw: ["worker"])
-    monkeypatch.setattr(client.subprocess, "Popen", Popen)
+    monkeypatch.setattr(pm_client, "runtime_environment", dict)
+    monkeypatch.setattr(pm_client, "_worker_command", lambda *a, **kw: ["worker"])
+    monkeypatch.setattr(pm_client.subprocess, "Popen", Popen)
     with pytest.raises(Stop):
-        client._request("ensure", {"name": "node", "explicit": False})
+        pm_client._request("ensure", {"name": "node", "explicit": False})
     assert sent[0]["context"]["lazy_installs_allowed"] is allowed
 
 
@@ -84,7 +84,7 @@ def test_read_only_request_skips_the_policy_read(no_override, monkeypatch):
     """hermes_bootstrap asks venv_is_current in every process, managed workers included; reading
     the policy there imports hermes_cli.config before the worker binds its frozen config, and the
     worker refuses to start ("worker policy must bind before runtime imports")."""
-    from pm import client
+    from pm import client as pm_client
 
     sent = []
 
@@ -115,11 +115,11 @@ def test_read_only_request_skips_the_policy_read(no_override, monkeypatch):
         raise AssertionError("read-only request read the lazy-install policy")
 
     monkeypatch.setattr(no_override, "lazy_installs_allowed", policy_read)
-    monkeypatch.setattr(client, "runtime_environment", dict)
-    monkeypatch.setattr(client, "_worker_command", lambda *a, **kw: ["worker"])
-    monkeypatch.setattr(client.subprocess, "Popen", Popen)
+    monkeypatch.setattr(pm_client, "runtime_environment", dict)
+    monkeypatch.setattr(pm_client, "_worker_command", lambda *a, **kw: ["worker"])
+    monkeypatch.setattr(pm_client.subprocess, "Popen", Popen)
     with pytest.raises(Stop):
-        client._request("venv_is_current", {"extras": [], "plugins": []})
+        pm_client._request("venv_is_current", {"extras": [], "plugins": []})
     assert "lazy_installs_allowed" not in sent[0]["context"]
 
 
