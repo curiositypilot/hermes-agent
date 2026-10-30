@@ -73,7 +73,7 @@ def test_timeout_returns_empty_and_does_not_block_parent_prefetch():
     assert m.delegation_context("goal") == ""
     assert time.monotonic() - start < 1.0
     # A stuck child recall must not register as a running prefetch (the parent would skip its next turn).
-    assert m._external_prefetch_threads == {}
+    assert not any(m._PREFETCH_GATE.calls.values())
     release.set()
 
 

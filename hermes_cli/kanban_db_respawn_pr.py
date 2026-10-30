@@ -14,31 +14,25 @@ import sqlite3
 from typing import Optional
 
 
-def _pr_comment_superseded(
+def _clean_park_resume(
     conn: sqlite3.Connection, task_id: str, comment_at: int,
     latest_run: Optional[sqlite3.Row],
 ) -> bool:
-    """Whether the newest PR comment no longer means "do not re-spawn".
+    """Whether the newest PR comment was followed by a clean park and its resume.
 
-    True on a handoff after the comment (see :func:`_is_handoff_event`), or on
-    a clean park: the latest ended run is ``blocked``, ended no earlier than
-    the comment (same second counts: a worker comments, then blocks), and a
+    True when the latest ended run is ``blocked``, ended no earlier than the
+    comment (same second counts: a worker comments, then blocks), and a
     ``promoted``/``unblocked`` event followed that run. A crash, reclaim,
-    timeout or spawn failure is never ``blocked``, so it stays guarded.
+    timeout or spawn failure is never ``blocked``, so it stays guarded; an
+    unreadable ``ended_at`` stays guarded too (fail closed). The handoff half
+    (:func:`_is_handoff_event`) is checked by the dispatcher first.
     """
-    events = conn.execute(
-        # Strictly after: a same-second tie stays guarded (fail closed).
-        "SELECT kind, payload FROM task_events "
-        "WHERE task_id = ? AND created_at > ? "
-        "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
-        (task_id, comment_at),
-    ).fetchall()
-    if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
-        return True
     if latest_run is None or latest_run["outcome"] != "blocked":
         return False
-    parked_at = int(latest_run["ended_at"] or 0)
-    if parked_at < comment_at:
+    from hermes_cli import kanban_db as _kb
+
+    parked_at = _kb._to_epoch(latest_run["ended_at"])
+    if parked_at is None or parked_at < comment_at:
         return False
     return conn.execute(
         "SELECT 1 FROM task_events WHERE task_id = ? AND created_at >= ? "

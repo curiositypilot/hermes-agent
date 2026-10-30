@@ -32,7 +32,7 @@ def _module_argv(monkeypatch) -> list[str]:
 
 def _pinned_env(cmd: list[str]) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
-    kbd._propagate_module_import_root(cmd, env)
+    kda._propagate_module_import_root(cmd, env)
     return env
 
 

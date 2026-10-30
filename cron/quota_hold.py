@@ -28,6 +28,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
+from cron import extra_fire
 from hermes_time import now as _hermes_now, safe_strftime
 
 logger = logging.getLogger("cron.scheduler")
@@ -76,7 +77,7 @@ def hold_seconds_from_failure(exc: BaseException) -> Optional[float]:
     return None
 
 
-def hold_active(job: Dict[str, Any], now: Optional[datetime] = None) -> bool:
+def hold_active(job: dict[str, Any], now: Optional[datetime] = None) -> bool:
     """True while the job is parked inside a provider window (an expired marker is inert)."""
     from cron.jobs import _instant_after, _parse_aware  # late: jobs imports this module's helpers
 
@@ -84,7 +85,7 @@ def hold_active(job: Dict[str, Any], now: Optional[datetime] = None) -> bool:
     return until is not None and _instant_after(until, now or _hermes_now())
 
 
-def clear_state(job: Dict[str, Any]) -> None:
+def clear_state(job: dict[str, Any]) -> None:
     job.pop(STATE_KEY, None)
     job.pop(ROUTE_KEY, None)
     job.pop(SCHEDULE_EXPR_KEY, None)
@@ -131,7 +132,7 @@ def _cron_default_provider() -> Optional[str]:
     return str(cron_cfg.get("model_provider") or "").strip() or None
 
 
-def is_recovery_fire(job: Dict[str, Any], next_run: str) -> bool:
+def is_recovery_fire(job: dict[str, Any], next_run: str) -> bool:
     """True for the exact off-lattice cron fire parked by ``plan_hold``.
 
     The expression fingerprint keeps a direct ``jobs.json`` schedule edit from inheriting the
@@ -158,7 +159,7 @@ def _window_end(hold_seconds: float, now: Optional[datetime] = None) -> datetime
 
 
 def _recovery_worthwhile(
-    job: Dict[str, Any], natural_next: datetime, window_end: datetime,
+    job: dict[str, Any], natural_next: datetime, window_end: datetime,
 ) -> bool:
     """One off-lattice recovery fire, and only for a sparse schedule.
 
@@ -197,17 +198,18 @@ def _parked_at(
                and _recovery_worthwhile(job, natural_next, window_end))
     if not blocked and not recover:
         return None, False
-    if kind == "cron" and blocked:
+    if kind == "cron" and blocked and not extra_fire.queued(job):
         # First LEGAL cron occurrence after the window; parking at the boundary would fire at a
         # time the expression excludes. ``compute_next_run`` returns None only when croniter is
         # missing or the schedule has no ``expr``: the job has no computable occurrence to park
-        # at, so it is not parked and keeps its natural next run.
-        return compute_next_run(schedule, window_end.isoformat()), False
+        # at, so it is not parked and keeps its natural next run. A queued run-now is not an
+        # occurrence: it waits for the boundary, not the next slot.
+        return compute_next_run(schedule, window_end.isoformat(), timezone=job.get("timezone")), False
     return window_end.isoformat(), recover
 
 
 def plan_hold(
-    job: Dict[str, Any], hold_seconds: float, *, recover_consumed_fire: bool = False,
+    job: dict[str, Any], hold_seconds: float, *, recover_consumed_fire: bool = False,
 ) -> bool:
     """Called under the jobs lock AFTER ``_advance_after_run`` computed the schedule's natural
     ``next_run_at`` for a failed run. A scheduled sparse cron may retry its consumed fire at the
@@ -228,7 +230,7 @@ def plan_hold(
         job[SCHEDULE_EXPR_KEY] = (job.get("schedule") or {}).get("expr")
     else:
         job.pop(SCHEDULE_EXPR_KEY, None)
-    job["next_run_at"] = parked
+    extra_fire.reschedule(job, parked)
     job[STATE_KEY] = parked
     logger.warning(
         "Job '%s': provider usage window closed for %.0fs (holding for %.0fs) — holding fires "
@@ -238,7 +240,7 @@ def plan_hold(
     return True
 
 
-def hold_notice(job: Dict[str, Any], hold_seconds: Optional[float]) -> str:
+def hold_notice(job: dict[str, Any], hold_seconds: Optional[float]) -> str:
     """Line appended to the failure alert delivered on entering the hold, else "" when the job
     will not be held: not recurring, paused, not blocked by the window, or retired by this very
     run (repeat limit reached, no next run computable). Uses the same logic as ``plan_hold``, on
@@ -256,7 +258,7 @@ def hold_notice(job: Dict[str, Any], hold_seconds: Optional[float]) -> str:
             or job.get("state") == "paused" or terminal_after_run(job):
         return ""
     now = _hermes_now()
-    natural_next = _parse_aware(compute_next_run(schedule, now.isoformat()))
+    natural_next = _parse_aware(compute_next_run(schedule, now.isoformat(), timezone=job.get("timezone")))
     parked, _recover = _parked_at(
         job, natural_next, hold_seconds, now, bool(job.get("_scheduled_instant")))
     if parked is None:

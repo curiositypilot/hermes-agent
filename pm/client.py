@@ -17,24 +17,22 @@ from pm.worker_operations import OPERATIONS
 
 
 def _missing_or_refuse(name, *, explicit=False):
-    """The chain's missing packages; refuse here what the worker would refuse anyway.
+    from pm.install import _refuse_lazy, current_target, is_installed, lazy_installs_allowed
+    from pm.registry import get_package, walk
 
-    A target gap is static package data, so a worker spawned for it only raises
-    the same error at ``pm.install._install`` -- ~2 s per call for callers that
-    probe on every use (``selected_git_env`` on POSIX, #129792).
-    """
-    from pm.install import _refuse_lazy, is_installed, lazy_installs_allowed
-    from pm.registry import walk
-    from pm.store import current_target
-
-    missing = [package for package in walk([name]) if not is_installed(package.name)]
-    if missing and not explicit and not lazy_installs_allowed():
-        raise _refuse_lazy(name, ", ".join(package.name for package in missing))
-    target = current_target()
-    for package in missing:
-        reason = package.missing_reason(target)
+    missing = [package.name for package in walk([name]) if not is_installed(package.name)]
+    target = current_target() if missing else None
+    for gap in missing:
+        # A registry gap (git on POSIX: "uses system git by choice") is static: no worker can
+        # install it, so answer with the worker's own refusal here. Asking one anyway cost a PM
+        # worker round trip (about a second) on every ``selected_git_env()``, which each
+        # checkpoint git child calls, so one gateway /rollback or /diff paid it several times.
+        # Fork: an explicit install is refused here too (it would fail the same way in the worker).
+        reason = get_package(gap).missing_reason(target)
         if reason is not None:
-            raise InstallError(package.name, f"unavailable on {target}: {reason}", "none")
+            raise InstallError(gap, f"unavailable on {target}: {reason}", "none")
+    if missing and not explicit and not lazy_installs_allowed():
+        raise _refuse_lazy(name, ", ".join(missing))
     return missing
 
 
@@ -195,13 +193,14 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
                 process.wait(timeout=5)
 
 
-def ensure(name, *, base_env=None, explicit=False, progress=None, pause_event=None, download_progress=None) -> Runner:
+def ensure(name, *, base_env=None, explicit=False, verify=True, progress=None, pause_event=None,
+           download_progress=None) -> Runner:
     from pm.install import env_for
     from pm.registry import get_package
 
     if is_runtime():
         from pm.install import ensure as direct
-        return direct(name, base_env=base_env, explicit=explicit, progress=progress,
+        return direct(name, base_env=base_env, explicit=explicit, verify=verify, progress=progress,
                       pause_event=pause_event, download_progress=download_progress)
     if not isinstance(get_package(name), StatePackage):
         # An explicit install still reaches the worker when nothing is missing: it re-verifies.
@@ -216,7 +215,9 @@ def ensure(name, *, base_env=None, explicit=False, progress=None, pause_event=No
     if download_progress is not None:
         callbacks["download_progress"] = lambda done, total, ranges: download_progress(
             done, total, {key: [tuple(row) for row in rows] for key, rows in ranges.items()})
-    _request("ensure", {"name": name, "explicit": explicit}, callbacks=callbacks, pause_event=pause_event)
+    # The worker's default is verify=True: only a lowered check travels in the request.
+    _request("ensure", {"name": name, "explicit": explicit, **({} if verify else {"verify": False})},
+             callbacks=callbacks, pause_event=pause_event)
     return Runner(name, env_for(name, base_env=base_env))
 
 
@@ -239,7 +240,7 @@ def sync_venv(extras=None, *, explicit=False, plugins: PluginInput | None = None
     if isinstance(plugins, Selection) and "expected_config" not in plugins.data:
         from pm.filesystem import file_digest
         plugins = Selection({**plugins.data,
-                             "expected_config": file_digest(Path(plugins.data["home"]) / "config.yaml") or "missing"})
+                             "expected_config": file_digest(Path(plugins.data["home"]) / "config.yaml") or "missing"})  # config-reader: ok — pm publication: byte-level compare-and-swap rewrite of the local file
     foreign = project_root is not None and Path(project_root).resolve() != paths.repo_root().resolve()
     if is_runtime() and not foreign:
         from pm.install import sync_venv as direct
@@ -408,13 +409,13 @@ def build_requirements_environment(requirements: Sequence[str], *, out: Path,
                                    python: Path | None = None, cache: Path | None = None,
                                    env: Mapping[str, str] | None = None, wheelhouse: Path | None = None,
                                    offline: bool = False, sealed: bool = False,
-                                   explicit: bool = False) -> Path:
+                                   explicit: bool = False, lock: Path | None = None) -> Path:
     if isinstance(requirements, str):
         raise TypeError("requirements must be a sequence, not a string")
     return Path(_python_operation("build_requirements_environment", {
         "requirements": list(requirements), "out": Path(out), "python": python, "cache": cache,
         "env": dict(env) if env is not None else None, "wheelhouse": wheelhouse,
-        "offline": offline, "sealed": sealed, "explicit": explicit,
+        "offline": offline, "sealed": sealed, "explicit": explicit, "lock": lock,
     }))
 
 

@@ -10,7 +10,7 @@ from cron.worker_bootstrap import worker_bootstrap as _boot_external_worker
 
 _boot_external_worker()
 
-from cron.jobs import (  # noqa: E402
+from cron.jobs import (
     create_job,
     get_job,
     list_jobs,
@@ -35,15 +35,15 @@ def __getattr__(name):
 
 
 __all__ = [
+    "JOBS_FILE",
     "create_job",
     "get_job",
     "list_jobs",
-    "remove_job",
-    "update_job",
     "pause_job",
-    "resume_job",
-    "trigger_job",
     "rearm_oneshot",
+    "remove_job",
+    "resume_job",
     "tick",
-    "JOBS_FILE",
+    "trigger_job",
+    "update_job",
 ]

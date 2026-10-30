@@ -33,6 +33,10 @@ class TestIsOAuthToken:
         key = "sk-ant-" + "usr-01-" + "x" * 40
         assert _is_oauth_token(key) is False
         assert build_anthropic_client(key).api_key == key
+    def test_user_scoped_api_key(self):
+        # sk-ant-usr* is a pay-per-token API key accepted as x-api-key — not an OAuth/setup
+        # token (#133856): classifying it as OAuth rides the Claude Code identity on it.
+        assert _is_oauth_token("sk-ant-usr01-abcdef1234567890") is False
 
 
 def test_missing_sdk_error_reports_why_the_lazy_install_did_not_land(monkeypatch):
@@ -729,7 +733,7 @@ class TestConvertMessages:
             },
             {"role": "user", "content": "Hi"},
         ]
-        system, result = convert_messages_to_anthropic(messages)
+        system, _result = convert_messages_to_anthropic(messages)
         # When cache_control is present, system should be a list of blocks
         assert isinstance(system, list)
         assert system[0]["cache_control"] == {"type": "ephemeral"}
@@ -764,7 +768,7 @@ class TestConvertMessages:
         ], native_anthropic=True)
 
         _, result = convert_messages_to_anthropic(messages)
-        assistant_msg = [m for m in result if m["role"] == "assistant"][0]
+        assistant_msg = next(m for m in result if m["role"] == "assistant")
         tool_use = assistant_msg["content"][-1]
 
         assert tool_use["type"] == "tool_use"
@@ -853,7 +857,7 @@ class TestConvertMessages:
         ], native_anthropic=True)
 
         _, result = convert_messages_to_anthropic(messages)
-        assistant_msg = [m for m in result if m["role"] == "assistant"][0]
+        assistant_msg = next(m for m in result if m["role"] == "assistant")
         thinking, tool_use = assistant_msg["content"]
 
         assert thinking["type"] == "thinking"

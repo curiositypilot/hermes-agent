@@ -46,3 +46,18 @@ def test_cron_run_inline_flag():
     parser = _build()
     assert parser.parse_args(["cron", "run", "x", "--inline"]).inline is True
     assert parser.parse_args(["cron", "run", "x"]).inline is False
+
+
+def test_cron_timezone_and_grace_flags():
+    parser = _build()
+    created = parser.parse_args(
+        ["cron", "create", "0 9 * * *", "hi", "--timezone", "Asia/Hong_Kong",
+         "--grace-minutes", "0"])
+    assert created.timezone == "Asia/Hong_Kong"
+    assert created.grace_minutes == "0", "an int-ish string must survive to the normalizer"
+
+    edited = parser.parse_args(["cron", "edit", "j", "--timezone", "", "--grace-minutes", ""])
+    assert edited.timezone == "", "an empty value is the documented clear"
+    assert edited.grace_minutes == ""
+
+    assert parser.parse_args(["cron", "edit", "j"]).timezone is None

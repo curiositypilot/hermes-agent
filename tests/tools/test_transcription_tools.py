@@ -300,17 +300,21 @@ class TestTranscribeLocalCommand:
 
         class Proc:
             returncode = 0
+            pid = 4242
             stdout = _Stream()
             stderr = _Stream()
 
             def wait(self, timeout=None):
                 return 0
 
+            def poll(self):
+                return 0
+
         def fake_popen(command, **kwargs):
             captured["env"] = kwargs["env"]
             return Proc()
 
-        monkeypatch.setattr("tools.tts_command_provider.subprocess.Popen", fake_popen)
+        monkeypatch.setattr("tools.tts_command_provider.spawn_owned", fake_popen)
 
         from tools.transcription_command import _run_command_stt
 
@@ -1684,7 +1688,7 @@ class TestExplicitOpenaiSelectionError:
             "tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True
         )
         monkeypatch.setattr(
-            "tools.transcription_tools._load_stt_config", lambda: {}
+            "tools.transcription_tools._load_stt_config", dict
         )
         with patch("tools.transcription_tools._HAS_OPENAI", True), \
              patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
@@ -1709,7 +1713,7 @@ class TestExplicitOpenaiSelectionError:
         without an explicit provider choice."""
         self._no_openai_credentials(monkeypatch)
         monkeypatch.setattr(
-            "tools.transcription_tools._load_stt_config", lambda: {}
+            "tools.transcription_tools._load_stt_config", dict
         )
         with patch("tools.transcription_tools._HAS_OPENAI", True), \
              patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \

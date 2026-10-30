@@ -1086,6 +1086,34 @@ def apply_route(task: Any, decision: Optional[RouteDecision]) -> None:
         task.reasoning_effort = cand.reasoning
 
 
+def replay_recorded_route(conn: Any, task: Any, run_id: Optional[int]) -> None:
+    """Re-apply the run's ``routed`` event to an IN-MEMORY task read back from the board.
+
+    The routed model never lands on the card (every retry routes afresh), and the worker is
+    now a thin client: the profile owner re-reads the task (``gateway/session_kanban.py``),
+    so without this replay a routed attempt runs on the card pin or the profile default."""
+    if run_id is None:
+        return
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='routed' "
+        "ORDER BY id DESC LIMIT 1", (task.id, run_id)).fetchone()
+    if row is None:
+        apply_route(task, None)
+        return
+    try:
+        payload = json.loads(row[0] or "{}")
+    except (TypeError, ValueError):
+        return
+    candidate = None
+    if payload.get("model"):
+        candidate = TierCandidate(model=payload["model"], provider=payload.get("provider"),
+                                  reasoning=payload.get("reasoning"))
+    apply_route(task, RouteDecision(source=str(payload.get("source") or "profile"),
+                                    lane=str(payload.get("lane") or "ready"),
+                                    requested_tier=payload.get("requested_tier"),
+                                    tier=payload.get("tier"), candidate=candidate))
+
+
 # --- Complexity estimate (auxiliary model) ----------------------------------
 
 ESTIMATE_SYSTEM_PROMPT = (

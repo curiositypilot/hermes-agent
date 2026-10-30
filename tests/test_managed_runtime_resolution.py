@@ -61,6 +61,7 @@ _EXEMPT_DIRS = (
     "evals",
     "website",
     "node_modules",
+    ".build",
     ".cache",
     ".git",
     ".venv",
@@ -101,6 +102,10 @@ _ALLOWED: dict[tuple[str, str], str] = {
     ("hermes_cli/kanban_sandbox.py", "uv"): (
         "Selftest probe asks for uv on the PATH a worker's terminal tool gets "
         "(PATH plus the managed dirs local.py appends)."
+    ),
+    ("tools/mcp_tool_config.py", "node"): (
+        "Looks up node only inside the sealed payload's own node dirs (an explicit "
+        "`path=`, never the ambient PATH), to run a package bin on the packaged node."
     ),
     ("apps/desktop/electron/fixtures/source-backend.py", "uv"): (
         "Test fixture drives the real uv deliberately placed on the test "
@@ -230,7 +235,7 @@ def _source_files() -> list[Path]:
     return files
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _is_packaging_copy(top_level: str) -> bool:
     """Whether *top_level* (a dir name under REPO_ROOT) is a build artifact."""
     if top_level in ("build", "dist") or top_level.endswith(".egg-info"):
