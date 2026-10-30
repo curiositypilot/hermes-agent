@@ -70,6 +70,7 @@ def _init_fallback_chain(agent, fallback_model):
         chain = []
     agent._fallback_chain = chain
     agent._fallback_index = 0
+    agent._primary_failure_reason = None
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None

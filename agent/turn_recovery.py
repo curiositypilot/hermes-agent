@@ -874,6 +874,14 @@ def _stamp_limit_reset(result: dict[str, Any], agent: Any, api_error: Exception,
         result["final_response"] = f"{result['final_response']}\n\n{line}"
 
 
+def _stamp_primary_failure(result: dict[str, Any], agent: Any) -> None:
+    """``primary_failure_reason``: why the turn left the primary, when it ended on a fallback. The
+    Kanban exit code reads it: a fallback's terminal error behind a rate-limited primary requeues."""
+    if getattr(agent, "_provider_fallback_active", False) and (
+            reason := getattr(agent, "_primary_failure_reason", None)):
+        result["primary_failure_reason"] = reason
+
+
 def _print_nonretryable_auth_guidance(
     agent: Any, classified: Any, *, status_code: Optional[int], provider: Any, base_url: Any, model: Any,
 ) -> None:
@@ -1149,6 +1157,7 @@ def nonretryable_client_error_result(
     if _keep_partial:
         result["partial"] = True
     _stamp_limit_reset(result, agent, api_error, classified)
+    _stamp_primary_failure(result, agent)
     if _welcome_hint and (_kind := _welcome_surface_kind(classified)):
         # The card form: the desktop renders the sign-in as a button, so no "To sign in" tail.
         _stamp_free_tier(result, _kind,
@@ -1298,6 +1307,7 @@ def max_retries_exhausted_result(
         result["final_response"] = _final_response
         result["partial"] = True
     _stamp_limit_reset(result, agent, api_error, classified)
+    _stamp_primary_failure(result, agent)
     if _free_tier_kind:
         _stamp_free_tier(result, _free_tier_kind, (
             _welcome_tier_guidance(classified, model=model, in_chat=True, door=False)

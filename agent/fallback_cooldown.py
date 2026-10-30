@@ -1,5 +1,6 @@
-"""Primary rate-limit cooldown arming and per-session model rejection markers, shared by the
-fallback walk (chat_completion_helpers) and restore_primary_runtime (agent_runtime_helpers)."""
+"""Primary rate-limit cooldown arming, fallback provenance and per-session model rejection
+markers, shared by the fallback walk (chat_completion_helpers) and restore_primary_runtime
+(agent_runtime_helpers)."""
 import logging
 import math
 import time
@@ -40,6 +41,14 @@ def switch_deferred_by_reset(agent, reason: FailoverReason | None, reset_at) -> 
         return False
     logging.info("Rate limit resets in %.0f s (< fallback.min_switch_reset_seconds=%.0f): staying on the primary", delay, threshold)
     return True
+
+
+def mark_provider_fallback_active(agent, reason: FailoverReason | None) -> None:
+    """Flag a bound fallback hop. The first hop away from the primary also records why it left;
+    later hops keep it, since each Kanban spawn starts on the primary again (turn_exit reads it)."""
+    if not getattr(agent, "_provider_fallback_active", False):
+        agent._primary_failure_reason = getattr(reason, "value", None)
+    agent._provider_fallback_active = True
 
 
 def _arm_rate_limit_cooldown(
