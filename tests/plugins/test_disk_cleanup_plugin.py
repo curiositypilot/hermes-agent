@@ -64,6 +64,16 @@ def _run_tool(pi, tool_name, args, create=None, result="OK", **ids):
     pi._on_post_tool_call(tool_name=tool_name, args=args, result=result, tool_call_id=call_id, **ids)
 
 
+def _backdate_tracked(dg, *paths, days=1):
+    """Age tracked.json entries (all, or those for *paths*) past the ``test`` 24h floor."""
+    wanted = {str(Path(p).resolve()) for p in paths}
+    tracked = dg.load_tracked()
+    for item in tracked:
+        if not wanted or item["path"] in wanted:
+            item["timestamp"] = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    dg.save_tracked(tracked)
+
+
 def _load_plugin_init():
     """Import the plugin's __init__.py (which depends on the library)."""
     repo_root = Path(__file__).resolve().parents[2]
@@ -224,6 +234,14 @@ class TestGuessCategory:
         p.write_text("x")
         assert dg.guess_category(p) is None
 
+    def test_scripts_tree_never_tracked(self, _isolate_env):
+        """$HERMES_HOME/scripts is user-authored; test_*/tmp_* there is not disposable (#107343)."""
+        dg = _load_lib()
+        p = _isolate_env / "scripts" / "test_result_gate.py"
+        p.parent.mkdir()
+        p.write_text("x")
+        assert dg.guess_category(p) is None
+
 
 class TestProfileUserTreesNeverCleaned:
     """``workspace/`` (and the other per-profile user trees) hold project files, so
@@ -235,7 +253,8 @@ class TestProfileUserTreesNeverCleaned:
 
     def test_session_end_hook_leaves_workspace_files_alone(self, _isolate_env):
         """End-to-end: write_file into a project tree, then session end. A scratch file at
-        the HERMES_HOME root is the control: it is still tracked and removed."""
+        the HERMES_HOME root is still classified ``test`` but same-day AUTO_QUICK
+        must not unlink it (24h floor)."""
         pi = _load_plugin_init()
         dg = _load_lib()
         keep = _isolate_env / "workspace" / "proj" / "tests" / "test_parse.py"
@@ -246,9 +265,9 @@ class TestProfileUserTreesNeverCleaned:
                       create=lambda p=p: p.write_text("x"), task_id="t_ws", session_id="s_ws")
         assert dg.guess_category(keep) is None
         assert dg.guess_category(scratch) == "test"
-        pi._on_session_end(session_id="s_ws", completed=True, interrupted=False)
+        pi._on_session_end(session_id="s_ws", task_id="t_ws", completed=True, interrupted=False)
         assert keep.exists(), "session-end cleanup must not touch workspace project files"
-        assert not scratch.exists(), "root-level scratch files are still cleaned up"
+        assert scratch.exists(), "same-day root-level test_* still needs the 24h floor"
 
     def test_empty_dir_sweep_skips_workspace(self, _isolate_env):
         """Empty dirs inside a project tree are meaningful (``data/``, ``.artifacts/``)
@@ -310,12 +329,13 @@ class TestProtectedDirsNeverRmtreed:
         _run_tool(pi, "write_file", {"path": str(scratch), "content": "x"},
                   create=lambda: scratch.write_text("x"), task_id="t1", session_id="s_kb")
 
-        pi._on_session_end(session_id="s_kb", completed=True, interrupted=False)
+        pi._on_session_end(session_id="s_kb", task_id="t1", completed=True, interrupted=False)
 
         assert att.exists(), "kanban attachments are task-managed, never auto-deleted"
         assert new_att.exists(), "kanban files a call created are never tracked or deleted"
-        assert not scratch.exists(), "root-level scratch files are still cleaned up (control)"
-        assert dg.load_tracked() == []
+        assert scratch.exists(), "same-day root-level test_* still needs the 24h floor"
+        remaining = dg.load_tracked()
+        assert remaining and Path(remaining[0]["path"]) == scratch.resolve()
 
 
 class TestGitWorktreeFilesNeverCleaned:
@@ -351,8 +371,9 @@ class TestGitWorktreeFilesNeverCleaned:
         scratch = _isolate_env / "test_scratch.py"
         scratch.write_text("x")
         assert dg.guess_category(scratch) == "test"
+        old_ts = (datetime.now(UTC) - timedelta(days=1)).isoformat()
         dg.save_tracked([{"path": str(scratch), "category": "test",
-                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}])
+                          "timestamp": old_ts, "size": 1}])
         result = dg.quick()
         assert not scratch.exists()
         assert result["deleted"] == 1
@@ -370,12 +391,14 @@ class TestGitWorktreeFilesNeverCleaned:
 
         dg = _load_lib()
         subprocess.run(["git", "init", "-q", str(_isolate_env)], check=True)
-        (dg.get_hermes_home() / "scripts").mkdir()
-        tracked = _isolate_env / "scripts" / "test_committed.py"
+        # tools/, not scripts/: scripts/ is never tracked by name (#107343), which would hide
+        # what this test pins, the git-tracked check.
+        (dg.get_hermes_home() / "tools").mkdir()
+        tracked = _isolate_env / "tools" / "test_committed.py"
         tracked.write_text("x")
         scratch = _isolate_env / "test_untracked.py"
         scratch.write_text("x")
-        subprocess.run(["git", "-C", str(_isolate_env), "add", "scripts/test_committed.py"],
+        subprocess.run(["git", "-C", str(_isolate_env), "add", "tools/test_committed.py"],
                        check=True)
 
         assert dg._inside_git_worktree(tracked) is True
@@ -390,8 +413,8 @@ class TestGitWorktreeFilesNeverCleaned:
 
         # A stale pre-fix entry is dropped by quick()'s re-validation, not deleted, while
         # untracked scratch beside it in the same repo is still cleaned.
-        now = datetime.now(UTC).isoformat()
-        dg.save_tracked([{"path": str(p), "category": "test", "timestamp": now, "size": 1}
+        day_old = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+        dg.save_tracked([{"path": str(p), "category": "test", "timestamp": day_old, "size": 1}
                          for p in (tracked, scratch)])
         result = dg.quick()
         assert tracked.exists(), "a git-tracked test file must never be auto-deleted"
@@ -406,9 +429,9 @@ class TestGitWorktreeFilesNeverCleaned:
 
         # HERMES_HOME nested in an enclosing repo (a ~/.git dotfiles repo) that tracks it.
         outer = _isolate_env.parent / "outer"
-        (outer / ".hermes" / "scripts").mkdir(parents=True)
+        (outer / ".hermes" / "tools").mkdir(parents=True)
         subprocess.run(["git", "init", "-q", str(outer)], check=True)
-        nested = outer / ".hermes" / "scripts" / "test_x.py"
+        nested = outer / ".hermes" / "tools" / "test_x.py"
         nested.write_text("x")
         subprocess.run(["git", "-C", str(outer), "add", "."], check=True)
         monkeypatch.setenv("HERMES_HOME", str(outer / ".hermes"))
@@ -505,6 +528,11 @@ class TestTrackForgetQuick:
         p = _isolate_env / "test_a.py"
         p.write_text("x")
         assert dg.track(str(p), "test", silent=True) is True
+        # Same-day test files are not auto-deleted (24h floor).
+        summary = dg.quick()
+        assert summary["deleted"] == 0
+        assert p.exists()
+        _backdate_tracked(dg, p)
         summary = dg.quick()
         assert summary["deleted"] == 1
         assert not p.exists()
@@ -549,7 +577,10 @@ class TestDryRun:
         dg.track(str(test_f), "test", silent=True)
         dg.track(str(big), "other", silent=True)
         auto, _prompt = dg.dry_run()
-        # test → auto, other → neither (doesn't hit any rule)
+        # same-day test is under the 24h floor → neither bucket
+        assert not any(i["path"] == str(test_f) for i in auto)
+        _backdate_tracked(dg, test_f)
+        auto, _prompt = dg.dry_run()
         assert any(i["path"] == str(test_f) for i in auto)
 
 
@@ -618,9 +649,11 @@ class TestPostToolCallHook:
     def test_a_call_never_uses_another_sessions_snapshot(self, _isolate_env):
         """tool_call_id is not unique: llama.cpp sends one constant id for every call. Session A
         patching the user's test_user.py must not consume session B's snapshot of a new file under
-        that id, or the user's file reads as created and is deleted when the turn ends; B's own
-        created file is still tracked and cleaned up."""
+        that id, or the user's file reads as created and is deleted when the turn ends. A's turn
+        end leaves B's live file alone (a gateway chat or a subagent ending must not delete it);
+        B's own turn end cleans it up once it is past the 24h floor."""
         pi = _load_plugin_init()
+        dg = _load_lib()
         user_file = _isolate_env / "test_user.py"
         user_file.write_text("keep")
         new_file = _isolate_env / "test_new.py"
@@ -632,9 +665,12 @@ class TestPostToolCallHook:
         new_file.write_text("x")
         pi._on_post_tool_call(tool_name="patch", args={"path": str(user_file)}, result="OK", **a)
         pi._on_post_tool_call(tool_name="write_file", args={"path": str(new_file)}, result="OK", **b)
-        pi._on_session_end(session_id="sA", completed=True, interrupted=False)
+        pi._on_session_end(session_id="sA", task_id="sA", completed=True, interrupted=False)
 
         assert user_file.read_text() == "keep"
+        assert new_file.exists(), "A's turn end deleted B's live file"
+        _backdate_tracked(dg, new_file)
+        pi._on_session_end(session_id="sB", task_id="sB", completed=True, interrupted=False)
         assert not new_file.exists()
 
 
@@ -646,7 +682,140 @@ class TestOnSessionEndHook:
                   create=lambda: p.write_text("x"), task_id="", session_id="s1")
         assert p.exists()
         pi._on_session_end(session_id="s1", completed=True, interrupted=False)
-        assert not p.exists(), "test file should be auto-deleted"
+        assert p.exists(), "same-day test file must survive session-end AUTO_QUICK"
+
+    def test_turn_end_keeps_a_file_another_process_tracked(self, _isolate_env):
+        """tracked.json is shared by every process on the profile (gateway + CLI): a turn end
+        deletes its own run's files, never another process's live one; orphans age out."""
+        pi = _load_plugin_init()
+        dg = _load_lib()
+        live, orphan = _isolate_env / "test_gateway.py", _isolate_env / "test_crashed.py"
+        for p in (live, orphan):
+            p.write_text("x")
+            dg.track(str(p), "test", silent=True)
+        tracked = dg.load_tracked()
+        tracked[1]["timestamp"] = (datetime.now(UTC) - timedelta(days=8)).isoformat()
+        dg.save_tracked(tracked)
+        mine = _isolate_env / "test_cli.py"
+        _run_tool(pi, "write_file", {"path": str(mine), "content": "x"},
+                  create=lambda: mine.write_text("x"), task_id="tC", session_id="sC")
+        _backdate_tracked(dg, mine)
+
+        pi._on_session_end(session_id="sC", task_id="tC", completed=True, interrupted=False)
+
+        assert not mine.exists()
+        assert live.exists(), "the CLI's turn end deleted the gateway's live test file"
+        assert not orphan.exists(), "a crashed process's file still ages out"
+
+    @pytest.mark.platforms("posix")
+    def test_turn_end_deletes_its_file_written_through_a_symlink(self, _isolate_env):
+        """tracked.json holds resolved paths (macOS /tmp is /private/tmp): the run's own file
+        must still match them at its turn end."""
+        pi = _load_plugin_init()
+        dg = _load_lib()
+        (_isolate_env / "real").mkdir()
+        (_isolate_env / "link").symlink_to(_isolate_env / "real", target_is_directory=True)
+        p = _isolate_env / "link" / "test_x.py"
+        _run_tool(pi, "write_file", {"path": str(p), "content": "x"},
+                  create=lambda: p.write_text("x"), task_id="t1", session_id="s1")
+        _backdate_tracked(dg, p)
+        pi._on_session_end(session_id="s1", task_id="t1", completed=True, interrupted=False)
+        assert not p.exists()
+
+
+class TestScriptsTreeNeverCleaned:
+    """Regression for #107343 — operator scripts under $HERMES_HOME/scripts
+    (including test_*.py and tmp_*.sh) must never be tracked or auto-deleted."""
+
+    def test_session_end_leaves_scripts_alone(self, _isolate_env):
+        pi = _load_plugin_init()
+        dg = _load_lib()
+        keep = _isolate_env / "scripts" / "test_result_gate.py"
+        keep.parent.mkdir()
+        keep.write_text("x")
+        assert dg.guess_category(keep) is None
+        # Post-fix the hook never tracks scripts/ files, so arm AUTO_QUICK with a
+        # same-day control file elsewhere in HERMES_HOME (it survives the 24h floor).
+        control = _isolate_env / "test_control_scratch.py"
+        _run_tool(pi, "write_file", {"path": str(control), "content": "x"},
+                  create=lambda: control.write_text("x"), task_id="t_sc", session_id="s_sc")
+        # A stale pre-fix tracked.json entry must be dropped, not deleted.
+        old_ts = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+        dg.save_tracked([{"path": str(keep), "category": "test",
+                          "timestamp": old_ts, "size": 1}])
+        pi._on_session_end(session_id="s_sc", task_id="t_sc", completed=True, interrupted=False)
+        assert keep.exists(), "scripts/ is user-authored, never AUTO_QUICK-deleted"
+        assert dg.load_tracked() == []
+
+    def test_quick_drops_stale_scripts_entry_instead_of_deleting(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "scripts" / "tmp_guard_cron.sh"
+        p.parent.mkdir()
+        p.write_text("x")
+        old_ts = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+        dg.save_tracked([{"path": str(p), "category": "test",
+                          "timestamp": old_ts, "size": 1}])
+        result = dg.quick()
+        assert p.exists()
+        assert result["deleted"] == 0
+        assert dg.load_tracked() == []
+
+
+class TestReplay:
+    def test_replay_t_f25f713c_untracked_script_test_survives_session_end(self, _isolate_env):
+        """Live loss: HERMES_HOME is a git checkout, a worker's write_file created a new,
+        still-untracked scripts/tests/test_mw_olx_retry.py, and the plugin tracked it as
+        ``test`` and deleted it at that worker's own session end, before review saw it."""
+        import subprocess
+
+        pi = _load_plugin_init()
+        dg = _load_lib()
+        git = ["git", "-C", str(_isolate_env), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(["git", "init", "-q", str(_isolate_env)], check=True)
+        (_isolate_env / "README.md").write_text("home\n")
+        subprocess.run([*git, "add", "README.md"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "init"], check=True)
+        new_test = _isolate_env / "scripts" / "tests" / "test_mw_olx_retry.py"
+        new_test.parent.mkdir(parents=True)
+
+        _run_tool(pi, "write_file", {"path": str(new_test), "content": "def test_x(): pass\n"},
+                  create=lambda: new_test.write_text("def test_x(): pass\n"),
+                  task_id="t_10a924ef", session_id="s_impl")
+        pi._on_session_end(session_id="s_impl", task_id="t_10a924ef",
+                           completed=True, interrupted=False)
+
+        assert new_test.exists(), "the worker's new untracked test was deleted at its session end"
+        assert all(Path(i["path"]) != new_test.resolve() for i in dg.load_tracked())
+
+
+class TestTestCategoryAgeFloor:
+    """Same-day category=test files must survive AUTO_QUICK; age>=1 day still deletes."""
+
+    def test_same_day_test_file_survives_quick(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "foo" / "test_y.py"
+        p.parent.mkdir()
+        p.write_text("x")
+        assert dg.guess_category(p) == "test"
+        dg.save_tracked([{"path": str(p), "category": "test",
+                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}])
+        result = dg.quick()
+        assert p.exists()
+        assert result["deleted"] == 0
+        remaining = dg.load_tracked()
+        assert remaining and Path(remaining[0]["path"]) == p.resolve()
+
+    def test_day_old_test_file_is_deleted(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "foo" / "test_stale.py"
+        p.parent.mkdir()
+        p.write_text("x")
+        old_ts = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+        dg.save_tracked([{"path": str(p), "category": "test",
+                          "timestamp": old_ts, "size": 1}])
+        result = dg.quick()
+        assert not p.exists()
+        assert result["deleted"] == 1
 
 
 

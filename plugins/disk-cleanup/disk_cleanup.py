@@ -1,6 +1,6 @@
 """disk_cleanup — ephemeral file cleanup library behind the disk-cleanup plugin.
 
-Rules: test files delete at task end (age >= 0); temp after 7 days; cron-output
+Rules: test files after 1 day; temp after 7 days; cron-output
 after 14 days; empty dirs under HERMES_HOME always. Prompt-only: research
 (keep 10 newest, > 30 days), chrome-profile > 14 days, any file > 500 MB.
 Scope: strictly HERMES_HOME and /tmp/hermes-*; never ~/.hermes/logs/ or system dirs.
@@ -110,6 +110,8 @@ _EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
     "patches", "projects", "skins", "themes", "contributors",
     # Per-profile user trees bootstrapped by ``profiles.py::_PROFILE_DIRS`` (#112859).
     "workspace", "plans", "home",
+    # User-authored operator scripts — not disposable, even when named test_*/tmp_* (#107343).
+    "scripts",
     # Kanban owns its own lifecycle (workspaces GC'd at terminal state, attachments live with the task).
     "kanban"})
 
@@ -128,6 +130,9 @@ _NEVER_TRACK_TOP_LEVEL = frozenset({
     # per-profile user trees bootstrapped by ``profiles.py::_PROFILE_DIRS`` (#112859).
     "patches", "projects", "skins", "themes", "contributors",
     "profiles", "backups", "optional-skills", "workspace", "plans", "home",
+    # User-authored operator scripts — never auto-delete files inside these just because they
+    # happen to be named test_* or tmp_* (#107343).
+    "scripts",
     # Kanban task attachments/workspaces have their own lifecycle; test_* staging files there are
     # not disposable (#114552).
     "kanban"})
@@ -220,8 +225,16 @@ def _live_items(tracked: list[dict], now: datetime, *, log_stale: bool = False) 
             _log(f"STALE: {p} (removed from tracking)")
 
 
+# ``.days`` truncates, so age >= 1 is a 24h floor. age >= 0 deleted files seconds
+# after write_file (session_end AUTO_QUICK); a same-day test_* under an unprotected
+# tree is still in use.
+_TEST_MIN_AGE_DAYS = 1
+
+
 def _is_auto_delete(cat: str, age: int) -> bool:
-    return cat == "test" or (cat == "temp" and age > 7) or (cat == "cron-output" and age > 14)
+    return ((cat == "test" and age >= _TEST_MIN_AGE_DAYS)
+            or (cat == "temp" and age > 7)
+            or (cat == "cron-output" and age > 14))
 
 
 def _prompt_group(item: dict, age: int) -> Optional[str]:
@@ -269,8 +282,9 @@ def dry_run() -> tuple[list[dict], list[dict]]:
     return auto, prompt
 
 
-def quick() -> dict[str, Any]:
-    """Safe deterministic cleanup — no prompts. Returns ``{deleted, empty_dirs, freed, errors}``."""
+def quick(own_tests: Optional[set[str]] = None) -> dict[str, Any]:
+    """Safe deterministic cleanup — no prompts. Returns ``{deleted, empty_dirs, freed, errors}``.
+    With *own_tests* (a turn end), other runs' ``test`` entries stay until older than 7 days."""
     deleted = freed = 0
     new_tracked: list[dict] = []
     errors: list[str] = []
@@ -287,7 +301,8 @@ def quick() -> dict[str, Any]:
         if _is_protected_dir(p):
             _log(f"SKIPPED: {p} (protected top-level dir)")
             continue
-        if not _is_auto_delete(cat, age):
+        live_elsewhere = cat == "test" and own_tests is not None and item["path"] not in own_tests and age <= 7
+        if live_elsewhere or not _is_auto_delete(cat, age):
             new_tracked.append(item)
             continue
         err = _delete_item(item)

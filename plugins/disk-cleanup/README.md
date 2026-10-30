@@ -16,13 +16,13 @@ never needs to remember to call a tool.
 |---|---|
 | `pre_tool_call` | Snapshot which paths named in the call's arguments do not exist yet, keyed by the owning task/session plus `tool_call_id` (the id alone is not unique: llama.cpp reuses one constant id). |
 | `post_tool_call` | When `write_file` / `terminal` / `patch` creates a file matching `test_*`, `tmp_*`, or `*.test.*` inside `HERMES_HOME` — a path named in the call that did not exist before it — track it silently as `test` / `temp` / `cron-output`. Existing files the call edits, runs or lists are never tracked, and neither is any path the call's own snapshot did not cover (e.g. one another plugin's `modify` hook swapped in). Calls without a `tool_call_id` (execute_code RPC) are not tracked. |
-| `on_session_end` | If any test files were auto-tracked during this turn, run `quick` cleanup (no prompts). |
+| `on_session_end` | If this turn auto-tracked test files, run `quick` cleanup (no prompts) and delete only those. A test file another run tracked (another gateway chat, a subagent, another process on the profile) stays until it is more than 7 days old. |
 
 Deletion rules (same as the original PR):
 
 | Category | Threshold | Confirmation |
 |---|---|---|
-| `test` | every session end | Never |
+| `test` | age ≥ 1 day: at the end of the turn that created it; another run's file after 7 days | Never |
 | `temp` | >7 days since tracked | Never |
 | `cron-output` | >14 days since tracked | Never |
 | empty dirs under HERMES_HOME | always | Never |
@@ -50,9 +50,9 @@ Deletion rules (same as the original PR):
 - `$HERMES_HOME/logs/`, `memories/`, `sessions/`, `skills/`, `plugins/`,
   and config files are never tracked
 - User project trees (`workspace/`, `projects/`, `plans/`, `home/`, `patches/`,
-  `skins/`, `themes/`, `contributors/`, `profiles/`, `backups/`) and `kanban/`
-  (task attachments/workspaces) are never tracked or swept, even for files
-  named `test_*`/`tmp_*`
+  `skins/`, `themes/`, `contributors/`, `profiles/`, `backups/`, `scripts/`) and
+  `kanban/` (task attachments/workspaces) are never tracked or swept, even for
+  files named `test_*`/`tmp_*`
 - A tracked *directory* under a protected top level (e.g. `cache/`, which holds
   terminal snapshots) is never removed; only its files age out. Stale entries
   are logged as `SKIPPED` and dropped
