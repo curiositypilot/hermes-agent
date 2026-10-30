@@ -65,7 +65,9 @@ def build_kanban_policy(connection, params, config):
         profile=task.assignee, workspaces_root=str(kb.workspaces_root(board=board).resolve()),
         skills=skills, goal_mode=task.goal_mode, goal_max_turns=task.goal_max_turns,
         goal_text='\n\n'.join(p for p in (task.title, task.body) if p), context=context,
-        max_runtime_seconds=task.max_runtime_seconds, accept_hooks=True)
+        max_runtime_seconds=task.max_runtime_seconds, accept_hooks=True,
+        # Fork: set by replay_recorded_route; bind_worker_context turns it into HERMES_KANBAN_PINNED.
+        route_pinned=bool(getattr(task, 'route_pinned', False)))
     context['db'] = str(path)
     request = json.loads(policy.request_json)
     request.update(source='kanban', board=board, task_id=task.id, run_id=task.current_run_id)
@@ -178,6 +180,12 @@ def bind_worker_context(frame):
             env[key] = value
     if context['goal_mode']:
         env['HERMES_KANBAN_GOAL_MODE'] = '1'
+    # Fork: a pinned route drops the fallback chain (agent_init_fallback._kanban_pinned_route). The
+    # agent is built in this process, so the dispatcher's spawn env never reaches it. `.get`: a
+    # kanban_json frozen before the key existed still binds (unpinned).
+    pinned = bool(context.get('route_pinned'))
+    if pinned:
+        env['HERMES_KANBAN_PINNED'] = '1'
     from hermes_cli.kanban_db_dispatch import _worker_terminal_timeout_env
     for key in ('TERMINAL_TIMEOUT', 'TERMINAL_MAX_FOREGROUND_TIMEOUT'):
         value = _worker_terminal_timeout_env(context['max_runtime_seconds'], os.environ.get(key))
@@ -211,6 +219,8 @@ def bind_worker_context(frame):
     if isinstance(expires, int) and claimed[1]:
         env['HERMES_KANBAN_CLAIM_TTL_SECONDS'] = str(max(1, expires - int(claimed[1])))
     _watch_submitter(Path(context['db']), context['run_id'])
+    if not pinned:
+        os.environ.pop('HERMES_KANBAN_PINNED', None)  # an inherited value must never pin a tier route
     os.environ.update(env)
     os.chdir(context['workspace'])
 

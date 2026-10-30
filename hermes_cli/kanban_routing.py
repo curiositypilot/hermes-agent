@@ -1067,8 +1067,10 @@ def apply_route(task: Any, decision: Optional[RouteDecision]) -> None:
     A task-level ``reasoning_effort`` still wins over a tier candidate's; a
     review candidate replaces it (the card's effort was set for the implementer).
 
-    Also sets ``task.route_pinned`` (``_default_spawn`` turns it into
-    ``HERMES_KANBAN_PINNED=1``, which drops the worker's fallback chain). It is set
+    Also sets ``task.route_pinned``: ``gateway/session_kanban.build_kanban_policy`` freezes it
+    into ``kanban_json`` and ``bind_worker_context`` turns it into ``HERMES_KANBAN_PINNED=1`` in
+    the managed worker that builds the agent, which drops its fallback chain
+    (``_default_spawn`` also sets it on the thin client's env). It is set
     BEFORE the applies-model guard because pinned decisions never pass it. With no
     decision (routing off, no review candidates) the card's own pin drives ``-m``,
     so that counts as pinned too."""
