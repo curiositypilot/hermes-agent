@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 
 from hermes_cli.kanban_db_run_scopes import _restart_safe_worker_argv, reap_ended_run_scopes
 from hermes_cli.kanban_db_respawn_pr import _clean_park_resume, _is_handoff_event
-from hermes_cli.kanban_sandbox import SandboxUnavailable, worker_sandbox
+from hermes_cli.kanban_sandbox import SandboxUnavailable, thin_client_preflight
 from hermes_cli.kanban_worker_log import current_run_section, spawn_marker_line
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli.kanban_db_dispatch_argv import _absolute_hermes_path, _is_windows_batch_shim, _module_hermes_argv
@@ -3033,36 +3033,36 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # external worker (#112729): applied to the sanitized env, after every other decision stands.
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
     env = pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parent.parent)
-    # kanban.sandbox: bwrap (per tenant) wraps the worker between the systemd scope and `hermes`;
-    # a configured sandbox that cannot be built raises SandboxUnavailable (spawn deferred).
-    with worker_sandbox(task, cmd, env, workspace, profile_home) as (cmd, env, pass_fds, log_prefix):
-        # A worker spawned by a managed systemd gateway must leave the gateway's
-        # cgroup before startup; otherwise restarting the service kills the worker
-        # that is performing the handoff.
-        cmd = _restart_safe_worker_argv(task, cmd)
-        from tools.process_registry import systemd_user_bus_env
-        env = systemd_user_bus_env(env)
-        log_f = _open_worker_log(task, board)
-        log_f.write(spawn_marker_line(task.current_run_id) + (log_prefix or b""))  # run boundary for tail readers
-        log_f.flush()
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=workspace if os.path.isdir(workspace) else None,
-                stdin=subprocess.DEVNULL,
-                stdout=log_f,
-                stderr=subprocess.STDOUT,
-                env=env,
-                start_new_session=True,  # detached-spawn: ok — restart-safe kanban worker, must survive the dispatcher
-                creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
-                pass_fds=pass_fds,
-            )
-        except FileNotFoundError:
-            log_f.close()
-            raise RuntimeError(
-                "`hermes` executable not found on PATH. "
-                "Install Hermes Agent or activate its venv before running the kanban dispatcher."
-            )
+    # kanban.sandbox (bwrap) wraps the agent where it runs, the gateway's managed worker. This thin
+    # client holds no agent and must reach gateway.sock, so it is never wrapped; a sandbox the host
+    # cannot build still defers the spawn here (SandboxUnavailable: infrastructure, not the card).
+    log_prefix = thin_client_preflight(task)
+    # A worker spawned by a managed systemd gateway must leave the gateway's
+    # cgroup before startup; otherwise restarting the service kills the worker
+    # that is performing the handoff.
+    cmd = _restart_safe_worker_argv(task, cmd)
+    from tools.process_registry import systemd_user_bus_env
+    env = systemd_user_bus_env(env)
+    log_f = _open_worker_log(task, board)
+    log_f.write(spawn_marker_line(task.current_run_id) + log_prefix)  # run boundary for tail readers
+    log_f.flush()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=workspace if os.path.isdir(workspace) else None,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,  # detached-spawn: ok — restart-safe kanban worker, must survive the dispatcher
+            creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
+        )
+    except FileNotFoundError:
+        log_f.close()
+        raise RuntimeError(
+            "`hermes` executable not found on PATH. "
+            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+        )
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
     if _kb._IS_WINDOWS:

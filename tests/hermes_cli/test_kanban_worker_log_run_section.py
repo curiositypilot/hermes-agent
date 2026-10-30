@@ -7,7 +7,6 @@ the real cause ("Kanban owner refused") was dropped. ``_worker_log_exit_code`` h
 same flaw for the exit trailer.
 """
 
-import contextlib
 import os
 
 import pytest
@@ -128,11 +127,7 @@ def test_default_spawn_writes_marker_before_sandbox_prefix(monkeypatch, tmp_path
     monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: log_dir)
     monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
 
-    @contextlib.contextmanager
-    def _sandbox(task, cmd, env, workspace, profile_home):
-        yield list(cmd), env, (), b"[kanban-sandbox] bwrap tenant=x\n"
-
-    monkeypatch.setattr(kbd, "worker_sandbox", _sandbox)
+    monkeypatch.setattr(kbd, "thin_client_preflight", lambda task: b"[kanban-sandbox] bwrap tenant=x\n")
 
     class _Proc:
         pid = 4321
