@@ -2936,6 +2936,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # Gating on the gateway-wide flag left B's worker inheriting the dispatcher's own OPENAI_API_KEY and
     # systemd-injected tokens on every single-profile host.
     routed = bool(profile_home) and _is_routed_home(profile_home)
+    # A key deleted from the launch .env since the last turn/cron reload must not reach this worker (t_8d6c7d5a).
+    from hermes_cli.env_loader import unpublish_removed_launch_dotenv_keys
+    unpublish_removed_launch_dotenv_keys()
     # build_subprocess_env's secret scrub resolves terminal.env_passthrough vars through get_secret(),
     # which without a bound scope reads the LAUNCH profile's ambient environment for a worker spawned
     # on B's behalf (and raises under multiplex) — so bind B's secret scope around the build.
@@ -2974,17 +2977,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # Tag the session `kanban` so session-browsing surfaces filter it out by
     # source instead of rendering one sidebar row per attempt.
     env["HERMES_SESSION_SOURCE"] = "kanban"
-    # TERMINAL_CWD takes precedence over process cwd in file_tools and
-    # build_context_files_prompt; without it relative writes land in the gateway
-    # user's home and workers load the gateway's AGENTS.md. file_tools rejects
-    # relative / sentinel values, so only set a real absolute directory.
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and context-file loader anchor on
     # the workspace, not whatever cwd the dispatching gateway happened to export. The worker subprocess is
     # already launched with cwd=workspace, but TERMINAL_CWD takes precedence over the process cwd in both
     # file_tools._resolve_base_dir (#41312 — relative write_file paths were landing in the gateway user's
     # home) and build_context_files_prompt (#34619 — workers loaded the dispatching gateway's AGENTS.md
     # instead of the task's). Setting it to the workspace fixes both: the workspace is where the task's work
-    # actually happens.
+    # actually happens. Only a real absolute directory: file_tools rejects relative / sentinel values.
     if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
         env["TERMINAL_CWD"] = workspace
     if task.branch_name:
