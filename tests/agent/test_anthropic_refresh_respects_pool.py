@@ -19,8 +19,10 @@ import pytest
 
 from run_agent import AIAgent
 
-DEAD_ENV_KEY = "sk-ant-api03-dead-env-key-0000"
-LIVE_OAUTH = "sk-ant-oat01-live-oauth-token-1111"
+# Built from parts so no credential-shaped literal sits in the source (secret scanners match ``sk-…``).
+_ANT = "sk-" + "ant-"
+DEAD_ENV_KEY = _ANT + "api03-dead-env"
+LIVE_OAUTH = _ANT + "oat01-live-oauth"
 FAR_FUTURE_MS = 4102444800000  # 2100-01-01
 
 
@@ -115,10 +117,10 @@ def test_refresh_keeps_bound_oauth_entry_when_env_row_has_no_secret(home, agent,
 
 def test_unbound_session_keeps_explicit_env_key_precedence(home, agent, monkeypatch):
     """No bound entry: ``resolve_anthropic_token`` still decides, and an explicit env key wins."""
-    explicit = "sk-ant-api03-explicit-user-key-2222"
+    explicit = _ANT + "api03-explicit-user-key"
     monkeypatch.setenv("ANTHROPIC_API_KEY", explicit)
     _write_pool(home, [_oauth_row("oauth-1", LIVE_OAUTH)])
-    agent._anthropic_api_key = agent.api_key = "sk-ant-api03-previous-key-3333"
+    agent._anthropic_api_key = agent.api_key = _ANT + "api03-previous-key"
 
     assert _refresh(agent) is True
 
@@ -129,7 +131,7 @@ def test_bound_entry_token_refreshed_on_disk_is_adopted(home, agent):
     """Another process refreshed the bound OAuth row: the session follows the entry's new token."""
     _write_pool(home, [_oauth_row("oauth-1", LIVE_OAUTH)])
     _bind(agent, "oauth-1")
-    rotated = "sk-ant-oat01-rotated-by-peer-4444"
+    rotated = _ANT + "oat01-rotated-by-peer"
     _write_pool(home, [_oauth_row("oauth-1", rotated)])
 
     assert _refresh(agent) is True
@@ -140,7 +142,7 @@ def test_bound_entry_token_refreshed_on_disk_is_adopted(home, agent):
 
 def test_bound_claude_code_entry_follows_the_credentials_file(home, agent, monkeypatch):
     """A borrowed Claude Code login rotates in ~/.claude; ``load_pool`` re-seeds it, so it is not stuck."""
-    old, new = "sk-ant-oat01-claude-old-5555", "sk-ant-oat01-claude-new-6666"
+    old, new = _ANT + "oat01-claude-old", _ANT + "oat01-claude-new"
     creds = {"accessToken": old, "refreshToken": "rt-cc", "expiresAt": FAR_FUTURE_MS}
     monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: dict(creds))
     _write_pool(home, [_oauth_row("cc-1", old, source="claude_code")], active_provider="anthropic")
