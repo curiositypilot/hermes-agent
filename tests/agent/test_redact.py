@@ -1726,6 +1726,9 @@ class TestJsonListAndPrefixedSecretKeys:
         ({"db_password": "hunter2xyz"}, ["hunter2xyz"]),
         ({"clientSecret": "hunter2xyz"}, ["hunter2xyz"]),
         ({"OPENAI_API_KEY": "plainvalue123456"}, ["plainvalue123456"]),
+        # Cursor exclusion must not swallow credential tokens ending in "token".
+        ({"SessionToken": "FwoGZXIvYXdzEJr0abcdefghijklmnop"}, ["FwoGZXIvYXdzEJr0abcdefghijklmnop"]),
+        ({"sessionToken": "FwoGZXIvYXdzEJr0abcdefghijklmnop"}, ["FwoGZXIvYXdzEJr0abcdefghijklmnop"]),
     ])
     def test_json_secret_masked_and_still_parseable(self, payload, secrets):
         import json
@@ -1744,6 +1747,12 @@ class TestJsonListAndPrefixedSecretKeys:
         {"keys": ["id", "name"]}, {"author": "Simon"}, {"secretary": "Ann"},
         {"tokenizer": "gpt2"}, {"GITHUB_TOKEN": "abcdefgh"}, {"password": [123, None]},
         {"password": ["***"]},
+        {"nextPageToken": "CiAKGjBpNDd2Nmp2Zml2cXRwYjBpOXA5bTJwZzdqEgIIAA"},
+        {"next_page_token": "CAESxyzABCDEFGHIJKLMNOP"},
+        {"pageToken": "CAESxyzABCDEFGHIJKLMNOP"},
+        {"nextSyncToken": "CPjL7qWbz_gCEPjL7qWbz_gCGAU="},
+        {"NextToken": "AAEAAQAAAAEcbm9kZS1hYmNkZWYxMjM0NTY3ODkw"},
+        {"continuationToken": "W3sidG9rZW4iOiIrUklEOn5hYmNkZWYifV0"},
     ])
     def test_non_secret_json_unchanged(self, payload):
         import json

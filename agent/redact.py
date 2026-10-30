@@ -872,8 +872,17 @@ def _assignment_sub(render, *, check_keyword: bool):
     return _sub
 
 
+# Pagination/sync cursors (Google ``nextPageToken``/``nextSyncToken``, AWS ``NextToken``, Azure
+# ``continuationToken``) end in ``token`` but are not credentials; masking them breaks paging
+# through MCP results, since the agent must echo the cursor back verbatim.
+_JSON_CURSOR_KEY_RE = re.compile(r"(?:page|next|continuation|sync|resume|cursor)_?token\Z")
+
+
 def _is_json_secret_key(key: str) -> bool:
-    """JSON key policy: the legacy exact names or the repr-field policy (credential suffixes)."""
+    """JSON key policy: the legacy exact names or the repr-field policy (credential suffixes),
+    minus pagination cursors."""
+    if _JSON_CURSOR_KEY_RE.search(key.casefold()):
+        return False
     return bool(_JSON_KEY_NAME_RE.fullmatch(key)) or _is_python_repr_secret_key(key)
 
 
