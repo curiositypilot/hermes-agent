@@ -25,13 +25,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _configured_worker_memory_max_bytes() -> Optional[int]:
+def configured_worker_memory_max_bytes() -> Optional[int]:
     """``kanban.worker_memory_max_mb`` in bytes, or None (unset, invalid, <= 0, unreadable config)
-    so the worker scope keeps the default MemoryMax bound."""
+    so the worker scope keeps the default MemoryMax bound. Read for both scopes of a run: the
+    dispatcher's thin client and the gateway's owner-run turn (``...-turn.scope``)."""
     from hermes_cli.config import load_config_readonly
+    from hermes_cli.config_backend import ConfigBackendUnavailable
 
     try:
         raw = ((load_config_readonly() or {}).get("kanban") or {}).get("worker_memory_max_mb")
+    except ConfigBackendUnavailable as exc:
+        # A SystemExit, so the clause below misses it: in the gateway it would escape the spawn thread.
+        logger.warning("kanban.worker_memory_max_mb unreadable (%s); using the default", exc)
+        return None
     except Exception:  # health: allow BLE001 -- a config read must never block a spawn; logged with traceback
         logger.warning("could not read kanban.worker_memory_max_mb; using the default", exc_info=True)
         return None
@@ -59,11 +65,15 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     dispatcher does not charge to the card). Under any other systemd unit
     (``Type=oneshot`` dispatch timers, #113612) ``outlives_parent=True`` gets the
     worker its own scope so the unit's cgroup teardown cannot kill it.
-    ``kanban.worker_memory_max_mb`` sets the scope's MemoryMax above the 4 GiB default cap.
+    ``kanban.worker_memory_max_mb`` sets this scope's MemoryMax above the 4 GiB default cap, but
+    this scope holds only the thin client (``hermes_cli.kanban_worker_client``): the agent turn
+    and its tools run in the gateway's managed worker, which the gateway wraps in the run's
+    ``hermes-worker-kanban-<task>-run-<run>-turn.scope`` under the same cap. That scope is what
+    bounds the work.
     """
     from tools.process_registry import restart_safe_gateway_child_argv
 
-    memory_max_bytes = _configured_worker_memory_max_bytes()
+    memory_max_bytes = configured_worker_memory_max_bytes()
 
     if task.current_run_id is None:
         # Outside managed systemd this is harmless, but a managed dispatch must
@@ -93,7 +103,8 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
 
 
 # Task ids are ``t_<hex>``; ``run-missing`` (no current run id) never matches, so it is never stopped.
-_RUN_SCOPE_UNIT = re.compile(r"^hermes-worker-kanban-(t_[0-9a-f]+)-run-([0-9]+)\.scope$")
+# ``-turn`` is the gateway's owner-run turn scope of the same run (agent + tool processes).
+_RUN_SCOPE_UNIT = re.compile(r"^hermes-worker-kanban-(t_[0-9a-f]+)-run-([0-9]+)(?:-turn)?\.scope$")
 RUN_SCOPE_REAP_INTERVAL_SECONDS = 300
 # Keyed per board: the gateway ticks every board in one process back to back, so a single
 # process-wide stamp would let the first board starve the rest.
