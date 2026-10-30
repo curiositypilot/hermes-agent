@@ -1712,3 +1712,43 @@ class TestWebappLaunchLinks:
     def test_code_that_builds_such_a_link_is_left_alone(self):
         source = "target.hash = `hermes-session=${token}`\nconst FRAGMENT_KEY = 'hermes-session'\n"
         assert redact_sensitive_text(source, code_file=True) == source
+
+
+class TestJsonListAndPrefixedSecretKeys:
+    """Lists under a secret key and prefixed/camelCase JSON keys (``GITHUB_TOKEN``,
+    ``db_password``) are masked like scalars under exact keys; metadata-shaped
+    neighbours (``token_count``, ``password_policy``) stay byte-identical."""
+
+    @pytest.mark.parametrize("payload, secrets", [
+        ({"password": ["hunter2xyz", "other2xyz"]}, ["hunter2xyz", "other2xyz"]),
+        ({"api_key": ["plainvalue123456"]}, ["plainvalue123456"]),
+        ({"GITHUB_TOKEN": "plainvalue123456"}, ["plainvalue123456"]),
+        ({"db_password": "hunter2xyz"}, ["hunter2xyz"]),
+        ({"clientSecret": "hunter2xyz"}, ["hunter2xyz"]),
+        ({"OPENAI_API_KEY": "plainvalue123456"}, ["plainvalue123456"]),
+    ])
+    def test_json_secret_masked_and_still_parseable(self, payload, secrets):
+        import json
+        out = redact_sensitive_text(json.dumps(payload), force=True)
+        assert not any(s in out for s in secrets), out
+        assert json.loads(out).keys() == payload.keys()
+
+    def test_repr_list_under_secret_key_masked_and_still_parseable(self):
+        out = redact_sensitive_text(repr({"password": ["hunter2xyz"]}), force=True)
+        assert "hunter2xyz" not in out
+        assert ast.literal_eval(out) == {"password": ["***"]}
+
+    @pytest.mark.parametrize("payload", [
+        {"token_count": "12"}, {"password_policy": "min8"}, {"secret_name": "prod-db"},
+        {"eos_token": "</s>"}, {"max_tokens": [1, 2]}, {"tokens": ["a", "b"]},
+        {"keys": ["id", "name"]}, {"author": "Simon"}, {"secretary": "Ann"},
+        {"tokenizer": "gpt2"}, {"GITHUB_TOKEN": "abcdefgh"}, {"password": [123, None]},
+        {"password": ["***"]},
+    ])
+    def test_non_secret_json_unchanged(self, payload):
+        import json
+        text = json.dumps(payload)
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_short_value_under_bare_token_env_assign_unchanged(self):
+        assert redact_sensitive_text("A_TOKEN=abc", force=True) == "A_TOKEN=abc"

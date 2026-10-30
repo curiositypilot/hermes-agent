@@ -384,17 +384,23 @@ def _redact_opt(value: Any) -> Any:
     return _redact(value) if value else value
 
 
-def _redact_pair(key: str, value: str) -> tuple:
+def _redact_pair(key: str, value: Any) -> tuple:
     """Redact one key/value pair as its own JSON text so key-name policies
-    (``"password": ...``) still fire, without a pattern ever spanning JSON
-    syntax of a neighbouring entry. A mangled pair falls back to per-string."""
+    (``"password": ...``, also over a list of scalars) still fire, without a
+    pattern ever spanning JSON syntax of a neighbouring entry. A mangled pair
+    falls back to per-string."""
     try:
         redacted = json.loads(redact_sensitive_text(json.dumps({key: value}), force=True))
     except json.JSONDecodeError:
         redacted = None
     if isinstance(redacted, dict) and len(redacted) == 1:
         return next(iter(redacted.items()))
-    return _redact(key), _redact(value)
+    return _redact(key), _redact_metadata_value(value)
+
+
+def _is_scalar_list(value: Any) -> bool:
+    return isinstance(value, (list, tuple)) and all(
+        item is None or isinstance(item, (str, int, float, bool)) for item in value)
 
 
 def _redact_metadata_value(value: Any) -> Any:
@@ -413,7 +419,7 @@ def _redact_metadata(metadata: dict) -> dict:
     closing quotes and break the re-parse)."""
     out: dict = {}
     for key, value in metadata.items():
-        if isinstance(key, str) and isinstance(value, str):
+        if isinstance(key, str) and (isinstance(value, str) or _is_scalar_list(value)):
             key, value = _redact_pair(key, value)
         else:
             key = _redact(key) if isinstance(key, str) else key
