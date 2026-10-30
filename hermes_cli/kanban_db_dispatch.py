@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 from hermes_cli.kanban_db_run_scopes import _restart_safe_worker_argv, reap_ended_run_scopes
 from hermes_cli.kanban_db_respawn_pr import _clean_park_resume, _is_handoff_event
 from hermes_cli.kanban_sandbox import SandboxUnavailable, worker_sandbox
+from hermes_cli.kanban_worker_log import current_run_section, spawn_marker_line
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli.kanban_db_dispatch_argv import _absolute_hermes_path, _is_windows_batch_shim, _module_hermes_argv
 from hermes_cli.kanban_db_dispatch_holds import _last_streak_event, _record_routing_hold
@@ -283,14 +284,14 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
 
     The durable twin of ``_recent_worker_exits``: written by the worker itself
     (``hermes_cli.quiet_single_query.exit_single_query``), so it is there whether
-    or not the process running this sweep ever reaped the worker. Last trailer
-    wins — the log is append-mode across re-runs.
+    or not the process running this sweep ever reaped the worker. Only the current
+    run's trailer counts: older runs' sit above its spawn marker (append-mode log).
     """
     try:
         raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
     except Exception:
         return None
-    matches = _EXIT_TRAILER_RE.findall(raw or "")
+    matches = _EXIT_TRAILER_RE.findall(current_run_section(raw or ""))
     return int(matches[-1]) if matches else None
 
 
@@ -1068,7 +1069,7 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
         return ""
     if not raw:
         return ""
-    raw = _EXIT_TRAILER_RE.sub("", raw)
+    raw = _EXIT_TRAILER_RE.sub("", current_run_section(raw))  # an older run's summary must not cut
     cut = raw.rfind(_exit_summary_marker())
     if cut != -1:
         raw = raw[:cut]
@@ -3042,9 +3043,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         from tools.process_registry import systemd_user_bus_env
         env = systemd_user_bus_env(env)
         log_f = _open_worker_log(task, board)
-        if log_prefix:
-            log_f.write(log_prefix)
-            log_f.flush()
+        log_f.write(spawn_marker_line(task.current_run_id) + (log_prefix or b""))  # run boundary for tail readers
+        log_f.flush()
         try:
             proc = subprocess.Popen(
                 cmd,
