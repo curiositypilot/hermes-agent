@@ -57,8 +57,8 @@ def _bind(safe_mode: bool, ignore_user_config: bool, config: dict) -> _SafeWorke
     with _bind_lock:
         if _policy is not None:
             raise RuntimeError("worker policy is already bound")
-        if _RUNTIME_IMPORTS.intersection(sys.modules):
-            raise RuntimeError("worker policy must bind before runtime imports")
+        if early := sorted(_RUNTIME_IMPORTS.intersection(sys.modules)):
+            raise RuntimeError("worker policy must bind before runtime imports: " + ", ".join(early))
         _policy = _SafeWorkerPolicy(os.getpid(), safe_mode, ignore_user_config, serialized)
         return _policy
 

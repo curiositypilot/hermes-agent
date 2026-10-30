@@ -80,6 +80,49 @@ def test_request_carries_the_client_policy(no_override, monkeypatch, allowed):
     assert sent[0]["context"]["lazy_installs_allowed"] is allowed
 
 
+def test_read_only_request_skips_the_policy_read(no_override, monkeypatch):
+    """hermes_bootstrap asks venv_is_current in every process, managed workers included; reading
+    the policy there imports hermes_cli.config before the worker binds its frozen config, and the
+    worker refuses to start ("worker policy must bind before runtime imports")."""
+    from pm import client
+
+    sent = []
+
+    class Stop(Exception):
+        pass
+
+    class Popen:
+        def __init__(self, *args, **kwargs):
+            self.stdin = self
+            self.stdout = self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def write(self, line):
+            sent.append(json.loads(line))
+
+        def flush(self):
+            raise Stop
+
+        def poll(self):
+            return 0
+
+    def policy_read():
+        raise AssertionError("read-only request read the lazy-install policy")
+
+    monkeypatch.setattr(no_override, "lazy_installs_allowed", policy_read)
+    monkeypatch.setattr(client, "runtime_environment", dict)
+    monkeypatch.setattr(client, "_worker_command", lambda *a, **kw: ["worker"])
+    monkeypatch.setattr(client.subprocess, "Popen", Popen)
+    with pytest.raises(Stop):
+        client._request("venv_is_current", {"extras": [], "plugins": []})
+    assert "lazy_installs_allowed" not in sent[0]["context"]
+
+
 # The worker's config import is sabotaged, so a worker that still read config would decide
 # differently from the client: `None` in sys.modules makes it look absent (bootstrap: allowed),
 # a raising finder makes it look broken (fail closed: refused).

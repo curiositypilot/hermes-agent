@@ -119,11 +119,15 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
     worker = Path(__file__).with_name("worker.py").resolve()
     environment = runtime_environment()
     command = _worker_command(spec, arguments, worker, environment)
-    from pm.install import lazy_installs_allowed
     # Over stdin only: an env "allow" switch would let an inherited environment
     # override security.allow_lazy_installs: false. An env disable set by
     # _worker_command still wins inside the worker.
-    message["context"]["lazy_installs_allowed"] = lazy_installs_allowed()
+    # Fork: read-only operations (bootstrap "never", e.g. hermes_bootstrap's venv_is_current)
+    # skip the policy read: it imports hermes_cli.config and the provider plugins, and a
+    # managed worker must bind its frozen config before those imports or it refuses to start.
+    if spec.bootstrap != "never":
+        from pm.install import lazy_installs_allowed
+        message["context"]["lazy_installs_allowed"] = lazy_installs_allowed()
     callback_error = None
     stopped = threading.Event()
     write_lock = threading.Lock()
