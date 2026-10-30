@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import cron.incidents as incidents
+from cron import incidents
 import cron.jobs as cron_jobs
 import cron.scheduler as sched
 from cron import quota_hold as qh
@@ -191,7 +191,7 @@ def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_r
 
 
 MONTHLY = 2581776  # Codex monthly 429: "retry after 2581776s" (~29.9 days)
-FROZEN = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
+FROZEN = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
 CAP = timedelta(seconds=qh.MAX_HOLD_SECONDS)
 SLACK = timedelta(seconds=qh.HOLD_SLACK_SECONDS)
 
@@ -242,7 +242,7 @@ def test_reprobe_on_a_still_closed_window_parks_again_with_its_own_alert(tmp_cro
     first = job["next_run_at"]
 
     day2 = FROZEN + CAP + SLACK
-    qh_now = lambda: day2  # noqa: E731
+    qh_now = lambda: day2
     with patch.object(qh, "_hermes_now", qh_now):
         job["next_run_at"] = (day2 + timedelta(minutes=15)).isoformat()  # _advance_after_run
         assert qh.plan_hold(job, MONTHLY - qh.MAX_HOLD_SECONDS)
@@ -330,7 +330,7 @@ def _main_runs_on(monkeypatch, provider, model):
 
 
 def _minutes_out(job_id):
-    return (datetime.fromisoformat(get_job(job_id)["next_run_at"]) - datetime.now(timezone.utc)
+    return (datetime.fromisoformat(get_job(job_id)["next_run_at"]) - datetime.now(UTC)
             ).total_seconds() / 60
 
 
@@ -473,7 +473,7 @@ def test_a_fully_explicit_route_edit_never_reads_the_main_model(tmp_cron_home, m
 
 def test_explicit_next_run_at_wins_over_the_repoint_reanchor(tmp_cron_home):
     held = _held_job()
-    requested = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
+    requested = (datetime.now(UTC) + timedelta(hours=5)).isoformat()
     updated = update_job(held["id"], {"provider": "anthropic", "next_run_at": requested})
     assert qh.STATE_KEY not in updated
     assert datetime.fromisoformat(updated["next_run_at"]) == datetime.fromisoformat(requested)
@@ -559,13 +559,13 @@ def day_clock(monkeypatch, tmp_path):
     # The platform preflight would refuse the unconnected telegram lane before the agent runs.
     (tmp_path / "config.yaml").write_text("cron:\n  preflight: false\n", encoding="utf-8")
     monkeypatch.setattr(incidents, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
-    box = [datetime.now(timezone.utc)]
+    box = [datetime.now(UTC)]
     for module in (qh, cron_jobs, sched, incidents):
         monkeypatch.setattr(module, "_hermes_now", lambda: box[0])
     return box
 
 
-def test_day_two_reprobe_delivers_its_alert_through_the_tick(tmp_path, day_clock, monkeypatch):
+def test_day_two_reprobe_delivers_its_alert_through_the_tick(tmp_path, day_clock, monkeypatch, cron_owner):
     """The re-probe's alert is delivered by the real scheduler path, not just composed, and the
     job is parked again each time. The shrinking ``retry after <N>s`` does NOT mint a new incident
     (durations are masked out of the signature, cron/incidents.py #129587), so the day-2 alert is
@@ -590,7 +590,7 @@ def test_day_two_reprobe_delivers_its_alert_through_the_tick(tmp_path, day_clock
 
 
 def test_day_two_reprobe_alert_is_withheld_inside_the_incident_cooldown(
-        tmp_path, day_clock, monkeypatch):
+        tmp_path, day_clock, monkeypatch, cron_owner):
     """A provider that repeats the same hint, with a cooldown longer than the hold, gets no day-2
     alert (normal failure-incident rules) but the job is still parked again."""
     monkeypatch.setattr(sched, "_failure_repeat_alert_hours", lambda: 48.0)
@@ -610,9 +610,9 @@ def test_day_two_reprobe_alert_is_withheld_inside_the_incident_cooldown(
 
 # --- The hold is keyed to the route it was measured on (t_30440fb0) ---------------------------
 
-import hermes_yaml as yaml  # noqa: E402
+import hermes_yaml as yaml
 
-from cron.jobs import load_jobs, save_jobs  # noqa: E402
+from cron.jobs import load_jobs, save_jobs
 
 CODEX = {"default": "gpt-6.1-sol", "provider": "openai-codex"}
 ANTHROPIC = {"default": "claude-opus-5-5", "provider": "anthropic"}

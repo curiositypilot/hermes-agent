@@ -587,7 +587,7 @@ def _bwrap_userns_available() -> bool:
         return False
     try:
         return subprocess.run(["bwrap", "--unshare-user", "--ro-bind", "/", "/", "true"],
-                              capture_output=True, timeout=10).returncode == 0
+                              capture_output=True, timeout=10, check=False).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 

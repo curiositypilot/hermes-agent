@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from typing import Any, Iterable
 
 from hermes_constants import get_default_hermes_root
@@ -48,7 +48,7 @@ def log_recalled(results: Iterable[Any], query: str, *, path: str | None = None)
         if not ids:
             return 0
         sha = hashlib.sha256(query.encode("utf-8", "replace")).hexdigest()[:16]
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         data = "".join(f'{{"ts":"{ts}","memory_id":"{i}","query_sha":"{sha}"}}\n' for i in ids).encode()
         target = path or log_path()
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT

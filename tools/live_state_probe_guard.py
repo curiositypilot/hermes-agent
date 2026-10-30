@@ -113,12 +113,12 @@ def block_message(module: str) -> str:
     )
 
 
-def _split_heredocs(command: str) -> Tuple[str, List[str]]:
+def _split_heredocs(command: str) -> tuple[str, list[str]]:
     """``command`` with heredoc bodies removed, plus the bodies in opener order."""
-    out: List[str] = []
-    bodies: List[str] = []
-    pending: List[Tuple[str, bool]] = []
-    current: List[str] = []
+    out: list[str] = []
+    bodies: list[str] = []
+    pending: list[tuple[str, bool]] = []
+    current: list[str] = []
     for line in command.split("\n"):
         if pending:
             delim, strip_tabs = pending[0]
@@ -136,16 +136,16 @@ def _split_heredocs(command: str) -> Tuple[str, List[str]]:
     return "\n".join(out), bodies
 
 
-def _segments(command: str) -> Iterator[Tuple[List[str], List[str], List[str], str]]:
+def _segments(command: str) -> Iterator[tuple[list[str], list[str], list[str], str]]:
     """Simple commands of *command*: (argv words, stdin texts, stdin file paths, the
     separator token that ends the segment, "" at the end)."""
     text, bodies = _split_heredocs(command)
     lex = shlex.shlex(text, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     lex.whitespace = " \t\r"  # newline separates commands, like ';'
-    words: List[str] = []
-    stdin_texts: List[str] = []
-    stdin_files: List[str] = []
+    words: list[str] = []
+    stdin_texts: list[str] = []
+    stdin_files: list[str] = []
     tokens = iter(lex)
     for tok in tokens:
         if tok and set(tok) <= _SEPARATOR_CHARS:
@@ -173,7 +173,7 @@ def _pipe_state(sep: str) -> str:
     return "group" if set(sep) <= {"(", ")"} else "drop"
 
 
-def _strip_prefix(words: List[str]) -> List[str]:
+def _strip_prefix(words: list[str]) -> list[str]:
     """Drop leading ``VAR=val`` assignments and wrapper commands (``env``, ``timeout 5``,
     ``uv run [opts]``) so ``words[0]`` is the program."""
     i = 0
@@ -197,7 +197,7 @@ def _strip_prefix(words: List[str]) -> List[str]:
     return words[i:]
 
 
-def _interpreter_inputs(args: List[str]) -> Tuple[List[str], Optional[str], bool]:
+def _interpreter_inputs(args: list[str]) -> tuple[list[str], Optional[str], bool]:
     """(inline code, script path, reads stdin) for a Python interpreter's argv tail."""
     i = 0
     while i < len(args):
@@ -240,11 +240,11 @@ def _read_local_script(path: str, cwd: str) -> Optional[str]:
     return None if b"\x00" in data else data.decode("utf-8", errors="replace")
 
 
-_Producer = Tuple[str, List[str], List[str], List[str], str]
+_Producer = tuple[str, list[str], list[str], list[str], str]
 
 
-def _produced(prog: str, argv: List[str], stdin_texts: List[str], stdin_files: List[str],
-              cwd: str) -> List[str]:
+def _produced(prog: str, argv: list[str], stdin_texts: list[str], stdin_files: list[str],
+              cwd: str) -> list[str]:
     """Text a pipeline producer segment may write to the next one's stdin: its arguments
     (``echo``/``printf``, escapes expanded), its here-docs and, for ``cat``, its files
     (read only once a stdin-reading interpreter consumes them)."""
@@ -255,7 +255,7 @@ def _produced(prog: str, argv: List[str], stdin_texts: List[str], stdin_files: L
     return texts
 
 
-def _shell_command_string(args: List[str]) -> Optional[str]:
+def _shell_command_string(args: list[str]) -> Optional[str]:
     """The ``-c`` command string of a shell's argv tail (``-c``, ``-lc``, ``-ec``...), or None."""
     for i, a in enumerate(args[:-1]):
         if _SHELL_C_FLAG_RE.match(a):
@@ -263,8 +263,8 @@ def _shell_command_string(args: List[str]) -> Optional[str]:
     return None
 
 
-def _segment_hit(prog: str, argv: List[str], stdin_texts: List[str], stdin_files: List[str],
-                 piped: List[_Producer], cwd: str, depth: int) -> Optional[str]:
+def _segment_hit(prog: str, argv: list[str], stdin_texts: list[str], stdin_files: list[str],
+                 piped: list[_Producer], cwd: str, depth: int) -> Optional[str]:
     if prog in _SHELLS and depth < _MAX_SHELL_DEPTH:
         body = _shell_command_string(argv[1:])
         return None if body is None else detect_in_command(body, cwd, depth + 1)
@@ -302,10 +302,10 @@ def detect_in_command(command: str, cwd: str, _depth: int = 0) -> Optional[str]:
         segments = list(_segments(command))
     except ValueError:  # unbalanced quotes: the shell rejects the command too
         return None
-    piped: List[_Producer] = []
+    piped: list[_Producer] = []
     for words, stdin_texts, stdin_files, sep in segments:
         argv = _strip_prefix(words)
-        produced: List[_Producer] = []
+        produced: list[_Producer] = []
         if argv:
             prog = os.path.basename(argv[0])
             if prog == "cd" and len(argv) > 1:

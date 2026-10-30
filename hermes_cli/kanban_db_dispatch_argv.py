@@ -35,8 +35,7 @@ def _module_hermes_argv() -> list[str]:
     workspace holding ``hermes_cli/``, ``pm/`` or ``yaml.py`` (a hermes-agent
     worktree) shadows the install and the worker dies at boot (t_8eb8551f).
     """
-    if sys.version_info >= (3, 11):
-        return [sys.executable, "-P", *_MODULE_ENTRY]
+    return [sys.executable, "-P", *_MODULE_ENTRY]
     return [sys.executable, *_MODULE_ENTRY]
 
 

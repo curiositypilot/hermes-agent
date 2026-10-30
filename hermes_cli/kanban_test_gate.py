@@ -81,7 +81,7 @@ def default_contract(workspace_kind: Optional[str], workspace_path: Optional[str
 
 def _read(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        return path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return ""
 
@@ -106,6 +106,7 @@ def run_test_contract(contract: str, workspace: Optional[str]) -> dict:
     from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 
     # Own process group (POSIX) so a timeout kills the whole test tree, never ours.
+    # detached-spawn: ok — awaited here; a timeout kills the whole group.
     group_kw: dict = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {"process_group": 0}
     started = time.monotonic()
     try:

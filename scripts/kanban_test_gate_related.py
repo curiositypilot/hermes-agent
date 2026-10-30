@@ -68,7 +68,7 @@ def main() -> int:
         return 0
     print(f"kanban test gate: {len(tests)} related test file(s) against {base}", flush=True)
     return subprocess.run([str(ROOT / "scripts/run_tests.sh"), "-j", "8", *tests], cwd=ROOT,
-                          stdin=subprocess.DEVNULL).returncode
+                          stdin=subprocess.DEVNULL, check=False).returncode
 
 
 if __name__ == "__main__":

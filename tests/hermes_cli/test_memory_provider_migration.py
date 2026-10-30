@@ -296,11 +296,11 @@ def test_recovery_copy_without_a_catalog_memory_entry_keeps_the_generic_hint(tmp
 
 
 def test_startup_recovery_backs_off_after_a_failed_install(tmp_path, monkeypatch):
-    """A failed agent-start install is not retried by every following process start (each `hermes chat`,
+    """(Fork: honcho, since hindsight stays bundled in core here.) A failed agent-start install is not retried by every following process start (each `hermes chat`,
     cron run, Desktop restart): one failure, then a quiet hour; `hermes update` still retries."""
     from pm import install as pm_install
 
-    (tmp_path / "config.yaml").write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: honcho\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(mig, "catalog_source", lambda n: n)
     monkeypatch.setattr(pm_install, "lazy_installs_allowed", lambda: True)
@@ -309,10 +309,10 @@ def test_startup_recovery_backs_off_after_a_failed_install(tmp_path, monkeypatch
     said: list[str] = []
     for _process in range(3):
         monkeypatch.setattr(mig, "_attempted", set())  # a fresh process each time
-        assert mig.recover_at_startup("hindsight", say=said.append) is False
-    assert attempts == ["hindsight"]
-    assert "`hermes plugins install hindsight`" in said[-1]  # still told memory is off, and the fix
+        assert mig.recover_at_startup("honcho", say=said.append) is False
+    assert attempts == ["honcho"]
+    assert "`hermes plugins install honcho`" in said[-1]  # still told memory is off, and the fix
     monkeypatch.setattr(mig, "STARTUP_RETRY_SECONDS", 0.0)
     monkeypatch.setattr(mig, "_attempted", set())
-    mig.recover_at_startup("hindsight")
-    assert attempts == ["hindsight", "hindsight"]
+    mig.recover_at_startup("honcho")
+    assert attempts == ["honcho", "honcho"]

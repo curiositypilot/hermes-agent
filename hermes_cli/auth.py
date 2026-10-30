@@ -1024,7 +1024,7 @@ def _merge_pool_row_generation(
     return _merge_disk_cooldown_state(merged, merge_disk, provider_id)
 
 
-def _merge_billing_streak(result: Dict[str, Any], entry: Dict[str, Any], disk_entry: Dict[str, Any]) -> Dict[str, Any]:
+def _merge_billing_streak(result: dict[str, Any], entry: dict[str, Any], disk_entry: dict[str, Any]) -> dict[str, Any]:
     """Carry the newest billing streak across a pool rewrite.
 
     The streak (``agent.credential_pool.BILLING_STREAK_KEYS``) sizes the escalating billing bench

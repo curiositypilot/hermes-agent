@@ -42,9 +42,9 @@ def _naive_requirement(spec: str) -> tuple[str, str]:
     return bare.strip().split("[", 1)[0].strip(), head
 
 
-def _parse_requirements(raw_deps: list[str]) -> list[tuple[str, "object | None", str]]:
+def _parse_requirements(raw_deps: list[str]) -> list[tuple[str, object | None, str]]:
     """``(name, marker, head)`` per dep spec — ``packaging`` when importable, else a naive split."""
-    parsed: list[tuple[str, "object | None", str]] = []
+    parsed: list[tuple[str, object | None, str]] = []
     try:
         from packaging.requirements import Requirement  # type: ignore
         for spec in raw_deps:

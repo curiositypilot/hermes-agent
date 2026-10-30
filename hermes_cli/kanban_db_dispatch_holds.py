@@ -37,7 +37,7 @@ def _last_streak_event(conn: sqlite3.Connection, task_id: str) -> tuple[Optional
 
 
 def _record_routing_hold(
-    conn: sqlite3.Connection, task_id: str, route: Optional["RouteDecision"],
+    conn: sqlite3.Connection, task_id: str, route: Optional[RouteDecision],
     reason: str = "tier_exhausted",
 ) -> None:
     """``routing_held`` once per streak: same reason, note and tier; noise events ignored."""

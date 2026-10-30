@@ -30,7 +30,7 @@ def _bwrap_works() -> bool:
         return False
     try:
         return subprocess.run(["bwrap", "--unshare-user", "--ro-bind", "/", "/", "true"],
-                              capture_output=True, timeout=10).returncode == 0
+                              capture_output=True, timeout=10, check=False).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -298,11 +298,11 @@ def test_built_sandbox_hides_what_it_claims(bwrap_host_dir):
                              assignee_home=host.root / "profiles" / "mine")
     try:
         proc = subprocess.run(plan.argv, capture_output=True, text=True, timeout=60, env=plan.outer_env,
-                              pass_fds=plan.pass_fds)
+                              pass_fds=plan.pass_fds, check=False)
     finally:
         plan.close()
     assert proc.returncode == 0, proc.stderr
-    seen = eval(proc.stdout.strip().splitlines()[-1])  # noqa: S307 -- our own repr output
+    seen = eval(proc.stdout.strip().splitlines()[-1])
     assert seen["ssh"] == []
     assert seen["wallet"] in ("", "PermissionError")
     assert seen["env"] == "OPENROUTER_API_KEY=ok\n"

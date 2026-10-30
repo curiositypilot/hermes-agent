@@ -251,7 +251,7 @@ def test_configured_fallback_chain_skips_denied_entries(policy_home, monkeypatch
     _write_config(policy_home, chain=[("antigravity", "gemini-3.8-flash"), ("anthropic", "claude-sonnet-5")])
     monkeypatch.setenv("HERMES_DATA_CLASS", "confidential")
 
-    client, model, label = ac._try_configured_fallback_chain("compression", "openai-codex")
+    client, _model, label = ac._try_configured_fallback_chain("compression", "openai-codex")
 
     assert fakes.provider_of(client) == "anthropic"
     assert label == "fallback_chain[1](anthropic)"
@@ -277,7 +277,7 @@ def test_configured_fallback_chain_is_unchanged_for_internal(policy_home, monkey
 
 def test_main_fallback_chain_skips_denied_entries(confidential, fakes):
     with patch.object(ac, "_is_provider_unhealthy", return_value=False):
-        client, model, provider = ac._try_main_fallback_chain("compression", "anthropic")
+        client, _model, _provider = ac._try_main_fallback_chain("compression", "anthropic")
 
     # fallback_providers = [antigravity, openai-codex]; confidential pins to the main provider
     # (anthropic), so neither entry is eligible.
@@ -289,7 +289,7 @@ def test_main_fallback_chain_skips_denied_entries(confidential, fakes):
 def test_main_fallback_chain_is_unchanged_for_internal(policy_home, fakes):
     with patch.object(ac, "_is_provider_unhealthy", return_value=False), \
             patch.object(ac, "_context_too_small", return_value=None):
-        client, model, provider = ac._try_main_fallback_chain("compression", "anthropic")
+        client, _model, _provider = ac._try_main_fallback_chain("compression", "anthropic")
 
     assert fakes.provider_of(client) == "antigravity"
 

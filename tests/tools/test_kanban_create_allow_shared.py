@@ -49,7 +49,7 @@ def test_schema_exposes_allow_shared():
     ({"allow_shared": "true"}, "dir"),
 ])
 def test_create_dir_on_repo(worker_env, repo, extra, expected):
-    import tools.kanban_tools  # noqa: F401  (registers the tools)
+    import tools.kanban_tools
     from tools.registry import registry
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc

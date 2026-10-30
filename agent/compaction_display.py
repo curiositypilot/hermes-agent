@@ -54,7 +54,7 @@ def project_compaction_message_for_display(message: dict[str, Any]) -> Optional[
     return _strip_todo_snapshot_for_display(projected)
 
 
-def _strip_todo_snapshot_for_display(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _strip_todo_snapshot_for_display(message: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Drop the compaction todo snapshot from a user row; ``None`` when it was the whole row.
 
     ``_fold_todo_snapshot`` appends the snapshot to the trailing real user turn, so without this

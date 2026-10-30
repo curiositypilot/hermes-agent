@@ -3197,6 +3197,9 @@ def _save_compose_deliver(
         and not _resolve_delivery_targets(job, for_failure=not d.success)
     )
     execution_id = job.get('execution_id')
+    if not d.success and _route_failure_before_send(job, deliver_content, fence):
+        d.delivery_attempted = True
+        return
     if execution_id and not job.get('no_agent'):
         from cron.delivery_queue import enqueue
         # Nothing to send: an origin-less job is ``not_configured``, never a queued "delivery".
@@ -3235,6 +3238,22 @@ def _save_compose_deliver(
             raise
         d.delivery_error = str(de)
         logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+
+def _route_failure_before_send(job: dict, content: str, fence) -> bool:
+    """``cron.failure_route`` (fork): hand a failure notice to the router before it is queued or
+    sent, so a card owns it whatever the lane (queued agent job, ``failure_deliver: local``).
+    Marks the job so ``_deliver_result`` (direct send or the queue drain) does not ask twice."""
+    from cron.failure_route import route_failure
+    with fence.side_effect_fence() as owns_delivery:
+        if not owns_delivery:
+            raise _FireClaimLostDuringSideEffect
+        routed = route_failure(job, content)
+    job["_failure_route_tried"] = True
+    if routed is None:
+        return False
+    job["_failure_routed"] = routed
+    return True
 
 
 def _deliver_crash_failure(

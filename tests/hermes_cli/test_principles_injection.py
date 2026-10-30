@@ -131,7 +131,7 @@ def test_fetch_directives_cap_is_a_parameter(monkeypatch):
     got = principles.fetch_directives(["task:coding"], cap_chars=200)
     assert sum(len(principles.render_directive(d)) + 1 for d in got) <= 200
     assert [d["name"] for d in got][:2] == ["r9", "r8"]
-    assert getattr(got, "omitted") == 10 - len(got)
+    assert got.omitted == 10 - len(got)
     assert len(principles.fetch_directives(["task:coding"], cap_chars=None)) == 10
 
 

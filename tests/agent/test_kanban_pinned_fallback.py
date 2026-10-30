@@ -134,6 +134,7 @@ def _settle(agent, err, retry_count=1, error_context=None):
     classified = classify_api_error(err, provider="antigravity")
     assert classified.reason == FailoverReason.rate_limit
     retry = SimpleNamespace(copilot_stale_cred_retry_attempted=False, primary_recovery_attempted=False,
+                            provider_stale_refresh_attempted=False,
                             has_retried_429=False, restart_with_redirected_messages=False)
     with patch("agent.turn_api_error.interruptible_backoff_sleep", lambda *a, **k: None), \
          patch("agent.turn_api_error.compute_error_backoff", lambda *a, **k: 0.0):
@@ -242,6 +243,7 @@ def test_pinned_billing_ends_turn_and_exits_75(monkeypatch):
     classified = classify_api_error(err, provider="xai-oauth")
     assert classified.reason == FailoverReason.billing
     retry = SimpleNamespace(copilot_stale_cred_retry_attempted=False, primary_recovery_attempted=False,
+                            provider_stale_refresh_attempted=False,
                             has_retried_429=False, restart_with_redirected_messages=False)
     with patch("agent.turn_api_error.interruptible_backoff_sleep", lambda *a, **k: None), \
          patch("agent.turn_api_error.compute_error_backoff", lambda *a, **k: 0.0):

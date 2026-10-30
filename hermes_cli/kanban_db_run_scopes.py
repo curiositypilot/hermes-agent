@@ -120,6 +120,7 @@ def _active_run_scope_units() -> Optional[list[str]]:
         [binary, "--user", "list-units", "--plain", "--no-legend", "hermes-worker-kanban-*-run-*.scope"],
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
         stdin=subprocess.DEVNULL, env=systemd_user_bus_env(),
+        check=False,
     )
     if result.returncode != 0:
         logger.debug("systemctl --user list-units exited %d: %s", result.returncode, result.stderr.strip())

@@ -27,7 +27,7 @@ def _run(args, tmp_path, *, extra_env=None):
     env.update(extra_env or {})
     return subprocess.run(
         [sys.executable, *args], cwd=REPO_ROOT, env=env, capture_output=True, text=True,
-        timeout=120)
+        timeout=120, check=False)
 
 
 def test_worker_entry_runs_without_runpy_double_import_warning(tmp_path):
@@ -54,7 +54,7 @@ def test_tick_is_resolved_lazily_and_unknown_names_still_raise():
 
     assert tick is cron.scheduler.tick
     with pytest.raises(AttributeError):
-        cron.nope  # noqa: B018
+        cron.nope
 
 
 _MAIN_ALIAS_PROBE = """

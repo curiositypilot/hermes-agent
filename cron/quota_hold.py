@@ -94,7 +94,7 @@ def clear_state(job: dict[str, Any]) -> None:
 _UNSET = object()
 
 
-def route_of(job: Dict[str, Any], cron_default_provider: Any = _UNSET) -> str:
+def route_of(job: dict[str, Any], cron_default_provider: Any = _UNSET) -> str:
     """``"<provider>@<base_url>"`` the job's provider resolve is sent to — the identity a quota
     window belongs to (the model is not part of it). Provider precedence mirrors the scheduler's
     ``_resolve_job_runtime``: per-job provider > ``cron.model_provider`` > the main
@@ -121,11 +121,12 @@ def route_of(job: Dict[str, Any], cron_default_provider: Any = _UNSET) -> str:
 
 def _cron_default_provider() -> Optional[str]:
     """``cron.model_provider``, read the way ``cron.scheduler._load_cron_job_config`` reads it."""
+    from hermes_cli.config_backend import config_exists
     from hermes_cli.config_effective import load_user_config_effective
     from hermes_constants import get_hermes_home
 
     cfg_path = get_hermes_home() / "config.yaml"
-    cfg = load_user_config_effective(cfg_path) if cfg_path.exists() else {}
+    cfg = load_user_config_effective(cfg_path) if config_exists(cfg_path) else {}
     cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
     if not isinstance(cron_cfg, dict):
         return None
@@ -179,9 +180,9 @@ def _recovery_worthwhile(
 
 
 def _parked_at(
-    job: Dict[str, Any], natural_next: Optional[datetime], hold_seconds: float, now: datetime,
+    job: dict[str, Any], natural_next: Optional[datetime], hold_seconds: float, now: datetime,
     recover_consumed_fire: bool,
-) -> Tuple[Optional[str], bool]:
+) -> tuple[Optional[str], bool]:
     """``(parked_iso, is_recovery_fire)`` for a recurring job failing at *now*, or ``(None,
     False)`` when no park applies (not recurring, or the natural next run already lands past the
     effective window and no recovery fire is due). One owner of the schedule/window arithmetic

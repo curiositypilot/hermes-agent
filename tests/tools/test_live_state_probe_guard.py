@@ -130,7 +130,7 @@ def test_must_pass(command, worker, tmp_path):
 
 
 def test_execute_code_refuses_a_cron_writer_import_without_spawning(worker, monkeypatch):
-    import tools.code_kernel as code_kernel
+    from tools import code_kernel
 
     ran: list[str] = []
     monkeypatch.setattr(cet, "SANDBOX_AVAILABLE", True)

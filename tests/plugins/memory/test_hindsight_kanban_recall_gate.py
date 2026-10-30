@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from plugins.memory.hindsight import HindsightMemoryProvider
+import itertools
 
 
 @pytest.fixture
@@ -192,7 +193,7 @@ def test_call_timeout_override_reaches_run_sync(make_provider, monkeypatch):
     seen = []
     monkeypatch.setattr("plugins.memory.hindsight._run_sync",
                         lambda coro, timeout: seen.append(timeout))
-    op = lambda c: None  # noqa: E731
+    op = lambda c: None
     p._call_timeout.value = 4
     p._run_hindsight_operation(op)
     p._call_timeout.value = None
@@ -250,7 +251,7 @@ def test_burst_replay_serializes(make_first_turn, tmp_path, first_turn):
         return
     assert len(intervals) == 3
     intervals.sort()
-    for (_, end), (start, _) in zip(intervals, intervals[1:]):
+    for (_, end), (start, _) in itertools.pairwise(intervals):
         assert start >= end
 
 

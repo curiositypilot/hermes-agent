@@ -49,7 +49,7 @@ def explicit_worker_memory_max_bytes(requested: int) -> int:
         _MIN_WORKER_MEMORY_MAX_BYTES,
     )
 
-    bounds: List[int] = []
+    bounds: list[int] = []
     cgroup_limit = gateway_cgroup_memory_max(_MIN_WORKER_MEMORY_MAX_BYTES)
     if cgroup_limit is not None:
         bounds.append(cgroup_limit)

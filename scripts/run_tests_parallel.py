@@ -1114,7 +1114,7 @@ def _detect_cgroup_v2_memory_limit(
     if not cgroup_file.exists():
         return None
     try:
-        content = cgroup_file.read_text(encoding="utf-8")
+        content = cgroup_file.read_text(encoding="utf-8-sig")
     except OSError:
         return None
 
@@ -1127,12 +1127,12 @@ def _detect_cgroup_v2_memory_limit(
         return None
 
     curr = cgroup_root / rel_path
-    limits: List[int] = []
+    limits: list[int] = []
     while True:
         mem_max_file = curr / "memory.max"
         if mem_max_file.exists():
             try:
-                val = mem_max_file.read_text(encoding="utf-8").strip()
+                val = mem_max_file.read_text(encoding="utf-8-sig").strip()
                 if val != "max" and val.isdigit():
                     num = int(val)
                     if num > 0:

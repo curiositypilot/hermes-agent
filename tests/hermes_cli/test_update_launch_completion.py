@@ -322,7 +322,7 @@ def test_relaunched_module_boots_dependencies_before_its_package_runs(tmp_path):
     argv = [str(root / "pkg" / "entry.py"), "--external-worker-file", "payload.json"]
     orig = [sys.executable, "-m", "pkg.entry", *argv[1:]]
     command = venv_sync.relaunch_command(Path(sys.executable), root, argv, orig, "pkg.entry")
-    result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == ["dependency", argv[1:]]
 

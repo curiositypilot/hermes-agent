@@ -75,7 +75,7 @@ _KANBAN_PERSIST_NOTE = (
 def _in_kanban_run_scope(cgroup_path: str = "/proc/self/cgroup") -> bool:
     """True when this process runs inside a Kanban worker run scope; unreadable = False."""
     try:
-        with open(cgroup_path, encoding="utf-8") as fh:
+        with open(cgroup_path, encoding="utf-8-sig") as fh:
             return any(_KANBAN_RUN_SCOPE_RE.search(line) for line in fh)
     except OSError:
         return False

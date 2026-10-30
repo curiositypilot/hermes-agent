@@ -13,7 +13,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-import kanban_test_gate_related as gate  # noqa: E402
+import kanban_test_gate_related as gate
 
 TREE = [
     "tests/pm/test_install_x.py",

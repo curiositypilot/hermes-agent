@@ -61,7 +61,7 @@ def test_fallback_module_argv_actually_runs(monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: None)
     argv = _module_argv(monkeypatch)
     r = subprocess.run([*argv, "--version"], env=_pinned_env(argv),
-                       capture_output=True, text=True, timeout=60)
+                       capture_output=True, text=True, timeout=60, check=False)
     assert r.returncode == 0, f"`{' '.join(argv)} --version` rc={r.returncode}: {r.stderr[-300:]}"
 
 
@@ -74,10 +74,10 @@ def test_worker_in_a_shadowing_workspace_runs_the_install(tmp_path, monkeypatch)
 
     # The fixture really shadows: the pre-fix argv (no -P) imports the cwd's package.
     old = subprocess.run([sys.executable, "-m", "hermes_cli.main", "--version"], cwd=tmp_path,
-                         env=env, capture_output=True, text=True, timeout=60)
+                         env=env, capture_output=True, text=True, timeout=60, check=False)
     assert old.returncode == 97
 
     r = subprocess.run([*argv, "--version"], cwd=tmp_path, env=env,
-                       capture_output=True, text=True, timeout=60)
+                       capture_output=True, text=True, timeout=60, check=False)
     assert r.returncode == 0, r.stderr[-500:]
     assert ROOT in r.stdout

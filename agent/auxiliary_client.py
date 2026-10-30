@@ -3155,7 +3155,7 @@ def _policy_provider_label(provider: Optional[str]) -> str:
     return _normalize_aux_provider(raw)
 
 
-def _aux_policy_context(main_runtime: Optional[Dict[str, Any]] = None) -> Optional[_AuxPolicy]:
+def _aux_policy_context(main_runtime: Optional[dict[str, Any]] = None) -> Optional[_AuxPolicy]:
     """The data-class policy for auxiliary routing, or None when the class leaves it unrestricted.
 
     Fails closed: an unresolvable class or an invalid policy raises ``ProviderDenied``. The main provider
@@ -3211,9 +3211,9 @@ def _assert_provider_in_data_class(provider: Optional[str], *, phase: str = "aux
 
 
 def _enforce_data_class_on_task_route(
-    route: Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]], *,
+    route: tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]], *,
     caller_chose_route: bool,
-) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
+) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Apply the data class to a resolved ``(provider, model, base_url, api_key, api_mode)`` route.
 
     ``auto`` passes: ``_resolve_auto_route`` starts at the main provider and gates every candidate behind
@@ -5581,7 +5581,7 @@ def resolve_provider_client(
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
-def _resolve_task_provider_model_for(task: Optional[str], main_runtime: Optional[Dict[str, Any]]):
+def _resolve_task_provider_model_for(task: Optional[str], main_runtime: Optional[dict[str, Any]]):
     """``_resolve_task_provider_model(task)`` under the caller's live main runtime, so the data-class
     pin compares against the provider the agent is really on (not a stale config default)."""
     if main_runtime:
@@ -6265,7 +6265,7 @@ def _resolve_task_provider_model(
 
 
 def _resolve_task_route(
-    task: str = None, provider: str = None, model: str = None, base_url: Optional[str] = None,
+    task: str | None = None, provider: str | None = None, model: str | None = None, base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Policy-blind (provider, model, base_url, api_key, api_mode) resolution.

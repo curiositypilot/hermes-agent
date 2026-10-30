@@ -1062,7 +1062,7 @@ def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[
 # Estimate: rough token/complexity read via the auxiliary model. NOT a dollar cost.
 # The prompt + parser live in ``kanban_routing`` (shared with auto-labelling);
 # re-exported here for existing importers.
-from hermes_cli.kanban_routing import ESTIMATE_SYSTEM_PROMPT as _ESTIMATE_SYSTEM_PROMPT  # noqa: E402,F401
+from hermes_cli.kanban_routing import ESTIMATE_SYSTEM_PROMPT as _ESTIMATE_SYSTEM_PROMPT
 
 
 class EstimateBody(BaseModel):

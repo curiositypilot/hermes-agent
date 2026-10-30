@@ -48,9 +48,11 @@ class _FakeManager:
 def _build(parent, goals):
     with patch("run_agent.AIAgent") as MockAgent:
         MockAgent.side_effect = lambda **kw: MagicMock()
+        from tools.delegate_tool_routes import TaskRoute
         children, err = _build_children(
-            [{"goal": g} for g in goals], [], dict(_CREDS), top_role="leaf", max_iterations=5,
-            parent_agent=parent, routing_cfg={}, live_deleg_id=None, live_writers=[],
+            [{"goal": g} for g in goals], [None] * len(goals),
+            [TaskRoute(creds=dict(_CREDS), routing_cfg={}) for _ in goals], top_role="leaf",
+            max_iterations=5, parent_agent=parent, live_deleg_id=None, live_writers=[],
         )
     assert err is None
     return children, [c.kwargs for c in MockAgent.call_args_list]

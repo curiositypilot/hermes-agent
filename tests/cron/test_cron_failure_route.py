@@ -25,6 +25,13 @@ _failing_run_job = _fd._failing_run_job
 _succeeding_run_job = _fd._succeeding_run_job
 
 
+@pytest.fixture(autouse=True)
+def _owner_seam(cron_owner):
+    """Agent jobs run inside the profile owner (``run_canonical_job``); run them through the
+    production owner execution seam so the real ``run_job`` body executes."""
+    return cron_owner
+
+
 def _router(tmp_path, *, rc=0, out='{"action": "filed_intake", "card": "t_abc"}', sleep=0):
     log = tmp_path / "router-calls.jsonl"
     script = tmp_path / "router.py"
@@ -41,6 +48,14 @@ def _calls(log):
     return [json.loads(line) for line in log.read_text().splitlines() if line.strip()] if log.exists() else []
 
 
+def _run_and_drain(job, **kwargs):
+    """Agent-job notices leave through the durable delivery queue: run, then drain it the way the
+    gateway tick does (the router is consulted at send time, inside ``_deliver_result``)."""
+    result = s.run_one_job(job, **kwargs)
+    s.drain_delivery_queue(adapters={}, loop=None)
+    return result
+
+
 def _configure(monkeypatch, cmd, timeout=30):
     monkeypatch.setattr(s, "load_config", lambda: {"cron": {"failure_route": {"command": cmd, "timeout": timeout}}})
 
@@ -50,7 +65,7 @@ def test_failure_goes_to_router_not_chat(run_env, monkeypatch, tmp_path):
     _configure(monkeypatch, cmd)
     monkeypatch.setattr(s, "run_job", _failing_run_job("Script exited with code 1 stderr: boom"))
 
-    s.run_one_job({"id": "j1", "name": "scout", "deliver": "slack:D0MAIN"})
+    _run_and_drain({"id": "j1", "name": "scout", "deliver": "slack:D0MAIN"})
 
     assert run_env["send"] == []
     calls = _calls(log)
@@ -66,7 +81,7 @@ def test_router_failure_falls_back_to_chat(run_env, monkeypatch, tmp_path):
     _configure(monkeypatch, cmd)
     monkeypatch.setattr(s, "run_job", _failing_run_job())
 
-    s.run_one_job({"id": "j2", "name": "scout", "deliver": "slack:D0MAIN"})
+    _run_and_drain({"id": "j2", "name": "scout", "deliver": "slack:D0MAIN"})
 
     assert len(_calls(log)) == 1
     assert [c["chat_id"] for c in run_env["send"]] == ["D0MAIN"]
@@ -81,7 +96,7 @@ def test_router_timeout_falls_back_to_chat(run_env, monkeypatch, tmp_path):
     real = sp.run
     monkeypatch.setattr(fr.subprocess, "run", lambda *a, **kw: real(*a, **{**kw, "timeout": 0.5}))
 
-    s.run_one_job({"id": "j3", "name": "scout", "deliver": "slack:D0MAIN"})
+    _run_and_drain({"id": "j3", "name": "scout", "deliver": "slack:D0MAIN"})
 
     assert [c["chat_id"] for c in run_env["send"]] == ["D0MAIN"]
 
@@ -97,7 +112,7 @@ def test_router_crash_falls_back_to_chat(run_env, monkeypatch, tmp_path):
 
     monkeypatch.setattr(fr, "_route_config", _bug)
 
-    s.run_one_job({"id": "j7", "name": "scout", "deliver": "slack:D0MAIN"})
+    _run_and_drain({"id": "j7", "name": "scout", "deliver": "slack:D0MAIN"})
 
     assert [c["chat_id"] for c in run_env["send"]] == ["D0MAIN"]
 
@@ -107,7 +122,7 @@ def test_success_never_consults_router(run_env, monkeypatch, tmp_path):
     _configure(monkeypatch, cmd)
     monkeypatch.setattr(s, "run_job", _succeeding_run_job())
 
-    s.run_one_job({"id": "j4", "name": "scout", "deliver": "slack:D0MAIN"})
+    _run_and_drain({"id": "j4", "name": "scout", "deliver": "slack:D0MAIN"})
 
     assert _calls(log) == []
     assert [c["chat_id"] for c in run_env["send"]] == ["D0MAIN"]
@@ -118,14 +133,14 @@ def test_local_failure_deliver_jobs_are_routed_too(run_env, monkeypatch, tmp_pat
     _configure(monkeypatch, cmd)
     monkeypatch.setattr(s, "run_job", _failing_run_job())
 
-    s.run_one_job({"id": "j5", "name": "scout", "deliver": "slack:D0MAIN", "failure_deliver": "local"})
+    _run_and_drain({"id": "j5", "name": "scout", "deliver": "slack:D0MAIN", "failure_deliver": "local"})
 
     assert run_env["send"] == [] and len(_calls(log)) == 1
 
 
 def test_unconfigured_is_byte_identical(run_env, monkeypatch):
     monkeypatch.setattr(s, "run_job", _failing_run_job())
-    s.run_one_job({"id": "j6", "name": "scout", "deliver": "slack:D0MAIN"})
+    _run_and_drain({"id": "j6", "name": "scout", "deliver": "slack:D0MAIN"})
     assert [c["chat_id"] for c in run_env["send"]] == ["D0MAIN"]
 
 
@@ -240,7 +255,8 @@ def _job_runtime(tmp_path, agent, *, primary_fails=False):
     home.mkdir(exist_ok=True)
     (home / "config.yaml").write_text(
         "model:\n  default: gpt-5.6-sol\n  provider: openai-codex\n"
-        "fallback_providers:\n  - provider: anthropic\n    model: claude-sonnet-5\n    api_key: fb-key\n")
+        "fallback_providers:\n  - provider: anthropic\n    model: claude-sonnet-5\n    api_key: fb-key\n"
+        "platforms:\n  slack:\n    enabled: true\n    token: xoxb-test\n")
 
     def _resolve(**kwargs):
         if primary_fails and kwargs.get("requested") != "anthropic":
@@ -253,7 +269,6 @@ def _job_runtime(tmp_path, agent, *, primary_fails=False):
          patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
          patch("hermes_cli.env_loader.load_hermes_dotenv"), \
          patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-         patch("hermes_state_registry.acquire", return_value=MagicMock()), \
          patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=_resolve), \
          patch("run_agent.AIAgent", return_value=agent):
         yield
@@ -278,7 +293,7 @@ def test_verifier_footer_routed_not_delivered(run_env, monkeypatch, tmp_path):
             return _REAL_RUN_JOB(job, **kw)
     monkeypatch.setattr(s, "run_job", _run_job)
 
-    s.run_one_job({**_job("j7"), "deliver": "slack:D0MAIN"})
+    _run_and_drain({**_job("j7"), "deliver": "slack:D0MAIN"})
 
     delivered = [c["message"] for c in run_env["send"]]
     assert len(delivered) == 1 and "Still running; nothing new needs you." in delivered[0]
@@ -308,7 +323,7 @@ def test_verifier_footer_kept_when_router_fails(monkeypatch, tmp_path):
 
 def test_verifier_footer_unconfigured_byte_identical(monkeypatch, tmp_path):
     from run_agent import AIAgent
-    monkeypatch.setattr(s, "load_config", lambda: {})
+    monkeypatch.setattr(s, "load_config", dict)
     _s, _o, final, _e = _run(tmp_path, _BRIEF, _FAILED)
     assert final == _BRIEF + "\n\n" + AIAgent._format_file_mutation_failure_footer(_FAILED)
 

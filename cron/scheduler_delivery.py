@@ -1775,7 +1775,7 @@ def _deliver_result(
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
-    if for_failure:
+    if for_failure and not job.get("_failure_route_tried"):
         # ``cron.failure_route``: the notice becomes a card, not a chat message; on any router
         # problem it falls through to the normal delivery below (cron/failure_route.py).
         from cron.failure_route import route_failure

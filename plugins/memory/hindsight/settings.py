@@ -149,7 +149,7 @@ def _recall_date(result: Any) -> str:
     return ""
 
 
-def _format_recall_lines(results: list, show_dates: bool = False) -> List[str]:
+def _format_recall_lines(results: list, show_dates: bool = False) -> list[str]:
     """Bullet lines for injected recall results: ``- text``, or ``- [YYYY-MM-DD] text`` with
     ``show_dates`` (undated results keep the plain form). Results without text are skipped."""
     lines = []
@@ -166,7 +166,7 @@ def _daemon_llm_provider(provider: str) -> str:
     return "openai" if provider in _OPENAI_WIRE_PROVIDERS else provider
 
 
-def _normalize_retain_tags(value: Any) -> List[str]:
+def _normalize_retain_tags(value: Any) -> list[str]:
     """Normalize tag config/tool values to a deduplicated list of strings."""
     if value is None:
         return []
@@ -201,7 +201,7 @@ def _kanban_recall_query(title: Any, body: Any, body_chars: int = _KANBAN_QUERY_
     return "\n\n".join(part for part in (title_text, body_text) if part)
 
 
-def _kanban_recall_tags(templates: Any, tenant: str) -> List[str]:
+def _kanban_recall_tags(templates: Any, tenant: str) -> list[str]:
     """Expand ``recall_kanban_tags`` templates for one worker. ``{tenant}`` is the card's
     tenant (``HERMES_TENANT``); a template naming ``{tenant}`` is dropped when the card has
     none, so an untenanted card never filters on a literal ``project:``."""
@@ -264,7 +264,7 @@ def _normalize_project_aliases(value: Any) -> dict:
     return {old: new for old, new in ((_slug(k), _slug(v)) for k, v in value.items()) if old and new and old != new}
 
 
-def _apply_project_aliases(tags: List[str], aliases: dict) -> List[str]:
+def _apply_project_aliases(tags: list[str], aliases: dict) -> list[str]:
     """Rewrite each ``project:<old>`` tag to ``project:<new>`` (deduped, order kept)."""
     out: list[str] = []
     for tag in tags:
@@ -275,7 +275,7 @@ def _apply_project_aliases(tags: List[str], aliases: dict) -> List[str]:
     return out
 
 
-def _observation_scope_tag_groups(tags: List[str], match: str, scopes: Any) -> list | None:
+def _observation_scope_tag_groups(tags: list[str], match: str, scopes: Any) -> list | None:
     """``tag_groups`` that keep a project filter from hiding consolidated observations, or None.
 
     Observations carry ONLY their consolidation-scope tags (``observation_scopes``), so a

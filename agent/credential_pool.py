@@ -434,11 +434,11 @@ def _is_billing_mark(status_code: Optional[int], failure_reason: Optional[str]) 
     return status_code == 402 or failure_reason == FAILURE_REASON_BILLING
 
 
-def _without_billing_streak(extra: Dict[str, Any]) -> Dict[str, Any]:
+def _without_billing_streak(extra: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in extra.items() if k not in BILLING_STREAK_KEYS}
 
 
-def _next_billing_streak(extra: Dict[str, Any], now: float) -> int:
+def _next_billing_streak(extra: dict[str, Any], now: float) -> int:
     """Streak for a billing mark at *now*: previous + 1 when the mark lands within
     ``BILLING_STREAK_CONTINUE_SECONDS`` after the previous bench ended, else 1.
 

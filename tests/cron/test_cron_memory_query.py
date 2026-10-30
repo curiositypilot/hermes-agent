@@ -9,6 +9,13 @@ so recalling against that message searched skill text / the hint instead of the 
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _owner_seam(cron_owner):
+    """Agent jobs run inside the profile owner (``run_canonical_job``); run them through the
+    production owner execution seam so the real ``run_job`` body executes."""
+    return cron_owner
+
+
 @pytest.fixture
 def cron_env(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
@@ -26,7 +33,7 @@ def cron_env(tmp_path, monkeypatch):
 
     _skill_bundles._bundles_cache = {}
     _skill_bundles._bundles_cache_mtime = None
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     return hermes_home, scheduler
 
@@ -64,7 +71,6 @@ def _run_capturing(monkeypatch, scheduler, hermes_home, job, **run_kwargs):
         def close(self):
             pass
 
-    monkeypatch.setattr("hermes_state_registry.acquire", _SessionDB)
     monkeypatch.setattr("run_agent.AIAgent", _Agent)
     monkeypatch.setattr("hermes_constants.resolve_reasoning_config", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -72,7 +78,7 @@ def _run_capturing(monkeypatch, scheduler, hermes_home, job, **run_kwargs):
         lambda **_k: {"api_key": "k", "base_url": None, "provider": "p", "api_mode": None,
                       "command": None, "args": None},
     )
-    monkeypatch.setattr("tools.mcp_tool_discovery.discover_mcp_tools", lambda: [])
+    monkeypatch.setattr("tools.mcp_tool_discovery.discover_mcp_tools", list)
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: hermes_home)
     monkeypatch.setattr(scheduler, "get_fallback_chain", lambda _cfg: [])
     monkeypatch.setattr(scheduler, "_guard_job_credential_exfil", lambda _job: None)

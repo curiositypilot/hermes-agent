@@ -437,14 +437,14 @@ class MemoryManager:
         if not query or not query.strip() or self._shutting_down:
             return ""
         limit = self._external_prefetch_timeout if timeout is None else float(timeout)
-        parts: List[str] = []
+        parts: list[str] = []
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
             fn = getattr(provider, "delegation_context", None)
             if not callable(fn):
                 continue
-            result_box: Dict[str, Any] = {}
+            result_box: dict[str, Any] = {}
 
             def _run(fn=fn, box=result_box) -> None:
                 try:

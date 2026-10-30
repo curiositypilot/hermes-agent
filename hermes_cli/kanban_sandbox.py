@@ -243,6 +243,7 @@ def _git_common_dir(workspace: Path) -> Optional[Path]:
             ["git", "-C", str(workspace), "rev-parse", "--path-format=absolute", "--git-common-dir"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
             stdin=subprocess.DEVNULL,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -261,9 +262,7 @@ def _is_under(path: Path, root: Path) -> bool:
 def _existing(paths: Iterable[Path], *, kind: str) -> list[Path]:
     out = []
     for p in paths:
-        if kind == "dir" and p.is_dir() and not p.is_symlink():
-            out.append(p)
-        elif kind == "file" and (p.is_file() or p.is_socket()) and not p.is_symlink():
+        if kind == "dir" and p.is_dir() and not p.is_symlink() or kind == "file" and (p.is_file() or p.is_socket()) and not p.is_symlink():
             out.append(p)
     return out
 
@@ -537,7 +536,7 @@ def _probe(spec: dict) -> list[dict]:
     def run(argv: list[str], cwd: Optional[str] = None, timeout: int = 120) -> tuple[int, str]:
         try:
             p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
-                               errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
+                               errors="replace", timeout=timeout, stdin=subprocess.DEVNULL, check=False)
             return p.returncode, (p.stdout + p.stderr).strip()[-300:]
         except (OSError, subprocess.SubprocessError) as exc:
             return 127, str(exc)
@@ -681,7 +680,7 @@ def run_selftest(*, hermes_root: Optional[Path] = None, as_json: bool = False,
         argv = [*plan.argv[:-1], *probe_cmd]  # swap the placeholder command for the probe
         proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
                               timeout=600, pass_fds=plan.pass_fds, env=plan.outer_env,
-                              stdin=subprocess.DEVNULL)
+                              stdin=subprocess.DEVNULL, check=False)
     except SandboxUnavailable as exc:
         print(f"sandbox-selftest: FAIL — {exc}", file=out)
         return 1

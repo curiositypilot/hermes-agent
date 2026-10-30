@@ -68,6 +68,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, Optional
+from datetime import UTC
 
 logger = logging.getLogger(__name__)
 
@@ -423,9 +424,9 @@ def _parse_iso_epoch(raw: Any) -> Optional[float]:
         return None
     try:
         from datetime import datetime, timezone
-        dt = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(raw).strip())
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         return dt.timestamp()
     except (TypeError, ValueError):
         return None
@@ -443,7 +444,7 @@ class QuotaSnapshot:
     providers: dict[str, tuple[float, Optional[float]]] = field(default_factory=dict)
     """provider -> ``(headroom 0..1, resets_at epoch or None)``."""
     unknown: dict[str, str] = field(default_factory=dict)
-    windows: dict[str, list["QuotaWindow"]] = field(default_factory=dict)
+    windows: dict[str, list[QuotaWindow]] = field(default_factory=dict)
     """provider -> its windows that carry a ``match`` (per-model gating); only for
     providers in ``providers``. Absent = every model is gated on the binding."""
 
@@ -452,12 +453,12 @@ class QuotaWindow(NamedTuple):
     """One headroom-file window a model can be gated on. ``match`` is a tuple of
     lower-cased model-id prefixes, or ``"*"`` (every model no prefix claims)."""
     name: str
-    match: "tuple[str, ...] | str"
+    match: tuple[str, ...] | str
     headroom: float
     resets_at: Optional[float]
 
 
-def _parse_match(raw: Any) -> "tuple[str, ...] | str | None":
+def _parse_match(raw: Any) -> tuple[str, ...] | str | None:
     """A window's ``match``: ``"*"`` or a non-empty list of non-empty strings; None = malformed."""
     if raw == "*":
         return "*"
@@ -518,7 +519,7 @@ def read_headroom(gate: QuotaGateConfig, *, now: Optional[float] = None) -> Quot
     if not gate.enabled:
         return QuotaSnapshot(path, "disabled")
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except FileNotFoundError:
         return QuotaSnapshot(path, "missing")
@@ -607,7 +608,7 @@ def read_mode(gate: QuotaGateConfig, *, now: Optional[float] = None) -> QuotaMod
     now = time.time() if now is None else now
     path = os.path.expanduser(gate.mode_file) if gate.mode_file else default_mode_path()
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except FileNotFoundError:
         return QuotaMode(path, "missing")
@@ -625,7 +626,7 @@ def read_mode(gate: QuotaGateConfig, *, now: Optional[float] = None) -> QuotaMod
                      since=data.get("since"), resets_at=_parse_iso_epoch(data.get("resets_at")), age_seconds=age)
 
 
-def _spend_down_key(cand: "TierCandidate") -> tuple[bool, bool]:
+def _spend_down_key(cand: TierCandidate) -> tuple[bool, bool]:
     """Opus first, then any other Anthropic model, then the rest (stable)."""
     anthropic = (cand.provider or "").strip().lower() == MODE_PROVIDER
     return (not anthropic, not (anthropic and "opus" in cand.model.lower()))
@@ -719,10 +720,10 @@ class _ClassCheck:
     the worker enforces the class there at init, so the router must agree."""
     data_class: Optional[str]
     """None = unresolved (every candidate is refused)."""
-    allowed: "list[str] | str" = "any"
+    allowed: list[str] | str = "any"
 
     @classmethod
-    def for_task(cls, task: Any, profile_home: Optional[str]) -> "_ClassCheck":
+    def for_task(cls, task: Any, profile_home: Optional[str]) -> _ClassCheck:
         from agent.provider_policy import ProviderDenied, allowed_providers, resolve_data_class
         try:
             with _home_scope(profile_home):
@@ -803,11 +804,11 @@ class RoutingContext:
         req = gate_requirement(snap, provider, model)
         return None if req is None else req.verdict(priority)
 
-    def order_tier(self, cands: "tuple[TierCandidate, ...] | list[TierCandidate]") -> list[TierCandidate]:
+    def order_tier(self, cands: tuple[TierCandidate, ...] | list[TierCandidate]) -> list[TierCandidate]:
         """One tier's candidates in walk order: static order, re-ordered only by spend-down."""
         return self.spend_down_order(cands)
 
-    def spend_down_order(self, cands: "list[TierCandidate] | tuple[TierCandidate, ...]") -> list[TierCandidate]:
+    def spend_down_order(self, cands: list[TierCandidate] | tuple[TierCandidate, ...]) -> list[TierCandidate]:
         """In quota mode ``open``: Opus first, other Anthropic models next, the rest
         in their existing order. Otherwise unchanged."""
         cands = list(cands)
@@ -1080,9 +1081,7 @@ def apply_route(task: Any, decision: Optional[RouteDecision]) -> None:
     cand = decision.candidate
     task.model_override = cand.model
     task.provider_override = cand.provider
-    if decision.source == "review":
-        task.reasoning_effort = cand.reasoning
-    elif cand.reasoning and not getattr(task, "reasoning_effort", None):
+    if decision.source == "review" or cand.reasoning and not getattr(task, "reasoning_effort", None):
         task.reasoning_effort = cand.reasoning
 
 

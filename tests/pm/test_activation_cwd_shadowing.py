@@ -34,6 +34,7 @@ def test_compose_env_ignores_a_pm_package_in_the_cwd(tmp_path: Path):
     result = subprocess.run(
         [bash(), "-c", script],
         capture_output=True, text=True, cwd=posix(decoy), env=bash_env(store), timeout=60,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     assert "HERMES_DECOY_PM" not in result.stdout

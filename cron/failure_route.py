@@ -112,7 +112,7 @@ def route_event(payload: dict, cfg: Optional[dict] = None) -> Optional[dict]:
         if not cmd or not str(payload.get("text") or "").strip():
             return None
         proc = subprocess.run(cmd, input=json.dumps(payload), capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=timeout)
+                              errors="replace", timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
         logger.warning("%s: failure router timed out; delivering the notice to chat instead", label)
         return None

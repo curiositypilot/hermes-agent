@@ -305,7 +305,7 @@ def _placeholder_candidates(text: str) -> set:
     runs = [m.span() for m in _TOKEN_RUN_RE.finditer(text)]
     run_starts = [s for s, _ in runs]
 
-    def run_at(pos: int) -> Optional[Tuple[int, int]]:
+    def run_at(pos: int) -> Optional[tuple[int, int]]:
         i = bisect_right(run_starts, pos) - 1
         return runs[i] if i >= 0 and pos < runs[i][1] else None
 
@@ -320,7 +320,7 @@ def _placeholder_candidates(text: str) -> set:
     return tokens
 
 
-def _changed_lines(original: str, new_content: str) -> Tuple[List[int], str]:
+def _changed_lines(original: str, new_content: str) -> tuple[list[int], str]:
     """(indices of ``original`` lines the edit replaced or deleted, text of the lines it
     inserted). Unchanged lines are excluded, so a secret line the edit left alone never counts."""
     import difflib
@@ -331,8 +331,8 @@ def _changed_lines(original: str, new_content: str) -> Tuple[List[int], str]:
     hi_old, hi_new = len(old), len(new)
     while hi_old > lo and hi_new > lo and old[hi_old - 1] == new[hi_new - 1]:
         hi_old, hi_new = hi_old - 1, hi_new - 1
-    removed: List[int] = []
-    inserted: List[str] = []
+    removed: list[int] = []
+    inserted: list[str] = []
     matcher = difflib.SequenceMatcher(None, old[lo:hi_old], new[lo:hi_new], autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag != "equal":
@@ -341,7 +341,7 @@ def _changed_lines(original: str, new_content: str) -> Tuple[List[int], str]:
     return removed, "\n".join(inserted)
 
 
-def _removed_views(original: str, removed: List[int], path: str) -> Tuple[str, List[str]]:
+def _removed_views(original: str, removed: list[int], path: str) -> tuple[str, list[str]]:
     """(raw text of the removed lines, those lines as the model could have seen them): the
     read_file/search_files view and the tool-result/diff view, each cut from the whole-file view
     (the context the model read), or redacted as a block when that view changed the line count."""

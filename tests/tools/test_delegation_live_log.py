@@ -492,14 +492,14 @@ def _manifest_of(paths):
 def _bound_writer(tmp_path, task_id="subagent-0-abc"):
     from tools import file_state
     file_state.get_registry().clear()
-    deleg_id, writers, paths = create_live_transcripts([{"goal": "write scripts"}], home=tmp_path / "home")
+    _deleg_id, writers, paths = create_live_transcripts([{"goal": "write scripts"}], home=tmp_path / "home")
     writers[0].bind_task(task_id)
     return writers[0], paths
 
 
 def test_manifest_carries_pid_start_time_and_task_id(tmp_path):
     from gateway.status import get_process_start_time
-    writer, paths = _bound_writer(tmp_path, "subagent-0-abc")
+    _writer, paths = _bound_writer(tmp_path, "subagent-0-abc")
     manifest = _manifest_of(paths)
     assert manifest["pid"] == os.getpid()
     assert manifest["pid_start"] == get_process_start_time(os.getpid())

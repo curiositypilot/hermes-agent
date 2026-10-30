@@ -90,7 +90,8 @@ def test_late_launcher_cannot_stamp_replacement_claim(tmp_path, monkeypatch):
     with closing(connect(board='owned')) as conn:
         tid = kb.create_task(conn, title='Owned race', assignee='default')
         old = kb.claim_task(conn, tid)
-        kb.block_task(conn, tid, reason='replace claim', expected_run_id=old.current_run_id)
+        # transient: the fork's retry gate (kanban_db_retry_gate) lets an infra block re-claim unchanged.
+        kb.block_task(conn, tid, reason='replace claim', kind='transient', expected_run_id=old.current_run_id)
         kb.unblock_task(conn, tid)
         new = kb.claim_task(conn, tid)
         dispatch._set_worker_pid(conn, tid, 424242, run_id=old.current_run_id, claim_lock=old.claim_lock)

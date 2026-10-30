@@ -29,7 +29,7 @@ DEEPGRAM_LISTEN_URL = "https://api.deepgram.com/v1/listen"
 _DEFAULT_REPETITION_THRESHOLD = 6
 
 
-def allowed_languages(stt_config: Dict[str, Any]) -> List[str]:
+def allowed_languages(stt_config: dict[str, Any]) -> list[str]:
     raw = (stt_config.get("local") or {}).get("allowed_languages") or []
     return [str(code).strip().lower() for code in raw if str(code).strip()]
 
@@ -38,11 +38,11 @@ def has_repetition_loop(text: str, threshold: int = _DEFAULT_REPETITION_THRESHOL
     """True when a 1-3 word chunk repeats ``threshold``+ times back to back ("da da da da da da")."""
     if threshold < 2 or not text:
         return False
-    pattern = r"\b(\w+(?:\W+\w+){0,2})(?:\W+\1\b){%d,}" % (threshold - 1)
+    pattern = r"\b(\w+(?:\W+\w+){0,2})(?:\W+\1\b){" + str(threshold - 1) + ",}"
     return re.search(pattern, text, flags=re.IGNORECASE | re.UNICODE) is not None
 
 
-def second_pass_reason(stt_config: Dict[str, Any], detected: Optional[str], transcript: str,
+def second_pass_reason(stt_config: dict[str, Any], detected: Optional[str], transcript: str,
                        language_was_forced: bool) -> Optional[str]:
     """Why the local result needs a second pass, or None (also None when the feature is off)."""
     sp_cfg = stt_config.get("second_pass") or {}
@@ -60,7 +60,7 @@ def second_pass_reason(stt_config: Dict[str, Any], detected: Optional[str], tran
     return None
 
 
-def best_allowed_language(allowed: Sequence[str], probs: Optional[Sequence[Tuple[str, float]]]) -> Optional[str]:
+def best_allowed_language(allowed: Sequence[str], probs: Optional[Sequence[tuple[str, float]]]) -> Optional[str]:
     """Most probable allowed language per the detector; first allowed entry when probs are missing."""
     if not allowed:
         return None
@@ -68,7 +68,7 @@ def best_allowed_language(allowed: Sequence[str], probs: Optional[Sequence[Tuple
     return max(allowed, key=lambda code: (scores.get(code, -1.0), -list(allowed).index(code)))
 
 
-def transcribe_deepgram(file_path: str, sp_cfg: Dict[str, Any], hints: Sequence[str] = ()) -> Dict[str, Any]:
+def transcribe_deepgram(file_path: str, sp_cfg: dict[str, Any], hints: Sequence[str] = ()) -> dict[str, Any]:
     """Deepgram pre-recorded transcription (raw-bytes POST). *hints* become ``language_hint`` params
     (nova-3 ``language=multi`` only; they bias detection, they don't restrict it)."""
     import requests
@@ -100,13 +100,13 @@ def transcribe_deepgram(file_path: str, sp_cfg: Dict[str, Any], hints: Sequence[
     return _ok_result(transcript, "deepgram")
 
 
-_SECOND_PASS_PROVIDERS: Dict[str, Callable[..., Dict[str, Any]]] = {
+_SECOND_PASS_PROVIDERS: dict[str, Callable[..., dict[str, Any]]] = {
     "deepgram": transcribe_deepgram}
 
 
-def run_second_pass(file_path: str, stt_config: Dict[str, Any], reason: str, detected: Optional[str],
-                    probs: Optional[Sequence[Tuple[str, float]]],
-                    rerun_local: Callable[[str], str], original: str) -> Dict[str, Any]:
+def run_second_pass(file_path: str, stt_config: dict[str, Any], reason: str, detected: Optional[str],
+                    probs: Optional[Sequence[tuple[str, float]]],
+                    rerun_local: Callable[[str], str], original: str) -> dict[str, Any]:
     """Cloud second pass, else local re-run forced to the best allowed language, else the original."""
     sp_cfg = stt_config.get("second_pass") or {}
     provider = str(sp_cfg.get("provider")).strip().lower()

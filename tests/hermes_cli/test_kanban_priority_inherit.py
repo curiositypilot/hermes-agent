@@ -107,7 +107,7 @@ def test_cli_create_without_priority_inherits_from_parent(kanban_home, capsys, m
 
 
 def test_tool_create_without_priority_inherits_from_parent(kanban_home, monkeypatch):
-    import tools.kanban_tools  # noqa: F401 — register the kanban tool
+    import tools.kanban_tools
     from tools.registry import registry
 
     with kbc.connect_closing() as conn:

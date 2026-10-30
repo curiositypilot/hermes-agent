@@ -1,6 +1,6 @@
 """Hindsight ``recall_show_dates``: dated auto-recall lines + one supersession header (t_4f2571c7)."""
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, UTC
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -31,7 +31,7 @@ class TestFormatter:
         assert _recall_date(_r("x", None, "2026-09-30T21:22:00+00:00")) == "2026-09-30"
 
     def test_accepts_datetime_and_dict_shapes(self):
-        assert _recall_date(_r("x", datetime(2026, 10, 4, 13, 1, tzinfo=timezone.utc))) == "2026-10-04"
+        assert _recall_date(_r("x", datetime(2026, 10, 4, 13, 1, tzinfo=UTC))) == "2026-10-04"
         assert _recall_date(_r("x", None, date(2026, 10, 2))) == "2026-10-02"
         assert _recall_date({"text": "x", "mentioned_at": "2026-10-06T14:22:00Z"}) == "2026-10-06"
 

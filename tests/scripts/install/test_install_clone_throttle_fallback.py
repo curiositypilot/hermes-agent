@@ -58,7 +58,7 @@ POWERSHELL = next((c for c in ("pwsh", "powershell") if shutil.which(c)), None)
 
 
 def _host_git_version() -> tuple:
-    out = subprocess.run(["git", "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False).stdout
     match = re.search(r"(\d+)\.(\d+)", out)
     return (int(match[1]), int(match[2])) if match else (0, 0)
 

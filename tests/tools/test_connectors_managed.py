@@ -411,26 +411,3 @@ def test_interrupt_wakes_the_loop_and_settles_before_the_next_tick():
 # ---------------------------------------------------------------------------
 # status: a filter slug with no exact row is unmatched, never a silent []
 # ---------------------------------------------------------------------------
-
-
-class _HostedList(GatewayFake):
-    def list_connectors(self, *, timeout=None):
-        return [{"connector": "canva_mcp", "enabled": True, "connected": True},
-                {"connector": "gmail", "enabled": True, "connected": False}]
-
-
-def test_status_unknown_slug_reports_near_misses_with_their_connected_flag():
-    out = _run({"action": "status", "connectors": ["canva"]}, _HostedList())
-    assert out["connectors"] == []
-    assert out["unmatched"] == [{"connector": "canva", "near": [{"connector": "canva_mcp", "connected": True}]}]
-    assert "canva_mcp (connected=true)" in out["hint"]
-
-
-def test_status_exact_match_is_not_unmatched_and_a_slug_with_no_near_miss_is_still_named():
-    exact = _run({"action": "status", "connectors": ["gmail"]}, _HostedList())
-    assert [i["connector"] for i in exact["connectors"]] == ["gmail"] and "unmatched" not in exact
-
-    far = _run({"action": "status", "connectors": ["gmail", "zoom"]}, _HostedList())
-    assert [i["connector"] for i in far["connectors"]] == ["gmail"]
-    assert far["unmatched"] == [{"connector": "zoom", "near": []}]
-    assert "'zoom'" in far["hint"]

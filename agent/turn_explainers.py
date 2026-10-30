@@ -186,9 +186,7 @@ class TurnExplainersMixin:
                     landed_dir_identity = os.path.dirname(first_identity)
 
             for path, info in list(state.items()):
-                if info.get("identity", _file_mutation_identity(path, task_id)) in cleared:
-                    state.pop(path, None)
-                elif (
+                if info.get("identity", _file_mutation_identity(path, task_id)) in cleared or (
                     landed_content_sha is not None
                     and landed_dir_identity is not None
                     and info.get("content_sha") == landed_content_sha
