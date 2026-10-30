@@ -221,6 +221,11 @@ class HermesProviderMixin:
     # Locked descriptor while this provider owns the refresh fence; cleared by
     # _hermes_release_refresh_fence. Never shared across instances.
     _hermes_fence: int | None = None
+    # Refresh token the authorization server rejected (400/401). After a failed refresh the SDK
+    # drops ``_initialized``, so every later request re-ran ``_initialize``, re-read the same pair
+    # from disk and POSTed the dead grant again: one connect attempt hit /token 16-38 times. A
+    # pair whose refresh token differs (peer rotation, `hermes mcp login`) is adopted as before.
+    _hermes_dead_refresh_token: str | None = None
 
     async def async_auth_flow(self, request):
         """Guarantee fence release even if the auth generator is abandoned.
@@ -381,7 +386,7 @@ class HermesProviderMixin:
         stored_refresh = getattr(stored, "refresh_token", None)
         if not stored_refresh or not getattr(stored, "access_token", None):
             return None
-        if stored_refresh == getattr(current, "refresh_token", None):
+        if stored_refresh in (getattr(current, "refresh_token", None), self._hermes_dead_refresh_token):
             return None
         return stored
 
@@ -409,6 +414,16 @@ class HermesProviderMixin:
             if meta is not None:
                 self.context.oauth_metadata = meta
         enforce_refresh_token_issuer(self.context)
+        self._hermes_drop_dead_refresh_token()
+
+    def _hermes_drop_dead_refresh_token(self) -> None:
+        """Strip a refresh token already rejected in this process from the freshly loaded pair, so
+        ``can_refresh_token()`` is False and the flow goes to 401 -> authorization instead of
+        presenting the dead grant again. The access token is kept (the SDK still checks its TTL)."""
+        tokens = self.context.current_tokens
+        dead = self._hermes_dead_refresh_token
+        if dead and tokens is not None and getattr(tokens, "refresh_token", None) == dead:
+            self.context.current_tokens = tokens.model_copy(update={"refresh_token": None})
 
     async def _store_tokens(self, token_response) -> None:
         self.context.current_tokens = token_response
@@ -449,6 +464,7 @@ class HermesProviderMixin:
     async def _hermes_handle_refresh_response(self, response) -> bool:
         if not (200 <= response.status_code < 300):
             self._hermes_logger.warning("Token refresh failed: %s", response.status_code)
+            failed_refresh = getattr(self.context.current_tokens, "refresh_token", None)
             # A writer outside the fence (interactive `hermes mcp login`, or a
             # pre-fence Hermes sharing this HERMES_HOME) may have rotated the
             # grant and persisted the replacement. Providers issuing single-use
@@ -459,6 +475,9 @@ class HermesProviderMixin:
                     "Recovered a peer-rotated refresh token instead of clearing the session"
                 )
                 return True
+            if response.status_code in (400, 401) and failed_refresh:
+                # Rejected, not a transient 5xx/429: never present this grant again.
+                self._hermes_dead_refresh_token = failed_refresh
             self.context.clear_tokens()
             return False
         from httpx import HTTPError
