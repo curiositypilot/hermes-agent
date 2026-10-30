@@ -25,7 +25,14 @@ _IS_WINDOWS = platform.system() == "Windows"
 # (not merely "not Windows") so macOS and other POSIX platforms never touch systemd.
 # See #70716.
 _IS_LINUX = platform.system() == "Linux"
-from tools.environments.local import _append_dropped_path_entries, _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env, _terminal_env
+from tools.environments.local import (
+    _append_dropped_path_entries,
+    _append_missing_sane_path_entries,
+    _find_shell,
+    _resolve_safe_cwd,
+    _sanitize_subprocess_env,
+    _terminal_env,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
@@ -1128,9 +1135,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     @staticmethod
     def _spawn_env(env_vars: dict) -> dict:
-        """Sanitized child env from the session's client toolchain; PYTHONUNBUFFERED so poll sees progress."""
+        """Sanitized child env from the session's client toolchain; PYTHONUNBUFFERED so poll sees progress.
+        PATH gets the same managed-runtime / ``~/.local/bin`` completion as foreground
+        ``LocalEnvironment`` runs (appended, so user entries keep precedence) — without it
+        a background job cannot find tools that live only in ``$HERMES_HOME/bin`` (#124820)."""
         from agent.session_client_env import toolchain_environ
-        env = _terminal_env(_sanitize_subprocess_env(toolchain_environ(), env_vars))
+        env = _terminal_env(_sanitize_subprocess_env(
+            toolchain_environ(), env_vars, fix_path=_append_missing_sane_path_entries))
         env["PYTHONUNBUFFERED"] = "1"
         return env
 
