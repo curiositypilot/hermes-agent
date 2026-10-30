@@ -265,3 +265,38 @@ def test_dry_run_dispatch_tick_never_stops_run_scopes(conn, systemctl):
     result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 0, dry_run=True, max_spawn=0)
 
     assert result.reaped_run_scopes == [] and systemctl.stopped == [] and systemctl.listings == 0
+
+
+# --- the owner-run turn scope (intake t_94026b0d) ---------------------------------------------
+# The gateway runs a card's turn in ``hermes-worker-kanban-<task>-run-<run>-turn.scope``; the
+# reaper stops it with its run, so tool processes the turn left behind die with the run too.
+
+
+@pytest.mark.parametrize("unit,expected", [
+    ("hermes-worker-kanban-t_ab12-run-12.scope", ("t_ab12", "12")),
+    ("hermes-worker-kanban-t_ab12-run-12-turn.scope", ("t_ab12", "12")),
+    ("hermes-worker-kanban-t_ab12-run-missing-turn.scope", None),
+    ("hermes-worker-kanban-t_ab12-run-12-turnx.scope", None),
+    ("hermes-worker-kanban-t_ab12-run-12-turn.service", None),
+    ("hermes-worker-cron-x-exec-y.scope", None),
+    ("hermes-worker-kanban-t_AB-run-1-turn.scope", None),
+])
+def test_run_scope_unit_names_match_both_scopes_of_a_run(unit, expected):
+    from hermes_cli.kanban_db_run_scopes import _RUN_SCOPE_UNIT
+
+    match = _RUN_SCOPE_UNIT.match(unit)
+    assert (match.groups() if match else None) == expected
+
+
+def test_reap_ended_run_scopes_stops_a_finished_runs_turn_scope_and_keeps_a_live_one(conn, systemctl):
+    from hermes_cli.kanban_db_run_scopes import reap_ended_run_scopes
+
+    old_tid, old_run = _ended_run(conn, ended_ago=600)
+    live_tid = kb.create_task(conn, title="running", assignee="coder")
+    kb.claim_task(conn, live_tid, claimer=kb._claimer_id())
+    live_run = kb._current_run_id(conn, live_tid)
+    finished = [_scope(old_tid, old_run), _scope(old_tid, old_run).replace(".scope", "-turn.scope")]
+    systemctl.units = [*finished, _scope(live_tid, live_run).replace(".scope", "-turn.scope")]
+
+    assert reap_ended_run_scopes(conn) == finished
+    assert systemctl.stopped == finished

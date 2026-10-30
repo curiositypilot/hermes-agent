@@ -627,6 +627,37 @@ async def _kanban_sandbox(authority, policy, command, env, cwd):
         raise RuntimeStoreError('sandbox_unavailable') from exc
 
 
+async def _kanban_turn_scope(policy, argv, env):
+    """``(argv, env)`` for a Kanban card's turn: under a systemd-supervised gateway, ``argv`` (the
+    plain interpreter or the sandbox plan) runs in the run's own transient
+    ``hermes-worker-kanban-<task>-run-<run>-turn.scope`` with ``kanban.worker_memory_max_mb`` as
+    its MemoryMax, so the turn and every tool it starts are bounded outside the gateway cgroup and
+    the run-scope reaper can stop leftovers once the run has ended. ``systemd-run --scope`` execs
+    in place: the Popen pid, pipes, session and ``pass_fds`` are unchanged. Not under systemd:
+    unchanged. A supervised gateway that cannot create the scope fails the admission closed before
+    any process exists: ``RuntimeStoreError('scope_unavailable')``, never an uncapped turn."""
+    from tools.process_registry import (
+        RestartSafeScopeUnavailable, restart_safe_gateway_child_argv, systemd_user_bus_env)
+
+    def build():
+        from hermes_cli.kanban_db_run_scopes import configured_worker_memory_max_bytes
+        context = json.loads(policy.kanban_json)
+        dispatch = restart_safe_gateway_child_argv(
+            argv, unit_suffix=f"kanban-{context['task_id']}-run-{context['run_id']}-turn",
+            require_restart_safe_scope=True, memory_max_bytes=configured_worker_memory_max_bytes())
+        if dispatch.mode != 'scoped':
+            return argv, env
+        # systemd-run reaches the user manager through the env it runs with (a scrubbed
+        # multiplex env may lack the bus); it passes that env on to the exec'd command.
+        return dispatch.argv, systemd_user_bus_env(env)
+    try:
+        return await asyncio.to_thread(build)
+    except RestartSafeScopeUnavailable as exc:
+        import logging
+        logging.getLogger(__name__).warning('Kanban turn scope unavailable, worker not spawned: %s', exc)
+        raise RuntimeStoreError('scope_unavailable') from exc
+
+
 def _popen_closing(plan):
     """``subprocess.Popen`` that closes the plan's memfds once the child holds them (in the spawn
     thread, so a cancelled spawn never closes them under a fork still in progress)."""
@@ -649,38 +680,43 @@ async def _spawn_registered_worker(authority, ref, row, policy=None):
     """Spawn the turn's child and register it for Stops: ``(worker, process)``, or None when the spawn was cancelled (the
     interrupted result is already recorded). The generation stays marked spawning until registration.
 
-    A Kanban card in a sandboxed tenant (``kanban.sandbox``) spawns inside bwrap; every other spawn
-    (chat, cron, unsandboxed cards) is the plain interpreter, unchanged."""
+    A Kanban card in a sandboxed tenant (``kanban.sandbox``) spawns inside bwrap, and every Kanban
+    card's turn runs in its run's ``-turn`` scope under ``kanban.worker_memory_max_mb`` on a
+    systemd-supervised gateway; chat and cron spawns are the plain interpreter, unchanged."""
     spawning = _mark_spawning(authority, ref, row)
     generation = row.get('generation')
-    plan = None
+    plan = unspawned = None  # unspawned: a plan whose memfds no spawn thread has taken yet
     try:
         env = await asyncio.to_thread(_worker_env, authority)
         cwd = (await asyncio.to_thread(Path(__file__).resolve)).parents[1]
         from gateway.session_worker_spawn import acquire_process
         from gateway.session_managed_worker_log import append_worker_note, worker_log_path
         log_path = worker_log_path(authority.profile_id)
-        command = [sys.executable, '-m', 'agent.managed_worker']
+        argv = [sys.executable, '-m', 'agent.managed_worker']
         note = b''
+        spawner = subprocess.Popen
         if getattr(policy, 'kanban_json', None):
-            plan, note = await _kanban_sandbox(authority, policy, command, env, cwd)
-        if plan is None:
-            process = await acquire_process(subprocess.Popen, command,
-                cwd=cwd, stdin=subprocess.PIPE, env=env, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE, **WORKER_POPEN)
-        else:
-            note = plan.log_line()
-            process = await acquire_process(_popen_closing(plan), list(plan.argv),
-                cwd=cwd, stdin=subprocess.PIPE, env=dict(plan.outer_env), stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE, **WORKER_POPEN)
+            plan, note = await _kanban_sandbox(authority, policy, argv, env, cwd)
+            if plan is not None:
+                unspawned = plan
+                note, spawner, argv, env = plan.log_line(), _popen_closing(plan), list(plan.argv), dict(plan.outer_env)
+            argv, env = await _kanban_turn_scope(policy, argv, env)
+        unspawned = None  # from here the spawn thread closes them (_popen_closing)
+        process = await acquire_process(spawner, argv,
+            cwd=cwd, stdin=subprocess.PIPE, env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE, **WORKER_POPEN)
     except asyncio.CancelledError:
         # acquire_process owns late-child cleanup; no bootstrap or reservation was sent.
+        if unspawned is not None:
+            unspawned.close()
         spawning.pop(ref.session_id, None)
         _interrupted_before_bootstrap(authority, row, _latched_stop_cause(authority, ref.session_id, generation))
         return None
     except RuntimeStoreError as exc:
         spawning.pop(ref.session_id, None)
-        if exc.reason == 'sandbox_unavailable':
+        if unspawned is not None:
+            unspawned.close()
+        if exc.reason in ('sandbox_unavailable', 'scope_unavailable'):
             # Nothing ran and nothing was reserved: the card's run learns why from the board note.
             _record_lost_attempt(authority, policy, exc, exc.reason, None)
         raise
