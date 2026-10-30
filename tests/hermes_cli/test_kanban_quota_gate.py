@@ -298,7 +298,7 @@ def test_dispatch_quota_hold_one_event_no_failure(conn, headroom, monkeypatch, a
     assert len(holds) == 1
     assert holds[0].payload["reason"] == "quota_hold" and holds[0].payload["retry_at"]
     assert "needs P2" in holds[0].payload["note"]
-    assert "quota_hold=1" in kbd.describe_suppression([res])
+    assert "quota_hold (1)" in kbd.describe_suppression([res])
 
 
 def test_held_card_does_not_consume_spawn_slot(conn, headroom, monkeypatch, all_assignees_spawnable):
