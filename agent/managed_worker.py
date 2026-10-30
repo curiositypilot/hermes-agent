@@ -110,8 +110,13 @@ def validate_bootstrap(frame):
     if set(frame) - {'attachments_v1'} != BOOTSTRAP_FIELDS or frame['version'] != 1:
         raise ValueError('invalid_managed_worker_bootstrap')
     scope = frame['scope']
+    # ``pid`` is the owner's (host) view of this process; ``ns_pid`` is ours, and differs from it
+    # only inside a pid namespace (bwrap --unshare-pid). An owner that predates ``ns_pid`` sends
+    # no such field: owner code stays in gateway memory until a restart, while workers load the
+    # checkout at spawn. Without ``ns_pid`` the owner's ``pid`` must be our own getpid().
     fields = {'profile_id', 'session_id', 'execution_id', 'generation', 'pid', 'birth', 'secret', 'epoch'}
-    if (not isinstance(scope, dict) or set(scope) != fields or scope['pid'] != os.getpid()
+    if (not isinstance(scope, dict) or set(scope) - {'ns_pid'} != fields
+            or scope.get('ns_pid', scope['pid']) != os.getpid()
             or scope['profile_id'] != frame['home'] or not Path(frame['home']).is_absolute()
             or not isinstance(frame['policy'], dict)
             or any(not isinstance(frame[k], str) for k in ('text', 'route', 'user_id', 'chat_id'))
@@ -327,12 +332,19 @@ def tool_frame(call_id, name, args, *result):
     return json.loads(json.dumps(frame, default=str))
 
 
+def adoption_scope(scope):
+    """The reserved scope as the worker presents it to its owner: the host pid the owner verified,
+    never the namespace-local ``ns_pid`` (a bootstrap-only field the adopt claim does not bind)."""
+    return {k: v for k, v in scope.items() if k != 'ns_pid'}
+
+
 def execute(frame, channel):
     # The owner RPC below imports gateway/config modules (hermes_cli.config, providers,
     # hermes_cli.plugins) transitively; the policy must already be frozen when they load.
     bind_worker_policy(frame)
-    from agent.runtime_session_store import RuntimeSessionStore, WorkerRPC
-    scope = dict(frame['scope'])
+    from agent.runtime_session_store import RuntimeSessionStore, WorkerRPC, bind_owner_view_pid
+    scope = adoption_scope(frame['scope'])
+    bind_owner_view_pid(scope['pid'])  # validate_bootstrap matched ns_pid to getpid(): pid is our host pid
     rpc = WorkerRPC(frame['home'])
     adopted = rpc('worker.adopt', **{k: v for k, v in scope.items() if k != 'epoch'})
     if adopted['owner_epoch'] != scope['epoch']:

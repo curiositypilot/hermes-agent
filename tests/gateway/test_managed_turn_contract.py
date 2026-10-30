@@ -23,7 +23,7 @@ def assignment(tmp_path, monkeypatch, *, finite=True, unattended=False, yolo=Fal
     ref = SimpleNamespace(session_id='sid')
     row = {'payload': {'text': 'hello', 'finite': finite, 'unattended': unattended}}
     scope = {'profile_id': str(tmp_path), 'session_id': 'sid', 'execution_id': 'x', 'generation': 1,
-             'pid': os.getpid(), 'birth': 0, 'secret': 's', 'epoch': 1}
+             'pid': os.getpid(), 'ns_pid': os.getpid(), 'birth': 0, 'secret': 's', 'epoch': 1}
     return _bootstrap(authority, ref, row, policy, scope), (authority, ref, row, policy, scope)
 
 
