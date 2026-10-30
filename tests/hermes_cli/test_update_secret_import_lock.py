@@ -131,7 +131,9 @@ def test_update_probe_children_skip_external_secret_sources(tmp_path):
          "from hermes_cli.update_cmd_validation import _validate_critical_modules_import\n"
          "print('PROBE=' + repr(_validate_critical_modules_import(__import__('os').getcwd())))"],
         capture_output=True, text=True, timeout=180, cwd=REPO_ROOT,
-        env={**os.environ, "HERMES_HOME": str(home)},
+        # An empty runtime store keeps the probe child on this interpreter: in a stamped install
+        # it would boot the store Python, which refuses the fresh HERMES_HOME with lazy installs off.
+        env={**os.environ, "HERMES_HOME": str(home), "HERMES_RUNTIME_DIR": str(tmp_path / "empty-store")},
     )
     assert result.returncode == 0, result.stderr
     assert "PROBE=(True, None, None)" in result.stdout, result.stdout + result.stderr
