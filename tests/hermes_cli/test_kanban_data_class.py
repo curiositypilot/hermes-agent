@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import sqlite3
 from pathlib import Path
@@ -127,7 +128,7 @@ def test_dispatch_exports_resolved_data_class(kanban_home, monkeypatch, tmp_path
     monkeypatch.setattr(process_registry, "systemd_user_bus_env", lambda env: env)
     monkeypatch.setattr(kbd, "_worker_argv", lambda *_args: ["hermes"])
     monkeypatch.setattr(kbd, "_restart_safe_worker_argv", lambda _task, command: command)
-    monkeypatch.setattr(kbd, "_open_worker_log", lambda *_args: object())
+    monkeypatch.setattr(kbd, "_open_worker_log", lambda *_args: io.BytesIO())
     monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
     monkeypatch.setattr(kbd._kb, "kanban_db_path", lambda **_kwargs: kanban_home / "kanban.db")
     monkeypatch.setattr(kbd._kb, "workspaces_root", lambda **_kwargs: str(kanban_home / "workspaces"))
