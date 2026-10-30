@@ -8,6 +8,7 @@ the real output directory — "cron output" alone sent operators hunting.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Optional
 
@@ -23,13 +24,27 @@ _HTTP_STATUS_IN_TEXT = re.compile(r"(?:\bHTTP\b|\bError code\b|\bstatus(?: code)
 _LEADING_EXC_TYPE = re.compile(r"^(?:[\w.]+\.)?([A-Z]\w*(?:Error|Timeout|Exception))\s*:")
 
 
-def classify_cron_failure_reason(text: str) -> str:
+def _json_body_in_text(text: str) -> Optional[dict]:
+    """The JSON object embedded in a failure string (first ``{`` to last ``}``), else None."""
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        body = json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def classify_cron_failure_reason(text: str, provider: str = "") -> str:
     """``FailoverReason`` value for a cron failure string (``"unknown"`` when unclassifiable).
 
     The scheduler only has ``str(exc)``, so the status code and exception type the classifier
     keys on are rebuilt from the text: a whole-token HTTP code after ``HTTP`` / ``Error code`` /
     ``status`` (a bare ``429`` inside a job id or hash never counts, #83188) and a leading
-    ``ReadTimeout:``-style type prefix."""
+    ``ReadTimeout:``-style type prefix. An embedded JSON error body and the job's ``provider``
+    are passed on too: provider-scoped codes (xAI's 403 ``personal-team-blocked:spending-limit``
+    is out-of-credits, not a rejected sign-in) only classify with both."""
     from agent.error_classifier import classify_api_error
 
     status = _HTTP_STATUS_IN_TEXT.search(text)
@@ -38,7 +53,10 @@ def classify_cron_failure_reason(text: str) -> str:
     exc = exc_cls(text)
     if status:
         exc.status_code = int(status.group(1))
-    return classify_api_error(exc).reason.value
+    body = _json_body_in_text(text)
+    if body is not None:
+        exc.body = body
+    return classify_api_error(exc, provider=provider or "").reason.value
 
 
 # What happened, per reason: the one gloss table shared with subagent notices lives in

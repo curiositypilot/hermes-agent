@@ -66,8 +66,34 @@ def test_cron_cause_gloss_is_the_shared_table():
     assert provider_failure_notice("Morning brief", "ab12cd34", "unknown", backup_provider_phrase="x.") is None
 
 
+_XAI_SPENDING_LIMIT = (
+    'RuntimeError: HTTP 403: {"code":"personal-team-blocked:spending-limit","error":"You have run '
+    'out of credits or need a Grok subscription. Purchase credits or subscribe to continue."}'
+)
 
 
+def test_xai_spending_limit_403_is_billing(monkeypatch):
+    """xAI's out-of-credits 403 carries a provider-scoped code in its JSON body: with the job's
+    provider and the parsed body the notice says credits, never "sign in again" (re-login cannot
+    restore credits)."""
+    from cron.scheduler_failure_copy import classify_cron_failure_reason
+
+    _no_chain(monkeypatch)
+    assert classify_cron_failure_reason(_XAI_SPENDING_LIMIT, provider="xai-oauth") == "billing"
+    msg = _summarize_cron_failure_for_delivery(
+        {**JOB, "provider": "xai-oauth", "model": "grok-4.7"}, _XAI_SPENDING_LIMIT)
+    assert "credit limit" in msg, msg
+    assert "/login" not in msg, msg
+
+
+def test_provider_scoped_code_and_plain_auth_stay_auth():
+    """Must-not-match: the xAI code is billing only for xai-oauth; a plain 401 stays auth; a
+    malformed JSON tail neither raises nor changes the verdict."""
+    from cron.scheduler_failure_copy import classify_cron_failure_reason
+
+    assert classify_cron_failure_reason(_XAI_SPENDING_LIMIT, provider="openrouter") == "auth"
+    assert classify_cron_failure_reason("HTTP 401: invalid api key", provider="xai-oauth") == "auth"
+    assert classify_cron_failure_reason('HTTP 403: {"code":', provider="xai-oauth") == "auth"
 
 
 def test_blocked_config_notice_says_it_did_not_run_and_will_self_heal():
