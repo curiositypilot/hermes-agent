@@ -260,6 +260,21 @@ class TestShellVariables:
             base_vars={"R": str(worktree)})
         assert hit and msg is not None and "$R" in msg
 
+    @pytest.mark.parametrize("command", [
+        "cd $NOPE_UNSET && git -C {outside} status",
+        "cd $NOPE_UNSET && cd {outside} && git checkout -- .",
+        "cd $NOPE_UNSET && cd {wt} && git checkout -q -- .",
+    ])
+    def test_absolute_target_escapes_unresolved_cwd(self, env, command):
+        """An absolute cd / -C word after an unresolved cwd resolves from ``/`` (no TypeError)."""
+        root, worktree, outside = env
+        command = command.format(outside=outside, wt=worktree)
+        assert not _blocked(command, outside, [root]), command
+
+    def test_absolute_root_after_unresolved_cwd_blocked(self, env):
+        root, _, outside = env
+        assert _blocked(f"cd $NOPE_UNSET && git -C {root} checkout -- .", outside, [root])
+
 
 class TestSnapshotWiring:
     """``shared_checkout_block`` reads exports from the session snapshot (``env._snapshot_path``)."""
