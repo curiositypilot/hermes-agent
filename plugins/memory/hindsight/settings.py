@@ -126,27 +126,26 @@ def _reranker_score(result: Any) -> float | None:
         return None
 
 
-# ``recall_show_dates``: one line above dated auto-recall items, so the model resolves a stale
+# ``recall_show_dates``: one line above dated recall items (auto-recall and the tool), so the model resolves a stale
 # pair (old and new fact injected side by side) by the date it can now see.
 _DATED_RECALL_HEADER = "Each fact shows the date it was recorded. When two facts conflict, the newer one supersedes the older."
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def _recall_date(result: Any) -> str:
-    """YYYY-MM-DD from ``mentioned_at``, falling back to ``occurred_start``; '' when neither parses.
-    Accepts ISO strings (the API shape) or date/datetime objects."""
-    for field in ("mentioned_at", "occurred_start"):
-        value = getattr(result, field, None)
-        if value is None and isinstance(result, dict):
-            value = result.get(field)
-        if value is None:
-            continue
-        if hasattr(value, "strftime"):
-            return value.strftime("%Y-%m-%d")
-        m = _ISO_DATE.match(str(value).strip())
-        if m:
-            return m.group(0)
-    return ""
+    """YYYY-MM-DD from ``mentioned_at`` (when the fact was recorded); '' when it does not parse.
+    Accepts ISO strings (the API shape) or date/datetime objects. ``occurred_start`` is never
+    used: it is the event's date, often in the future, and under the "newer supersedes" header a
+    plan dated by its event outranks the later cancellation of it (EDTH replay E, t_f59f3b7d#1)."""
+    value = getattr(result, "mentioned_at", None)
+    if value is None and isinstance(result, dict):
+        value = result.get("mentioned_at")
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    m = _ISO_DATE.match(str(value).strip())
+    return m.group(0) if m else ""
 
 
 def _format_recall_lines(results: list, show_dates: bool = False) -> list[str]:
@@ -160,6 +159,22 @@ def _format_recall_lines(results: list, show_dates: bool = False) -> list[str]:
         date = _recall_date(r) if show_dates else ""
         lines.append(f"- [{date}] {text}" if date else f"- {text}")
     return lines
+
+
+def _format_tool_recall(results: list, show_dates: bool, dropped: int = 0) -> str:
+    """hindsight_recall tool body: numbered ``N. text`` lines, ``N. [YYYY-MM-DD] text`` plus the
+    dated-facts header on top with *show_dates* (undated rows stay plain). With no rows it is the
+    fallback line alone; *dropped* > 0 (relative floor) appends one note line in both cases."""
+    if results:
+        dated = (_recall_date(r) if show_dates else "" for r in results)
+        lines = [f"{i}. [{d}] {r.text}" if d else f"{i}. {r.text}" for i, (r, d) in enumerate(zip(results, dated), 1)]
+        if show_dates:
+            lines.insert(0, _DATED_RECALL_HEADER)
+    else:
+        lines = ["No relevant memories found."]
+    if dropped:
+        lines.append(f"({dropped} lower-relevance results dropped; refine the query to see them)")
+    return "\n".join(lines)
 
 
 def _daemon_llm_provider(provider: str) -> str:
