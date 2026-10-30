@@ -761,6 +761,33 @@ class TestScriptsTreeNeverCleaned:
         assert dg.load_tracked() == []
 
 
+class TestReplay:
+    def test_replay_t_f25f713c_untracked_script_test_survives_session_end(self, _isolate_env):
+        """Live loss: HERMES_HOME is a git checkout, a worker's write_file created a new,
+        still-untracked scripts/tests/test_mw_olx_retry.py, and the plugin tracked it as
+        ``test`` and deleted it at that worker's own session end, before review saw it."""
+        import subprocess
+
+        pi = _load_plugin_init()
+        dg = _load_lib()
+        git = ["git", "-C", str(_isolate_env), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(["git", "init", "-q", str(_isolate_env)], check=True)
+        (_isolate_env / "README.md").write_text("home\n")
+        subprocess.run([*git, "add", "README.md"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "init"], check=True)
+        new_test = _isolate_env / "scripts" / "tests" / "test_mw_olx_retry.py"
+        new_test.parent.mkdir(parents=True)
+
+        _run_tool(pi, "write_file", {"path": str(new_test), "content": "def test_x(): pass\n"},
+                  create=lambda: new_test.write_text("def test_x(): pass\n"),
+                  task_id="t_10a924ef", session_id="s_impl")
+        pi._on_session_end(session_id="s_impl", task_id="t_10a924ef",
+                           completed=True, interrupted=False)
+
+        assert new_test.exists(), "the worker's new untracked test was deleted at its session end"
+        assert all(Path(i["path"]) != new_test.resolve() for i in dg.load_tracked())
+
+
 class TestTestCategoryAgeFloor:
     """Same-day category=test files must survive AUTO_QUICK; age>=1 day still deletes."""
 
