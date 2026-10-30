@@ -292,4 +292,4 @@ def register(ctx) -> None:
     LAST_SKIP_REASON = ""
     kwargs, LAST_SKIP_REASON = register_provider(ctx, logger, _TAG, BasicAuthProvider, _settings)
     if kwargs is not None:
-        logger.info("dashboard-auth-basic: registered password provider (username=%s)", kwargs["username"])
+        logger.debug("dashboard-auth-basic: registered password provider (username=%s)", kwargs["username"])

@@ -370,7 +370,7 @@ class PluginContext(PluginCapabilityCtxMixin):
         handle = self._manager._track_scoped_registration(
             self.manifest, kind, registry_name, registry, provider, previous
         )
-        logger.info("Plugin '%s' registered %s: %s", self.manifest.name, label, registry_name)
+        logger.debug("Plugin '%s' registered %s: %s", self.manifest.name, label, registry_name)
         return handle
 
     @property
@@ -703,7 +703,7 @@ class PluginContext(PluginCapabilityCtxMixin):
             current=engine, previous=previous,
             restore=lambda replacement: self._manager._restore_value("_context_engine", engine, replacement),
         )
-        logger.info("Plugin '%s' registered context engine: %s", self.manifest.name, engine.name)
+        logger.debug("Plugin '%s' registered context engine: %s", self.manifest.name, engine.name)
         return handle
 
     def register_context_reference(self, provider) -> None:
@@ -720,7 +720,7 @@ class PluginContext(PluginCapabilityCtxMixin):
         except ValueError as exc:
             logger.warning("Plugin '%s' context reference registration failed: %s", self.manifest.name, exc)
             return
-        logger.info("Plugin '%s' registered context reference: @%s:", self.manifest.name, provider.prefix)
+        logger.debug("Plugin '%s' registered context reference: @%s:", self.manifest.name, provider.prefix)
 
     def register_memory_provider(self, provider) -> None:
         """Record a memory provider (inert). Activation is owned by ``plugins/memory`` via
@@ -771,8 +771,8 @@ class PluginContext(PluginCapabilityCtxMixin):
             return
         handle = self._track("dashboard_auth_provider", registry_name,
                              lambda: unregister_global_provider(registry_name, provider), persistent=True)
-        logger.info("Plugin '%s' registered dashboard-auth provider: %s (%s)", self.manifest.name,
-                    registry_name, provider.display_name)
+        logger.debug("Plugin '%s' registered dashboard-auth provider: %s (%s)", self.manifest.name,
+                     registry_name, provider.display_name)
         return handle
 
     @_serialized_replacement
