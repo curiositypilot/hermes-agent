@@ -43,6 +43,7 @@ from .embedded import (
     _export_port_health_grace_timeout, _load_simple_env, _local_runtime_hint, _materialize_embedded_profile_env,
     _may_rewrite_profile_env,
 )
+from . import state_lines
 from .recall_log import log_recalled
 from .settings import (
     _DEFAULT_API_URL, _DEFAULT_IDLE_TIMEOUT, _DEFAULT_LOCAL_URL, _DEFAULT_REFLECT_TIMEOUT, _DEFAULT_RETAIN_SOURCE,
@@ -52,7 +53,7 @@ from .settings import (
     _normalize_observation_scopes, _normalize_project_aliases, _normalize_retain_contexts,
     _normalize_retain_tags, _observation_scope_tag_groups, _parse_bool_setting, _parse_int_setting,
     _parse_score_floor, _reranker_score, _resolve_bank_id_template,
-    _DATED_RECALL_HEADER, _format_recall_lines,
+    _DATED_RECALL_HEADER, _format_recall_lines, _format_tool_recall,
 )
 
 logger = logging.getLogger(__name__)
@@ -715,7 +716,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_delegate_children", "description": "Before delegate_task spawns subagents, recall once per child on its goal (parent-side, read-only) and put the result in the child's system prompt. Children never get a memory provider or memory tools", "default": True},
             {"key": "recall_delegate_max_items", "description": "Maximum recalled memories handed to each delegate_task child (0 = none)", "default": 8},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
-            {"key": "recall_show_dates", "description": "Prefix each auto-recalled memory with the date it was recorded ('- [YYYY-MM-DD] text', from mentioned_at, else occurred_start) and add one line telling the model the newer of two conflicting facts supersedes the older. Applies to auto-recall and delegate_task children, not the hindsight_recall tool", "default": False},
+            {"key": "recall_show_dates", "description": "Prefix each recalled memory with the date it was recorded ('- [YYYY-MM-DD] text', or 'N. [YYYY-MM-DD] text' in hindsight_recall tool output; from mentioned_at only, a memory without it stays undated) and add one line telling the model the newer of two conflicting facts supersedes the older. Applies to auto-recall, delegate_task children and the hindsight_recall tool", "default": False},
+            {"key": "recall_state_lines", "description": "Latest-status lines from the memory-system entity-state index (data/memory-system/entity-state/index.sqlite under the default Hermes root) for auto-recall, the Kanban first-turn recall and the hindsight_recall tool. 'on' puts up to 3 status lines above the hits and marks older hits '[older than <key> status YYYY-MM-DD]'; 'shadow' serves the block unchanged and logs what 'on' would add to data/memory-system/state_lines.jsonl ('on' logs too). A missing, foreign-schema or >6 h old index adds nothing", "default": "off", "choices": ["off", "shadow", "on"]},
             {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
             {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
@@ -731,7 +733,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "recall_min_reranker", "description": "Auto-recall relevance floor (0-1): drop results whose normalized reranker score is below it, so an off-topic turn injects nothing. Blank applies no floor. The explicit hindsight_recall tool is not filtered.", "default": ""},
-            {"key": "recall_min_relative_reranker", "description": "Auto-recall relative floor (0-1): keep only items scoring >= this fraction of the turn's best reranker score. Blank or 0 applies no relative floor. The explicit hindsight_recall tool is not filtered.", "default": ""},
+            {"key": "recall_min_relative_reranker", "description": "Auto-recall relative floor (0-1): keep only items scoring >= this fraction of the turn's best reranker score. Blank or 0 applies no relative floor. The explicit hindsight_recall tool is filtered only with recall_tool_relative_floor.", "default": ""},
+            {"key": "recall_tool_relative_floor", "description": "Also apply recall_min_relative_reranker to the hindsight_recall tool; the output then ends with one line counting the dropped lower-relevance results. recall_min_reranker never applies to the tool", "default": False},
             {"key": "recall_kanban_card_query", "description": "In Kanban workers (HERMES_KANBAN_TASK set), auto-recall with the card's title + the start of its body instead of the dispatcher's topic-free 'work kanban task <id>' message", "default": False},
             {"key": "recall_kanban_body_chars", "description": "Card-body characters appended to the title for recall_kanban_card_query (0 = title only). Longer queries dilute the reranker score", "default": _KANBAN_QUERY_BODY_CHARS},
             {"key": "recall_kanban_tags", "description": "Auto-recall tag filter for Kanban workers, replacing recall_tags there (comma-separated or list; '{tenant}' expands to the card's tenant and the tag is dropped for untenanted cards), e.g. 'project:{tenant},scope:personal'. Blank keeps recall_tags", "default": ""},
@@ -1145,12 +1148,14 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_indicator = bool(cfg.get("recall_indicator", True))
         # Opt-in: prefix each auto-recalled fact with its date plus one "newer supersedes older" line.
         self._recall_show_dates = _parse_bool_setting(cfg.get("recall_show_dates"), False)
+        self._recall_state_lines = state_lines.parse_mode(cfg.get("recall_state_lines"))  # off|shadow|on
         # Auto-recall abstention: a server-side reranker floor (min_scores.reranker) so an
         # off-topic turn injects nothing instead of the top-N zero-score results. None = no floor.
         self._recall_min_reranker = _parse_score_floor(cfg.get("recall_min_reranker"))
         # Relative floor: keep auto-recall items scoring >= this fraction of the turn's best
         # reranker score, cutting the weak tail behind one strong hit. None/0 = off.
         self._recall_min_relative_reranker = _parse_score_floor(cfg.get("recall_min_relative_reranker"))
+        self._recall_tool_relative_floor = _parse_bool_setting(cfg.get("recall_tool_relative_floor"), False)
         self._recall_prefer_observations = _parse_bool_setting(cfg.get("recall_prefer_observations"), False)
         # Kanban-worker auto-recall (Retrieval·W2). Both default off: today's query and filter.
         self._recall_kanban_card_query = _parse_bool_setting(cfg.get("recall_kanban_card_query"), False)
@@ -1364,7 +1369,7 @@ class HindsightMemoryProvider(MemoryProvider):
             # hung request would otherwise hold the slot for the full API timeout (120 s).
             self._call_timeout.value = self._recall_kanban_recall_timeout_s or None
             try:
-                return self._do_recall(query)
+                return self._do_recall(query, "kanban_first")
             finally:
                 self._call_timeout.value = None
 
@@ -1372,7 +1377,8 @@ class HindsightMemoryProvider(MemoryProvider):
         """One recall. *auto* marks the injected auto-recall path, the only one the
         ``recall_min_reranker`` floor applies to: an explicit hindsight_recall is a
         deliberate search whose relevance the model judges itself, and the reranker's
-        absolute scores are not calibrated across queries."""
+        absolute scores are not calibrated across queries (the tool's opt-in relative
+        floor, ``recall_tool_relative_floor``, runs in ``_tool_recall``)."""
         kwargs: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
         kanban_tags = self._kanban_recall_context()[1] if auto else []
         if kanban_tags:
@@ -1421,9 +1427,10 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return resp.text
 
-    def _do_recall(self, query: str) -> tuple[str, int]:
+    def _do_recall(self, query: str, where: str = "auto") -> tuple[str, int]:
         """One recall/reflect for *query* (background prefetch and ``recall_sync`` paths)
-        -> (text, memory count); the count is 0 for reflect (synthesis) and on error."""
+        -> (text, memory count); the count is 0 for reflect (synthesis) and on error.
+        *where* labels the block for ``recall_state_lines`` (auto | kanban_first)."""
         # A Kanban worker's turns all serve one card; its title/body is the topic.
         query = self._kanban_recall_context()[0] or query
         if self._recall_max_input_chars:
@@ -1436,7 +1443,10 @@ class HindsightMemoryProvider(MemoryProvider):
                          self._bank_id, len(query), self._budget)
             results = self._recall(query, auto=True)
             logger.debug("Recall: returned %d results", len(results))
-            return self._render_recall_lines(_format_recall_lines(results, self._recall_show_dates)), len(results)
+            served = [r for r in results if getattr(r, "text", None)]
+            text = state_lines.decorate(self._recall_state_lines, where, query, served, lambda marks: (
+                self._render_recall_lines(_format_recall_lines(served, self._recall_show_dates, marks))))
+            return text, len(results)
         except Exception as e:
             # INFO (not debug): a turn with no memory block needs a logged cause at the default level.
             logger.info("Hindsight recall failed: %s", e)
@@ -1809,7 +1819,11 @@ class HindsightMemoryProvider(MemoryProvider):
         overrides, notes = self._tool_overrides(args, with_types=True)
         results = self._recall(query, overrides=overrides)
         logger.debug("Tool hindsight_recall: %d results", len(results))
-        text = "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
+        kept = results
+        if self._recall_tool_relative_floor and self._recall_min_relative_reranker:
+            kept = self._apply_relative_floor(results, self._recall_min_relative_reranker)
+        text = state_lines.decorate(self._recall_state_lines, "tool", query, kept, lambda marks: (
+            _format_tool_recall(kept, self._recall_show_dates, len(results) - len(kept), marks)))
         return "\n".join([*notes, text])
 
     def _tool_reflect(self, args: dict) -> str:

@@ -175,7 +175,7 @@ def test_first_turn_recall_bounds_its_call_timeout(make_first_turn):
     p = make_first_turn(recall_kanban_first_turn=True, recall_kanban_recall_timeout_s=4)
     seen = []
     p._run_sync = lambda coro: None
-    p._do_recall = lambda q: (seen.append(getattr(p._call_timeout, "value", None)), ("x", 1))[1]
+    p._do_recall = lambda q, *_: (seen.append(getattr(p._call_timeout, "value", None)), ("x", 1))[1]
     p.prefetch("turn 1")
     assert seen == [4]
     assert p._call_timeout.value is None
@@ -231,7 +231,7 @@ def test_burst_replay_serializes(make_first_turn, tmp_path, first_turn):
         cfg["recall_kanban_first_turn"] = True
     intervals, lock = [], threading.Lock()
 
-    def fake_recall(query):
+    def fake_recall(query, *_):
         start = time.monotonic()
         time.sleep(0.3)
         with lock:
