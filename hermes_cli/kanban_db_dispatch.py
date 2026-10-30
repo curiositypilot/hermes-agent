@@ -72,6 +72,8 @@ _RESPAWN_BLOCKER_RE = re.compile(
     r"invalid[\s_]api[\s_]key)\b",
     re.IGNORECASE,
 )
+_BLOCKER_EXEMPT_OUTCOMES = frozenset({"crashed", "blocked", "review_requested",
+                                      "changes_requested", "scheduled", "completed"})
 
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
@@ -1611,7 +1613,7 @@ def check_respawn_guard(
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth pattern; the breaker still trips eventually), then for the
+    (quota/auth stamp, unless the latest run crashed or ended cleanly), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
@@ -1650,24 +1652,21 @@ def check_respawn_guard(
                 return "infrastructure_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
         if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, skipping blocker_auth so
-            # the stamped rate-limit text doesn't re-trap the task.
-            return None
+            return None  # cooldown disabled: respawn now; the stamp must not re-trap it
         ended_at = _kb._to_epoch(latest_run["ended_at"])
         if ended_at is not None and (now - ended_at) < rl_cooldown:
             return "rate_limit_cooldown"
-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        # Cooldown elapsed — return early so blocker_auth doesn't catch the stamped text; this
+        # retries forever (spaced by the cooldown) until quota returns or a real run supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.  A plain
-    # crash is different: its persisted error includes the worker's last
-    # captured output, which is context rather than a diagnosis and may contain
-    # benign commands such as ``claude auth status`` (#117097).
+    # 2. Quota / auth blocker: retrying immediately will not help. Exempt (_BLOCKER_EXEMPT_OUTCOMES):
+    #    a crash, whose error is captured output such as ``claude auth status`` (#117097), and a
+    #    clean worker end after the stamp: the provider worked, and since only complete/unblock
+    #    clear the stamp, a dependency park + promote would otherwise hold the card forever.
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if err and latest_outcome not in _BLOCKER_EXEMPT_OUTCOMES and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
