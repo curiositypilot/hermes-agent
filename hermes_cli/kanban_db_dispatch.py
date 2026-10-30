@@ -176,12 +176,16 @@ class DispatchResult:
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
+    ``active_pr (1), recent_success (2), rate_limited (1), skipped_locked (1),
+    memory_pressure (critical)`` — the respawn-guard reasons counted per task
     plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
     CLI daemon and the embedded gateway dispatcher, which otherwise report a
     bare zero-spawn count while ``hermes kanban tail`` is the only place the
     guard reason is written (#111910).
+
+    No ``reason=value`` shape: the log redactor reads ``<word>_auth=<value>``
+    as an env secret, so ``blocker_auth=1,`` reached the log as
+    ``blocker_auth=***``.
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
@@ -196,9 +200,9 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
-    parts = [f"{k}={v}" for k, v in sorted(counts.items())]
+    parts = [f"{k} ({v})" for k, v in sorted(counts.items())]
     if pressure:
-        parts.append(f"memory_pressure={pressure}")
+        parts.append(f"memory_pressure ({pressure})")
     return ", ".join(parts)
 
 
