@@ -343,6 +343,16 @@ def _restart_wait_socket_ticket(runner, scope) -> bool:
         runner, scope.get('method'), scope.get('path'), scope.get('query_string', b'').decode('latin-1'))
 
 
+def bootstrap_auth_identity(grant: dict) -> dict:
+    """The WS identity a redeemed local ticket confers. ``worker_binding`` (a sandboxed managed
+    worker's host ``(pid, birth)``, None for every other grant) rides to ``AuthorityConnection``,
+    where ``session_worker._claim`` confines the connection to that one process."""
+    return {'user_id': grant['subject'], 'provider': 'local', 'profile_id': grant['profile_id'],
+            'instance_id': grant['instance_id'], 'capabilities': grant['capabilities'],
+            'native_bootstrap': True, 'profile_scope': grant.get('scope', 'profile'),
+            'worker_binding': grant.get('worker_binding')}
+
+
 class GatewayRuntimeAPI:
     """Redeem private local tickets at the existing WS subprotocol boundary.
 
@@ -480,9 +490,5 @@ class GatewayRuntimeAPI:
         from tui_gateway.ws import handle_ws
         from gateway.session_authorities import owner_scope
         with owner_scope(authority), attached_client(self.runner):
-            await handle_ws(ws, auth_identity={'user_id': grant['subject'], 'provider': 'local',
-                                              'profile_id': grant['profile_id'],
-                                              'instance_id': grant['instance_id'],
-                                              'capabilities': grant['capabilities'], 'native_bootstrap': True,
-                                              'profile_scope': grant.get('scope', 'profile')},
+            await handle_ws(ws, auth_identity=bootstrap_auth_identity(grant),
                             subprotocol=CANONICAL_GATEWAY_PROTOCOL, operator=operator)

@@ -28,6 +28,11 @@ def _claim(connection, ref, params):
     if (type(pid) is not int or pid <= 0 or pid == os.getpid()
             or type(birth) not in (int, float) or not isinstance(secret, str) or not 16 <= len(secret) <= 256):
         raise RuntimeStoreError('invalid_params')
+    # A sandboxed worker's connection claims only its own process. `_verify` already binds the
+    # secret, but this holds even if another worker's adoption secret leaked, before any DB read.
+    binding = getattr(connection, 'worker_binding', None)
+    if binding is not None and (pid, birth) != tuple(binding):
+        raise RuntimeStoreError('permission_denied')
     try:
         process = psutil.Process(pid)
         from hermes_cli.process_identity import worker_birth
@@ -65,6 +70,10 @@ def _verify(connection, ref, params, claim):
 async def worker_request(connection, ref, params, *, operation):
     from gateway.session_authorities import require_serving
     require_serving(connection.authority)  # adopt/persist would write with the released epoch
+    if operation == 'register' and getattr(connection, 'worker_binding', None) is not None:
+        # A managed worker only adopts its owner's reservation; registering would park it in
+        # another idle session (agent/managed_worker.py never registers).
+        raise RuntimeStoreError('permission_denied')
     if operation == "persist" and isinstance(params.get("operation"), str) and params["operation"].startswith("delegation."):
         from gateway.session_worker_delegation import worker_delegation_request
         return await worker_delegation_request(connection, ref, params)
