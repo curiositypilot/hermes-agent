@@ -222,6 +222,16 @@ class MCPServerRunMixin:
                     "self-probe until it is re-enabled", self.name)
                 paused = True
                 continue
+            # Parked on an OAuth failure and nothing re-authorized since: a probe would only replay
+            # the grant the authorization server already rejected (every interval, for the life of
+            # the process — a rate-limit/ban risk). `hermes mcp login` rewrites the token/client
+            # files (new stamp) and an explicit reconnect still revives at once.
+            if outcome == "self-probe" and self._auth_park_unchanged():
+                (logger.debug if paused else logger.info)(
+                    "MCP server '%s': parked on an OAuth failure; pausing the self-probe until "
+                    "`hermes mcp login %s` rewrites its credentials", self.name, self.name)
+                paused = True
+                continue
             # Nobody asked for this revival: a self-probe must never open a browser OAuth flow. The
             # OAuth provider runs inside THIS task (the SDK's auth flow sits in the transport), so a
             # task-local ContextVar reaches it; it stays set for the task's life — every later
@@ -238,6 +248,12 @@ class MCPServerRunMixin:
                 outcome,
             )
             return False
+
+    def _auth_park_unchanged(self) -> bool:
+        """True while an OAuth auth-failure park (``_arm_auth_park``) still sees the credentials it
+        failed with; False when not auth-parked or once the token/client files changed."""
+        auth_park = self._auth_park
+        return auth_park is not None and auth_park[0].credential_stamp() == auth_park[1]
 
     def _still_configured_enabled(self) -> bool:
         """Whether ``mcp_servers`` on disk still wants this server connected: entry present
