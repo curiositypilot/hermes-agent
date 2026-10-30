@@ -30,7 +30,7 @@ def _target(scope: Optional[str], *, create: bool) -> dict[str, DashboardAuthPro
 
 
 def _log_registered(kind: str, provider: DashboardAuthProvider) -> None:
-    _log.info("dashboard-auth: registered %s%r (%s)", kind, provider.name, provider.display_name)
+    _log.debug("dashboard-auth: registered %s%r (%s)", kind, provider.name, provider.display_name)
 
 
 def register_provider(provider: DashboardAuthProvider, *, scope: Optional[str] = None) -> None:
