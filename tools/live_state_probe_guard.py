@@ -54,6 +54,7 @@ _ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=")
 _HEREDOC_OPEN_RE = re.compile(r"(?<!<)<<(-?)\s*(['\"]?)([A-Za-z_][\w.-]*)\2")
 _SEPARATOR_CHARS = frozenset(";&|()\n")
 _REDIRECT_CHARS = frozenset("<>&")
+_WORD_BREAK_CHARS = frozenset(" \t\r\n;&|()<>")
 _MAX_SCRIPT_BYTES = 1 << 20
 _MAX_SHELL_DEPTH = 3
 
@@ -136,18 +137,50 @@ def _split_heredocs(command: str) -> tuple[str, list[str]]:
     return "\n".join(out), bodies
 
 
+def _unfold(text: str) -> str:
+    """*text* without unquoted ``#`` comments and backslash-newline continuations, so a
+    comment cannot swallow the newline that ends it and a continued line stays one command."""
+    out: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(text):
+        ch, nxt = text[i], text[i + 1:i + 2]
+        if ch == "\\" and nxt == "\n" and quote != "'":
+            i += 2
+            continue
+        if ch == "\\" and quote != "'":
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if quote:
+            quote = "" if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (not out or out[-1] in _WORD_BREAK_CHARS):  # `\;#` is mid-word
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _segments(command: str) -> Iterator[tuple[list[str], list[str], list[str], str]]:
     """Simple commands of *command*: (argv words, stdin texts, stdin file paths, the
     separator token that ends the segment, "" at the end)."""
     text, bodies = _split_heredocs(command)
-    lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+    # An unquoted newline is an operator token like ';' (a quoted one stays in its word).
+    lex = shlex.shlex(_unfold(text), posix=True, punctuation_chars=";&|()<>\n")
     lex.whitespace_split = True
-    lex.whitespace = " \t\r"  # newline separates commands, like ';'
+    lex.whitespace = " \t\r"
+    lex.commenters = ""
     words: list[str] = []
     stdin_texts: list[str] = []
     stdin_files: list[str] = []
     tokens = iter(lex)
     for tok in tokens:
+        if tok and set(tok) == {"\n"} and not (words or stdin_texts or stdin_files):
+            continue  # blank line, or a newline after an operator (`a |\n b`)
         if tok and set(tok) <= _SEPARATOR_CHARS:
             yield words, stdin_texts, stdin_files, tok
             words, stdin_texts, stdin_files = [], [], []
@@ -226,10 +259,18 @@ def _interpreter_inputs(args: list[str]) -> tuple[list[str], Optional[str], bool
     return [], None, True
 
 
+def _expand(path: str) -> Path:
+    """``~`` expanded; an unknown ``~user`` (pathlib raises RuntimeError) stays literal."""
+    try:
+        return Path(path).expanduser()
+    except RuntimeError:
+        return Path(path)
+
+
 def _read_local_script(path: str, cwd: str) -> Optional[str]:
     """Bounded host read (local backend only); None for missing, oversized or binary files."""
     try:
-        p = Path(path).expanduser()
+        p = _expand(path)
         if not p.is_absolute():
             p = Path(cwd) / p
         if not p.is_file() or p.stat().st_size > _MAX_SCRIPT_BYTES:
@@ -309,7 +350,7 @@ def detect_in_command(command: str, cwd: str, _depth: int = 0) -> Optional[str]:
         if argv:
             prog = os.path.basename(argv[0])
             if prog == "cd" and len(argv) > 1:
-                cwd = str(Path(cwd) / Path(argv[1]).expanduser())
+                cwd = str(Path(cwd) / _expand(argv[1]))
             else:
                 hit = _segment_hit(prog, argv, stdin_texts, stdin_files, piped, cwd, _depth)
                 if hit:

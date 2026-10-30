@@ -483,7 +483,12 @@ def live_state_probe_block(
     from tools.terminal_tool import _resolve_command_cwd
 
     guard_cwd = _resolve_command_cwd(workdir=workdir, default_cwd=cwd, session_key=session_key)
-    module = detect_in_command(command, guard_cwd)
+    try:
+        module = detect_in_command(command, guard_cwd)
+    except Exception:  # accident guard: a parser bug must not kill the tool call
+        logger.warning("live-state probe guard failed; command allowed (command: %s)",
+                       _safe_command_preview(command), exc_info=True)
+        return None
     if not module:
         return None
     logger.warning("Blocked live cron-writer probe (%s; command: %s)", module, _safe_command_preview(command))

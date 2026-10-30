@@ -129,6 +129,80 @@ def test_must_pass(command, worker, tmp_path):
     assert _refusal(command, tmp_path) is None
 
 
+# Multi-line commands (t_2c27aaa7): an unquoted newline separates commands like ';'.
+# Incident t_afd71ddc run 7288 (state.db message 511204): `cd ~\ntest ...` lexed `~\ntest`
+# as one word, expanded it as `~user` and the guard crashed the tool call.
+INCIDENT_MULTILINE = (
+    "chmod 755 ~/.hermes/bin/ruff; cd ~\ntest \"$(command -v ruff)\" = \"$HOME/.hermes/bin/ruff\";"
+    " echo c1=$?\nruff --version | grep -qx 'ruff 0.15.22' && ~/.hermes/scripts/hermes-python -m ruff"
+    " --version | grep -qx 'ruff 0.15.22'; echo c2=$?\n~/.hermes/scripts/hermes-python -m pytest"
+    " --version; echo c3=$?\ngit -C ~/.hermes check-ignore -q bin/uv && ! git -C ~/.hermes"
+    " check-ignore -q bin/ruff && git -C ~/.hermes check-ignore -q lsp/bin/; echo c5=$?"
+)
+CRON_IMPORT = "from cron.jobs import create_job"
+
+MULTILINE_NO_CRASH = [
+    INCIDENT_MULTILINE,
+    "cd ~\npython3 -c 1",
+    "cd ~nosuchuser && python3 -c 1",
+    "python3 ~nosuchuser/x.py",
+]
+
+
+@pytest.mark.parametrize("command", MULTILINE_NO_CRASH)
+def test_multiline_and_unknown_user_do_not_crash(command, worker, tmp_path):
+    from tools.live_state_probe_guard import detect_in_command
+
+    assert detect_in_command(command, str(tmp_path)) is None
+    assert _refusal(command, tmp_path) is None
+
+
+MULTILINE_MUST_BLOCK = [
+    f"echo hi\npython3 -c '{CRON_IMPORT}'",
+    f"cd /tmp\npython3 -c '{CRON_IMPORT}'",
+    f"echo x # note\npython3 -c '{CRON_IMPORT}'",
+    f"python3 \\\n  -c '{CRON_IMPORT}'",
+    f"printf '{CRON_IMPORT}' |\n python3 -",
+]
+
+
+@pytest.mark.parametrize("command", MULTILINE_MUST_BLOCK)
+def test_multiline_must_block(command, worker, tmp_path):
+    assert _refusal(command, tmp_path) is not None
+
+
+MULTILINE_MUST_PASS = [
+    f"python3 -c 'print(1)'\necho '{CRON_IMPORT}'",
+    f"# python3 -c \"{CRON_IMPORT}\"\necho ok",
+    "python3 -c '#x\nprint(1)'",
+]
+
+
+@pytest.mark.parametrize("command", MULTILINE_MUST_PASS)
+def test_multiline_must_pass(command, worker, tmp_path):
+    assert _refusal(command, tmp_path) is None
+
+
+def test_cd_is_tracked_across_a_newline(worker, tmp_path):
+    (tmp_path / "probe.py").write_text(f"{CRON_IMPORT}\n")
+    assert _refusal(f"cd {tmp_path}\npython3 probe.py", tmp_path.parent) is not None
+
+
+def test_guard_failure_allows_the_command_and_logs(worker, monkeypatch, tmp_path, caplog):
+    import tools.live_state_probe_guard as guard
+    from tools.terminal_tool_guards import live_state_probe_block
+
+    def boom(command, cwd, _depth=0):
+        raise RuntimeError("parser bug")
+
+    monkeypatch.setattr(guard, "detect_in_command", boom)
+    with caplog.at_level("WARNING"):
+        result = live_state_probe_block(command="python3 -c 1", cwd=str(tmp_path), workdir=None,
+                                        session_key="")
+    assert result is None
+    assert any("probe guard failed" in r.getMessage() and r.exc_info for r in caplog.records)
+
+
 def test_execute_code_refuses_a_cron_writer_import_without_spawning(worker, monkeypatch):
     from tools import code_kernel
 
