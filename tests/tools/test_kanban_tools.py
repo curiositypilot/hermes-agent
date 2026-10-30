@@ -509,6 +509,46 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
         )
 
 
+def test_schedule_until_then_start_wakes_card_ready(worker_env):
+    """A worker can self-schedule a dated ``start`` wake (t_9c46378f): before,
+    the tool took only ``reason`` and a dated park always woke as ``ask``."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_schedule as kbs
+    from tools.registry import registry
+
+    handler = registry.get_entry("kanban_schedule").handler
+    out = json.loads(handler({"reason": "wait for release", "until": "2099-01-01T09:30", "then": "start"}))
+
+    assert (out["ok"], out["status"], out["until"], out["then"]) == (
+        True, "scheduled", "2099-01-01 09:30", "start")
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert (task.status, task.scheduled_then) == ("scheduled", "start")
+        assert task.scheduled_until == kbs.parse_until("2099-01-01T09:30")
+        assert kbs.wake_due_scheduled(conn, now=task.scheduled_until - 60) == []
+        assert kbs.wake_due_scheduled(conn, now=task.scheduled_until) == [(worker_env, "ready")]
+        assert kb.get_task(conn, worker_env).status == "ready"
+
+
+@pytest.mark.parametrize("args, error", [
+    ({"then": "start"}, "then=start needs a date"),
+    ({"until": "next tuesday"}, "until must be YYYY-MM-DD"),
+    ({"until": "2099-01-01", "then": "later"}, "then must be one of"),
+    ({"until": 4102444800}, "until must be a string"),
+])
+def test_schedule_rejects_bad_until_then_without_parking(worker_env, args, error):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+
+    out = json.loads(registry.get_entry("kanban_schedule").handler(args))
+
+    assert error in out["error"]
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
 def test_schedule_rejects_invalid_reason_and_unowned_contexts(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
