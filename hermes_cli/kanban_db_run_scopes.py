@@ -34,8 +34,11 @@ def configured_worker_memory_max_bytes() -> Optional[int]:
 
     try:
         raw = ((load_config_readonly() or {}).get("kanban") or {}).get("worker_memory_max_mb")
-    # ConfigBackendUnavailable is a SystemExit: in the gateway it would escape the spawn thread.
-    except (Exception, ConfigBackendUnavailable):  # health: allow BLE001 -- a config read must never block a spawn; logged with traceback
+    except ConfigBackendUnavailable as exc:
+        # A SystemExit, so the clause below misses it: in the gateway it would escape the spawn thread.
+        logger.warning("kanban.worker_memory_max_mb unreadable (%s); using the default", exc)
+        return None
+    except Exception:  # health: allow BLE001 -- a config read must never block a spawn; logged with traceback
         logger.warning("could not read kanban.worker_memory_max_mb; using the default", exc_info=True)
         return None
     if raw is None:
