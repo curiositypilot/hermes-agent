@@ -393,19 +393,48 @@ def _protected_checkouts() -> list:
     return protected_checkout_roots(configured, get_hermes_home())
 
 
+# One ``export -p`` line of the session snapshot. bash quotes the value in double quotes and
+# backslash-escapes ``"``, ``\``, ``$`` and backticks inside it (shlex would keep ``\$``).
+_SNAPSHOT_EXPORT_RE = re.compile(
+    r'(?:declare -[A-Za-z-]*x[A-Za-z-]*|export) ([A-Za-z_][A-Za-z0-9_]*)="((?:[^"\\]|\\.)*)"')
+_SNAPSHOT_MAX_BYTES = 1 << 20
+
+
+def _snapshot_exports(env: Any) -> Optional[dict[str, str]]:
+    """Variables the session shell exported in earlier calls, read from its ``export -p`` snapshot
+    (``env._snapshot_path``, rewritten after every command). None when there is no ready snapshot
+    or it cannot be read; lines that do not parse (multi-line values) are skipped. No subprocess."""
+    path = getattr(env, "_snapshot_path", None)
+    if getattr(env, "_snapshot_ready", False) is not True or not isinstance(path, str):
+        return None
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(_SNAPSHOT_MAX_BYTES)
+    except OSError as exc:
+        logger.debug("shared-checkout guard: session snapshot unreadable (%s)", type(exc).__name__)
+        return None
+    exports: dict[str, str] = {}
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        if match := _SNAPSHOT_EXPORT_RE.fullmatch(line):
+            exports[match.group(1)] = re.sub(r"\\(.)", r"\1", match.group(2), flags=re.DOTALL)
+    return exports
+
+
 def shared_checkout_block(
     *,
     command: str,
     cwd: str,
     workdir: Optional[str],
     session_key: str,
+    env: Any = None,
 ) -> Optional[str]:
     """Refuse git commands that overwrite or discard uncommitted work in a shared checkout.
 
     Every OS, local backend only. Runs before the approval chain, so
     ``approvals.mode: off`` and yolo do not bypass it: the tree holds other
-    agents' uncommitted edits, which no approval can bring back. Returns the
-    JSON error string when blocked, else None.
+    agents' uncommitted edits, which no approval can bring back. ``env`` (the
+    session's terminal environment) supplies variables exported in earlier
+    calls. Returns the JSON error string when blocked, else None.
     """
     from tools.self_repo_guard import detect_shared_checkout_git_mutation
     from tools.terminal_tool import _resolve_command_cwd
@@ -414,7 +443,8 @@ def shared_checkout_block(
     if not roots:
         return None
     guard_cwd = _resolve_command_cwd(workdir=workdir, default_cwd=cwd, session_key=session_key)
-    hit, msg = detect_shared_checkout_git_mutation(command, guard_cwd, roots)
+    hit, msg = detect_shared_checkout_git_mutation(
+        command, guard_cwd, roots, base_vars=_snapshot_exports(env))
     if not hit:
         return None
     logger.warning("Blocked shared-checkout git mutation (command: %s)", _safe_command_preview(command))
