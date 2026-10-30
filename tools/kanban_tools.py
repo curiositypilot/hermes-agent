@@ -897,10 +897,13 @@ def _handle_block(args: dict, **kw) -> str:
 
 @_kanban_handler("kanban_schedule")
 def _handle_schedule(args: dict, **kw) -> str:
-    """Park the current task until an orchestrator re-gates it."""
+    """Park the current task; with ``until`` the dispatcher wakes it on that date
+    (``then=start`` -> ready, ``ask`` -> blocked for a human)."""
     tid = _worker_guard("kanban_schedule", args)
     raw_reason = args.get("reason")
     _check(raw_reason is None or isinstance(raw_reason, str), "reason must be a string")
+    for key in ("until", "then"):
+        _check(args.get(key) is None or isinstance(args[key], str), f"{key} must be a string")
     reason = _redact(raw_reason.strip()) if raw_reason and raw_reason.strip() else None
     metadata = _stamp_worker_session_metadata(tid, None)
     with _board(args.get("board")) as (kb, conn):
@@ -911,9 +914,16 @@ def _handle_schedule(args: dict, **kw) -> str:
                "goal_mode tasks cannot be scheduled: use kanban_block with kind "
                f"in {sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} for a genuine external "
                "blocker, or kanban_complete so the completion judge can evaluate it.")
+        # A malformed until/then raises ValueError before any write.
         ok = kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), metadata=metadata)
+            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), metadata=metadata,
+            until=args.get("until"), then=args.get("then"))
         _check(ok, f"could not schedule {tid} (unknown id or not in todo/ready/running/blocked)")
+        landed = kb.get_task(conn, tid)
+        if landed and landed.scheduled_until:
+            from hermes_cli.kanban_db_schedule import format_until
+            return _ok_landed(kb, conn, tid, "scheduled", reason=reason,
+                              until=format_until(landed.scheduled_until), then=landed.scheduled_then)
         return _ok_landed(kb, conn, tid, "scheduled", reason=reason)
 
 
