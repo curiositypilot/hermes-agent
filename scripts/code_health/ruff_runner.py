@@ -24,7 +24,8 @@ _CHUNK = 400
 @dataclass
 class RuffFile:
     cc_by_line: dict[int, int] = field(default_factory=dict)
-    hits: list[tuple[str, int]] = field(default_factory=list)
+    # (code, row, ruff's message): the message names the offending symbol, the rule title does not.
+    hits: list[tuple[str, int, str]] = field(default_factory=list)
     # Ruff could not parse the file (code-less diagnostics): its CC and hits are missing.
     errors: list[str] = field(default_factory=list)
 
@@ -100,6 +101,6 @@ def _record(results: dict[str, RuffFile], root: Path, diag: dict) -> None:
         if match:
             entry.cc_by_line[row] = int(match.group(1))
     elif code:
-        entry.hits.append((code, row))
+        entry.hits.append((code, row, diag.get("message", "")))
     else:
         entry.errors.append(f"line {row}: {diag.get('message', 'syntax error')}")

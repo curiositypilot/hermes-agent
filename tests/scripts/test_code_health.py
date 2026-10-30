@@ -100,6 +100,24 @@ def test_moved_code_keeps_its_cap(tmp_path, capsys):
     assert code == 0, out
 
 
+def test_finding_names_the_offending_symbol_and_labels_the_scope(tmp_path, capsys):
+    """An F811 inside a test read as "test defined twice": the report showed only the enclosing
+    function. Ruff's message names the symbol; the scope is labelled as the place, not the culprit."""
+    repo, base = _repo(tmp_path)
+    files: dict[str, str | None] = {
+        "pkg/r.py": "from os import path\n\n\ndef f():\n    from os import path\n    return path\n",
+        "pkg/g.py": "def g():\n    unused = 1\n",
+        "pkg/h.py": "import asyncio\n\n\ndef h():\n    return asyncio.get_event_loop()\n",
+    }
+    code, out = _verdict(repo, base, files, capsys)
+    assert code == 1, out
+    assert "pkg/r.py:5  F811  in f\n" in out and "Redefinition of unused `path` from line 1" in out
+    assert "  F811  f\n" not in out
+    assert "Local variable `unused` is assigned to but never used" in out
+    # a rule with no measurer message keeps the bare title, no dangling ": "
+    assert "pkg/h.py:5  HX008  in h\n    asyncio.get_event_loop()\n    fix:" in out
+
+
 _RUN = "import subprocess\n\n\ndef f(cmd):\n    return subprocess.run(cmd{})\n"
 _PROC = "import asyncio\n\n\nasync def f(cmd):\n    proc = await asyncio.create_subprocess_exec(*cmd)\n{}\n"
 _TWO_RUNS = "import subprocess\n\n\ndef f(a, b):\n    subprocess.run(a){}\n    subprocess.run(b){}\n"

@@ -39,6 +39,9 @@ class FileMeasure:
     hits: Counter[Hit] = field(default_factory=Counter)
     # Line numbers of each hit occurrence, for reporting only.
     hit_lines: dict[Hit, list[int]] = field(default_factory=dict)
+    # (rule, line) -> the measurer's message (ruff names the offending symbol), for reporting
+    # only: it stays out of Hit so renaming a variable never makes old debt look new.
+    hit_notes: dict[tuple[str, int], str] = field(default_factory=dict)
     # 1-based line -> source text, for messages.
     lines: list[str] = field(default_factory=list)
     # 1-based line -> text of the real comment tokens on it (allow directives live only here,
@@ -58,10 +61,13 @@ class FileMeasure:
             line = line[: line.rindex(comment)]
         return " ".join(line.split())
 
-    def add_hit(self, rule: str, scope: str, line_no: int) -> None:
+    def add_hit(self, rule: str, scope: str, line_no: int, note: str = "") -> None:
         hit = Hit(rule, scope, self.code_line(line_no))
         self.hits[hit] += 1
         self.hit_lines.setdefault(hit, []).append(line_no)
+        if note:  # one line can carry several (`from x import a, b`, both redefined)
+            old = self.hit_notes.get((rule, line_no))
+            self.hit_notes[(rule, line_no)] = note if old in (None, note) else f"{old}; {note}"
 
     def source_line(self, line_no: int) -> str:
         if 1 <= line_no <= len(self.lines):
