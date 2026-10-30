@@ -94,6 +94,48 @@ def test_owned_lagging_store_is_not_written_and_names_the_remedy(tmp_path):
     assert not set(_ADDED_TABLES) & _tables(path)
 
 
+def test_owned_lagging_store_lists_compact_rows_read_only(tmp_path):
+    """The session-sort-daily crash (2026-10-30): the checkout moved to code declaring
+    sessions.runtime_revision while an older gateway still owned the store, so the cron's read-only
+    ``list_sessions_rich(compact_rows=True)`` died on ``no such column: s.runtime_revision``. A
+    read-only listing must project what the store lacks instead, and write nothing."""
+    from gateway.runtime_ownership import ProfileOwnership
+
+    home = _profile_home(tmp_path)
+    path = _pre_merge_store(home / "state.db")
+    before = path.read_bytes()
+    owner = ProfileOwnership()  # the older gateway that keeps the store
+    owner.reserve([home])
+    try:
+        db = SessionDB(db_path=path, read_only=True)
+        try:
+            rows = db.list_sessions_rich(limit=10, compact_rows=True)
+            assert [row["id"] for row in rows] == ["kept"]
+            assert rows[0]["runtime_revision"] == 0
+            assert rows[0]["runtime_generation"] == 0
+            assert list(db._get_session_rich_rows_batch(["kept"], compact_rows=True)) == ["kept"]
+        finally:
+            db.close()
+    finally:
+        owner.close()
+    assert path.read_bytes() == before
+    assert "runtime_revision" not in _session_columns(path)
+
+
+def test_current_store_read_only_compact_projection_matches_writable(tmp_path):
+    path = tmp_path / "state.db"
+    with SessionDB(db_path=path) as db:
+        db.create_session("kept", source="cli")
+        writable = db._compact_session_cols()
+    db = SessionDB(db_path=path, read_only=True)
+    try:
+        read_only = db._compact_session_cols()
+    finally:
+        db.close()
+    assert read_only == writable
+    assert " AS " not in read_only
+
+
 def test_corrupt_store_still_returns_503(tmp_path):
     """Corruption is not drift: the open fails with the corrupt-store 503 and nothing is written."""
     path = tmp_path / "state.db"

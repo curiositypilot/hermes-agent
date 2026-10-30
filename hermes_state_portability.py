@@ -208,16 +208,32 @@ class SessionPortabilityMixin:
 
         return self._execute_write(_do)
 
-    @classmethod
-    def _compact_session_cols(cls) -> str:
+    def _compact_session_cols(self) -> str:
         """``s.``-prefixed SELECT list of every SCHEMA_SQL ``sessions`` column except
-        prompt storage internals (the compact_rows projection)."""
+        prompt storage internals (the compact_rows projection).
+
+        A writable open reconciled the schema, so the declared list is the live one (class-cached).
+        A read-only open reconciles nothing, and its store can lag SCHEMA_SQL: code updated before
+        the owner's next writable open, or another profile kept by an older gateway. There each
+        declared column the live table lacks is projected as its declared DEFAULT (else NULL), the
+        value the later ALTER ADD COLUMN gives it, so rows keep their shape (read once per instance)."""
+        cls = type(self)
         if cls._session_compact_cols_sql is None:
             declared = cls._parse_schema_columns(SCHEMA_SQL)["sessions"]
             cls._session_compact_cols_sql = ", ".join(
                 f"s.{name}" for name in declared if name not in cls._SESSION_COMPACT_EXCLUDED
             )
-        return cls._session_compact_cols_sql
+        if not self.read_only:
+            return cls._session_compact_cols_sql
+        live_sql = getattr(self, "_session_compact_cols_live", None)
+        if live_sql is None:
+            live = {row[1] for row in self._read_rows('PRAGMA table_info("sessions")')}
+            declared = cls._parse_schema_columns(SCHEMA_SQL)["sessions"]
+            live_sql = self._session_compact_cols_live = ", ".join(
+                f"s.{name}" if name in live else f"{spec.partition('DEFAULT ')[2] or 'NULL'} AS {name}"
+                for name, spec in declared.items() if name not in cls._SESSION_COMPACT_EXCLUDED
+            )
+        return live_sql
 
     @classmethod
     def _rich_row(cls, row) -> dict[str, Any]:
