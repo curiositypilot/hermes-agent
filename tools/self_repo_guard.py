@@ -179,9 +179,9 @@ def _target(
     text, resolved = _expand_word(word, _lookup_in(shell_vars, scope.base_vars))
     if scope.fail_closed and not resolved:
         return _Unresolved(word)
-    if isinstance(base, _Unresolved) and not os.path.isabs(text):
-        return base
-    return _absolute(text, base)  # type: ignore[arg-type]  # base is a Path here
+    if isinstance(base, _Unresolved):  # only an absolute word escapes an unresolved cwd
+        return _absolute(text, Path("/")) if os.path.isabs(text) else base
+    return _absolute(text, base)
 
 
 def _unresolved_operation(name: str, target: _Unresolved) -> _Operation:
