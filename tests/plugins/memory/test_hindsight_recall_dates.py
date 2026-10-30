@@ -27,12 +27,14 @@ class TestFormatter:
         # mentioned_at = when the fact was recorded; occurred_start = when the event happened.
         assert _recall_date(_r("x", "2026-10-05T09:00:00Z", "2025-01-01T00:00:00Z")) == "2026-10-05"
 
-    def test_falls_back_to_occurred_start(self):
-        assert _recall_date(_r("x", None, "2026-09-30T21:22:00+00:00")) == "2026-09-30"
+    def test_occurred_start_alone_is_undated(self):
+        # The event date is not the recorded date: a future event would outrank its cancellation.
+        assert _recall_date(_r("x", None, "2026-11-06T00:00:00+00:00")) == ""
+        assert _format_recall_lines([_r("event fact", None, "2026-11-06")], True) == ["- event fact"]
 
     def test_accepts_datetime_and_dict_shapes(self):
         assert _recall_date(_r("x", datetime(2026, 10, 4, 13, 1, tzinfo=timezone.utc))) == "2026-10-04"
-        assert _recall_date(_r("x", None, date(2026, 10, 2))) == "2026-10-02"
+        assert _recall_date(_r("x", date(2026, 10, 2))) == "2026-10-02"
         assert _recall_date({"text": "x", "mentioned_at": "2026-10-06T14:22:00Z"}) == "2026-10-06"
 
     @pytest.mark.parametrize("bad", [None, "", "yesterday", "10-04 13:01"])
@@ -97,10 +99,25 @@ class TestProviderWiring:
         assert "- [2026-10-03] Kanban gained native dated scheduling." in out
         assert "Undated fact." not in out  # cap applies to fact lines, not the header
 
-    def test_tool_recall_output_is_unchanged(self, make_provider):
+    def test_tool_recall_dated_when_flag_on(self, make_provider):
         p = make_provider(recall_show_dates=True)
-        out = p.handle_tool_call("hindsight_recall", {"query": "kanban"})
-        assert _DATED_RECALL_HEADER not in out
+        out = json.loads(p.handle_tool_call("hindsight_recall", {"query": "kanban"}))["result"]
+        assert out.splitlines() == [_DATED_RECALL_HEADER,
+                                    "1. [2026-10-01] Scheduled only parks a card.",
+                                    "2. [2026-10-03] Kanban gained native dated scheduling.",
+                                    "3. Undated fact."]
+
+    def test_tool_recall_plain_when_flag_off(self, make_provider):
+        out = json.loads(make_provider().handle_tool_call("hindsight_recall", {"query": "kanban"}))["result"]
+        assert out == ("1. Scheduled only parks a card.\n"
+                       "2. Kanban gained native dated scheduling.\n"
+                       "3. Undated fact.")
+
+    def test_tool_recall_empty_stays_the_fallback_line_with_dates_on(self, make_provider):
+        p = make_provider(recall_show_dates=True)
+        p._client.arecall = AsyncMock(return_value=SimpleNamespace(results=[]))
+        out = json.loads(p.handle_tool_call("hindsight_recall", {"query": "kanban"}))["result"]
+        assert out == "No relevant memories found."
 
     def test_declared_in_config_schema_default_off(self, make_provider):
         field = next(f for f in make_provider().get_config_schema() if f["key"] == "recall_show_dates")
