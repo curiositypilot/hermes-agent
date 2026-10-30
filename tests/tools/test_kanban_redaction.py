@@ -223,3 +223,9 @@ def test_kanban_request_review_metadata_env_assign(worker_env):
     finally:
         conn.close()
     assert stored["revert"] == "cp a back; or env HINDSIGHT_LOCAL_LLM_AUTH_SKIP=***"
+
+
+def test_redact_metadata_scalar_list_keeps_its_key_policy():
+    from tools import kanban_tools as kt
+    out = kt._redact_metadata({"password": ["hunter2xyz"], "GITHUB_TOKEN": "plainvalue123456", "n": [1, 2]})
+    assert out == {"password": ["***"], "GITHUB_TOKEN": "***", "n": [1, 2]}

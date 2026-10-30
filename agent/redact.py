@@ -438,7 +438,22 @@ def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> b
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
-_JSON_FIELD_RE = re.compile(rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"', re.IGNORECASE)
+_JSON_KEY_NAME_RE = re.compile(_JSON_KEY_NAMES, re.IGNORECASE)
+# Any identifier-shaped key holding a string or a flat list of scalars; the key policy
+# (_is_json_secret_key) runs in the callback, so prefixed keys (``GITHUB_TOKEN``,
+# ``db_password``, ``clientSecret``) count like the repr pass's. The lookahead only admits keys
+# containing a credential word: it keeps secret-free JSON off the callback, and a non-secret
+# pair (``"msg": "hello, "``) cannot consume the opening quote of a secret key after it.
+# Linear: the key/lookahead scan stops at the first non-identifier char after a quote, and
+# the list body is a separator-delimited run of atoms with possessive quantifiers.
+_JSON_SCALAR = r'(?:"(?:[^"\\]|\\.)*+"|-?[0-9][0-9.eE+\-]*+|true|false|null)'
+_JSON_FIELD_RE = re.compile(
+    r'(?P<key>"(?=[A-Za-z0-9_]*(?:key|token|secret|passw|credential|authorization|bearer))'
+    r'[A-Za-z_][A-Za-z0-9_]*")(?P<sep>\s*:\s*)'
+    rf'(?:"(?P<value>[^"]+)"|(?P<list>\[\s*(?:{_JSON_SCALAR}(?:\s*,\s*{_JSON_SCALAR})*+)?\s*\]))',
+    re.IGNORECASE,
+)
+_JSON_STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 # The same field inside a JSON-encoded string (``{"output": "{\\"api_key\\": \\"…\\"}"}``): every tool result
 # that wraps a config dump in JSON escapes the quotes, so the rule above never saw the value (#115104).
 # The backreference keeps the key's and value's escape depth equal.
@@ -493,13 +508,17 @@ _PYTHON_REPR_CREDENTIAL_SUFFIXES = (
     "credential",
     "credentials",
 )
+_PY_REPR_ATOM = r"""(?:[bB]?'(?:\\.|[^'\\])*+'|[bB]?"(?:\\.|[^"\\])*+"|-?[0-9][0-9.eE+\-]*+|None|True|False)"""
+# A flat list of atoms (``{'password': ['a', 'b']}``) is masked element-wise in the callback.
 _PYTHON_REPR_FIELD_RE = re.compile(
     r"'(?P<key>[A-Za-z_][A-Za-z0-9_]*)'(?P<sep>\s*:\s*)"
     r"(?:"
     r"(?P<single_prefix>[bB]?)'(?P<single_value>(?:\\.|[^'\\])+)'"
     r"|(?P<double_prefix>[bB]?)\"(?P<double_value>(?:\\.|[^\"\\])+)\""
+    r"|(?P<list_value>\[\s*(?:" + _PY_REPR_ATOM + r"(?:\s*,\s*" + _PY_REPR_ATOM + r")*+)?\s*\])"
     r")"
 )
+_PY_REPR_STRING_RE = re.compile(r"""(?P<prefix>[bB]?)(?P<quote>['"])(?P<value>(?:\\.|(?!(?P=quote))[^\\])*)(?P=quote)""")
 
 # Terminal/process output normally uses ``code_file=True`` to preserve source.
 # Add repr masking only to high-confidence diagnostic lines: pytest assertion
@@ -700,6 +719,26 @@ def is_secret_field_name(key: object) -> bool:
     return isinstance(key, str) and _is_python_repr_secret_key(key)
 
 
+def _keep_python_repr_value(value: str) -> bool:
+    """True when a repr value under a secret key must stay as is."""
+    # Mapping repr can contain code-shaped fixture values too. Preserve
+    # programmatic env lookups just like the ENV/JSON/YAML passes do.
+    # An upstream pass (MCP probe header scrub, _mask_token) already masked this
+    # value; re-masking would erase the scheme word it deliberately kept
+    # (``'Authorization': 'Digest ***'`` → ``'***'``).
+    return (not value or bool(_ENV_LOOKUP_VALUE_RE.match(value))
+            or "***" in value or value.startswith("«redacted:"))
+
+
+def _mask_python_repr_list(list_text: str) -> str:
+    """Fully mask every non-empty string atom of a flat repr list; other atoms stay."""
+    def _atom(m: re.Match) -> str:
+        if _keep_python_repr_value(m.group("value")):
+            return m.group(0)
+        return f"{m.group('prefix')}{m.group('quote')}***{m.group('quote')}"
+    return _PY_REPR_STRING_RE.sub(_atom, list_text)
+
+
 def _redact_python_repr_fields(text: str) -> str:
     """Fully mask credential fields in Python mapping ``repr`` output."""
     def _sub(match: re.Match) -> str:
@@ -707,6 +746,9 @@ def _redact_python_repr_fields(text: str) -> str:
         if not _is_python_repr_secret_key(key):
             return match.group(0)
 
+        list_value = match.group("list_value")
+        if list_value is not None:
+            return f"'{key}'{match.group('sep')}{_mask_python_repr_list(list_value)}"
         single_value = match.group("single_value")
         if single_value is not None:
             prefix = match.group("single_prefix") or ""
@@ -717,14 +759,7 @@ def _redact_python_repr_fields(text: str) -> str:
             quote = '"'
             value = match.group("double_value")
 
-        # Mapping repr can contain code-shaped fixture values too. Preserve
-        # programmatic env lookups just like the ENV/JSON/YAML passes do.
-        if _ENV_LOOKUP_VALUE_RE.match(value):
-            return match.group(0)
-        # An upstream pass (MCP probe header scrub, _mask_token) already masked this
-        # value; re-masking would erase the scheme word it deliberately kept
-        # (``'Authorization': 'Digest ***'`` → ``'***'``).
-        if "***" in value or value.startswith("«redacted:"):
+        if _keep_python_repr_value(value):
             return match.group(0)
         # Do not retain head/tail characters here: escaped repr atoms can cross
         # a slicing boundary and leave an unescaped quote behind. A full mask is
@@ -837,6 +872,46 @@ def _assignment_sub(render, *, check_keyword: bool):
     return _sub
 
 
+# Pagination/sync cursors (Google ``nextPageToken``/``nextSyncToken``, AWS ``NextToken``, Azure
+# ``continuationToken``) end in ``token`` but are not credentials; masking them breaks paging
+# through MCP results, since the agent must echo the cursor back verbatim.
+_JSON_CURSOR_KEY_RE = re.compile(r"(?:page|next|continuation|sync|resume|cursor)_?token\Z")
+
+
+def _is_json_secret_key(key: str) -> bool:
+    """JSON key policy: the legacy exact names or the repr-field policy (credential suffixes),
+    minus pagination cursors."""
+    if _JSON_CURSOR_KEY_RE.search(key.casefold()):
+        return False
+    return bool(_JSON_KEY_NAME_RE.fullmatch(key)) or _is_python_repr_secret_key(key)
+
+
+def _redact_json_fields(text: str, mask) -> str:
+    """Mask string values, and each string of a flat list value, under secret JSON keys. A list
+    element passes the same gate as a scalar of that key; numbers/bools/null stay."""
+    def _element(key: str):
+        def _sub(m: re.Match) -> str:
+            value = m.group(1)
+            if not value or not _should_redact_assignment(key, value, check_keyword=False):
+                return m.group(0)
+            masked = mask(value)
+            # A head/tail slice can end on a backslash and escape the closing quote.
+            return '"***"' if "\\" in masked else f'"{masked}"'
+        return _sub
+
+    def _sub(m: re.Match) -> str:
+        key = m.group("key")[1:-1]
+        if not _is_json_secret_key(key):
+            return m.group(0)
+        if m.group("list") is not None:
+            return f'{m.group("key")}{m.group("sep")}{_JSON_STRING_RE.sub(_element(key), m.group("list"))}'
+        if not _should_redact_assignment(key, m.group("value"), check_keyword=False):
+            return m.group(0)
+        return f'{m.group("key")}: "{mask(m.group("value"))}"'
+
+    return _JSON_FIELD_RE.sub(_sub, text)
+
+
 def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
     """ENV / config / JSON / YAML assignment passes (skipped for code files). Passes
     that would match ``token=``/``key=`` URL params skip ``://`` text (web-URL query
@@ -870,8 +945,7 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
             text = _CFG_ANCHORED_RE.sub(_redact_env, text)
 
     if ":" in text and '"' in text:
-        text = _JSON_FIELD_RE.sub(
-            _assignment_sub(lambda g: f'{g[0]}: "{mask(g[1])}"', check_keyword=False), text)
+        text = _redact_json_fields(text, mask)
         if '\\"' in text:
             text = _JSON_FIELD_ESCAPED_RE.sub(
                 _assignment_sub(lambda g: f'{g[0]}: {g[1]}"{mask(g[2])}{g[1]}"', check_keyword=False), text)
