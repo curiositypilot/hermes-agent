@@ -115,7 +115,7 @@ Verified against the merge result: 31 files carry both sides, 3 are the fork's v
 4. **Tests:** `scripts/run_tests.sh` re-execs into the PM test env unless `HERMES_PYTHON` points at an
    interpreter with pytest; `tests/_fixtures/` holds the env filter and platform gating; `platforms(...)`
    is the only OS marker. The home-IO guard whitelists the checkout but not other paths under
-   `~/.hermes`, so run suites from a clone outside `~/.hermes` (this card used `/tmp/hermes-t91`).
+   `~/.hermes`, so run suites from a clone outside `~/.hermes` (this card used `/tmp/hermes-t91`). <!-- no-tmp: ok — historical record of the clone path the t91 sync card used -->
 5. **Memory providers left core:** hindsight/honcho/supermemory/mem0/openviking are catalog plugins
    upstream (`hermes_cli/memory_provider_migration.py` auto-installs for configured homes). The fork
    keeps hindsight bundled; moving MB's controls into the catalog plugin repo would retire the largest
@@ -134,7 +134,7 @@ gate, declared-deps doctor check, account-usage percent semantics, cron `interpr
 
 ## 5. Test evidence
 
-Environment for every run: clone `/tmp/hermes-t91` at the branch head, interpreter
+Environment for every run: clone `/tmp/hermes-t91` at the branch head, interpreter <!-- no-tmp: ok — historical record of the clone path the t91 sync card used -->
 `~/.hermes/cache/scratch/sync-venv-t91/bin/python` (Python 3.14, upstream lock + pytest), `SSL_CERT_FILE`
 unset, box load average ~75 on 36 cores (other kanban workers). Raw logs: `~/.hermes/cache/scratch/t91_r*.txt`,
 `t91_forkgate_run.txt`, `t91_kanban_run.txt`.
@@ -164,7 +164,7 @@ for three independent reasons:
 2. The worktree's git dir is `~/.hermes/hermes-agent/.git/worktrees/t_91ce4a22`; the suite's
    `tests/home_io_guard.py` whitelists the checkout but not that path, so any test that probes the git dir
    (e.g. the `hermes-update-pull` marker) fails with "file I/O against the REAL hermes home". Verified:
-   `tests/cron/test_cron_pinned_job_fallback.py` is 19/19 green in `/tmp/hermes-t91` and 6/19 in the worktree.
+   `tests/cron/test_cron_pinned_job_fallback.py` is 19/19 green in `/tmp/hermes-t91` and 6/19 in the worktree. <!-- no-tmp: ok — historical record of the clone path the t91 sync card used -->
 3. The worktree has no test environment: upstream's lock is Python ≥ 3.14 only, the live venv is 3.11
    without pytest, so `run_tests.sh` would re-exec into `run-in-hermes-env` and try to build one.
 

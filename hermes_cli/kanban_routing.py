@@ -518,7 +518,7 @@ def read_headroom(gate: QuotaGateConfig, *, now: Optional[float] = None) -> Quot
     if not gate.enabled:
         return QuotaSnapshot(path, "disabled")
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except FileNotFoundError:
         return QuotaSnapshot(path, "missing")
@@ -607,7 +607,7 @@ def read_mode(gate: QuotaGateConfig, *, now: Optional[float] = None) -> QuotaMod
     now = time.time() if now is None else now
     path = os.path.expanduser(gate.mode_file) if gate.mode_file else default_mode_path()
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except FileNotFoundError:
         return QuotaMode(path, "missing")

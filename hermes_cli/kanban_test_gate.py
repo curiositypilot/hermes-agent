@@ -81,7 +81,7 @@ def default_contract(workspace_kind: Optional[str], workspace_path: Optional[str
 
 def _read(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        return path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return ""
 

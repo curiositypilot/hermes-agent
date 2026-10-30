@@ -595,7 +595,7 @@ class BaseEnvironment(ABC):
         try:
             from tools.spill_safety import write_text_exclusive
             spill = Path(path)
-            split = _split_cwd_marker(spill.read_text(encoding="utf-8", errors="replace"), self._cwd_marker)
+            split = _split_cwd_marker(spill.read_text(encoding="utf-8-sig", errors="replace"), self._cwd_marker)
             if split is not None:
                 write_text_exclusive(spill, split[1], private=True, overwrite=True, errors="replace")
         except OSError:
