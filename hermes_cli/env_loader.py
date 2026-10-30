@@ -73,6 +73,10 @@ _SECRET_SOURCE_CACHE_LOCK = threading.RLock()
 # One process-wide record (not per home/project scope): the environ is process-wide, so alternating
 # callers (gateway with a project .env, cron without; home A then B) must peel each other's output too.
 _DOTENV_PUBLISHED: dict[str, tuple[str | None, str, int]] = {}
+# Variable → resolved path of the dotenv file whose pass last published it. A reload republishes what a
+# file defines but used to leave a key the file stopped defining in ``os.environ`` until restart, so a
+# credential deleted from ``.env`` kept reaching every turn and spawned worker (t_8d6c7d5a).
+_DOTENV_PUBLISHED_FROM: dict[str, str] = {}
 _DOTENV_PASSES = itertools.count()
 _DOTENV_LOCK = threading.RLock()
 
@@ -321,16 +325,9 @@ def _sanitize_loaded_credentials() -> None:
         )
 
 
-def _load_dotenv_with_fallback(
-    path: Path, *, override: bool, load_pass: int | None = None, managed: bool = False,
-) -> None:
-    """Load one dotenv file into ``os.environ`` like ``dotenv.load_dotenv`` — same parser, same
-    ``${VAR}`` / ``${VAR:-default}`` / precedence rules — except that ``${VAR}`` resolves against the value
-    VAR had before this process's earlier passes published it (see ``_DOTENV_PUBLISHED``).
-
-    ``load_pass`` groups the layered files of one ``load_hermes_dotenv`` call: within a pass a later layer
-    (project, managed) still sees the earlier layer's output, as it always did; only OTHER passes' output
-    is peeled. A bare call (``hermes send``'s direct reload) is its own pass."""
+def _parse_dotenv_assignments(path: Path) -> list[tuple[str, str | None]]:
+    """``(name, raw value)`` pairs of one dotenv file, uninterpolated, via the parser the loader publishes
+    with — so the removed-key sweep and the publish pass agree on what the file defines."""
     raw = path.read_bytes()
     try:
         # utf-8-sig strips a leading BOM (PowerShell 5.1 / Notepad); plain utf-8 would keep U+FEFF on the
@@ -343,9 +340,59 @@ def _load_dotenv_with_fallback(
     # Imported here, not at module level: gateway tests stub ``sys.modules["dotenv"]`` with a bare module
     # exposing only ``load_dotenv``, and ``gateway.run`` imports this module at import time.
     from dotenv.main import DotEnv
-    from dotenv.variables import parse_variables
 
-    assignments = list(DotEnv(dotenv_path=None, stream=io.StringIO(text), interpolate=False).parse())
+    return list(DotEnv(dotenv_path=None, stream=io.StringIO(text), interpolate=False).parse())
+
+
+def _unpublish_keys_removed_from(path: Path) -> None:
+    """Take back what an earlier pass published from *path* once the file stops defining it.
+
+    Only a key whose last publisher was *path* and whose ``os.environ`` value is still exactly what we
+    published: a value the shell, an external secret source or the managed ``.env`` set since is theirs
+    and stays (the same guard as the PATH-growth fix). A revoked key gets back the value it held before
+    our first publish, or is removed when it had none. A missing file is skipped (bare-profile semantics,
+    as in ``_clear_known_keys_missing_from_dotenv``)."""
+    source = str(path.resolve())
+    with _DOTENV_LOCK:
+        mine = [name for name, src in _DOTENV_PUBLISHED_FROM.items() if src == source]
+        if not mine or not path.exists():
+            return
+        try:
+            defined = {name for name, value in _parse_dotenv_assignments(path) if value is not None}
+        except OSError:  # unreadable right now: revoke nothing rather than drop live credentials
+            return
+        for name in mine:
+            if name in defined:
+                continue
+            del _DOTENV_PUBLISHED_FROM[name]
+            baseline, published, _pass = _DOTENV_PUBLISHED.pop(name)
+            if os.environ.get(name) != published:
+                continue
+            if baseline is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = baseline
+
+
+def unpublish_removed_launch_dotenv_keys() -> None:
+    """Drop keys the launch ``.env`` no longer defines from ``os.environ`` without a full reload, for a
+    caller about to copy the environ into a child (the Kanban dispatcher) between turn/cron reloads."""
+    _unpublish_keys_removed_from(_process_hermes_home() / ".env")
+
+
+def _load_dotenv_with_fallback(
+    path: Path, *, override: bool, load_pass: int | None = None, managed: bool = False,
+) -> None:
+    """Load one dotenv file into ``os.environ`` like ``dotenv.load_dotenv`` — same parser, same
+    ``${VAR}`` / ``${VAR:-default}`` / precedence rules — except that ``${VAR}`` resolves against the value
+    VAR had before this process's earlier passes published it (see ``_DOTENV_PUBLISHED``).
+
+    ``load_pass`` groups the layered files of one ``load_hermes_dotenv`` call: within a pass a later layer
+    (project, managed) still sees the earlier layer's output, as it always did; only OTHER passes' output
+    is peeled. A bare call (``hermes send``'s direct reload) is its own pass."""
+    assignments = _parse_dotenv_assignments(path)
+    from dotenv.variables import parse_variables  # lazy: see _parse_dotenv_assignments
+    source = str(path.resolve())
 
     with _DOTENV_LOCK:
         if load_pass is None:
@@ -375,6 +422,7 @@ def _load_dotenv_with_fallback(
             baseline = record[0] if ours else current
             os.environ[name] = value
             _DOTENV_PUBLISHED[name] = (baseline, value, load_pass)
+            _DOTENV_PUBLISHED_FROM[name] = source
     # Every key this file defines, for the launch-residue strip: dotenv never unsets, so a key later
     # removed from the launch .env stays in os.environ and a re-parse of the file no longer names it.
     # Managed keys are recorded separately: they are administrator policy, not launch-profile residue.
@@ -505,6 +553,7 @@ def load_hermes_dotenv(
 
     if user_env.exists():
         _load_dotenv_with_fallback(user_env, override=True, load_pass=load_pass)
+        _unpublish_keys_removed_from(user_env)
         loaded.append(user_env)
         _clear_known_keys_missing_from_dotenv(user_env)  # mirrors reload_env(): inherited keys must not leak
 

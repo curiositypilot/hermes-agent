@@ -878,6 +878,30 @@ class ClientLifecycleMixin:
             logger.info("Copilot credentials re-exchanged after stale-credential 400 (source=%s)", token_source)
         return ok
 
+    def _bound_anthropic_pool_token(self) -> Optional[str]:
+        """Current token of the pool entry this session is bound to; ``None`` when none is bound.
+
+        A rotation (``_swap_credential``) binds the session to one entry. Re-resolving through
+        ``resolve_anthropic_token`` here put an env ``ANTHROPIC_API_KEY`` back over that entry before every
+        request, so a dead env key undid each rotation and the turn looped on 400s (t_8d6c7d5a). Refresh
+        only the bound entry: a fresh ``load_pool`` re-seeds singleton rows (a Claude Code / PKCE refresh by
+        another process lands there), else the bound pool's own copy. ``""`` = nothing to adopt. A store that
+        fails to load raises into the caller's existing refresh-failure path (keep the current key)."""
+        pool = getattr(self, "_credential_pool", None)
+        entry_id = getattr(self, "_credential_pool_entry_id", None)
+        if pool is None or not isinstance(entry_id, str) or not entry_id:
+            return None
+        from agent.credential_pool import credential_pool_entry_serves_endpoint, load_pool
+        base_url = getattr(self, "_anthropic_base_url", None)
+
+        def _entry_token(source) -> str:
+            entry = next((e for e in source.entries() if getattr(e, "id", None) == entry_id), None)
+            if entry is None or not credential_pool_entry_serves_endpoint(entry, base_url):
+                return ""
+            return str(getattr(entry, "runtime_api_key", "") or "").strip()
+
+        return _entry_token(load_pool(getattr(pool, "provider", None) or "anthropic")) or _entry_token(pool)
+
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         # Only native Anthropic rotates OAuth tokens; other anthropic_messages providers (MiniMax, Alibaba, ...)
         # and Azure use static keys — a refresh would pick up the ~/.claude OAuth token and break auth.
@@ -897,8 +921,10 @@ class ClientLifecycleMixin:
         if not official_host and not (current_key.startswith("sk-ant-") or getattr(self, "_is_anthropic_oauth", False)):
             return False
         try:
-            from agent.anthropic_credentials import resolve_anthropic_token
-            new_token = resolve_anthropic_token(model=self.model)
+            new_token = self._bound_anthropic_pool_token()
+            if new_token is None:  # no bound pool entry: the resolver's precedence (explicit env key first) holds
+                from agent.anthropic_credentials import resolve_anthropic_token
+                new_token = resolve_anthropic_token(model=self.model)
         except Exception as exc:
             logger.debug("Anthropic credential refresh failed: %s", exc)
             return False
