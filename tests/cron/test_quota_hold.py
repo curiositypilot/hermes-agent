@@ -554,7 +554,9 @@ def day_clock(monkeypatch, tmp_path):
     """Every clock the failure path reads (hold plan, job store, incident ledger and its
     cooldown) follows one movable instant, and the incident ledger lives under *tmp_path*.
     Jobs under test deliver to a real lane (not ``local``): only a ping that leaves the process
-    marks its incident ``alerted``, which is what arms the cooldown."""
+    marks its incident ``alerted``, which is what arms the cooldown. Failure notices go through
+    the durable delivery queue and are booked ``alerted`` only when the drain sends them, so a
+    test arms the cooldown with ``_tick_failing(..., settle=True)``, which emulates that drain."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     # The platform preflight would refuse the unconnected telegram lane before the agent runs.
     (tmp_path / "config.yaml").write_text("cron:\n  preflight: false\n", encoding="utf-8")
@@ -576,7 +578,7 @@ def test_day_two_reprobe_delivers_its_alert_through_the_tick(tmp_path, day_clock
         job = create_job("probe", "every 15m", deliver="telegram:123")
         deliveries: list = []
 
-        _tick_failing(get_job(job["id"]), tmp_path, deliveries, _quota_hint_error(MONTHLY))
+        _tick_failing(get_job(job["id"]), tmp_path, deliveries, _quota_hint_error(MONTHLY), settle=True)
         assert len(deliveries) == 1 and "This job is held" in deliveries[0], deliveries
         first = get_job(job["id"])
         assert first[qh.STATE_KEY] == first["next_run_at"]
@@ -600,7 +602,7 @@ def test_day_two_reprobe_alert_is_withheld_inside_the_incident_cooldown(
         job = create_job("probe", "every 15m", deliver="telegram:123")
         deliveries: list = []
 
-        _tick_failing(get_job(job["id"]), tmp_path, deliveries, _quota_hint_error(MONTHLY))
+        _tick_failing(get_job(job["id"]), tmp_path, deliveries, _quota_hint_error(MONTHLY), settle=True)
         assert len(deliveries) == 1
 
         day_clock[0] += CAP + SLACK
