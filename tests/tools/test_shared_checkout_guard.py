@@ -124,6 +124,63 @@ def test_incident_t_ab53aec9_commands_blocked(shared):
         assert _blocked(command, root, [root]), command
 
 
+class TestEnvVarTargets:
+    """``$VAR`` in cd / ``git -C`` targets resolves like the shell would (intake t_cdc954c3): a
+    nested repo under ``$GUARDTMP`` is not the cwd's checkout, and ``$ROOTVAR`` names the root."""
+
+    @pytest.fixture
+    def env(self, shared, tmp_path, monkeypatch):
+        root, _, workspace = shared
+        scratch = root / "cache" / "scratch"
+        scratch.mkdir(parents=True)
+        repo = scratch / "repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "--detach",
+                        str(scratch / "wt")], check=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        monkeypatch.setenv("GUARDTMP", str(scratch))
+        monkeypatch.setenv("ROOTVAR", str(root))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("NOPE_UNSET", raising=False)
+        return root, workspace, outside
+
+    @pytest.mark.parametrize("command", [
+        "cd $GUARDTMP/wt && git checkout -q -- .",
+        "cd ${GUARDTMP}/wt && git checkout -- .",
+        "git -C $GUARDTMP/wt restore --worktree -- x",
+        'cd "$GUARDTMP/wt" && git reset --hard',
+    ])
+    def test_nested_linked_worktree_not_blocked(self, env, command):
+        root, workspace, _ = env
+        for cwd in (root, workspace):
+            assert not _blocked(command, cwd, [root]), (command, cwd)
+
+    @pytest.mark.parametrize("command", [
+        "cd $ROOTVAR && git checkout -- .",
+        "git -C $ROOTVAR checkout -- .",
+        "cd ${ROOTVAR}/scripts && git restore .",
+        'git -C "$ROOTVAR" reset --hard',
+        "cd $HOME/home && git checkout -- .",
+    ])
+    def test_root_named_by_var_blocked_from_outside(self, env, command):
+        root, _, outside = env
+        assert _blocked(command, outside, [root]), command
+
+    def test_unknown_var_keeps_cwd_relative_fallback(self, env):
+        """Residual: an unset name stays literal, so the verdict still follows the cwd."""
+        root, _, outside = env
+        command = "cd $NOPE_UNSET/x && git checkout -- ."
+        assert _blocked(command, root, [root])
+        assert not _blocked(command, outside, [root])
+
+    def test_read_only_via_var_not_blocked(self, env):
+        root, _, outside = env
+        assert not _blocked("git -C $ROOTVAR status", outside, [root])
+
+
 class TestProtectedRootsConfig:
     def test_unset_defaults_to_git_home(self, shared):
         root, _, _ = shared

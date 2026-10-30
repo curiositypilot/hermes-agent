@@ -94,7 +94,11 @@ def get_running_source_root() -> Path | None:
 
 
 def _resolve(path_str: str, base: Path) -> Path:
-    path = base / Path(os.path.expanduser(path_str))  # ``/`` keeps an absolute right operand
+    # The shell expands ``$VAR`` before ``cd``/``git -C`` see the word; left literal, ``$TMPDIR/x``
+    # joins onto ``base`` and the verdict follows the cwd instead of the target. Unknown names stay
+    # literal, so an unresolvable word keeps the cwd-relative fallback. ``/`` keeps an absolute
+    # right operand.
+    path = base / Path(os.path.expanduser(os.path.expandvars(path_str)))
     with contextlib.suppress(OSError, RuntimeError, ValueError):
         return path.resolve()
     return path
