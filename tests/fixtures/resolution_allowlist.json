@@ -241,6 +241,12 @@
     "reason": "bwrap is an OS package (bubblewrap), never Hermes-managed; missing bwrap raises SandboxUnavailable (fail closed)"
   },
   {
+    "path": "hermes_cli/kanban_sandbox.py",
+    "symbol": "thin_client_preflight",
+    "kind": "bare_which",
+    "reason": "presence probe for the host bwrap (OS package bubblewrap, never Hermes-managed) that the gateway's sandboxed worker spawn needs; installs nothing, missing bwrap raises SandboxUnavailable (fail closed)"
+  },
+  {
     "path": "hermes_cli/linux_desktop_entry.py",
     "symbol": "_refresh_hicolor_cache",
     "kind": "bare_which"
