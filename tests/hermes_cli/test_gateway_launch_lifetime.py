@@ -129,9 +129,8 @@ def test_retained_tui_worktree_kept_while_any_session_in_it_resumes(tmp_path, mo
     monkeypatch.setattr(main_tui_launch.subprocess, 'call', ink)
     with pytest.raises(SystemExit):
         main_tui_launch._launch_tui(worktree=True)
-    listing = subprocess.run(['git', '-C', str(repo), 'worktree', 'list', '--porcelain', '-z'],
-                             capture_output=True, text=True, check=True).stdout
-    reason = next(f[len('locked '):] for f in listing.split('\0') if f.startswith('locked '))
+    found, reason = worktree_ops._worktree_lock_reason(str(repo), str(ink.checkout), 10)
+    assert found and reason and reason.startswith('hermes ')
     # The launcher process is gone by the next launch, whichever lock it left.
     subprocess.run(['git', '-C', str(repo), 'worktree', 'unlock', str(ink.checkout)], check=True)
     subprocess.run(['git', '-C', str(repo), 'worktree', 'lock', '--reason',
