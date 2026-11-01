@@ -190,8 +190,9 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
 
 
 def worker_route(policy, construct):
-    """Child side: the ``api_key`` / ``base_url`` / ``api_mode`` overrides for the worker's agent, resolved
-    as the in-process turn resolves its route (``route_runtime`` with the launch key, if one was bound),
+    """Child side: the ``api_key`` / ``base_url`` / ``api_mode`` / ``credential_pool`` overrides for the
+    worker's agent, resolved as the in-process turn resolves its route (``route_runtime`` with the launch
+    key, if one was bound),
     from this process's profile home (its HERMES_HOME and ``.env``). The frozen ``model.base_url`` alone
     is not the route: a per-model api_mode (opencode-go Responses models) and a resolved endpoint
     (Bedrock's regional URL) come only from resolution. A fallback entry's route belongs to another
@@ -215,8 +216,15 @@ def worker_route(policy, construct):
     if (api_mode == 'chat_completions' and runtime.get('provider') != 'custom'
             and not (frozen.get('model') or {}).get('api_mode')):
         api_mode = None
+    # The pool the route resolved from rides along as in-process turns pass it (``_runtime_agent_kwargs``):
+    # without it a 403/429 never benches the entry, so auth.json and the routing gates read a dead
+    # credential as ok. A bound launch key the pool did not select is not one of its entries, and a
+    # pool is never benched or rotated for a key it does not hold.
+    pool = runtime.get('credential_pool')
+    if construct['api_key'] and construct['api_key'] != runtime.get('api_key'):
+        pool = None
     return {'api_key': construct['api_key'] or runtime.get('api_key'), 'base_url': runtime.get('base_url'),
-            'api_mode': api_mode}
+            'api_mode': api_mode, 'credential_pool': pool}
 
 
 def checkpoint_agent_kwargs(config):
