@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 from hermes_cli.cli_output import line_input
 from hermes_cli.gateway_host_record import _discard_dead_host_record, _forget_host_gateway_probe
+from hermes_cli.gateway_lifecycle_guards import refuse_from_inside_gateway as _refuse_from_inside_gateway
 import json
 import logging
 import os
@@ -5012,18 +5013,6 @@ def _stop_installed_service(system: bool) -> bool:
         return False
 
 
-def _refuse_from_inside_gateway(verb: str, reason: str) -> None:
-    """Refuse self-targeting stop/restart/uninstall from inside the gateway process (#92560)."""
-    from tools.process_registry import _is_supervised_gateway_process
-    if _is_supervised_gateway_process():
-        print_error(
-            f"Refusing to {verb} the gateway from inside the gateway process.\n"
-            f"This command was blocked to prevent {reason}.\n"
-            f"Use `hermes gateway {verb}` from a shell outside the running gateway."
-        )
-        sys.exit(1)
-
-
 def _print_lines(*lines: str) -> None:
     for line in lines:
         print(line)
@@ -5445,6 +5434,8 @@ def _restart_all_as_host(owner, system: bool, detach: bool = False, owe_online_n
 
 def _cmd_restart(args):
     _refuse_from_inside_gateway("restart", "restart loops")
+    from hermes_cli.gateway_restart_when_idle import dispatch_hold_until_idle, preflight
+    preflight(args)
     from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
     if profile_lifecycle("restart", args):
         return
@@ -5456,6 +5447,12 @@ def _cmd_restart(args):
     # unreachable for `-p X gateway restart --all` (it printed a bare `gateway restart` instead).
     if not restart_all:
         _guard_named_profile_under_multiplexer(force=force)
+    # --when-idle: hold new Kanban work in the target gateway until it is idle, then restart.
+    with dispatch_hold_until_idle(args):
+        _restart_past_profile_guards(args, system, restart_all, force)
+
+
+def _restart_past_profile_guards(args, system: bool, restart_all: bool, force: bool) -> None:
     from hermes_cli.gateway_lifecycle_guards import refuse_while_sessions_live
     refuse_while_sessions_live("restart", args)
     if restart_all and _dispatch_all_via_service_manager_if_s6("restart"):
@@ -5473,7 +5470,7 @@ def _cmd_restart(args):
     try:
         _reap_unsupervised_gateway_orphans()
     except Exception as exc:
-        logger.debug("orphan reap before gateway restart failed: %s", exc)
+        logger.debug("orphan reap before gateway restart failed: %s", exc, exc_info=True)
 
     # The Windows restart path handles both registered installs and detached restarts.
     kind = _installed_service_kind_for(is_windows)

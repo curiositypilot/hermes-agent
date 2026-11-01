@@ -25,6 +25,20 @@ from typing import Any, Optional
 INTERRUPT_FLAG = "--yes"
 
 
+def refuse_from_inside_gateway(verb: str, reason: str) -> None:
+    """Refuse self-targeting stop/restart/uninstall from inside the gateway process (#92560)."""
+    from tools.process_registry import _is_supervised_gateway_process
+    if _is_supervised_gateway_process():
+        from hermes_cli.gateway import print_error
+
+        print_error(
+            f"Refusing to {verb} the gateway from inside the gateway process.\n"
+            f"This command was blocked to prevent {reason}.\n"
+            f"Use `hermes gateway {verb}` from a shell outside the running gateway."
+        )
+        sys.exit(1)
+
+
 def _live_work_from_state(home: Path) -> Optional[dict[str, Any]]:
     """``active_agents`` from a fresh ``gateway_state.json`` whose writer is alive (older gateways)."""
     from gateway.status import parse_active_agents, read_runtime_status, runtime_status_is_stale, runtime_status_pid_is_live
@@ -68,21 +82,34 @@ def _candidate_homes(system: bool = False) -> list[Path]:
     return homes
 
 
-def refusal_lines(verb: str, homes: list[Path], *, flag_hint: str = f"hermes gateway {{verb}} {INTERRUPT_FLAG}",
-                  profile: Optional[str] = None) -> list[str]:
-    """Refusal text for ``verb`` while the first answering gateway among ``homes`` has live work, else []."""
+def first_live_work(homes: list[Path], profile: Optional[str] = None) -> Optional[tuple[Path, dict[str, Any]]]:
+    """``(home, live_work)`` of the first gateway among ``homes`` that answers, else None."""
     for home in homes:
         work = live_work(home, profile)
         if work is not None:
-            return _work_lines(verb, home, work, flag_hint)
-    return []
+            return home, work
+    return None
+
+
+def refusal_lines(verb: str, homes: list[Path], *, flag_hint: str = f"hermes gateway {{verb}} {INTERRUPT_FLAG}",
+                  profile: Optional[str] = None) -> list[str]:
+    """Refusal text for ``verb`` while the first answering gateway among ``homes`` has live work, else []."""
+    found = first_live_work(homes, profile)
+    return _work_lines(verb, found[0], found[1], flag_hint) if found else []
+
+
+def live_count(work: Optional[dict[str, Any]]) -> int:
+    """How many live units a ``live_work`` answer reports (0 for no answer)."""
+    if not work:
+        return 0
+    return max(len([u for u in work.get("active_work") or [] if isinstance(u, dict)]), int(work.get("active_agents") or 0))
 
 
 def _work_lines(verb: str, home: Path, work: dict[str, Any], flag_hint: str) -> list[str]:
     from hermes_cli.update_cmd_drain_report import describe_active_work_unit
 
     units = [u for u in work.get("active_work") or [] if isinstance(u, dict)]
-    count = max(len(units), int(work.get("active_agents") or 0))
+    count = live_count(work)
     if not count:
         return []
     lines = [f"Refusing to {verb} the gateway: {count} live session(s) would be interrupted."]
@@ -126,4 +153,7 @@ def refuse_while_sessions_live(verb: str, args, *, host_home: Optional[Path] = N
     print_error(lines[0])
     for line in lines[1:]:
         print(line)
+    if verb == "restart" and not profile and not getattr(args, "when_idle", False):
+        print("  Or hold new Kanban work and restart once the rest finishes:\n"
+              "    hermes gateway restart --when-idle")
     sys.exit(1)

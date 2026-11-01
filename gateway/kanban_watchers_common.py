@@ -97,8 +97,27 @@ def _gc_retention_days() -> int:
         return 30
 
 
+_logged_restart_hold: Optional[tuple] = None
+
+
+def _restart_hold_engaged() -> bool:
+    """True while ``hermes gateway restart --when-idle`` holds THIS gateway's dispatch; logs each engagement once."""
+    global _logged_restart_hold
+    from hermes_cli.kanban_restart_hold import active_hold
+
+    hold = active_hold()
+    key = (hold.get("gateway_pid"), hold.get("engaged_at")) if hold else None
+    if key != _logged_restart_hold:
+        if hold:
+            logger.info("kanban dispatch held for gateway restart (%s)", hold.get("reason") or "no reason given")
+        else:
+            logger.info("kanban dispatch resumed: gateway restart hold released or expired")
+        _logged_restart_hold = key
+    return hold is not None
+
+
 def _kanban_dispatch_allowed() -> bool:
-    """False while the global emergency stop (`hermes pause`) is engaged.
+    """False while the global emergency stop (`hermes pause`) or a restart hold is engaged.
 
     Checked every tick before spawning, so a pause applies on the next tick;
     in-flight workers are never touched. Fails open if estop is unimportable.
@@ -106,8 +125,8 @@ def _kanban_dispatch_allowed() -> bool:
     try:
         from agent.estop import check_paused
     except ImportError:
-        return True
-    return not check_paused("kanban", logger)
+        return not _restart_hold_engaged()
+    return not check_paused("kanban", logger) and not _restart_hold_engaged()
 
 
 def _acquire_singleton_lock(lock_path) -> tuple[Optional[object], str]:

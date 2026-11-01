@@ -153,6 +153,11 @@ def build_gateway_parser(
         "Without an installed service, start the replacement in the background (as `gateway ensure` "
         "does) instead of in this terminal; used by apps that run the restart as a short-lived client"))
     _add_compat_platform_flag(gateway_restart)
+    _flag(gateway_restart, "--when-idle", dest="when_idle", help=(
+        "Hold new Kanban work in the target gateway, wait until no live work is left, then restart "
+        "(exit 1 on --idle-timeout); for scripts and retry loops"))
+    gateway_restart.add_argument("--idle-timeout", dest="idle_timeout", type=int, default=3600, metavar="S",
+        help="With --when-idle: seconds to wait for live work to finish (default: 3600)")
 
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
     _flag(gateway_status, "--deep", help="Deep status check")
