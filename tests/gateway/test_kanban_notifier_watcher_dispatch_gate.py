@@ -1,7 +1,10 @@
-"""Notifier polling has an independent gateway config gate."""
+"""Notifier polling has an independent gateway config gate; dispatch has the ESTOP and restart-hold gate."""
 
 import asyncio
+import os
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
@@ -66,3 +69,59 @@ def test_notifier_watcher_polls_without_dispatch_ownership():
     assert past_gate, (
         "gateways without the dispatch lock must still poll owned subscriptions"
     )
+
+
+# ── Dispatch gate: `gateway restart --when-idle` hold (t_50ffb4fd) ───────────────────────────────
+
+
+@pytest.fixture
+def hold(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    from hermes_cli import kanban_restart_hold
+    yield kanban_restart_hold
+    kanban_restart_hold.release()
+
+
+def test_dispatch_is_held_while_a_restart_hold_names_this_gateway(hold):
+    from gateway.kanban_watchers_common import _kanban_dispatch_allowed
+
+    assert _kanban_dispatch_allowed() is True
+    hold.engage(os.getpid(), 60, "gateway restart --when-idle")
+    assert _kanban_dispatch_allowed() is False
+    hold.release()
+    assert _kanban_dispatch_allowed() is True
+
+
+@pytest.mark.parametrize("pid_offset, ttl", [(0, -1), (1, 60)], ids=["expired", "other-gateway"])
+def test_dispatch_ignores_an_expired_hold_or_one_for_another_gateway(hold, pid_offset, ttl):
+    from gateway.kanban_watchers_common import _kanban_dispatch_allowed
+
+    hold.engage(os.getpid() + pid_offset, ttl, "not for this gateway")
+    assert _kanban_dispatch_allowed() is True
+
+
+def test_estop_still_pauses_dispatch_without_a_hold(hold):
+    from agent import estop
+    from gateway.kanban_watchers_common import _kanban_dispatch_allowed
+
+    estop.engage(reason="test")
+    try:
+        assert _kanban_dispatch_allowed() is False
+    finally:
+        estop.disengage()
+    assert _kanban_dispatch_allowed() is True
+
+
+def test_hold_engagement_is_logged_once_and_release_once(hold, caplog):
+    from gateway.kanban_watchers_common import _kanban_dispatch_allowed
+
+    hold.engage(os.getpid(), 60, "landing t_x")
+    with caplog.at_level("INFO", logger="gateway.run"):
+        for _ in range(3):
+            _kanban_dispatch_allowed()
+        hold.release()
+        for _ in range(3):
+            _kanban_dispatch_allowed()
+    held = [r for r in caplog.records if "dispatch held for gateway restart (landing t_x)" in r.getMessage()]
+    resumed = [r for r in caplog.records if "dispatch resumed" in r.getMessage()]
+    assert len(held) == 1 and len(resumed) == 1
