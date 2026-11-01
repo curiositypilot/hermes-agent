@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import os
 from contextlib import redirect_stdout
+from pathlib import Path
 from types import SimpleNamespace
 
 def _fake_multiplexer(monkeypatch, tmp_path, *, multiplex: bool, pid_file: bool = True):
@@ -37,6 +38,8 @@ def _fake_multiplexer(monkeypatch, tmp_path, *, multiplex: bool, pid_file: bool 
         "start_time": status._get_process_start_time(os.getpid()), "hermes_home": str(tmp_path),
     }))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "beta"))
+    # Keep the profile alias scan (~/.local/bin wrappers) off the developer's real home.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
     monkeypatch.setattr(
         status, "_read_process_cmdline", lambda pid: "python -m hermes_cli.main gateway run --replace"
