@@ -52,7 +52,12 @@ CHILD_ENV_KEYS = ('PATH', 'LANG', 'TZ', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', '
 
 
 def child_env():
-    return {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
+    # The kill switch keeps a self-managed checkout (install-stamp.json) from syncing a per-home
+    # environment and relaunching the daemon with -I, which drops PYTHONPATH; a literal, so it
+    # holds whether or not tests/conftest.py exported it.
+    env = {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
+    env['HERMES_DISABLE_LAZY_INSTALLS'] = '1'
+    return env
 
 
 async def rpc(ws, method, **params):

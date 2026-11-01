@@ -136,7 +136,9 @@ def test_ordinary_owner_launches_tool_worker_and_detach_does_not_cancel(tmp_path
         "            f.write(json.dumps({'pid': os.getpid(), 'path': str(args[0])}) + '\\n')\n"
         "sys.addaudithook(witness)\n")
     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=os.pathsep.join([str(site), str(root)]),
-               OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)
+               OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url,
+               # A self-managed checkout would relaunch the owner with -I (dropping the witness PYTHONPATH).
+               HERMES_DISABLE_LAZY_INSTALLS='1')
 
     def query(sql, args=()):
         with closing(sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True)) as db:
