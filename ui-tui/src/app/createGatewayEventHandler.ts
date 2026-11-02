@@ -6,7 +6,7 @@ import { relativeLuminance } from '@hermes/shared/color'
 import type { MessageDeltaPayload, SubagentStatus, Usage } from '@hermes/shared/gateway-events'
 import type { UsageLimit } from '@hermes/shared/plan-usage'
 
-import { STARTUP_IMAGE, STARTUP_QUERY, STARTUP_RESUME_CHECK } from '../config/env.js'
+import { STARTUP_IMAGE, STARTUP_NO_AUTO_RESUME, STARTUP_QUERY, STARTUP_RESUME_CHECK } from '../config/env.js'
 import { STREAM_BATCH_MS } from '../config/timing.js'
 import { buildSetupRequiredSections, setupRequiredTitle } from '../content/setup.js'
 import { usageFromTick } from '../domain/usage.js'
@@ -1121,6 +1121,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     if (STARTUP_RESUME_ID) {
       patchUiState({ status: t('session.status.resuming') })
       resumeById(STARTUP_RESUME_ID)
+      scheduleStartupPrompt()
+
+      return
+    }
+
+    if (STARTUP_NO_AUTO_RESUME) {
+      // Typed creation flags (`-m`, `--yolo`, `-w`, a dashboard workspace…) ask for a fresh session
+      // with those options, as classic `hermes -m X` does; auto-resume would silently drop them.
+      patchUiState({ status: t('gatewayMsg.status.forgingSession') })
+      newSession()
       scheduleStartupPrompt()
 
       return

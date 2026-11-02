@@ -565,6 +565,12 @@ def _resolve_chat_argv(
             resume = latest_resume
         env["HERMES_TUI_RESUME"] = resume
 
+    # A fresh chat in a picked workspace must not be swapped for the most recent session
+    # (display.tui_auto_resume_recent), which lives in some other cwd.
+    env.pop("HERMES_TUI_NO_AUTO_RESUME", None)
+    if workspace_cwd and not resume:
+        env["HERMES_TUI_NO_AUTO_RESUME"] = "1"
+
     if sidecar_url:
         env["HERMES_TUI_SIDECAR_URL"] = sidecar_url
 

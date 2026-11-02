@@ -112,3 +112,43 @@ def test_fresh_launch_drops_an_inherited_check(monkeypatch):
     with pytest.raises(SystemExit):
         main_mod._launch_tui(None, resume_check={"requested": {"model": "x"}})
     assert "HERMES_TUI_RESUME_CHECK" not in captured["env"]
+
+
+# display.tui_auto_resume_recent must not swap a fresh-intent launch for the most recent session (t_3d966055).
+
+
+@pytest.mark.parametrize("flags", [{"model": "x"}, {"yolo": True}, {"in_dir": "."}, {"worktree": True}])
+def test_typed_flags_or_worktree_ask_for_a_fresh_session(flags):
+    assert main_tui_launch._tui_fresh_launch(_args(**{"resume": None, "worktree": False, **flags})) is True
+
+
+def test_bare_launch_or_resume_is_not_a_fresh_launch():
+    assert main_tui_launch._tui_fresh_launch(_args(resume=None, worktree=False)) is False
+    assert main_tui_launch._tui_fresh_launch(_args(resume="sid-1", model="x", worktree=True)) is False
+
+
+def _launch_env(monkeypatch, resume_session_id=None, **kwargs):
+    import hermes_cli.main as main_mod
+
+    monkeypatch.setenv("HERMES_PYTHON", sys.executable)
+    monkeypatch.setattr(main_tui_launch, "_make_tui_argv", lambda tui_dir, tui_dev: (["node", "entry.js"], Path(".")))
+    monkeypatch.setattr("hermes_cli.shared_session_attach.configure_tui_attachment", lambda env, sid: None)
+    monkeypatch.setattr(main_tui_launch, "_print_tui_exit_summary", lambda *a: None)
+    captured = {}
+    monkeypatch.setattr(main_mod.subprocess, "call", lambda argv, cwd=None, env=None: captured.update(env=env) or 0)
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui(resume_session_id, **kwargs)
+    return captured["env"]
+
+
+def test_fresh_launch_tells_ink_to_skip_auto_resume(monkeypatch):
+    assert _launch_env(monkeypatch, fresh_launch=True)["HERMES_TUI_NO_AUTO_RESUME"] == "1"
+
+
+def test_inherited_no_auto_resume_never_rides_along(monkeypatch):
+    monkeypatch.setenv("HERMES_TUI_NO_AUTO_RESUME", "1")
+    assert "HERMES_TUI_NO_AUTO_RESUME" not in _launch_env(monkeypatch, fresh_launch=False)
+
+
+def test_explicit_resume_never_sets_no_auto_resume(monkeypatch):
+    assert "HERMES_TUI_NO_AUTO_RESUME" not in _launch_env(monkeypatch, "sid-1", fresh_launch=True)

@@ -29,6 +29,9 @@ export const TERMUX_TUI_MODE: boolean = isTermuxTuiMode()
 export const STARTUP_RESUME_ID = (process.env.HERMES_TUI_RESUME ?? '').trim()
 // `hermes --tui --resume <id>` with typed creation flags: what the startup resume must not change.
 export const STARTUP_RESUME_CHECK = parseResumeLaunchCheck(process.env.HERMES_TUI_RESUME_CHECK)
+// A launch that typed creation flags, made a `-w` worktree or picked a dashboard workspace wants a
+// fresh session: `display.tui_auto_resume_recent` must not attach the most recent one instead.
+export const STARTUP_NO_AUTO_RESUME = truthy(process.env.HERMES_TUI_NO_AUTO_RESUME)
 export const STARTUP_QUERY = (process.env.HERMES_TUI_QUERY ?? '').trim()
 export const STARTUP_IMAGE = (process.env.HERMES_TUI_IMAGE ?? '').trim()
 // Workspace the dashboard user picked for a fresh chat (`/api/pty?cwd=`). Sent as the explicit
