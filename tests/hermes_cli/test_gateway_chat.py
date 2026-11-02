@@ -31,6 +31,17 @@ def test_unsupported_launch_options_fail_before_connection(monkeypatch, capsys):
     assert calls == []
 
 
+def test_no_fallback_flag_in_thin_policy():
+    """`-z` / stream-json `--no-fallback` rides session.create; a resume adding it is refused (t_bec8a9cb)."""
+    from hermes_cli import gateway_chat
+    assert gateway_chat._requested_policy(argparse.Namespace(no_fallback=True))["no_fallback"] is True
+    assert "no_fallback" not in gateway_chat._requested_policy(argparse.Namespace(no_fallback=False))
+    with pytest.raises(gateway_chat.GatewayClientError, match="--no-fallback differs"):
+        gateway_chat.check_resume_policy(argparse.Namespace(no_fallback=True), {"info": {"launch_request": {}}})
+    gateway_chat.check_resume_policy(argparse.Namespace(no_fallback=True),
+                                     {"info": {"launch_request": {"no_fallback": True}}})
+
+
 def test_resume_repeating_source_desktop_matches_the_stored_gui_session():
     """`--source desktop` creates as `gui`; repeating it on `--resume` is the same session source."""
     from hermes_cli import gateway_chat

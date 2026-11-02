@@ -20,7 +20,8 @@ _UNSUPPORTED = (
     "run_budget", "verbose", "compact",
 )
 _POLICY = ("model", "provider", "reasoning", "toolsets", "max_turns", "base_url", "ignore_rules", "api_key",
-           "yolo", "safe_mode", "ignore_user_config", "skills", "checkpoints", "accept_hooks", "pass_session_id")
+           "yolo", "safe_mode", "ignore_user_config", "skills", "checkpoints", "accept_hooks", "pass_session_id",
+           "no_fallback")
 # Where each refused option lives now; the refusal names it so the user is not left guessing.
 _RELOCATED = {
     "image": "`hermes --tui` or the Desktop app to attach the image",
@@ -40,7 +41,7 @@ _SAFE_MODE_EXAMPLE = 'hermes chat --safe-mode --provider openrouter --model anth
 # by riding THIS session's session.create; a resume keeps the frozen route.
 _ENV_LAUNCH_FLAGS = (("yolo", "HERMES_YOLO_MODE"), ("ignore_rules", "HERMES_IGNORE_RULES"),
                      ("safe_mode", "HERMES_SAFE_MODE"), ("ignore_user_config", "HERMES_IGNORE_USER_CONFIG"),
-                     ("accept_hooks", "HERMES_ACCEPT_HOOKS"))
+                     ("accept_hooks", "HERMES_ACCEPT_HOOKS"), ("no_fallback", "HERMES_NO_FALLBACK"))
 
 
 def env_launch_flags() -> dict:

@@ -48,6 +48,9 @@ class CanonicalCreateParams(ProfileParams):
     cwd_explicit: bool | None = None
     # Wall-clock budget per run in seconds (the classic CLI's `--run-budget`).
     run_budget: float | None = None
+    # `hermes chat --no-fallback`: a failure on the session's route fails the run instead of walking
+    # `fallback_providers`. An older gateway refuses the field rather than silently dropping it.
+    no_fallback: bool = False
     # The classic CLI's `-v`: the session agent's status lines are not quieted.
     verbose: bool = False
     # A shell-launched client's allowlisted environment (HERMES_* behaviour values, toolchain PATH/venv),

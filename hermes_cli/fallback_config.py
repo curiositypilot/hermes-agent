@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -126,8 +128,25 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
 _NON_CHAT_PLATFORMS = frozenset({"cron", "subagent"})
 
 
+# A gateway session created with ``no_fallback`` (``hermes chat --no-fallback`` riding session.create):
+# the shared gateway's env never carries the client's HERMES_NO_FALLBACK, so the turn's policy scope
+# binds this instead (``gateway.session_policy.policy_scope``).
+_SESSION_NO_FALLBACK: ContextVar[bool] = ContextVar("session_no_fallback", default=False)
+
+
+@contextmanager
+def session_no_fallback_scope(enabled: bool):
+    """Bind ``fallback_disabled()`` for this context (one gateway session's turn), reset on exit."""
+    token = _SESSION_NO_FALLBACK.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _SESSION_NO_FALLBACK.reset(token)
+
+
 def fallback_disabled() -> bool:
-    """True when this process runs with ``--no-fallback`` (``HERMES_NO_FALLBACK=1``): the operator
+    """True when this run is ``--no-fallback``: the process has ``HERMES_NO_FALLBACK=1``, or the
+    gateway session executing in this context was created with ``no_fallback``. The operator
     pinned a route and wants a failure, not an answer from another model.
 
     The single reader of the switch. ``get_fallback_chain`` deliberately ignores it: the
@@ -135,6 +154,8 @@ def fallback_disabled() -> bool:
     """
     import os
 
+    if _SESSION_NO_FALLBACK.get():
+        return True
     return os.environ.get("HERMES_NO_FALLBACK") == "1"  # health: allow HX002 -- per-run bridge of the --no-fallback CLI flag (like HERMES_IGNORE_USER_CONFIG), not a config setting; relaunched/child processes inherit it
 
 

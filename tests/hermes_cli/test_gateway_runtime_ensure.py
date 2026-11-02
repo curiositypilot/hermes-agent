@@ -15,7 +15,8 @@ def test_unmanaged_runtime_drops_session_config_bypass_flags(tmp_path, monkeypat
     from hermes_cli import gateway_runtime_start as start
     from hermes_cli import gateway_windows
 
-    flags = ('HERMES_SAFE_MODE', 'HERMES_IGNORE_USER_CONFIG')
+    # HERMES_NO_FALLBACK rides session.create; inherited, every later session the daemon runs loses fallback.
+    flags = ('HERMES_SAFE_MODE', 'HERMES_IGNORE_USER_CONFIG', 'HERMES_NO_FALLBACK')
     for key in flags:
         monkeypatch.setenv(key, '1')
     monkeypatch.setenv('RUNTIME_TEST_SENTINEL', 'retained')
