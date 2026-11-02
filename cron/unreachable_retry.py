@@ -65,6 +65,23 @@ def is_model_unreachable_failure(exc: BaseException, agent: Any = None) -> bool:
     return _is_transient_provider_resolve_error(exc)
 
 
+# ``ensure_gateway_runtime`` verdicts that clear on their own: an update (or a launch-time
+# dependency sync holding the checkout lock) fences the install, or the owner is still booting.
+# ``incompatible``/``inaccessible``/``absent`` are config, permission or protocol faults that must
+# alert at once, so they stay out.
+_TRANSIENT_GATEWAY_STATES = frozenset({"draining", "starting"})
+
+
+def is_gateway_unavailable_presubmit(exc: BaseException) -> bool:
+    """True when the canonical path found no ready gateway owner for a transient reason before
+    submitting anything (``GatewayUnavailableError`` in a draining/starting state): the fire never
+    reached the model, so the same bounded ladder applies."""
+    from hermes_cli.gateway_client import GatewayUnavailableError
+
+    return (isinstance(exc, GatewayUnavailableError)
+            and getattr(exc, "state", None) in _TRANSIENT_GATEWAY_STATES)
+
+
 def _ladder_applies(job: dict[str, Any]) -> bool:
     """The ladder's applicability gate: recurring, not paused, and enabled in config."""
     return is_recurring(job) and job.get("state") != "paused" and retry_enabled()
