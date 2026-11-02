@@ -6,7 +6,7 @@ import { evictInkCaches } from '@hermes/ink'
 import type { InflightTurn, SessionResumeResult, Usage } from '@hermes/shared/gateway-events'
 import { type RefObject, useCallback, useEffect, useMemo, useRef } from 'react'
 
-import { localCreationOptions } from '../canonicalGateway.js'
+import { localCreationOptions, type ResumeLaunchCheck, resumeLaunchMismatch } from '../canonicalGateway.js'
 import { STARTUP_WORKSPACE_CWD } from '../config/env.js'
 import { buildSetupRequiredSections, setupRequiredTitle } from '../content/setup.js'
 import { introMsg, toTranscriptMessages } from '../domain/messages.js'
@@ -26,7 +26,7 @@ import { asRpcResult } from '../lib/rpc.js'
 import type { Msg, PanelSection, SessionInfo } from '../types.js'
 
 import { applyConnectionRequest, clearConnectionOperation } from './connectionOperationStore.js'
-import type { ComposerActions, GatewayRpc, StateSetter } from './interfaces.js'
+import type { ComposerActions, GatewayRpc, ResumeByIdOptions, StateSetter } from './interfaces.js'
 import { patchOverlayState } from './overlayStore.js'
 import { scheduleResumeScrollToBottom } from './sessionResumeView.js'
 import { renameCanonicalSession } from './slash/canonicalSessionCommands.js'
@@ -646,8 +646,21 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     ]
   )
 
+  // `hermes --tui --resume` with a typed creation flag the session was not launched with: classic's
+  // refusal. The attach is released as it was taken (no end_reason, so the owner keeps the session as it
+  // was); nothing renders or is adopted, and `onRefused` exits so the launcher can print the message.
+  const refuseResumeLaunch = useCallback(
+    (r: { session_id: string }, check: ResumeLaunchCheck, keys: string[], onRefused?: (keys: string[]) => void) => {
+      writeFileSync(check.refusal_file, JSON.stringify(keys))
+      const subscriptionId = (r as { subscription_id?: string }).subscription_id
+
+      return detachCanonical(r.session_id, subscriptionId).then(() => onRefused?.(keys))
+    },
+    [detachCanonical]
+  )
+
   const resumeById = useCallback(
-    (id: string) => {
+    (id: string, opts?: ResumeByIdOptions) => {
       const flight = ++attachmentFlight.current
       pendingAttachments.current.add(flight)
       const current = captureDestination()
@@ -698,6 +711,12 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                 sys(`error: ${t('session.common.invalidResponse', 'session.resume')}`)
 
                 return patchUiState({ status: 'ready' })
+              }
+
+              const refused = opts?.launchCheck ? resumeLaunchMismatch(opts.launchCheck, r.info) : []
+
+              if (opts?.launchCheck && refused.length) {
+                return refuseResumeLaunch(r, opts.launchCheck, refused, opts.onLaunchRefused)
               }
 
               const storedSid = r.session_key || r.info?.stored_session_id || r.stored_session_id || r.resumed || id
@@ -763,6 +782,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       finishAttachment,
       gw,
       panel,
+      refuseResumeLaunch,
       resetSession,
       rpc,
       scrollRef,

@@ -637,7 +637,6 @@ export function useMainApp(gw: GatewayClient) {
 
   const gateway = useMemo(() => ({ gw, rpc }), [gw, rpc])
   const catalog = useSlashCatalog(rpc)
-
   const { die, dieWithCode, exitClose } = useDie(gw, exit)
 
   const session = useSessionLifecycle({
@@ -1028,6 +1027,7 @@ export function useMainApp(gw: GatewayClient) {
         session: {
           STARTUP_RESUME_ID,
           colsRef,
+          dieWithCode,
           newSession: session.newSession,
           recoverSidRef,
           resetSession: session.resetSession,
@@ -1050,6 +1050,7 @@ export function useMainApp(gw: GatewayClient) {
       bellOnPrompt,
       composerActions.enqueue,
       composerActions.setInput,
+      dieWithCode,
       gateway,
       panel,
       session.newSession,

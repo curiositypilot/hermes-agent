@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest'
 
 import { canonicalRequest, canonicalResult, localCreationOptions, sharedControlParams } from '../canonicalGateway.js'
+import { parseResumeLaunchCheck, resumeLaunchMismatch } from '../canonicalGateway.js'
 
 it.each(['HERMES_SAFE_MODE', 'HERMES_IGNORE_USER_CONFIG'])('carries %s on the launching session policy', flag => {
   const field = flag === 'HERMES_SAFE_MODE' ? 'safe_mode' : 'ignore_user_config'
@@ -64,5 +65,36 @@ it('sends the launcher\'s client environment (LC-8, T3) only to a gateway that t
 
   for (const raw of ['not json', '[]', '{"PATH": 1}']) {
     expect(localCreationOptions({ HERMES_TUI_CLIENT_ENV: raw } as NodeJS.ProcessEnv)).not.toHaveProperty('client_env')
+  }
+})
+
+it('compares a `--tui --resume` launch check with the frozen launch the way classic check_resume_policy does', () => {
+  const info = { cwd: '/work/project', launch_request: { model: 'anthropic/claude-x', yolo: true, toolsets: ['web', 'terminal'] } }
+
+  expect(resumeLaunchMismatch({ requested: { model: 'anthropic/claude-x' } }, info)).toEqual([])
+  expect(resumeLaunchMismatch({ requested: { model: 'fast' } }, { launch_request: { model: 'anthropic/claude-x', model_requested: 'fast' } })).toEqual([])
+  expect(resumeLaunchMismatch({ requested: { model: 'fast' }, model_resolved: 'anthropic/claude-x' }, info)).toEqual([])
+  expect(resumeLaunchMismatch({ requested: { model: 'fast' }, model_resolved: 'openai/gpt-y' }, info)).toEqual(['model'])
+  expect(resumeLaunchMismatch({ requested: { model: 'fast' } }, info)).toEqual(['model'])
+  expect(resumeLaunchMismatch({ requested: { model: 'fast' }, model_resolved: 'anthropic/claude-x' },
+    { launch_request: { model: 'anthropic/claude-x', model_requested: 'other' } })).toEqual(['model'])
+  expect(resumeLaunchMismatch({ requested: { yolo: true } }, { launch_request: { model: 'm' } })).toEqual(['yolo'])
+  expect(resumeLaunchMismatch({ requested: { yolo: true, toolsets: ['web', 'terminal'] } }, info)).toEqual([])
+  expect(resumeLaunchMismatch({ requested: { toolsets: ['terminal', 'web'] } }, info)).toEqual(['toolsets'])
+  expect(resumeLaunchMismatch({ requested: { no_fallback: true } }, info)).toEqual(['no_fallback'])
+  expect(resumeLaunchMismatch({ requested: { model: 'anthropic/claude-x', no_fallback: true, safe_mode: true } }, { cwd: '/w' })).toEqual(['model', 'no_fallback', 'safe_mode'])
+  expect(resumeLaunchMismatch({ requested: { yolo: true } }, null)).toEqual(['yolo'])
+  expect(resumeLaunchMismatch({ requested: { api_key: 'sk-new', yolo: true } }, info)).toEqual([])
+  expect(resumeLaunchMismatch({ requested: { cwd: '/work/project' } }, info)).toEqual([])
+  expect(resumeLaunchMismatch({ requested: { cwd: '/elsewhere' } }, info)).toEqual(['cwd'])
+})
+
+it('reads the launcher\'s HERMES_TUI_RESUME_CHECK hand-off and carries no check for an unreadable one', () => {
+  const check = { requested: { model: 'x' }, model_resolved: 'y', refusal_file: '/tmp/refusal.json' }
+
+  expect(parseResumeLaunchCheck(JSON.stringify(check))).toEqual(check)
+
+  for (const raw of [undefined, '', 'not json', '{"requested": {"model": "x"}}', '[]']) {
+    expect(parseResumeLaunchCheck(raw)).toBeNull()
   }
 })
