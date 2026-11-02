@@ -181,7 +181,43 @@ def _image_block_from_openai_url(url: str) -> dict[str, Any]:
     mime_part = header[len("data:"):].split(";", 1)[0].strip()
     media_type = mime_part if mime_part.startswith("image/") else "image/jpeg"
     media_type = "image/jpeg" if media_type.lower() == "image/jpg" else media_type
+    # The API checks the declared media_type against the bytes and 400s on a mismatch or on
+    # undecodable data; once such a block sits in history every later turn replays it and fails.
+    # Trust the magic bytes: relabel a mislabelled supported raster, omit anything unreadable.
+    sniffed = _sniff_base64_image_mime(data)
+    if sniffed is None:
+        logger.warning("Anthropic image block: undecodable or unrecognised base64 image (declared %s) — omitted",
+                       media_type)
+        return _text_block("[image omitted: invalid image data]")
+    if sniffed not in _ANTHROPIC_INLINE_IMAGE_MIMES:
+        return _text_block(f"[image omitted: {sniffed} is not a supported image format]")
+    if sniffed != media_type:
+        logger.warning("Anthropic image block: declared %s but bytes are %s — relabelled", media_type, sniffed)
+        media_type = sniffed
     return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
+
+
+_ANTHROPIC_INLINE_IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
+
+
+def _sniff_base64_image_mime(data: str) -> Optional[str]:
+    """Image MIME from the magic bytes at the head of a base64 payload; None when the head does not
+    decode or carries no known image signature."""
+    import base64
+    import binascii
+    from agent.image_routing import _sniff_mime_from_bytes
+    head = re.sub(r"\s+", "", data or "")[:88]  # 88 chars -> 66 bytes, past every signature offset
+    head = head[: len(head) - len(head) % 4]
+    if not head:
+        return None
+    try:
+        raw = base64.b64decode(head, validate=True)
+    except (binascii.Error, ValueError):
+        try:
+            raw = base64.urlsafe_b64decode(head)
+        except (binascii.Error, ValueError):
+            return None
+    return _sniff_mime_from_bytes(raw)
 
 
 def _convert_content_part_to_anthropic(part: Any) -> Optional[dict[str, Any]]:

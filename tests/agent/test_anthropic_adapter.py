@@ -1790,7 +1790,7 @@ class TestFinalPayloadHasNoBlankTextBlocks:
                     {"type": "text", "text": "   "},
                     {
                         "type": "image_url",
-                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                        "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
                     },
                 ],
             },
