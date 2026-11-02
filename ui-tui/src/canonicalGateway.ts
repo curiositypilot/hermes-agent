@@ -136,11 +136,14 @@ export function localCreationOptions(env = process.env): Record<string, unknown>
 
   // `--checkpoints` / `--pass-session-id` / `--accept-hooks` (and an exported HERMES_ACCEPT_HOOKS=1)
   // are this session's creation policy too: the owner applies them, nothing reads them in-process.
+  // So is `--no-fallback` (and an exported HERMES_NO_FALLBACK=1): the gateway daemon strips that variable
+  // from its own env and client_env does not carry it, so without this field the session walks
+  // fallback_providers.
   for (const [field, value] of [
     ['yolo', env.HERMES_YOLO_MODE], ['ignore_rules', env.HERMES_IGNORE_RULES],
     ['safe_mode', env.HERMES_SAFE_MODE], ['ignore_user_config', env.HERMES_IGNORE_USER_CONFIG],
     ['checkpoints', env.HERMES_TUI_CHECKPOINTS], ['pass_session_id', env.HERMES_TUI_PASS_SESSION_ID],
-    ['accept_hooks', env.HERMES_ACCEPT_HOOKS]
+    ['accept_hooks', env.HERMES_ACCEPT_HOOKS], ['no_fallback', env.HERMES_NO_FALLBACK]
   ] as const) {
     if (truthy(value)) { options[field] = true }
   }

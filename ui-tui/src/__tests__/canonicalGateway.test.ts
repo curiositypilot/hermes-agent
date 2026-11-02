@@ -32,6 +32,19 @@ it('carries -s/--checkpoints/--pass-session-id/--accept-hooks (and exported HERM
   expect(canonicalRequest('session.create', { request_id: 'owned', ...options }, contract).params).toMatchObject(options)
 })
 
+it('carries `hermes --tui --no-fallback` (HERMES_NO_FALLBACK) onto session.create as the frozen launch flag', () => {
+  const options = localCreationOptions({ HERMES_NO_FALLBACK: '1' } as NodeJS.ProcessEnv)
+  expect(options).toEqual({ no_fallback: true })
+
+  for (const value of ['0', '', 'no']) {
+    expect(localCreationOptions({ HERMES_NO_FALLBACK: value } as NodeJS.ProcessEnv)).not.toHaveProperty('no_fallback')
+  }
+
+  expect(localCreationOptions({} as NodeJS.ProcessEnv)).not.toHaveProperty('no_fallback')
+  const contract = { sources: ['tui'], parameters: ['request_id', 'source', 'no_fallback'] }
+  expect(canonicalRequest('session.create', { request_id: 'owned', ...options }, contract).params.no_fallback).toBe(true)
+})
+
 it('rebuilds --max-turns from the launcher environment as the integer the session policy requires', () => {
   const options = localCreationOptions({ HERMES_TUI_MAX_TURNS: '5', HERMES_MODEL: 'local-model' } as NodeJS.ProcessEnv)
   expect(options.max_turns).toBe(5)
