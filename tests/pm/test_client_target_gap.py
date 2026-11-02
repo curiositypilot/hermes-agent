@@ -35,7 +35,7 @@ def worker_calls(monkeypatch):
 
 @pytest.mark.parametrize("explicit", [False, True])
 def test_gapped_package_raises_without_a_worker(monkeypatch, worker_calls, explicit):
-    monkeypatch.setattr(pm.store, "current_target", lambda: GAPPED_TARGET)
+    monkeypatch.setattr(pm.install, "current_target", lambda: GAPPED_TARGET)
 
     with pytest.raises(InstallError) as caught:
         client.ensure("git", explicit=explicit)
@@ -48,7 +48,7 @@ def test_gapped_package_raises_without_a_worker(monkeypatch, worker_calls, expli
 
 
 def test_ungapped_missing_package_still_reaches_the_worker(monkeypatch, worker_calls):
-    monkeypatch.setattr(pm.store, "current_target", lambda: UNGAPPED_TARGET)
+    monkeypatch.setattr(pm.install, "current_target", lambda: UNGAPPED_TARGET)
 
     runner = client.ensure("git", base_env={"KEEP": "1"})
 
@@ -56,19 +56,20 @@ def test_ungapped_missing_package_still_reaches_the_worker(monkeypatch, worker_c
     assert runner.env == {"KEEP": "1"}
 
 
-def test_lazy_install_refusal_wins_over_the_gap(monkeypatch, worker_calls):
-    monkeypatch.setattr(pm.store, "current_target", lambda: GAPPED_TARGET)
+def test_gap_wins_over_the_lazy_install_refusal(monkeypatch, worker_calls):
+    monkeypatch.setattr(pm.install, "current_target", lambda: GAPPED_TARGET)
     monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
 
     with pytest.raises(InstallError) as caught:
         client.ensure("git")
 
-    assert "lazy installs are disabled" in caught.value.cause
+    assert f"unavailable on {GAPPED_TARGET}" in caught.value.cause
+    assert GAP_REASON in caught.value.cause
     assert worker_calls == []
 
 
 def test_selected_git_env_falls_back_to_base_without_a_worker(monkeypatch, worker_calls):
-    monkeypatch.setattr(pm.store, "current_target", lambda: GAPPED_TARGET)
+    monkeypatch.setattr(pm.install, "current_target", lambda: GAPPED_TARGET)
     base = {"PATH": "/usr/bin", "KEEP": "1"}
 
     assert selected_git_env(base) == base

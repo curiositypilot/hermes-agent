@@ -370,6 +370,22 @@ def test_real_bootstrap_reexecs_before_app_imports(source_launch, tmp_path, isol
     # Copy the real bootstrap so it owns this disposable source install. The
     # other modules remain real checkout imports; only acquisition is injected.
     shutil.copy2(repository / "hermes_bootstrap.py", root / "hermes_bootstrap.py")
+    destination_pm = root / "pm"
+    if not destination_pm.exists():
+        destination_pm.symlink_to(repository / "pm")
+    for item in (repository / "hermes_cli").iterdir():
+        dest = root / "hermes_cli" / item.name
+        if not dest.exists():
+            dest.symlink_to(item)
+    for name in ("utils.py", "hermes_constants.py", "hermes_yaml.py", "hermes_dir_acl.py"):
+        destination = root / name
+        if not destination.exists():
+            destination.symlink_to(repository / name)
+    (root / "hermes_cli" / "source_completion.py").write_text(
+        "import json, sys\n"
+        f"open({str(tmp_path / 'completion-calls')!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n",
+        encoding="utf-8",
+    )
     (root / "launch_test_tools.py").write_text(
         "import sys\n"
         "from pathlib import Path\n"
@@ -377,9 +393,22 @@ def test_real_bootstrap_reexecs_before_app_imports(source_launch, tmp_path, isol
         "import pm.client\n"
         "from pm import paths\n"
         f"paths.lockfile_path = lambda: Path({str(tmp_path / 'tool-lock.json')!r})\n"
-        f"pm.client.runtime_command = lambda *args, **kwargs: {worker_command!r}\n",
+        f"pm.client.runtime_command = lambda *args, **kwargs: {worker_command!r}\n"
+        "import pm.install\n"
+        f"pm.install.runtime_command = lambda *args, **kwargs: {worker_command!r}\n",
         encoding="utf-8",
     )
+    (root / "sitecustomize.py").unlink(missing_ok=True)
+    shutil.copy2(repository / "hermes_bootstrap.py", root / "hermes_bootstrap.py")
+    bootstrap_content = (root / "hermes_bootstrap.py").read_text(encoding="utf-8")
+    future_import = "from __future__ import annotations\n"
+    assert future_import in bootstrap_content
+    bootstrap_content = bootstrap_content.replace(
+        future_import,
+        future_import + "\ntry:\n    import launch_test_tools\nexcept Exception:\n    pass\n",
+        1,
+    )
+    (root / "hermes_bootstrap.py").write_text(bootstrap_content, encoding="utf-8")
     entry = root / "launch_probe.py"
     entry.write_text(
         "import launch_test_tools\n"
