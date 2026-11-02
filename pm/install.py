@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 import threading
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -830,8 +831,20 @@ def _commit_selection(package, facts: Facts, change, *, enabled: list[str], stam
     from hermes_cli.runtime_state import finish_publication, recover_publication
 
     try:
-        result = {} if current else (package.apply(enabled, explicit=explicit,
-                                                   skip_invalid_secondary=skip_invalid_secondary, **inputs) or {})
+        # collect_generations takes the same lock (_venv_install_lock on paths.repo_root()),
+        # so a retained candidate cannot be removed mid-adoption.
+        readopted = None
+        if current:
+            result = {}
+        elif not repair:
+            readopted = package.retained_generation(stamp)
+            result = readopted if readopted is not None else (
+                package.apply(enabled, explicit=explicit,
+                              skip_invalid_secondary=skip_invalid_secondary, **inputs) or {}
+            )
+        else:
+            result = (package.apply(enabled, explicit=explicit,
+                                    skip_invalid_secondary=skip_invalid_secondary, **inputs) or {})
         if not repair and package.expected_stamp(enabled, **inputs) != stamp:
             raise ValueError("Dependency inputs changed while preparing publication; retry.")
         if change is not None:
@@ -840,10 +853,26 @@ def _commit_selection(package, facts: Facts, change, *, enabled: list[str], stam
             if result.get("environment") is not None:
                 from pm.environments import flush_before_selecting
                 flush_before_selecting()
+                if readopted is None and not repair:
+                    generation = Path(result["environment"]).parent
+                    marker_file = generation / ".venv-stamp"
+                    fd, tmp_file = tempfile.mkstemp(dir=generation, prefix=".venv-stamp-")
+                    try:
+                        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                            stream.write(stamp + "\n")
+                        os.replace(tmp_file, marker_file)
+                    finally:
+                        Path(tmp_file).unlink(missing_ok=True)
             facts.record_state("venv", stamp, enabled, **result)
         if change is not None:
             finish_publication(paths.repo_root())
-        receipt.record_venv_rebuild(not current, "already in sync" if current else "")
+        if current:
+            receipt.record_venv_rebuild(False, "already in sync")
+        elif readopted is not None:
+            gen_name = Path(readopted["environment"]).parent.name
+            receipt.record_venv_rebuild(False, f"re-adopted generation {gen_name}")
+        else:
+            receipt.record_venv_rebuild(True, "")
     except BaseException:
         recover_publication(paths.repo_root())
         raise
