@@ -78,3 +78,32 @@ def test_resolve_chat_cwd_fails_closed_and_reaches_the_tui_env(monkeypatch, tmp_
 
     _argv, _cwd, env = web_server_chat._resolve_chat_argv()
     assert "HERMES_TUI_CWD" not in env
+
+
+def test_picked_workspace_skips_auto_resume(monkeypatch, tmp_path):
+    """A fresh chat in a picked workspace is never swapped for the most recent session
+    (display.tui_auto_resume_recent, t_3d966055); a dashboard resume or a bare chat leaves it alone."""
+    import hermes_cli.main_tui_launch as tui_launch
+    from hermes_cli import web_server_sessions
+
+    monkeypatch.setattr(
+        tui_launch, "_make_tui_argv", lambda *_a, **_k: (["node", "fake-tui.js"], tmp_path))
+    monkeypatch.setattr(tui_launch, "_apply_tui_python_env", lambda _env: None)
+    monkeypatch.setenv("HERMES_TUI_NO_AUTO_RESUME", "1")
+
+    class _Db:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(web_server_sessions, "_open_session_db_for_profile", lambda *_a, **_k: _Db())
+    monkeypatch.setattr(web_server_sessions, "_session_latest_descendant", lambda sid, _db: (sid, None))
+
+    _argv, _cwd, env = web_server_chat._resolve_chat_argv(workspace_cwd=str(tmp_path))
+    assert env["HERMES_TUI_NO_AUTO_RESUME"] == "1"
+
+    _argv, _cwd, env = web_server_chat._resolve_chat_argv()
+    assert "HERMES_TUI_NO_AUTO_RESUME" not in env
+
+    _argv, _cwd, env = web_server_chat._resolve_chat_argv(resume="sid-1", workspace_cwd=str(tmp_path))
+    assert env["HERMES_TUI_RESUME"] == "sid-1"
+    assert "HERMES_TUI_NO_AUTO_RESUME" not in env

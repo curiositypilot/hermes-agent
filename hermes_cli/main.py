@@ -884,9 +884,7 @@ from hermes_cli.main_install_repair import (  # frozen updater surface: update_c
     _update_marker_path,
     _venv_scripts_dir,
 )
-from hermes_cli.main_desktop import (
-    cmd_gui,
-)
+from hermes_cli.main_desktop import cmd_gui
 from hermes_cli.main_desktop import (  # frozen updater surface: update_cmd*.py resolve these via _m()
     _desktop_build_needed,
     _desktop_dist_exists,
@@ -911,6 +909,7 @@ from hermes_cli.main_tui_launch import (
     _refuse_unforwarded_tui_flags,
     _resolve_use_tui,
     _sync_bundled_skills_quietly,
+    _tui_fresh_launch,
     _tui_resume_check,
 )
 
@@ -1739,7 +1738,7 @@ def cmd_chat(args):
             passthrough.pop("resume"), tui_dev=getattr(args, "tui_dev", False),
             native_mode=getattr(args, "tui_native", False) or None,
             model=getattr(args, "model", None), resume_check=_tui_resume_check(args),
-            accept_hooks=getattr(args, "accept_hooks", False),
+            fresh_launch=_tui_fresh_launch(args), accept_hooks=getattr(args, "accept_hooks", False),
             **passthrough,
         )
 

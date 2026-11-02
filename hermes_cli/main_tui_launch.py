@@ -473,6 +473,21 @@ def _tui_resume_check(args) -> Optional[dict]:
     return resume_check_request(args)
 
 
+def _tui_fresh_launch(args) -> bool:
+    """A launch that typed creation flags or asked for a ``--worktree`` wants a FRESH session, so
+    ``display.tui_auto_resume_recent`` must not attach the most recent one (classic ``hermes -m X``
+    never resumes). Exported HERMES_* values without a typed flag are not a request."""
+    if getattr(args, "resume", None):
+        return False
+    if getattr(args, "worktree", False):
+        return True
+    if getattr(args, "in_dir", None):
+        # _apply_in_dir already entered --in DIR, so a relative DIR no longer resolves from here.
+        args = argparse.Namespace(**{**vars(args), "in_dir": os.getcwd()})
+    from hermes_cli.gateway_chat import _resume_requested
+    return bool(_resume_requested(args))
+
+
 def _arm_resume_check(env: dict, resume_session_id: Optional[str], resume_check: Optional[dict]) -> Optional[str]:
     """Hand the Ink client the startup resume's flag check (HERMES_TUI_RESUME_CHECK). It writes the
     differing keys to the returned refusal file and exits 2 instead of attaching; an inherited value
@@ -485,6 +500,14 @@ def _arm_resume_check(env: dict, resume_session_id: Optional[str], resume_check:
     os.close(fd)
     env["HERMES_TUI_RESUME_CHECK"] = json.dumps({**resume_check, "refusal_file": refusal_file})
     return refusal_file
+
+
+def _arm_no_auto_resume(env: dict, resume_session_id: Optional[str], fresh_launch: bool) -> None:
+    """Typed creation flags or a new --worktree ask for a fresh session, so the Ink app skips
+    display.tui_auto_resume_recent (HERMES_TUI_NO_AUTO_RESUME); an inherited value never rides along."""
+    env.pop("HERMES_TUI_NO_AUTO_RESUME", None)
+    if fresh_launch and not resume_session_id:
+        env["HERMES_TUI_NO_AUTO_RESUME"] = "1"
 
 
 def _read_resume_refusal(path: Optional[str]) -> list:
@@ -519,7 +542,8 @@ def _launch_tui(
     provider: Optional[str] = None, toolsets: object = None, skills: object = None,
     verbose: Optional[bool] = None, quiet: bool = False, query: Optional[str] = None,
     image: Optional[str] = None, worktree: bool = False, checkpoints: bool = False,
-    pass_session_id: bool = False, max_turns: Optional[int] = None, accept_hooks: bool = False):
+    pass_session_id: bool = False, max_turns: Optional[int] = None, accept_hooks: bool = False,
+    fresh_launch: bool = False):
     """Replace current process with the TUI."""
     from hermes_cli.main import PROJECT_ROOT
     tui_dir = PROJECT_ROOT / "ui-tui"
@@ -615,6 +639,7 @@ def _launch_tui(
     env.pop("HERMES_TUI_RESUME", None)
     if resume_session_id:
         env["HERMES_TUI_RESUME"] = resume_session_id
+    _arm_no_auto_resume(env, resume_session_id, fresh_launch or worktree)
     refusal_file = _arm_resume_check(env, resume_session_id, resume_check)
 
     argv, cwd = _make_tui_argv(tui_dir, tui_dev)
