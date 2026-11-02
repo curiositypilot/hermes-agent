@@ -313,7 +313,13 @@ def _native_screenshot_result(result: dict[str, Any], path: str) -> Optional[dic
             return None
         # History-reuse cap: this data URL bakes into the tool result and is re-sent every later turn —
         # same policy as the vision_analyze native embed.
-        data_url = _resize_image_for_vision(Path(path), mime_type="image/png",
+        # The "screenshot" is any image path printed during the exec (often a downloaded JPEG photo),
+        # so the MIME comes from its bytes: a hardcoded image/png label on JPEG bytes 400s on Anthropic.
+        from agent.image_routing import _sniff_mime_from_bytes
+        from tools.vision_tools_image_prep import _determine_mime_type
+        with open(path, "rb") as fh:
+            mime = _sniff_mime_from_bytes(fh.read(64))
+        data_url = _resize_image_for_vision(Path(path), mime_type=mime or _determine_mime_type(Path(path)),
                                             max_base64_bytes=resolve_embed_target_bytes(),
                                             max_dimension=_EMBED_MAX_DIMENSION, force_jpeg=True)
         text = json.dumps(result, ensure_ascii=False)
