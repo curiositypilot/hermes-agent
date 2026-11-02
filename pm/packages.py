@@ -518,6 +518,80 @@ class Venv(StatePackage):
         (generation / ".lease-managed").touch()
         return {"environment": candidate, "resolved_lock": resolved_lock}
 
+    def retained_generation(self, stamp: str) -> dict | None:
+        """Find a qualifying retained generation matching *stamp* to avoid rebuild.
+
+        Scan install_state_dir(project)/environments/*, newest .lease-managed mtime first.
+        Skip symlinks and non-dirs. A candidate qualifies only when all criteria hold:
+        - .venv-stamp content == stamp
+        - .lease-managed exists
+        - venv/pyvenv.cfg exists and venv_python(venv) exists
+        - workspace/uv.lock exists and workspace/pyproject.toml exists
+        - managed_environment(venv, ...).check(workspace/uv.lock) passes
+        """
+        from pm.environments import install_state_dir, venv_python
+        from pm.environment import managed_environment
+        from pm.native_build import source_build_environment
+
+        project = self.project_root()
+        environments_dir = install_state_dir(project) / "environments"
+        if not environments_dir.is_dir():
+            return None
+
+        candidates = []
+        for gen in environments_dir.iterdir():
+            if gen.is_symlink() or not gen.is_dir():
+                continue
+            marker = gen / ".lease-managed"
+            if not marker.is_file():
+                continue
+            try:
+                mtime = marker.stat().st_mtime
+            except OSError:
+                continue
+            candidates.append((mtime, gen))
+
+        # Newest .lease-managed mtime first
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        for _mtime, gen in candidates:
+            try:
+                stamp_file = gen / ".venv-stamp"
+                if not stamp_file.is_file():
+                    LOG.info("retained generation %s missing stamp file", gen.name)
+                    continue
+                if stamp_file.read_text(encoding="utf-8").strip() != stamp:
+                    LOG.info("retained generation %s stamp mismatch: file=%r stamp=%r", gen.name, stamp_file.read_text(encoding="utf-8").strip(), stamp)
+                    continue
+                candidate_venv = gen / "venv"
+                if not (candidate_venv / "pyvenv.cfg").is_file():
+                    LOG.info("retained generation %s missing pyvenv.cfg", gen.name)
+                    continue
+                py_bin = venv_python(candidate_venv)
+                if not py_bin.is_file():
+                    LOG.info("retained generation %s py_bin not file: %s", gen.name, py_bin)
+                    continue
+                lock_file = gen / "workspace" / "uv.lock"
+                if not lock_file.is_file():
+                    LOG.info("retained generation %s missing uv.lock", gen.name)
+                    continue
+                pyproject_file = gen / "workspace" / "pyproject.toml"
+                if not pyproject_file.is_file():
+                    LOG.info("retained generation %s missing pyproject.toml", gen.name)
+                    continue
+                env = managed_environment(
+                    candidate_venv,
+                    env=source_build_environment(project),
+                    output=sys.stderr,
+                )
+                env.check(lock_file)
+                (gen / ".lease-managed").touch()
+                return {"environment": candidate_venv, "resolved_lock": lock_file}
+            except (OSError, InstallError) as exc:
+                LOG.info("retained generation %s did not qualify: %s", gen.name, exc)
+                continue
+        return None
+
 
 @register
 class Nodejs(_BionicDebArm, BinaryPackage, DebPackage):
