@@ -98,20 +98,22 @@ def test_cold_cli_builds_own_runtime_discovers_plugins_and_repairs_app(tmp_path,
     source = Path(__file__).resolve().parents[2]
     repo = tmp_path / "source"
     repo.mkdir()
-    for name in ("pm", "hermes_cli"):
+    for name in ("pm", "hermes_cli", "agent", "hermes_platform"):
         shutil.copytree(source / name, repo / name,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     for name in ("utils.py", "hermes_constants.py", "hermes_yaml.py",
-                 "hermes_bootstrap.py"):
+                 "hermes_bootstrap.py", "hermes_dir_acl.py"):
         shutil.copy2(source / name, repo / name)
     # No production application lock or metadata enters this source snapshot.
     recipe = tomllib.loads((repo / "pm" / "pyproject.toml").read_text())
     yaml_requirement = next(dep for dep in recipe["project"]["dependencies"]
                             if dep.startswith("ruamel.yaml"))
+    dotenv_requirement = next(dep for dep in (source / "pyproject.toml").read_text().splitlines()
+                              if "python-dotenv" in dep).strip(' ",')
     (repo / "pyproject.toml").write_text(
         '[project]\nname="cold-pm-app"\nversion="0.0.0"\n'
         'requires-python=">=3.14,<3.15"\n'
-        f'dependencies=[{json.dumps(yaml_requirement)}]\n'
+        f'dependencies=[{json.dumps(yaml_requirement)}, {json.dumps(dotenv_requirement)}]\n'
         '[project.optional-dependencies]\nall=[]\n'
         '[tool.uv]\npackage=false\n', encoding="utf-8",
     )
@@ -207,7 +209,7 @@ assert importlib.util.find_spec('idna') is None
             )
             launched = _run([str(bootstrap_python), "-B", str(entry)], cwd=repo, env=env)
             launch_report = json.loads(launched.stdout)
-            assert Path(launch_report["python"]).is_relative_to(store)
+            assert Path(launch_report["python"]).is_relative_to(store), launched.stderr
             assert launch_report["version"] == list(sys.version_info[:2])
             assert Path(launch_report["idna"]).is_relative_to(hermes_home / "installs")
             assert launched.stderr.count("completing source-update dependencies") == 1
