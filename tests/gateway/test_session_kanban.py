@@ -230,3 +230,36 @@ def test_bind_worker_context_sets_and_clears_pin(tmp_path, monkeypatch, _restore
     else:
         assert 'HERMES_KANBAN_PINNED' not in os.environ
         assert _kanban_pinned_route() is False
+
+
+@pytest.mark.parametrize('case', ['inherited', 'unknown'])
+def test_bind_worker_context_binds_task_data_class(tmp_path, monkeypatch, _restore_environ, case):
+    """The managed worker inherits its owner daemon's env, and an env class wins over the task row
+    in ``_base_data_class``: the class must come from THIS card's row. An unknown class fails the
+    start closed and records its ``provider_denied`` event on the card's own (non-default) board."""
+    import os
+    import sqlite3
+    from contextlib import closing
+    from gateway import session_kanban
+    from agent.provider_policy import ProviderDenied, current_data_class
+    policy = _claimed_policy(tmp_path, monkeypatch, data_class='confidential')
+    context = json.loads(policy.kanban_json)
+    os.environ['HERMES_DATA_CLASS'] = 'internal'  # the client that cold-started the owner
+    monkeypatch.setattr(session_kanban, '_watch_submitter', lambda db, run_id: None)
+    frame = {'policy': {'source': 'kanban', 'kanban_json': json.dumps(context)}}
+    if case == 'inherited':
+        session_kanban.bind_worker_context(frame)
+        assert os.environ['HERMES_DATA_CLASS'] == 'confidential'
+        assert current_data_class() == 'confidential'
+        return
+    # The class left the profile's policy after the card was created.
+    with closing(sqlite3.connect(context['db'])) as conn, conn:
+        conn.execute("UPDATE tasks SET data_class='retired' WHERE id=?", (context['task_id'],))
+    with pytest.raises(ProviderDenied, match='retired'):
+        session_kanban.bind_worker_context(frame)
+    assert 'HERMES_DATA_CLASS' not in os.environ
+    with closing(sqlite3.connect(context['db'])) as conn:
+        rows = conn.execute("SELECT payload, run_id FROM task_events WHERE task_id=? AND kind='provider_denied'",
+                            (context['task_id'],)).fetchall()
+    assert [(json.loads(p)['data_class'], json.loads(p)['phase'], r) for p, r in rows] == [
+        ('retired', 'resolution', context['run_id'])]

@@ -221,7 +221,15 @@ def bind_worker_context(frame):
     _watch_submitter(Path(context['db']), context['run_id'])
     if not pinned:
         os.environ.pop('HERMES_KANBAN_PINNED', None)  # an inherited value must never pin a tier route
+    # Fork: the card's data class, from its row, always. A single-profile managed worker inherits
+    # the daemon's env, and ``_base_data_class`` lets an env value win over the row, so an inherited
+    # class (the client that cold-started the owner) would decide this card's provider policy.
+    # Resolved after the env is bound: an unknown class records its ``provider_denied`` event via
+    # HERMES_KANBAN_DB/TASK/RUN_ID (this board, this run) and raises, so the start fails closed.
+    os.environ.pop('HERMES_DATA_CLASS', None)
     os.environ.update(env)
+    from agent.provider_policy import resolve_data_class
+    os.environ['HERMES_DATA_CLASS'] = resolve_data_class(task)
     os.chdir(context['workspace'])
 
 
