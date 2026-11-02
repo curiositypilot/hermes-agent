@@ -331,3 +331,108 @@ def test_a_facts_file_without_published_entries_hides_nothing(tmp_path):
     workspace._copy_core_inputs(core, destination)
 
     assert (destination / "agent/chromium-1208/kept.txt").read_text(encoding="utf-8") == "KEPT\n"
+
+
+# --- identical member copies collapse by content (intake t_7a1ad159) ---
+# Profile clones copy plugins/ byte for byte; keying members by path rebuilt an identical
+# environment on every profile create, delete and selection edit.
+
+_HINDSIGHT_PYPROJECT = (
+    '[project]\nname = "hermes-plugin-hindsight"\nversion = "1.0.1"\nrequires-python = ">=3.11"\n'
+    'dependencies = ["hindsight-client>=0.10.1,<1"]\n[tool.uv]\npackage = false\n'
+)
+
+
+def _virtual_member(plugin, pyproject=_HINDSIGHT_PYPROJECT, code="VALUE = 1\n"):
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text("name: hindsight\n", encoding="utf-8")
+    (plugin / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    (plugin / "__init__.py").write_text(code, encoding="utf-8")
+    return plugin
+
+
+def _deps_member(plugin, specs):
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text(f"name: legacy\npython_dependencies: {json.dumps(specs)}\n", encoding="utf-8")
+    return plugin
+
+
+def _generated_members(tmp_path, plugin_dirs):
+    import tomllib
+
+    core = tmp_path / "core"
+    if not core.exists():
+        core.mkdir()
+        (core / "pyproject.toml").write_text(
+            '[project]\nname="core"\nversion="1"\nrequires-python=">=3.11"\n[tool.uv]\npackage=false\n',
+            encoding="utf-8")
+    root = tmp_path / f"generation-{len(list(tmp_path.glob('generation-*')))}"
+    workspace._generate_pyproject(plugin_dirs, root, source=core, python=Path(sys.executable))
+    document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    return document["tool"]["uv"]["workspace"]["members"]
+
+
+def test_identical_member_copies_share_one_stamp(tmp_path):
+    a = _virtual_member(tmp_path / "home" / "plugins" / "hindsight")
+    b = tmp_path / "home" / "profiles" / "gtm" / "plugins" / "hindsight"
+    shutil.copytree(a, b)
+    # Build output never reaches a generation, so it cannot tell copies apart.
+    (b / "__pycache__").mkdir()
+    (b / "__pycache__" / "x.pyc").write_bytes(b"compiled elsewhere")
+
+    stamp = workspace.members_stamp([a])
+    assert workspace.members_stamp([a, b]) == stamp == workspace.members_stamp([b])
+    members = _generated_members(tmp_path, [a, b])
+    assert len(members) == 1 and members[0].startswith("plugin-sources/hindsight-"), members
+
+
+@pytest.mark.parametrize("change", ["source byte", "install_requirements", "external source path"])
+def test_differing_member_copies_never_collapse(tmp_path, change):
+    pyproject = _HINDSIGHT_PYPROJECT
+    if change == "external source path":
+        # Resolved against each copy's own home: home-a/libs/dep vs home-b/libs/dep.
+        pyproject += '[tool.uv.sources]\nhindsight-client = { path = "../../libs/dep" }\n'
+    a = _virtual_member(tmp_path / "home-a" / "plugins" / "hindsight", pyproject)
+    b = _virtual_member(tmp_path / "home-b" / "plugins" / "hindsight", pyproject)
+    if change == "source byte":
+        (b / "__init__.py").write_text("VALUE = 2\n", encoding="utf-8")
+    elif change == "install_requirements":
+        (b / "pyproject.toml").write_text(pyproject.replace("<1", "<0.20"), encoding="utf-8")
+
+    assert workspace.members_stamp([a, b]) not in {workspace.members_stamp([a]), workspace.members_stamp([b])}
+    assert workspace.members_stamp([a]) != workspace.members_stamp([b])
+    members = _generated_members(tmp_path, [a, b])
+    assert len(members) == 2 and len(set(members)) == 2, members
+
+
+def test_external_source_resolving_to_one_path_still_collapses(tmp_path):
+    """The identity only matters through what it resolves to: copies in one home share their external tree."""
+    pyproject = _HINDSIGHT_PYPROJECT + '[tool.uv.sources]\nhindsight-client = { path = "../../libs/dep" }\n'
+    a = _virtual_member(tmp_path / "home" / "plugins" / "group" / "x", pyproject)
+    b = _virtual_member(tmp_path / "home" / "plugins" / "other" / "x", pyproject)
+    assert workspace.members_stamp([a, b]) == workspace.members_stamp([a])
+    assert len(_generated_members(tmp_path, [a, b])) == 1
+
+
+def test_pyprojectless_members_collapse_only_on_identical_specs(tmp_path):
+    a = _deps_member(tmp_path / "home-a" / "plugins" / "legacy", ["example>=1,<2"])
+    same = _deps_member(tmp_path / "home-b" / "plugins" / "legacy", ["example>=1,<2"])
+    other = _deps_member(tmp_path / "home-c" / "plugins" / "legacy", ["example>=2,<3"])
+
+    assert workspace.members_stamp([a, same]) == workspace.members_stamp([a]) == workspace.members_stamp([same])
+    members = _generated_members(tmp_path, [a, same])
+    assert len(members) == 1 and members[0].startswith("plugin-deps/legacy-"), members
+    assert workspace.members_stamp([a, other]) not in {workspace.members_stamp([a]), workspace.members_stamp([other])}
+    assert len(set(_generated_members(tmp_path, [a, other]))) == 2
+
+
+def test_staged_update_substitutes_before_the_dedupe(tmp_path):
+    """publication.py maps an identity to its staged tree; the staged content is what collapses or not."""
+    a = _virtual_member(tmp_path / "home" / "plugins" / "hindsight")
+    b = tmp_path / "home" / "profiles" / "gtm" / "plugins" / "hindsight"
+    shutil.copytree(a, b)
+    staged = _virtual_member(tmp_path / "staging" / "hindsight", code="VALUE = 'updated'\n")
+
+    assert workspace.members_stamp({a: a, b: staged}) != workspace.members_stamp([a])
+    assert workspace.members_stamp({a: a, b: staged}) == workspace.members_stamp([a, staged])
+    assert workspace.members_stamp({a: a, b: b}) == workspace.members_stamp([a])

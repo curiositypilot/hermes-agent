@@ -40,26 +40,61 @@ def member_sources(plugin_dirs) -> dict[Path, Path]:
     return {Path(identity).resolve(): Path(source).resolve() for identity, source in rows}
 
 
-def members_stamp(plugin_dirs) -> str:
-    """Hash the member inputs copied into a generation, independent of staging paths."""
+def member_digest(identity: Path, source: Path) -> str:
+    """Hash what a generation gets from one member, not where the member lives.
+
+    Profile clones copy ``plugins/`` byte for byte, so keying by path made every profile
+    create, delete or selection edit rebuild an identical environment. The identity only
+    enters through ``tool.uv.sources`` paths outside the plugin, which ``_workspace_member``
+    resolves against it: copies whose external sources differ never collapse.
+    """
     h = hashlib.sha256()
-    for identity, entry in sorted(member_sources(plugin_dirs).items()):
-        h.update(str(identity).encode("utf-8"))
+    declaration = read_python_declaration(source)
+    for path in declaration.files:
+        h.update(path.name.encode("utf-8"))
+        h.update(path.read_bytes())
         h.update(b"\0")
-        declaration = read_python_declaration(entry)
-        for source in declaration.files:
-            h.update(source.name.encode("utf-8"))
-            h.update(source.read_bytes())
-            h.update(b"\0")
-        if (entry / "pyproject.toml").is_file():
-            for directory, dirs, files in os.walk(entry):
-                dirs[:] = sorted(set(dirs) - set(_member_ignored(directory, dirs)))
-                for name in sorted(set(files) - set(_member_ignored(directory, files))):
-                    path = Path(directory) / name
-                    h.update(path.relative_to(entry).as_posix().encode())
-                    h.update(b"\0")
-                    h.update(os.readlink(path).encode() if path.is_symlink() else path.read_bytes())
-                    h.update(b"\0")
+    if (source / "pyproject.toml").is_file():
+        for directory, dirs, files in os.walk(source):
+            dirs[:] = sorted(set(dirs) - set(_member_ignored(directory, dirs)))
+            for name in sorted(set(files) - set(_member_ignored(directory, files))):
+                path = Path(directory) / name
+                h.update(path.relative_to(source).as_posix().encode())
+                h.update(b"\0")
+                h.update(os.readlink(path).encode() if path.is_symlink() else path.read_bytes())
+                h.update(b"\0")
+    external = []
+    if declaration.pyproject is not None:
+        import tomllib
+
+        document = tomllib.loads(declaration.pyproject.read_text(encoding="utf-8-sig"))
+        external = [resolved for _spec, resolved in _external_sources(document, source, identity)]
+    h.update(json.dumps({"requirements": list(declaration.install_requirements), "sources": external}).encode())
+    return h.hexdigest()
+
+
+def effective_member_sources(plugin_dirs) -> dict[Path, Path]:
+    """``member_sources`` with one entry per distinct member content (lowest identity kept).
+
+    Byte-identical copies would otherwise be separate uv workspace members: a buildable one
+    declares one ``[project].name`` twice and fails ``uv lock``, a virtual one only churns the
+    stamp. Staged updates are substituted by the caller before this runs.
+    """
+    return dict(_distinct_members(plugin_dirs).values())
+
+
+def _distinct_members(plugin_dirs) -> dict[str, tuple[Path, Path]]:
+    kept: dict[str, tuple[Path, Path]] = {}
+    for identity, source in sorted(member_sources(plugin_dirs).items(), key=lambda row: str(row[0])):
+        kept.setdefault(member_digest(identity, source), (identity, source))
+    return kept
+
+
+def members_stamp(plugin_dirs) -> str:
+    """Hash the distinct member contents copied into a generation, independent of their paths."""
+    h = hashlib.sha256()
+    for digest in sorted(_distinct_members(plugin_dirs)):
+        h.update(digest.encode())
     return h.hexdigest()
 
 
@@ -146,7 +181,7 @@ def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Pat
     core_text = core_pyproject.read_text(encoding="utf-8-sig")
 
     members = [_workspace_member(source, root, identity=identity).relative_to(root).as_posix()
-               for identity, source in member_sources(plugin_dirs).items()
+               for identity, source in effective_member_sources(plugin_dirs).items()
                if _is_member_candidate(source)]
 
     if members:
@@ -281,15 +316,31 @@ def enabled_member_dirs(*, proposed_home=None, enabled=None, disabled=None) -> l
     return members
 
 
-def _member_key(identity: Path) -> str:
-    """``<plugin dir name>-<sha256(path)[:16]>``: the hash keeps two same-named plugins from
-    different homes apart; the name is what a user sees in uv's conflict text
-    (``hermes-plugin-<key> depends on …``) — a bare hash told them nothing to disable."""
+def _member_key(identity: Path, source: Path) -> str:
+    """``<plugin dir name>-<member_digest[:16]>``: the content digest keeps two different
+    same-named plugins apart while identical copies share one key; the name is what a user
+    sees in uv's conflict text (``hermes-plugin-<key> depends on …``) — a bare hash told
+    them nothing to disable."""
     import re
 
-    digest = hashlib.sha256(str(identity.resolve()).encode()).hexdigest()[:16]
+    digest = member_digest(identity, source)[:16]
     name = re.sub(r"[^a-z0-9._-]+", "-", identity.name.lower()).strip("-.") or "plugin"
     return f"{name}-{digest}"
+
+
+def _external_sources(document: dict, plugin_dir: Path, identity: Path):
+    """``(spec, path)`` for each relative ``tool.uv.sources`` path that leaves *plugin_dir*,
+    with the path resolved against the installed *identity* (a staged copy sits elsewhere)."""
+    for sources in document.get("tool", {}).get("uv", {}).get("sources", {}).values():
+        for spec in sources if isinstance(sources, list) else [sources]:
+            if not isinstance(spec, dict) or "path" not in spec:
+                continue
+            relative = Path(spec["path"])
+            if relative.is_absolute():
+                continue
+            if (plugin_dir / relative).resolve().is_relative_to(plugin_dir.resolve()):
+                continue  # The referenced tree is copied with the member.
+            yield spec, (identity / relative).resolve().as_posix()
 
 
 def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path) -> Path:
@@ -297,7 +348,7 @@ def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path) -> Path:
     import json
     import tomllib
 
-    key = _member_key(identity)
+    key = _member_key(identity, plugin_dir)
     declaration = read_python_declaration(plugin_dir)
     pyproject = declaration.pyproject
     if pyproject is not None:
@@ -316,18 +367,9 @@ def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path) -> Path:
         changed = declaration.install_requirements != declaration.requirements
         if changed:
             document["project"]["dependencies"] = list(declaration.install_requirements)
-        for sources in document.get("tool", {}).get("uv", {}).get("sources", {}).values():
-            for spec in sources if isinstance(sources, list) else [sources]:
-                if not isinstance(spec, dict) or "path" not in spec:
-                    continue
-                relative = Path(spec["path"])
-                if relative.is_absolute():
-                    continue
-                resolved = (plugin_dir / relative).resolve()
-                if resolved.is_relative_to(plugin_dir.resolve()):
-                    continue  # The referenced tree was copied with this member.
-                spec["path"] = (identity / relative).resolve().as_posix()
-                changed = True
+        for spec, resolved in list(_external_sources(document, plugin_dir, identity)):
+            spec["path"] = resolved
+            changed = True
         if virtual:
             document.setdefault("project", {})["name"] = f"hermes-plugin-{key}"
         project = document.get("project")
