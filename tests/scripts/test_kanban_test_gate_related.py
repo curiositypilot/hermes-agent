@@ -63,3 +63,37 @@ def test_changed_test_file_is_selected_wherever_it_lives(repo):
 
 def test_init_and_conftest_stems_select_nothing(repo):
     assert gate.related_tests({"pkg/__init__.py", "tests/conftest.py", "conftest.py"}) == []
+
+
+def test_cross_dir_tests_selects_mapped_and_mirror(repo, monkeypatch):
+    extra = [
+        "hermes_cli/venv_sync.py",
+        "tests/hermes_cli/test_venv_sync.py",
+        "tests/pm/test_source_update_launch.py",
+        "tests/cron/test_restart_safe_worker.py",
+    ]
+    for rel in extra:
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+
+    selected = gate.related_tests({"hermes_cli/venv_sync.py"})
+    assert selected == [
+        "tests/cron/test_restart_safe_worker.py",
+        "tests/hermes_cli/test_venv_sync.py",
+        "tests/pm/test_source_update_launch.py",
+    ]
+
+
+def test_cross_dir_tests_ignores_missing_targets_and_skip_parts(repo, monkeypatch):
+    monkeypatch.setattr(gate, "CROSS_DIR_TESTS", {
+        "bar.py": (
+            "tests/missing/test_missing.py",
+            "tests/e2e/test_ignored_e2e.py",
+            "tests/tools/test_foo.py",
+        )
+    })
+    (repo / "tests/e2e/test_ignored_e2e.py").write_text("")
+    selected = gate.related_tests({"bar.py"})
+    assert selected == ["tests/tools/test_foo.py"]
+

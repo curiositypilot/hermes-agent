@@ -23,6 +23,22 @@ ROOT = Path(__file__).resolve().parent.parent
 # discovered files, and this gate passes explicit paths, so the gate filters them itself.
 SKIP_PARTS = frozenset({"integration", "e2e", "docker"})
 
+# Explicit cross-package contract test mapping for critical runtime/root modules whose
+# dependents live outside the mirror directory structure.
+CROSS_DIR_TESTS: dict[str, tuple[str, ...]] = {
+    "hermes_cli/venv_sync.py": (
+        "tests/pm/test_source_update_launch.py",
+        "tests/cron/test_restart_safe_worker.py",
+    ),
+    "hermes_bootstrap.py": (
+        "tests/pm/test_bootstrap_import_closure.py",
+        "tests/pm/test_source_update_launch.py",
+    ),
+    "cron/worker_bootstrap.py": (
+        "tests/cron/test_restart_safe_worker.py",
+    ),
+}
+
 
 def _git(*args: str) -> list[str]:
     out = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
@@ -57,6 +73,10 @@ def related_tests(files: set[str]) -> list[str]:
     for f in files:
         if f.endswith(".py") and not f.startswith("tests/") and Path(f).stem not in {"__init__", "conftest"}:
             tests |= _mirror_tests(f)
+            mapped = CROSS_DIR_TESTS.get(f) or ()
+            for target in mapped:
+                if not SKIP_PARTS.intersection(PurePosixPath(target).parts) and (ROOT / target).is_file():
+                    tests.add(target)
     return sorted(tests)
 
 
