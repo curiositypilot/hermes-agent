@@ -143,6 +143,11 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
     except Exception as exc:
         if attempted:
             raise CronExecutionUnknown(f'Cron execution unverified; reconcile {journal}: {exc}') from exc
+        from cron.unreachable_retry import is_gateway_unavailable_presubmit
+        if is_gateway_unavailable_presubmit(exc):
+            # Nothing was submitted and the owner is draining (update fence) or still starting:
+            # the unreachable ladder re-runs the fire and holds the notice meanwhile.
+            job['_model_unreachable'] = True
         error = f'{type(exc).__name__}: {exc}'
         return False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error
 
