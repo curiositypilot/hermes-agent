@@ -481,6 +481,30 @@ def test_run_budget_flag_rides_session_create():
     assert "run_budget" not in _creation_policy({"run_budget": None})
 
 
+def test_no_fallback_rides_session_create(monkeypatch):
+    """`hermes chat -Q --no-fallback` sets HERMES_NO_FALLBACK before the classic CLI builds its launch;
+    the gateway that runs the turn never sees that env, so the flag must ride session.create (t_bec8a9cb)."""
+    from hermes_cli.gateway_session_store import _creation_policy
+    monkeypatch.delenv("HERMES_NO_FALLBACK", raising=False)
+    assert "no_fallback" not in _creation_policy({})
+    monkeypatch.setenv("HERMES_NO_FALLBACK", "1")
+    assert _creation_policy({})["no_fallback"] is True
+
+
+def test_no_fallback_on_classic_resume_is_checked_against_the_frozen_route(store, monkeypatch):
+    """`hermes chat --resume X --no-fallback` on a session created without it is refused, never
+    silently dropped (the flag only exists as HERMES_NO_FALLBACK in the classic CLI); repeating it is fine."""
+    db, client = store
+    monkeypatch.setenv("HERMES_NO_FALLBACK", "1")
+    _frozen_launch(client, {"model": "m"})
+    with pytest.raises(GatewayClientError, match="--no-fallback differs"):
+        GatewaySessionStore(db.connection).open_session(cli("local-old", resumed=True), {})
+    _frozen_launch(client, {"model": "m", "no_fallback": True})
+    assert GatewaySessionStore(db.connection).open_session(cli("local-old", resumed=True), {}) == "local-old"
+    monkeypatch.delenv("HERMES_NO_FALLBACK")  # a bare resume keeps the frozen route, flag included
+    assert GatewaySessionStore(db.connection).open_session(cli("local-old", resumed=True), {}) == "local-old"
+
+
 def test_verbose_flag_rides_session_create():
     from hermes_cli.gateway_session_store import _creation_policy
     assert _creation_policy({"verbose": True})["verbose"] is True

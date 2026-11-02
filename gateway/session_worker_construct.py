@@ -150,12 +150,14 @@ def _dict_list(value):
 def route_runtime(policy, frozen, model, key, *, fallback=True):
     """``(runtime, fallback_entry)`` for a launch-policy route: the session's FROZEN config and launch
     credential, walking its own fallback chain on an AuthError unless ``fallback=False`` (a session
-    control asking which route the session itself runs). The one resolver an in-process turn
-    (``_resolve_policy_agent_runtime``) and a managed worker (``worker_route``) share."""
+    control asking which route the session itself runs) or the session is ``no_fallback`` (also
+    outside its turn's policy scope: the pre-turn resolutions in ``run_inbound``). The one resolver an
+    in-process turn (``_resolve_policy_agent_runtime``) and a managed worker (``worker_route``) share."""
     from hermes_cli.runtime_provider import (
         frozen_runtime_config, resolve_runtime_provider, resolve_runtime_with_fallback,
     )
     from hermes_cli.runtime_provider_custom import _resolve_named_custom_runtime
+    fallback = fallback and not policy.no_fallback
     provider = (frozen.get('model') or {}).get('provider')
     launch_url = json.loads(policy.request_json).get('base_url')
     if launch_url:

@@ -519,3 +519,24 @@ def test_verbose_is_a_frozen_launch_option(tmp_path):
     assert build_policy(dict(cwd=str(tmp_path)), {}).verbose is False
     with pytest.raises(RuntimeStoreError, match='invalid_params'):
         build_policy(dict(cwd=str(tmp_path), verbose='yes'), {})
+
+
+def test_no_fallback_is_a_frozen_launch_option(tmp_path):
+    """`hermes chat --no-fallback` (t_bec8a9cb): a boolean create field, frozen in the creation request
+    (echoed as ``launch_request``, so a resume changing it is refused) and declared on the wire contract."""
+    import argparse
+    import json
+    from gateway.session_policy import build_policy
+    from hermes_cli.gateway_chat import GatewayClientError, check_resume_policy
+    from hermes_state_runtime import RuntimeStoreError
+    from tui_gateway.contracts.registry import CANONICAL_METHODS, canonical_param_problems
+    policy = build_policy(dict(cwd=str(tmp_path), no_fallback=True), {})
+    assert policy.no_fallback is True and json.loads(policy.request_json)['no_fallback'] is True
+    assert build_policy(dict(cwd=str(tmp_path)), {}).no_fallback is False
+    with pytest.raises(RuntimeStoreError, match='invalid_params'):
+        build_policy(dict(cwd=str(tmp_path), no_fallback='yes'), {})
+    contract = CANONICAL_METHODS['session.create']
+    assert canonical_param_problems(contract, {'request_id': 'r', 'source': 'cli', 'no_fallback': True}) == []
+    plain = {'info': {'launch_request': json.loads(build_policy(dict(cwd=str(tmp_path)), {}).request_json)}}
+    with pytest.raises(GatewayClientError, match='--no-fallback differs'):
+        check_resume_policy(argparse.Namespace(no_fallback=True), plain)

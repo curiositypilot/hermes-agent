@@ -16,7 +16,8 @@ CREATE_FIELDS = frozenset({'request_id', 'source', 'cwd', 'model', 'toolsets',
                            'provider', 'base_url', 'reasoning', 'max_turns', 'ignore_rules', 'api_key', 'editor',
                            'yolo', 'safe_mode', 'ignore_user_config',
                            'skills', 'checkpoints', 'accept_hooks', 'pass_session_id', 'follow_profile_config',
-                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env'})
+                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env',
+                           'no_fallback'})
 # Sections a ``follow_profile_config`` session re-reads from the owning profile's CURRENT config each
 # turn (main's Bot Chat row), credentials included: a frozen key never crosses a profile route change.
 FOLLOW_SECTIONS = ('model', 'providers', 'custom_providers', 'fallback_providers', 'fallback_model', 'model_aliases',
@@ -330,6 +331,12 @@ class LocalSessionPolicy:
         return json.loads(self.request_json).get('verbose', False)
 
     @property
+    def no_fallback(self):
+        """`hermes chat --no-fallback`: this session's route fails instead of walking its fallback chain.
+        Bound per turn (``policy_scope``) for ``fallback_config.fallback_disabled``, the one reader."""
+        return json.loads(self.request_json).get('no_fallback', False)
+
+    @property
     def run_budget_seconds(self):
         """Frozen `agent.run_budget_seconds` (`--run-budget` folds into it); None = no budget."""
         from agent.agent_init import _normalize_run_budget_seconds
@@ -605,7 +612,7 @@ def _apply_launch_overrides(params, config):
                     _refuse('base_url', 'must be an http(s) URL without credentials, query or fragment')
             config.setdefault('model', {})[key] = value
     bad_flag = next((flag for flag in ('ignore_rules', 'yolo', 'checkpoints', 'accept_hooks', 'pass_session_id',
-                                      'follow_profile_config', 'cwd_explicit', 'verbose')
+                                      'follow_profile_config', 'cwd_explicit', 'verbose', 'no_fallback')
                      if flag in params and type(params[flag]) is not bool), None)
     if bad_flag:
         _refuse(bad_flag, 'must be a boolean')
@@ -1134,8 +1141,9 @@ def policy_scope(policy, *, authority=None):
         # Auxiliary tasks read the session's frozen section, never live config.yaml (a rotated key there).
         auxiliary = policy.config(authority).get('auxiliary') if authority is not None else None
         aux_scope = session_auxiliary_scope(auxiliary) if authority is not None else contextlib.nullcontext()
+        from hermes_cli.fallback_config import session_no_fallback_scope
         with (editor_scope(policy), editor_mcp_scope(authority, policy), aux_scope,
-              policy.client_env_scope()):
+              policy.client_env_scope(), session_no_fallback_scope(policy.no_fallback)):
             yield
     finally:
         _ACTIVE_POLICY.reset(policy_token)

@@ -515,18 +515,22 @@ def _classic_only_policy(launch):
 
 # Flags a resume may only repeat (``toolsets`` arrives here only from an explicit ``-t``).
 _RESUME_CHECKED = _LAUNCH_POLICY
+# Creation flags the classic CLI carries only as their env equivalent (``--no-fallback`` sets
+# HERMES_NO_FALLBACK before the launch dict exists): a resume repeating one is fine, adding one is refused.
+_RESUME_CHECKED_ENV = ("no_fallback",)
 
 
 def _check_resume_launch(launch, snapshot):
     """Explicit launch flags on ``--resume`` / ``-c`` against the session's frozen route, as the thin
     client checks them: the same flags again are fine, a different value is refused, never dropped."""
-    from hermes_cli.gateway_chat import check_resume_policy, resume_policy_error
+    from hermes_cli.gateway_chat import check_resume_policy, env_launch_flags, resume_policy_error
     fields = {key: launch.get(key) for key in _RESUME_CHECKED}
     if isinstance(fields.get("toolsets"), (list, tuple)):
         fields["toolsets"] = ",".join(str(item) for item in fields["toolsets"])
     check_resume_policy(argparse.Namespace(**fields), snapshot)
     frozen = ((snapshot.get("info") or {}).get("launch_request") or {})
-    differs = [key for key, value in _classic_only_policy(launch).items() if frozen.get(key) != value]
+    env = {key: value for key, value in env_launch_flags().items() if key in _RESUME_CHECKED_ENV}
+    differs = [key for key, value in {**_classic_only_policy(launch), **env}.items() if frozen.get(key) != value]
     if differs:
         raise resume_policy_error(differs)
 

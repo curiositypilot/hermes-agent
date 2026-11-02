@@ -8648,6 +8648,11 @@
             "default": null,
             "title": "Run Budget"
           },
+          "no_fallback": {
+            "default": false,
+            "title": "No Fallback",
+            "type": "boolean"
+          },
           "verbose": {
             "default": false,
             "title": "Verbose",

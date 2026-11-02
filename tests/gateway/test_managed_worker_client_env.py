@@ -127,3 +127,92 @@ def test_managed_workers_run_each_sessions_tools_under_its_client_toolchain(tmp_
         db.close()
     text = json.dumps(public, default=str)
     assert not [s for s in sentinels.values() if s in text], 'client_env leaked into a public projection'
+
+
+
+class DeadPrimary(BaseHTTPRequestHandler):
+    """404s the pinned model (the 2026-11-02 gemini-3.1-pro signature); any other model answers ``OK``."""
+    seen: list = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        type(self).seen.append(body.get('model'))
+        if body.get('model') == 'dead':
+            payload = json.dumps({'error': {'message': 'model dead not found', 'type': 'not_found_error',
+                                            'code': 'model_not_found'}}).encode()
+            self.send_response(404)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        message = {'role': 'assistant', 'content': 'OK'}
+        frame = {'id': 'fb', 'model': body.get('model'), 'choices': [{'index': 0, 'delta': message, 'finish_reason': 'stop'}],
+                 'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}}
+        if body.get('stream'):
+            payload, kind = ('data: ' + json.dumps(frame) + '\n\ndata: [DONE]\n\n').encode(), 'text/event-stream'
+        else:
+            frame['choices'][0]['message'] = frame['choices'][0].pop('delta')
+            payload, kind = json.dumps(frame).encode(), 'application/json'
+        self.send_response(200)
+        self.send_header('Content-Type', kind)
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+@pytest.mark.platforms("linux")
+def test_managed_worker_no_fallback_session_fails_instead_of_switching_models(tmp_path):
+    """t_bec8a9cb on a real gateway with managed workers: a session created with ``no_fallback`` whose
+    pinned model 404s fails its turn and never reaches the fallback model; the same session without the
+    flag is answered by the fallback (the 2026-11-02 incident), proving the check bites."""
+    from tests.gateway.fixtures.local_recovery_probe import daemon, rpc, websocket
+    home, user = tmp_path / 'state', tmp_path / 'user'
+    home.mkdir(mode=0o700)
+    user.mkdir()
+    DeadPrimary.seen = []
+    peer = ThreadingHTTPServer(('127.0.0.1', 0), DeadPrimary)
+    threading.Thread(target=peer.serve_forever, daemon=True).start()
+    url = f'http://127.0.0.1:{peer.server_port}/v1'
+    (home / 'config.yaml').write_text(json.dumps({
+        'gateway': {'multiplex_profiles': False, 'managed_workers': True},
+        'model': {'provider': 'custom', 'default': 'dead', 'base_url': url},
+        'fallback_providers': [{'provider': 'custom', 'model': 'alive', 'base_url': url, 'api_key': 'loopback-only'}],
+        'auxiliary': {'title_generation': {'enabled': False}}, 'approvals': {'mode': 'off'},
+        'platform_toolsets': {'cli': []}}))
+    env = {k: os.environ[k] for k in ('LANG', 'TZ', 'PATH') if k in os.environ}
+    env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(ROOT),
+               OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)
+
+    def settled(request_id):
+        with closing(sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True)) as db:
+            rows = db.execute('SELECT status FROM session_admissions WHERE request_id=?', (request_id,)).fetchall()
+            return rows == [('terminal',)]
+
+    async def turn(ws, name, **flags):
+        created = await rpc(ws, 'session.create', request_id=name, source='cli', cwd=str(home), model='dead',
+                            provider='custom', base_url=url, api_key='loopback-only', toolsets=[],
+                            ignore_rules=True, **flags)
+        assert 'result' in created, created
+        sid = created['result']['session_id']
+        DeadPrimary.seen = []
+        assert 'result' in await rpc(ws, 'prompt.submit', session_id=sid, input_id=f'turn-{name}', text='hi')
+        await async_wait_until(lambda: settled(f'turn-{name}'), timeout=120, interval=.1, what=f'{name} turn to settle')
+        messages = (await rpc(ws, 'session.resume', session_id=sid))['result']['messages']
+        return list(DeadPrimary.seen), [m.get('content') for m in messages if m['role'] == 'assistant']
+
+    async def exercise(desc):
+        async with websocket(home, desc) as ws:
+            return await turn(ws, 'pinned', no_fallback=True), await turn(ws, 'plain')
+    try:
+        with daemon(ROOT, home, env, barrier=False) as (_owner, desc):
+            pinned, plain = asyncio.run(exercise(desc))
+    finally:
+        peer.shutdown()
+        peer.server_close()
+    assert 'alive' in plain[0] and 'OK' in plain[1], plain  # without the flag: the incident's switch
+    assert {model for model in pinned[0] if model} == {'dead'}, pinned  # never asked the fallback model
+    assert 'OK' not in pinned[1], pinned

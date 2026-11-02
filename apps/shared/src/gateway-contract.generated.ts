@@ -4983,6 +4983,7 @@ export interface CanonicalCreateParams {
   service_tier?: string | null
   cwd_explicit?: boolean | null
   run_budget?: number | null
+  no_fallback?: boolean
   verbose?: boolean
   client_env?: Record<string, string> | null
 }
