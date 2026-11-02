@@ -1,5 +1,6 @@
 import type { MouseTrackingMode } from '@hermes/ink'
 
+import { parseResumeLaunchCheck } from '../canonicalGateway.js'
 import { isTermuxTuiMode } from '../lib/termux.js'
 
 const truthy = (v?: string) => /^(?:1|true|yes|on)$/i.test((v ?? '').trim())
@@ -26,6 +27,8 @@ const parseToggle = (v?: string): boolean | null => {
 export const TERMUX_TUI_MODE: boolean = isTermuxTuiMode()
 
 export const STARTUP_RESUME_ID = (process.env.HERMES_TUI_RESUME ?? '').trim()
+// `hermes --tui --resume <id>` with typed creation flags: what the startup resume must not change.
+export const STARTUP_RESUME_CHECK = parseResumeLaunchCheck(process.env.HERMES_TUI_RESUME_CHECK)
 export const STARTUP_QUERY = (process.env.HERMES_TUI_QUERY ?? '').trim()
 export const STARTUP_IMAGE = (process.env.HERMES_TUI_IMAGE ?? '').trim()
 // Workspace the dashboard user picked for a fresh chat (`/api/pty?cwd=`). Sent as the explicit

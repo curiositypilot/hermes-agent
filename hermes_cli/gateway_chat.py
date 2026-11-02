@@ -297,12 +297,43 @@ def _requested_policy(args):
     return policy
 
 
-def check_resume_policy(args, snapshot):
-    """A resume may repeat the flags the session was created with (scripts re-run one command
-    line); anything that would CHANGE the frozen route is refused, as before."""
+def _resume_requested(args):
+    """The typed creation flags a resume compares with the session's frozen launch (exported
+    HERMES_* values without a typed flag are not a request)."""
     requested = _requested_policy(args)
     if getattr(args, "in_dir", None):
         requested["cwd"] = str(Path(args.in_dir).expanduser().resolve())
+    return requested
+
+
+def _resolved_launch_model(requested):
+    """The model id the owner freezes for this ``-m`` (a ``model_aliases:`` name resolves to its target)."""
+    from gateway.session_local_route import resolve_launch_route
+    from hermes_cli.config_effective import load_user_config_effective
+    from hermes_constants import get_hermes_home
+    flags = {key: requested[key] for key in ("model", "provider", "base_url", "api_key") if key in requested}
+    return resolve_launch_route(flags, load_user_config_effective(get_hermes_home() / "config.yaml"))["model"]
+
+
+def resume_check_request(args):
+    """``hermes --tui --resume``'s half of check_resume_policy: the launcher holds no snapshot, so
+    the Ink client compares these inputs with the one it attaches (HERMES_TUI_RESUME_CHECK).
+    None when nothing was typed. ``model_resolved`` is absent when the alias does not resolve:
+    the model then differs unless it equals the frozen one verbatim."""
+    requested = _resume_requested(args)
+    if not requested:
+        return None
+    check = {"requested": requested}
+    if "model" in requested:
+        with contextlib.suppress(Exception):  # an unresolvable alias refuses unless verbatim equal
+            check["model_resolved"] = _resolved_launch_model(requested)
+    return check
+
+
+def check_resume_policy(args, snapshot):
+    """A resume may repeat the flags the session was created with (scripts re-run one command
+    line); anything that would CHANGE the frozen route is refused, as before."""
+    requested = _resume_requested(args)
     if not requested:
         return
     info = snapshot.get("info") if isinstance(snapshot, dict) else None
@@ -313,11 +344,7 @@ def check_resume_policy(args, snapshot):
         requested["model"] = frozen.get("model")  # the alias the owner resolved at creation
     elif "model" in requested and requested["model"] != frozen.get("model") and "model_requested" not in frozen:
         # The owner froze the resolved id of a `-m <alias>`; the same alias again is the same route.
-        from gateway.session_local_route import resolve_launch_route
-        from hermes_cli.config_effective import load_user_config_effective
-        from hermes_constants import get_hermes_home
-        flags = {key: requested[key] for key in ("model", "provider", "base_url", "api_key") if key in requested}
-        requested["model"] = resolve_launch_route(flags, load_user_config_effective(get_hermes_home() / "config.yaml"))["model"]
+        requested["model"] = _resolved_launch_model(requested)
     # api_key is never durable; a repeated key is not a policy change.
     differs = [key for key, value in requested.items() if key != "api_key" and frozen.get(key) != value]
     if differs:

@@ -5,6 +5,7 @@ are imported lazily inside the functions that use them (avoids an import cycle).
 """
 
 import logging
+import argparse
 import contextlib
 import json
 import os
@@ -460,9 +461,61 @@ def _refuse_unforwarded_tui_flags(args) -> None:
         raise SystemExit(2)
 
 
+def _tui_resume_check(args) -> Optional[dict]:
+    """The typed creation flags a ``--tui`` resume must not change (classic refuses them); None for
+    a fresh launch or when nothing was typed."""
+    if not getattr(args, "resume", None):
+        return None
+    if getattr(args, "in_dir", None):
+        # _apply_in_dir already entered --in DIR, so a relative DIR no longer resolves from here.
+        args = argparse.Namespace(**{**vars(args), "in_dir": os.getcwd()})
+    from hermes_cli.gateway_chat import resume_check_request
+    return resume_check_request(args)
+
+
+def _arm_resume_check(env: dict, resume_session_id: Optional[str], resume_check: Optional[dict]) -> Optional[str]:
+    """Hand the Ink client the startup resume's flag check (HERMES_TUI_RESUME_CHECK). It writes the
+    differing keys to the returned refusal file and exits 2 instead of attaching; an inherited value
+    never rides along, so only this invocation's typed flags are checked."""
+    env.pop("HERMES_TUI_RESUME_CHECK", None)
+    if not (resume_session_id and resume_check):
+        return None
+    import tempfile
+    fd, refusal_file = tempfile.mkstemp(prefix="hermes-tui-resume-refusal-", suffix=".json")
+    os.close(fd)
+    env["HERMES_TUI_RESUME_CHECK"] = json.dumps({**resume_check, "refusal_file": refusal_file})
+    return refusal_file
+
+
+def _read_resume_refusal(path: Optional[str]) -> list:
+    """The flag keys the Ink client refused the resume for; an empty or unreadable file refused nothing."""
+    if not path:
+        return []
+    try:
+        keys = json.loads(Path(path).read_text(encoding="utf-8-sig") or "[]")
+    except (OSError, ValueError):
+        return []
+    return [str(key) for key in keys] if isinstance(keys, list) else []
+
+
+def _exit_if_resume_refused(refusal_file: Optional[str]) -> None:
+    """Classic's refusal, same words and exit code 2, when the Ink client refused the startup resume (the
+    session was left as it was); raised inside the launcher's try so its cleanup still runs."""
+    refused = _read_resume_refusal(refusal_file)
+    if refused:
+        from hermes_cli.gateway_chat import exit_on_resume_refusal, resume_policy_error
+        exit_on_resume_refusal(resume_policy_error(refused))
+
+
+def _unlink_quietly(*paths: Optional[str]) -> None:
+    for path in filter(None, paths):
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
 def _launch_tui(
     resume_session_id: Optional[str] = None, tui_dev: bool = False, native_mode: Optional[bool] = None,
-    model: Optional[str] = None,
+    model: Optional[str] = None, resume_check: Optional[dict] = None,
     provider: Optional[str] = None, toolsets: object = None, skills: object = None,
     verbose: Optional[bool] = None, quiet: bool = False, query: Optional[str] = None,
     image: Optional[str] = None, worktree: bool = False, checkpoints: bool = False,
@@ -562,6 +615,7 @@ def _launch_tui(
     env.pop("HERMES_TUI_RESUME", None)
     if resume_session_id:
         env["HERMES_TUI_RESUME"] = resume_session_id
+    refusal_file = _arm_resume_check(env, resume_session_id, resume_check)
 
     argv, cwd = _make_tui_argv(tui_dir, tui_dev)
     code: Optional[int] = None
@@ -571,12 +625,12 @@ def _launch_tui(
         except KeyboardInterrupt:
             code = 130
 
+        _exit_if_resume_refused(refusal_file)
         if code in {0, 130}:
             _print_tui_exit_summary(resume_session_id, active_session_file)
     finally:
         attached_session = _read_tui_active_session_file(active_session_file) or resume_session_id
-        with contextlib.suppress(OSError):
-            os.unlink(active_session_file)
+        _unlink_quietly(active_session_file, refusal_file)
         if wt_info and code in {0, 130}:
             from hermes_cli.worktree_exit import ask_exit_choice
             ask_exit_choice(wt_info)

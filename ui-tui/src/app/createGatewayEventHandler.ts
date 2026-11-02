@@ -6,7 +6,7 @@ import { relativeLuminance } from '@hermes/shared/color'
 import type { MessageDeltaPayload, SubagentStatus, Usage } from '@hermes/shared/gateway-events'
 import type { UsageLimit } from '@hermes/shared/plan-usage'
 
-import { STARTUP_IMAGE, STARTUP_QUERY } from '../config/env.js'
+import { STARTUP_IMAGE, STARTUP_QUERY, STARTUP_RESUME_CHECK } from '../config/env.js'
 import { STREAM_BATCH_MS } from '../config/timing.js'
 import { buildSetupRequiredSections, setupRequiredTitle } from '../content/setup.js'
 import { usageFromTick } from '../domain/usage.js'
@@ -806,7 +806,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   syncThemeToTerminalBackground()
 
   const { gw, rpc } = ctx.gateway
-  const { STARTUP_RESUME_ID, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
+  const { STARTUP_RESUME_ID, dieWithCode, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
   const { bellOnComplete, bellOnPrompt, stdout, sys } = ctx.system
 
   // display.bell_on_prompt — BEL whenever a blocking prompt modal opens
@@ -1098,6 +1098,22 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       // so override it here to keep the distinct "recovering" label visible for
       // the duration of the resume RPC (which later flips status to 'ready').
       patchUiState({ status: t('gatewayMsg.status.recoveringSession') })
+
+      return
+    }
+
+    if (STARTUP_RESUME_ID && STARTUP_RESUME_CHECK) {
+      // `--resume` plus typed creation flags: a flag the session was not launched with refuses the resume
+      // (exit 2; the launcher prints classic's message), so nothing attaches and no startup prompt is sent.
+      let refused = false
+      patchUiState({ status: t('session.status.resuming') })
+      void resumeById(STARTUP_RESUME_ID, {
+        launchCheck: STARTUP_RESUME_CHECK,
+        onLaunchRefused: () => {
+          refused = true
+          dieWithCode?.(2)
+        }
+      }).then(() => refused || scheduleStartupPrompt())
 
       return
     }

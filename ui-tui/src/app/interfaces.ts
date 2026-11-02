@@ -2,6 +2,7 @@ import type { MouseTrackingMode, ScrollBoxHandle } from '@hermes/ink'
 import type { Usage } from '@hermes/shared/gateway-events'
 import type { MutableRefObject, ReactNode, RefObject, SetStateAction } from 'react'
 
+import type { ResumeLaunchCheck } from '../canonicalGateway.js'
 import type { PasteEvent } from '../components/textInput.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import type {
@@ -496,6 +497,13 @@ export interface InputHandlerResult {
   pagerPageSize: number
 }
 
+/** Only the `hermes --tui --resume` startup attach carries a launch check; picks, recovery and
+ *  auto-resume never do. `onLaunchRefused` runs after the refused attach was released. */
+export interface ResumeByIdOptions {
+  launchCheck?: null | ResumeLaunchCheck
+  onLaunchRefused?: (keys: string[]) => void
+}
+
 export interface GatewayEventHandlerContext {
   composer: {
     enqueue?: ComposerActions['enqueue']
@@ -505,11 +513,12 @@ export interface GatewayEventHandlerContext {
   session: {
     STARTUP_RESUME_ID: string
     colsRef: MutableRefObject<number>
+    dieWithCode?: (code: number) => void
     newSession: (msg?: string, title?: string) => void
     // Session carried across a transport loss or child exit, cleared after resume.
     recoverSidRef?: MutableRefObject<null | string>
     resetSession: () => void
-    resumeById: (id: string) => Promise<void>
+    resumeById: (id: string, opts?: ResumeByIdOptions) => Promise<void>
     setCatalog: (catalog: null | SlashCatalog) => void
   }
   submission: {

@@ -182,3 +182,53 @@ export function launchToolProgress(env = process.env): string | undefined {
 
   return raw
 }
+
+/** `hermes --tui --resume` with typed creation flags (HERMES_TUI_RESUME_CHECK): the inputs of classic's
+ * `check_resume_policy`, computed by the launcher (`hermes_cli/gateway_chat.py resume_check_request`),
+ * which holds no snapshot. The keys that differ go back through `refusal_file`; the launcher prints the
+ * refusal and exits 2. */
+export interface ResumeLaunchCheck {
+  model_resolved?: string
+  refusal_file: string
+  requested: Record<string, unknown>
+}
+
+export function parseResumeLaunchCheck(raw?: string): null | ResumeLaunchCheck {
+  if (!raw?.trim()) { return null }
+
+  try {
+    const value = JSON.parse(raw)
+
+    if (value?.requested && typeof value.requested === 'object' && typeof value.refusal_file === 'string') {
+      return value as ResumeLaunchCheck
+    }
+  } catch {
+    // An unreadable hand-off carries no check, as no typed flag.
+  }
+
+  return null
+}
+
+/** The requested keys the resumed session was not launched with (`check_resume_policy`'s comparison): a
+ * repeat of the creation flags passes, and `-m <alias>` matches the id the owner resolved at creation.
+ * A snapshot without `launch_request` (legacy transport) differs on every key, as classic's `frozen = {}`. */
+export function resumeLaunchMismatch(
+  check: Pick<ResumeLaunchCheck, 'model_resolved' | 'requested'>,
+  info?: null | { cwd?: unknown; launch_request?: null | Record<string, unknown> }
+): string[] {
+  const frozen: Record<string, unknown> = { ...(info?.launch_request ?? {}) }
+
+  if (info && 'cwd' in info) { frozen.cwd = info.cwd }
+
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
+
+  const modelMatches = (model: unknown) =>
+    model === frozen.model ||
+    ('model_requested' in frozen ? model === frozen.model_requested
+      : check.model_resolved !== undefined && check.model_resolved === frozen.model)
+
+  // api_key is never durable; a repeated key is not a policy change.
+  return Object.entries(check.requested)
+    .filter(([key, value]) => key !== 'api_key' && (key === 'model' ? !modelMatches(value) : !same(frozen[key], value)))
+    .map(([key]) => key)
+}
