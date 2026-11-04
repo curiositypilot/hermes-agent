@@ -44,6 +44,7 @@ from .embedded import (
     _may_rewrite_profile_env,
 )
 from . import state_lines
+from .envelope import agent_note_envelope, chat_envelope, first_line, lookup_session_title
 from .recall_log import log_recalled
 from .settings import (
     _DEFAULT_API_URL, _DEFAULT_IDLE_TIMEOUT, _DEFAULT_LOCAL_URL, _DEFAULT_REFLECT_TIMEOUT, _DEFAULT_RETAIN_SOURCE,
@@ -419,17 +420,6 @@ _METADATA_ATTRS = (
     "session_id", "parent_session_id", "platform", "user_id", "user_name", "chat_id", "chat_name",
     "chat_type", "thread_id", "agent_identity",
 )
-# Source envelope on auto-retained chat turns (retain profile v1.15.0 reads these; keys and the
-# trust value match memory-system evals/retain_quality/configs/universal_v3.json).
-_ENVELOPE_TITLE_MAX = 120
-
-
-def _first_line(text: Any, limit: int = _ENVELOPE_TITLE_MAX) -> str:
-    """First non-empty line of *text*, capped at *limit* chars ('' when none)."""
-    for line in str(text or "").splitlines():
-        if line := line.strip():
-            return line[:limit].rstrip()
-    return ""
 
 
 # Reply-quote collapse (retain path only). The gateway prepends ``[Replying to…: "<full quoted
@@ -535,29 +525,6 @@ def _collapse_repeated_reply_quote(
         return user_content
     short = quote[:_REPLY_QUOTE_KEEP_CHARS].rstrip() + " …"
     return user_content[:match.end()] + short + user_content[end:]
-
-
-def _lookup_session_title(hermes_home: Any, session_id: str) -> str:
-    """Session title from ``<hermes_home>/state.db``; '' on any miss or error (fail open).
-
-    Plain read-only sqlite so a retain never opens a writer, runs schema init or blocks on the
-    gateway's write lock."""
-    if not hermes_home or not session_id:
-        return ""
-    try:
-        import sqlite3
-        db_path = Path(hermes_home) / "state.db"
-        if not db_path.is_file():
-            return ""
-        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True, timeout=1.0)
-        try:
-            row = conn.execute("SELECT title FROM sessions WHERE id = ?", (session_id,)).fetchone()
-        finally:
-            conn.close()
-        return _first_line(row[0]) if row and row[0] else ""
-    except Exception:
-        logger.debug("Hindsight envelope: session title lookup failed", exc_info=True)
-        return ""
 
 
 _SYSTEM_PROMPT_TAILS = {
@@ -701,6 +668,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_tags", "description": "Default tags applied to retained memories (comma-separated)", "default": ""},
             {"key": "observation_scopes", "description": "How observations are scoped during consolidation: 'combined' (default — one pass over all tags), 'per_tag' (one isolated observation per tag), 'all_combinations' (every tag subset — expensive), or a JSON list of tag-lists for explicit custom scopes. Empty uses Hindsight's 'combined' default.", "default": ""},
             {"key": "retain_source", "description": "Metadata source value attached to retained memories (identifies the client that stored them)", "default": _DEFAULT_RETAIN_SOURCE},
+            {"key": "tool_retain_strategy", "description": "Retain strategy name sent on hindsight_retain tool items, plus the agent-note source envelope (source_kind=agent-note, trust=agent). Blank sends neither", "default": ""},
             {"key": "retain_user_prefix", "description": "Label used before user turns in retained transcripts", "default": "User"},
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
@@ -1110,6 +1078,9 @@ class HindsightMemoryProvider(MemoryProvider):
         # keep conversation facts from ever consolidating with each other. session_id and
         # parent_session_id stay in the item metadata either way.
         self._retain_lineage_tags = _parse_bool_setting(cfg.get("retain_lineage_tags"), True)
+        # Bank-side strategy name for hindsight_retain tool items; set, those items also carry the
+        # agent-note envelope. Blank/absent sends neither (items as before the key existed).
+        self._tool_retain_strategy = str(cfg.get("tool_retain_strategy") or "").strip() or None
         self._auto_retain_block_reason: str | None = None
 
     def _resolve_auto_retain_block(self) -> str | None:
@@ -1559,7 +1530,7 @@ class HindsightMemoryProvider(MemoryProvider):
         now = _event_timestamp()  # one turn -> both messages share the event timestamp
         self._last_turn_at = now
         if not self._first_user_line:
-            self._first_user_line = _first_line(user_content)
+            self._first_user_line = first_line(user_content)
         user_content = _collapse_repeated_reply_quote(
             user_content, self._session_assistant_texts, self._handed_hermes_home
         )
@@ -1592,23 +1563,13 @@ class HindsightMemoryProvider(MemoryProvider):
                          occurred_at: str) -> dict[str, str]:
         """Source envelope for an auto-retained chat document. Title = the SessionDB title, else
         the session's first user line; with neither, the title keys are omitted (fail open)."""
-        platform = self._platform or "cli"
-        envelope = {
-            "source_kind": "chat",
-            "source_origin": platform,
-            "source_site_or_author": f"hermes {platform} session",
-            "trust": "self",
-        }
-        title = _lookup_session_title(hermes_home, session_id) or first_user_line
-        if title:
-            envelope["source_title"] = envelope["session_topic"] = title
-        if occurred_at:
-            envelope["occurred_at"] = occurred_at
-        return envelope
+        title = lookup_session_title(hermes_home, session_id) or first_user_line
+        return chat_envelope(platform=self._platform, title=title, occurred_at=occurred_at)
 
     def _build_retain_kwargs(self, content: str, *, context: str | None = None,
                              metadata: dict[str, str] | None = None, tags: list[str] | None = None,
-                             occurred_at: str | None = None, update_mode: str | None = None) -> dict[str, Any]:
+                             occurred_at: str | None = None, update_mode: str | None = None,
+                             strategy: str | None = None) -> dict[str, Any]:
         """Build one aretain_batch item. The server resolves occurred_start/end (incl.
         relative phrases in content) from the item timestamp: explicit occurred_at
         wins, else the configured event clock."""
@@ -1619,7 +1580,8 @@ class HindsightMemoryProvider(MemoryProvider):
             "timestamp": (occurred_at or "").strip() or _event_timestamp(),
         }
         merged_tags = _normalize_retain_tags(list(self._retain_tags) + _normalize_retain_tags(tags))
-        item.update({k: v for k, v in (("context", context), ("update_mode", update_mode)) if v is not None})
+        item.update({k: v for k, v in (("context", context), ("update_mode", update_mode), ("strategy", strategy))
+                     if v is not None})
         item.update({k: v for k, v in (("tags", merged_tags), ("observation_scopes", self._observation_scopes)) if v})
         return item
 
@@ -1740,8 +1702,16 @@ class HindsightMemoryProvider(MemoryProvider):
         # (the server stamps it on every extracted fact; see RETAIN_SCHEMA).
         if args.get("context"):
             logger.debug("Tool hindsight_retain: ignoring context=%r", args["context"])
-        item = self._build_retain_kwargs(content, tags=args.get("tags"),
-                                         occurred_at=args.get("occurred_at"))
+        occurred_at = args.get("occurred_at")
+        metadata = strategy = None
+        if self._tool_retain_strategy:
+            strategy = self._tool_retain_strategy
+            metadata = self._build_metadata(message_count=1, turn_index=self._turn_index)
+            metadata.update(agent_note_envelope(
+                platform=self._platform, occurred_at=str(occurred_at or "").strip(),
+                title=lookup_session_title(self._envelope_home(), self._session_id)))
+        item = self._build_retain_kwargs(content, metadata=metadata, tags=args.get("tags"),
+                                         occurred_at=occurred_at, strategy=strategy)
         logger.debug("Tool hindsight_retain: bank=%s, content_len=%d", self._bank_id, len(content))
         self._retain_batch(item, bank_id=self._bank_id)
         logger.debug("Tool hindsight_retain: success")

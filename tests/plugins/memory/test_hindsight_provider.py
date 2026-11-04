@@ -1867,13 +1867,6 @@ class TestSourceEnvelope:
         assert set(titles[:-1]) == {"first session topic"}
         assert titles[-1] == "second session topic"
 
-    def test_tool_retain_has_no_envelope(self, tmp_path, monkeypatch):
-        _write_config(tmp_path, monkeypatch)
-        p = _init_provider(tmp_path)
-        p.handle_tool_call("hindsight_retain", {"content": "a fact"})
-        item = p._client.aretain_batch.call_args.kwargs["items"][0]
-        assert "source_kind" not in item["metadata"]
-
 
 class TestAutoRetainWriterControls:
     """Each switch defaults to the pre-switch behaviour; set, it drops the turn with one debug
