@@ -1030,11 +1030,15 @@ class GatewayAgent:
             self._todo_from_result(result)
         diff = payload.get("inline_diff")
         if isinstance(diff, str) and diff:
-            from cli import _cprint
-            from hermes_cli.cli_modern_layout import diff_printer
-            emit = diff_printer(_cprint)
-            for line in diff.rstrip("\n").splitlines():
-                emit(line)
+            # tool_complete_callback is the CLI's "show inline diffs" contract
+            # (None under -Q and display.inline_diffs: false). The gateway ships
+            # the diff on the frame; printing it here used to bypass that gate.
+            if self.tool_complete_callback is not None:
+                from cli import _cprint
+                from hermes_cli.cli_modern_layout import diff_printer
+                emit = diff_printer(_cprint)
+                for line in diff.rstrip("\n").splitlines():
+                    emit(line)
             if name == "delegate_task" and self.tool_complete_callback is not None:
                 self.tool_complete_callback(call_id, name, args, result)
         elif self.tool_complete_callback is not None:

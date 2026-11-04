@@ -123,6 +123,37 @@ def test_tool_events_drive_progress_and_complete_callbacks(make_agent):
     assert completes == [("c1", "read_file", {"path": "notes.txt"}, "{}")]
 
 
+_INLINE_DIFF = "x.json\n@@ -1 +1 @@\n-a\n+b"
+
+
+def _inline_diff_script():
+    return [
+        frame("tool.complete", {"tool_id": "c1", "name": "patch", "args": {"path": "x.json"},
+                                "result": "ok", "is_error": False, "duration_s": 0.1,
+                                "inline_diff": _INLINE_DIFF}),
+        frame("message.complete", {"text": "done", "outcome": "completed"}),
+    ]
+
+
+def test_inline_diff_not_printed_without_tool_complete_callback(make_agent, capsys):
+    """-Q and display.inline_diffs:false null the callback; the frame must not hit stdout."""
+    agent, _ = make_agent(_inline_diff_script(), tool_complete_callback=None)
+    agent.run_conversation("edit")
+    assert "+b" not in capsys.readouterr().out
+
+
+def test_inline_diff_printed_with_tool_complete_callback(make_agent, capsys):
+    """Callback set is the show-diffs contract: print the diff, do not also fire the callback."""
+    completes = []
+    agent, _ = make_agent(
+        _inline_diff_script(),
+        tool_complete_callback=lambda *a: completes.append(a),
+    )
+    agent.run_conversation("edit")
+    assert "+b" in capsys.readouterr().out
+    assert completes == []
+
+
 def test_approval_request_calls_cli_approval_callback_then_responds(make_agent):
     from tools.terminal_tool import set_approval_callback
     seen = []
