@@ -81,9 +81,9 @@ class TestPatternsData:
         for rule in p.SECURITY_PATTERNS:
             assert "ruleName" in rule
             assert rule.get("reminder")
-            # At least one of substrings/regex/path_check must be present —
+            # At least one of substrings/regex/scan_literals/path_check must be present —
             # otherwise the rule could never fire.
-            assert any(k in rule for k in ("substrings", "regex", "path_check")), rule
+            assert any(k in rule for k in ("substrings", "regex", "scan_literals", "path_check")), rule
 
     def test_rule_names_are_unique(self):
         p = _load_patterns()
@@ -429,3 +429,150 @@ class TestSkillManageScan:
         assert isinstance(out, dict)
         assert out["action"] == "block"
         assert "pickle_deserialization" in out["message"]
+
+
+
+# ---------------------------------------------------------------------------
+# Doc-default path filter and Python literal masking (intake t_d1714856)
+# ---------------------------------------------------------------------------
+
+_PROSE_RISKS = "yaml.load(f) and verify=False and subprocess.run(x, shell=True)\n"
+
+
+def _names(mod, path: str, content: str) -> list[str]:
+    return [name for name, _ in mod._scan_content(path, content)]
+
+
+class TestDocDefaultFilter:
+    def test_spec_md_quoting_xml_parse_is_quiet(self):
+        mod = _load_plugin_init()
+        assert "xml_unsafe_parse" not in _names(mod, "/x/spec.md", "quotes `root = ET.fromstring(body)` in prose")
+
+    @pytest.mark.parametrize("path", ["/x/notes.md", "/x/cfg.yaml", "/x/x.json", "/x/readme.txt"])
+    def test_doc_files_skip_language_rules(self, path):
+        mod = _load_plugin_init()
+        assert _names(mod, path, _PROSE_RISKS) == []
+
+    @pytest.mark.parametrize(
+        ("path", "content", "rule"),
+        [
+            (".github/workflows/ci.yml", "name: CI\n", "github_actions_workflow"),
+            ("/x/app.py", "root = ET.fromstring(body)\n", "xml_unsafe_parse"),
+            ("/x/app.go", 'cmd := exec.Command("sh", "-c", c)\n', "go_exec_shell_injection"),
+            ("/x/x.ts", "el.innerHTML = v\n", "innerHTML_xss"),
+        ],
+    )
+    def test_code_files_still_match(self, path, content, rule):
+        mod = _load_plugin_init()
+        assert rule in _names(mod, path, content)
+
+
+class TestPythonLiteralMasking:
+    @pytest.mark.parametrize(
+        ("content", "rule"),
+        [
+            # t_8c3667d6's fixture: a patch payload quoted inside a test dict.
+            ('p = {"new_string": "+root = ET.fromstring(body)"}\n', "xml_unsafe_parse"),
+            ('def f():\n    """Never call yaml.load(f)."""\n', "unsafe_yaml_load"),
+            ("x = 1  # pickle.loads is unsafe\n", "pickle_deserialization"),
+            ('s = f"call ET.fromstring({x})"\n', "xml_unsafe_parse"),
+        ],
+    )
+    def test_literals_and_comments_do_not_match(self, content, rule):
+        mod = _load_plugin_init()
+        assert rule not in _names(mod, "/x/tests/test_x.py", content)
+
+    @pytest.mark.parametrize(
+        ("content", "rule"),
+        [
+            ('x = f"{ET.fromstring(b)}"\n', "xml_unsafe_parse"),
+            ('a = np.load("f.npy", allow_pickle=True)\n', "pickle_wrapper_load"),
+            ('cfg = yaml.load(open("c"))\n', "unsafe_yaml_load"),
+            ('subprocess.run("ls " + p, shell=True)\n', "python_subprocess_shell"),
+            ('s = "a"; ET.parse(f)\n', "xml_unsafe_parse"),
+        ],
+    )
+    def test_code_around_literals_still_matches(self, content, rule):
+        mod = _load_plugin_init()
+        assert rule in _names(mod, "/x/app.py", content)
+
+    def test_masking_applies_to_pyi_not_ipynb(self):
+        mod = _load_plugin_init()
+        fixture = 'x = "ET.fromstring(b)"\n'
+        assert "xml_unsafe_parse" not in _names(mod, "/x/stub.pyi", fixture)
+        assert "xml_unsafe_parse" in _names(mod, "/x/nb.ipynb", fixture)
+
+    def test_open_call_fragment_still_matches(self):
+        mod = _load_plugin_init()
+        assert "xml_unsafe_parse" in _names(mod, "/x/app.py", "foo(ET.fromstring(\n")
+
+    def test_unterminated_triple_quote_is_masked_to_end(self):
+        mod = _load_plugin_init()
+        findings = mod._scan_content("/x/app.py", 'a = """open\nET.parse(f)\n')
+        assert isinstance(findings, list)
+        assert "xml_unsafe_parse" not in [n for n, _ in findings]
+
+    def test_unterminated_single_quote_masks_only_its_line(self):
+        mod = _load_plugin_init()
+        assert "xml_unsafe_parse" not in _names(mod, "/x/app.py", 'x = "ET.parse(f)\n')
+        assert "xml_unsafe_parse" in _names(mod, "/x/app.py", 'x = "abc\nET.parse(f)\n')
+
+    def test_bad_dedent_fragment_does_not_raise(self):
+        mod = _load_plugin_init()
+        assert "xml_unsafe_parse" in _names(mod, "/x/app.py", "def f():\n  x = 1\n y = 2\nET.parse(q)\n")
+
+    @pytest.mark.parametrize(
+        ("path", "content", "rule"),
+        [
+            ("/x/page.py", "HTML = '<script src=\"https://cdn.x/a.js\"></script>'\n", "script_src_without_sri"),
+            ("/x/c.py", "c = AES.new(k, mode='aes-256-ecb')\n", "aes_ecb_mode"),
+            ("/x/c.py", 'NODE_TLS_REJECT_UNAUTHORIZED = "0"\n', "tls_verification_disabled"),
+        ],
+    )
+    def test_scan_literals_arms_read_raw_content(self, path, content, rule):
+        mod = _load_plugin_init()
+        assert rule in _names(mod, path, content)
+
+    def test_masked_text_keeps_line_structure(self):
+        mod = _load_plugin_init()
+        src = 'a = """x\ny"""  # c\r\nb = 1\n'
+        masked = mod._mask_python_literals(src)
+        assert len(masked) == len(src)
+        assert masked.count("\n") == src.count("\n") and masked.count("\r") == src.count("\r")
+        assert masked.endswith("b = 1\n") and "x" not in masked and "#" not in masked
+
+
+class TestV4APatchSections:
+    def test_pathless_patch_uses_section_path(self):
+        mod = _load_plugin_init()
+        args = {"mode": "patch", "patch": "*** Begin Patch\n*** Update File: docs/spec.md\n+root = ET.fromstring(body)\n*** End Patch\n"}
+        assert mod._scan_args("patch", args) == []
+
+    def test_code_section_in_mixed_patch_still_warns(self):
+        mod = _load_plugin_init()
+        args = {
+            "mode": "patch",
+            "patch": (
+                "*** Begin Patch\n*** Update File: docs/spec.md\n+ET.fromstring(prose)\n"
+                "*** Add File: app/x.py\n+import x\n+root = ET.fromstring(body)\n"
+                "*** Update File: app/y.py\n@@ def f @@\n+root = ET.parse(f)\n*** End Patch\n"
+            ),
+        }
+        assert [name for name, _ in mod._scan_args("patch", args)] == ["xml_unsafe_parse"]
+
+    def test_removed_lines_and_quoted_payloads_do_not_warn(self):
+        mod = _load_plugin_init()
+        args = {
+            "mode": "patch",
+            "patch": (
+                "*** Begin Patch\n*** Update File: app/x.py\n@@ def f @@\n"
+                "-root = ET.fromstring(body)\n+root = safe_fromstring(body)\n"
+                '+FIXTURE = "+root = ET.fromstring(body)"\n*** End Patch\n'
+            ),
+        }
+        assert mod._scan_args("patch", args) == []
+
+    def test_headerless_patch_text_scanned_at_arg_path(self):
+        mod = _load_plugin_init()
+        args = {"path": "/x/app.py", "patch": "root = ET.fromstring(body)\n"}
+        assert "xml_unsafe_parse" in [name for name, _ in mod._scan_args("patch", args)]
