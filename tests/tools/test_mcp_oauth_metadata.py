@@ -135,6 +135,7 @@ class TestManagerOAuthProviderMetadata:
 
         manager = MagicMock()
         manager.invalidate_if_disk_changed = AsyncMock(return_value=False)
+        manager.tokens_removed.return_value = False
 
         with patch.object(
             _HERMES_PROVIDER_CLS.__bases__[-1],

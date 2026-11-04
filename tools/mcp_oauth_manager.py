@@ -31,13 +31,16 @@ except ImportError:  # pragma: no cover — SDK required in CI; module must stil
 class _ProviderEntry:
     """Per-server OAuth state. ``last_mtime_ns``: last-seen tokens-file mtime (0 = never read),
     ``last_version`` its ``file_cache_version``, for external-refresh detection; ``lock`` binds to the first asyncio loop awaiting it (the MCP
-    loop); ``pending_401`` dedupes thundering-herd 401s by failed access_token."""
+    loop); ``pending_401`` dedupes thundering-herd 401s by failed access_token. ``tokens_removed``: the tokens file
+    this entry had read was deleted (disconnect, `hermes mcp remove`, a peer's reauth); every auth flow refuses until
+    a new file lands, since removing the file is the only revocation signal a non-gateway process sees."""
 
     server_url: str
     oauth_config: Optional[dict]
     provider: Optional[Any] = None
     last_mtime_ns: int = 0
     last_version: tuple = ()
+    tokens_removed: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_401: dict[str, asyncio.Future[bool]] = field(default_factory=dict)
 
@@ -240,10 +243,18 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
             f"client_secret), then run `hermes mcp login {name}`.")
 
     async def async_auth_flow(self, request):  # type: ignore[override]
+        manager = get_manager()
+        name, home = getattr(self, "_hermes_server_name", ""), getattr(self, "_hermes_home", "")
         try:  # pre-flow hook: reload from disk if it changed (non-fatal on error)
-            await get_manager().invalidate_if_disk_changed(self._hermes_server_name, hermes_home=self._hermes_home)
+            await manager.invalidate_if_disk_changed(name, hermes_home=home)
         except Exception as exc:  # pragma: no cover — defensive
             self._log_nonfatal("pre-flow disk-watch", exc)
+        if manager.tokens_removed(name, hermes_home=home):
+            # Refuse before the SDK generator starts: its 401 branch would register a client (writing
+            # .client.json, which also makes a failed reauth's only_if_absent restore skip the backup)
+            # and an interactive/dashboard context would then authorize and write a fresh tokens file.
+            from tools.mcp_oauth_provider import tokens_removed_error
+            raise tokens_removed_error(name)
         # Bridge the bidirectional generator by hand: a naive ``async for item in inner: yield
         # item`` DISCARDS the responses httpx sends back via ``asend``, and the SDK crashes on None.
         # Manually bridge the bidirectional generator protocol. httpx's auth_flow driver
@@ -380,8 +391,28 @@ class MCPOAuthManager:
         with self._entries_lock:
             return self._entries.pop(self._key(server_name, hermes_home), None)
 
+    def tokens_removed(self, server_name: str, *, hermes_home: str | Path | None = None) -> bool:
+        """True while the tokens file this process had read stays deleted (see ``_ProviderEntry``)."""
+        entry = self._entries.get(self._key(server_name, hermes_home))
+        return entry is not None and entry.tokens_removed
+
+    @staticmethod
+    def _drop_removed_tokens(server_name: str, entry: _ProviderEntry) -> None:
+        """The tokens file was seen and is now gone: forget the in-memory pair so it is never refreshed and
+        written back, and reset the baseline so the next file to land reloads (``old == 0`` path)."""
+        provider = entry.provider
+        context = getattr(provider, "context", None)
+        if context is not None:
+            context.current_tokens = None
+        if provider is not None and hasattr(provider, "_initialized"):
+            provider._initialized = False
+        entry.last_version, entry.last_mtime_ns, entry.tokens_removed = (), 0, True
+        logger.info("MCP OAuth '%s': tokens file removed, dropping in-memory tokens", server_name)
+
     async def invalidate_if_disk_changed(self, server_name: str, *, hermes_home: str | Path | None = None) -> bool:
-        """Force the SDK provider to reload when the tokens file mtime changed (e.g. a cron refresh); True if so."""
+        """Force the SDK provider to reload when the tokens file mtime changed (e.g. a cron refresh); True if so.
+        A removed file that was seen before drops the in-memory tokens and returns False: there is nothing to
+        reload, so ``_recover_401`` surfaces ``needs_reauth``."""
         from tools.mcp_oauth import _get_token_dir, _safe_filename
         from utils import file_cache_version
         entry = self._entries.get(self._key(server_name, hermes_home))
@@ -393,8 +424,13 @@ class MCPOAuthManager:
                 # and a racy digest going empty later would read as a change and tear the session down.
                 version = file_cache_version(_get_token_dir(hermes_home) / f"{_safe_filename(server_name)}.json",
                                              always_digest=True)
+            except FileNotFoundError:
+                if entry.last_version:
+                    self._drop_removed_tokens(server_name, entry)
+                return False
             except OSError:
                 return False
+            entry.tokens_removed = False
             if version == entry.last_version:
                 return False
             mtime_ns, entry.last_version = version[0], version

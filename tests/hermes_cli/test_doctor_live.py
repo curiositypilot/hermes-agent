@@ -136,6 +136,24 @@ class TestConfiguredOnlySelection:
         assert len(results) == 2
         assert all(r.status == "pass" for r in results)
 
+    def test_disabled_mcp_server_skipped_without_connecting(self, monkeypatch):
+        """A disabled entry must not be connected: an OAuth probe would refresh or register a
+        client and re-create the token files removed to disconnect it (intake t_53c1ac88)."""
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"mcp_servers": {"off": {"url": "https://x", "enabled": False},
+                                     "on": {"url": "https://y"}}})
+        probed = []
+        monkeypatch.setattr(
+            doctor_live, "_probe_mcp_server",
+            lambda name, cfg, timeout: probed.append(name) or [("t", "d")])
+        issues: list[str] = []
+        results = {r.name: r for r in run_live_checks(issues) if r.name.startswith("MCP")}
+        assert probed == ["on"]
+        assert (results["MCP: off"].status, results["MCP: off"].detail) == ("skip", "(disabled)")
+        assert results["MCP: on"].status == "pass"
+        assert not any("off" in i for i in issues)
+
     def test_tts_local_provider_skipped(self, monkeypatch):
         monkeypatch.setattr(
             "hermes_cli.config.load_config_readonly",
