@@ -163,6 +163,16 @@ _GIT_TIMEOUT: int = max(10, min(60, env_int("HERMES_CHECKPOINT_TIMEOUT", 30)))
 # Max files to snapshot — skip huge directories to avoid slowdowns.
 _MAX_FILES = 50_000
 
+# Pathspec magic (``:(exclude,literal)``) is ignored or misread when the
+# inherited environment sets any of these; ``1`` for LITERAL turns the magic
+# prefix into a literal filename that never matches.
+_PATHSPEC_MAGIC_ENV: dict[str, str] = {
+    "GIT_LITERAL_PATHSPECS": "0",
+    "GIT_GLOB_PATHSPECS": "0",
+    "GIT_NOGLOB_PATHSPECS": "0",
+    "GIT_ICASE_PATHSPECS": "0",
+}
+
 # Valid git commit hash pattern: 4–40 hex chars (short or full SHA-1/SHA-256).
 _COMMIT_HASH_RE = re.compile(r'^[0-9a-fA-F]{4,64}$')
 
@@ -837,7 +847,8 @@ class CheckpointManager:
         are dropped when the store exceeds this after a commit.
     max_file_size_mb : int
         Skip adding any single file larger than this to a checkpoint.
-        (Implemented via ``.gitignore`` excludes + a post-stage size check.)
+        (Excluded before staging by a pathspec, and pruned from an index
+        seeded from the last checkpoint.)
     """
 
     def __init__(
@@ -929,8 +940,8 @@ class CheckpointManager:
         index_file = _index_path(store, dir_hash)
 
         # Stage the current tree so the name-only diff sees new files too.
-        _run_git(["add", "-A"], store, abs_dir,
-                 timeout=_GIT_TIMEOUT * 2, index_file=index_file)
+        # Oversize files are not staged (nor hashed); they are appended below.
+        _, _, oversize = self._stage_all(store, abs_dir, index_file)
         ok, names_out, err = _run_git(
             ["diff", "--name-only", "-z", commit_hash, "--cached"],
             store, abs_dir, index_file=index_file,
@@ -952,7 +963,13 @@ class CheckpointManager:
                     "ledger_empty": True}
         restore: list[str] = []
         skipped: list[str] = []
-        for rel in filter(None, names_out.split("\x00")):
+        changed = list(filter(None, names_out.split("\x00")))
+        # An oversize path always differs from the checkpoint: absent from it,
+        # or stored while it was under the cap. Listing it unhashed keeps the
+        # names _restore classifies (kept_oversize) the same as a full add.
+        listed = set(changed)
+        changed += [rel for rel in oversize if rel not in listed]
+        for rel in changed:
             abs_path = Path(abs_dir) / rel
             entry = ledger.get(str(abs_path))
             recorded = entry.get("sha256") if isinstance(entry, dict) else None
@@ -1109,17 +1126,23 @@ class CheckpointManager:
         dir_hash = _project_hash(abs_dir)
         index_file = _index_path(store, dir_hash)
 
-        # Stage current state into the per-project index to compare.
-        _run_git(["add", "-A"], store, abs_dir,
-                 timeout=_GIT_TIMEOUT * 2, index_file=index_file)
+        # Stage current state into the per-project index to compare. Oversize
+        # files are neither staged nor compared (an index entry they kept from
+        # the last checkpoint is stale), and the stat says so.
+        _, _, oversize = self._stage_all(store, abs_dir, index_file)
+        scope: list[str] = []
+        scope_env: Optional[dict[str, str]] = None
+        if oversize:
+            scope = ["--", ".", *(f":(exclude,literal){rel}" for rel in oversize)]
+            scope_env = _PATHSPEC_MAGIC_ENV
 
         ok_stat, stat_out, _ = _run_git(
-            ["diff", "--stat", commit_hash, "--cached"],
-            store, abs_dir, index_file=index_file,
+            ["diff", "--stat", commit_hash, "--cached", *scope],
+            store, abs_dir, index_file=index_file, extra_env=scope_env,
         )
         ok_diff, diff_out, _ = _run_git(
-            ["diff", commit_hash, "--cached", "--no-color"],
-            store, abs_dir, index_file=index_file,
+            ["diff", commit_hash, "--cached", "--no-color", *scope],
+            store, abs_dir, index_file=index_file, extra_env=scope_env,
         )
 
         # Reset staged tree back to the project's last checkpoint so the
@@ -1132,10 +1155,16 @@ class CheckpointManager:
         if not ok_stat and not ok_diff:
             return {"success": False, "error": "Could not generate diff"}
 
+        stat = stat_out if ok_stat else ""
+        if oversize:
+            note = (f"(not compared, over {self.max_file_size_mb} MB: "
+                    f"{', '.join(oversize)})")
+            stat = f"{stat}\n{note}" if stat else note
         return {
             "success": True,
-            "stat": stat_out if ok_stat else "",
+            "stat": stat,
             "diff": diff_out if ok_diff else "",
+            "skipped_oversize": oversize,
         }
 
     def session_diff(self, working_dir: str) -> dict:
@@ -1516,14 +1545,11 @@ class CheckpointManager:
             # First snapshot for this project.
             index_file.parent.mkdir(parents=True, exist_ok=True)
 
-        # Stage with per-project index.  Include a per-stage file-size filter
-        # via ``core.bigFileThreshold`` is not what we want — instead, we
-        # rely on the exclude file for broad patterns and post-stage prune
-        # any path whose size exceeds max_file_size_mb.
-        ok, _, err = _run_git(
-            ["add", "-A"], store, working_dir,
-            timeout=_GIT_TIMEOUT * 2, index_file=index_file,
-        )
+        # Stage with the per-project index. Files over max_file_size_mb are
+        # excluded by pathspec before git hashes them; one already in the
+        # index (seeded from the last checkpoint, since grown past the cap)
+        # keeps its stale entry, which the drop below removes.
+        ok, err, _oversize = self._stage_all(store, working_dir, index_file)
         if not ok:
             logger.debug("Checkpoint git-add failed: %s", err)
             return False
@@ -1632,6 +1658,60 @@ class CheckpointManager:
         except OSError:
             return False
 
+    def _oversize_paths(
+        self, store: Path, working_dir: str, index_file: Path,
+    ) -> list[str]:
+        """Workdir-relative paths ``add -A`` would stage that exceed the size cap.
+
+        ``ls-files`` lists the same candidate set as ``add -A`` (tracked plus
+        untracked, honouring the excludes) without hashing a byte, so the cap
+        is applied before git writes any blob. A cap of 0 or a listing failure
+        yields ``[]`` (stage as before).
+        """
+        if self.max_file_size_mb <= 0:
+            return []
+        ok, stdout, _ = _run_git(
+            ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            store, working_dir, index_file=index_file,
+        )
+        if not ok or not stdout:
+            return []
+        abs_workdir = _normalize_path(working_dir)
+        return [
+            rel for rel in dict.fromkeys(p for p in stdout.split("\x00") if p)
+            if self._exceeds_size_cap(abs_workdir / rel)
+        ]
+
+    def _stage_all(
+        self, store: Path, working_dir: str, index_file: Path,
+    ) -> tuple[bool, str, list[str]]:
+        """``git add -A`` minus oversize files.  Returns ``(ok, err, oversize)``.
+
+        Excluding by pathspec keeps git from hashing and compressing a
+        multi-GB file only for :meth:`_drop_oversize_from_index` to unstage it
+        (a 67 GB tree timed out mid-add and left a 1.4 GB tmp pack). An
+        excluded path that is already in the index keeps its entry, so
+        callers that commit still prune it afterwards.
+        """
+        oversize = self._oversize_paths(store, working_dir, index_file)
+        if not oversize:
+            ok, _, err = _run_git(
+                ["add", "-A"], store, working_dir,
+                timeout=_GIT_TIMEOUT * 2, index_file=index_file,
+            )
+            return ok, err, []
+        with tempfile.TemporaryDirectory(prefix="stage-exclude-", dir=store) as scratch:
+            spec_file = Path(scratch) / "pathspec"
+            specs = [b"."] + [b":(exclude,literal)" + os.fsencode(p) for p in oversize]
+            spec_file.write_bytes(b"".join(s + b"\0" for s in specs))
+            args = ["add", "-A", f"--pathspec-from-file={spec_file}", "--pathspec-file-nul"]
+            ok, _, err = _run_git(
+                args, store, working_dir,
+                timeout=_GIT_TIMEOUT * 2, index_file=index_file,
+                extra_env=_PATHSPEC_MAGIC_ENV,
+            )
+        return ok, err, oversize
+
     def _drop_oversize_from_index(
         self, store: Path, working_dir: str, index_file: Path,
     ) -> None:
@@ -1665,12 +1745,15 @@ class CheckpointManager:
             len(oversize), self.max_file_size_mb,
         )
         # Use --pathspec-from-file for safety with many paths.
-        # Chunk into manageable batches.
+        # Chunk into manageable batches. ``-f``: an entry _stage_all left
+        # stale (excluded, grown past the cap since the last checkpoint)
+        # matches neither the file nor HEAD, and plain ``rm --cached``
+        # refuses it; with --cached only the index entry goes.
         BATCH = 200
         for i in range(0, len(oversize), BATCH):
             chunk = oversize[i:i + BATCH]
             _run_git(
-                ["rm", "--cached", "--quiet", "--"] + chunk,
+                ["rm", "--cached", "-f", "--quiet", "--"] + chunk,
                 store, working_dir, index_file=index_file,
                 allowed_returncodes={128},
             )
