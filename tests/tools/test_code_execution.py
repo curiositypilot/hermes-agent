@@ -469,6 +469,75 @@ except ValueError as e:
         self.assertIn("caught: nope", result["output"])
 
 
+# Tool results as handle_function_call returns them after transform_tool_result hooks ran
+# (security-guidance appends a Markdown block after the JSON). Keyed by terminal command.
+_SHAPED_RESULTS = {
+    "appended": '{"success": true}' + "\n\n---\n⚠️ Security guidance — x\n",
+    "big": json.dumps({"blob": "x" * 70000}) + "\n\n---\nline a\n\nline b\n",
+    "n2": '{"n": 2}',
+    "clean": '{"a": 1}',
+    "plain": "not json at all",
+    "jsonstr": json.dumps('{"k": 1}'),
+    "list_trailer": "[1, 2]\n\nwarning\n",
+    "has_appended": '{"_appended": "mine"}\n\ntrailer\n',
+}
+
+
+@unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
+class TestRpcResultFraming(unittest.TestCase):
+    """Regression for t_fc266f65: a tool result with text appended after its JSON (a
+    plugin transform) crashed the stub's json.loads although the tool had run, and its
+    interior newlines could split the newline-framed UDS reply across two calls."""
+
+    def _run(self, keys):
+        code = (
+            "import json\nfrom hermes_tools import terminal\n"
+            f"out = {{k: terminal(k) for k in {keys!r}}}\n"
+            "if 'big' in out:\n"
+            "    out['big'] = {'blob_len': len(out['big']['blob']), '_appended': out['big']['_appended']}\n"
+            "print(json.dumps(out))\n"
+        )
+        with patch("model_tools.handle_function_call",
+                   side_effect=lambda name, args, **kw: _SHAPED_RESULTS[args["command"]]):
+            result = json.loads(execute_code(code=code, task_id="test-task",
+                                             enabled_tools=["terminal"]))
+        self.assertEqual(result["status"], "success", result)
+        return json.loads(result["output"].strip().splitlines()[-1])
+
+    def test_rpc_result_with_appended_text(self):
+        r = self._run(["appended"])["appended"]
+        self.assertIs(r["success"], True)
+        self.assertIn("Security guidance", r["_appended"])
+
+    def test_rpc_multiline_result_no_desync(self):
+        out = self._run(["big", "n2"])
+        self.assertEqual(out["n2"], {"n": 2})
+        self.assertEqual(out["big"], {"blob_len": 70000, "_appended": "---\nline a\n\nline b"})
+
+    def test_results_without_trailer_unchanged(self):
+        out = self._run(["clean", "plain", "jsonstr", "list_trailer", "has_appended"])
+        self.assertEqual(out["clean"], {"a": 1})
+        self.assertEqual(out["plain"], "not json at all")
+        self.assertEqual(out["jsonstr"], {"k": 1})
+        self.assertEqual(out["list_trailer"], _SHAPED_RESULTS["list_trailer"])
+        self.assertEqual(out["has_appended"], {"_appended": "mine"})
+
+    def test_decode_result_replays_patch_with_security_warning(self):
+        """The t_534dd2ab call-2 shape: patch JSON followed by the xml_unsafe_parse block."""
+        namespace = {}
+        exec(generate_hermes_tools_module([]), namespace)
+        patch_json = json.dumps({"success": True, "diff": "--- a/kb-ask.py\n+++ b/kb-ask.py\n"
+                                 "@@ -1 +1 @@\n-x\n+root = ET.fromstring(body)\n",
+                                 "files_modified": ["kb-ask.py"], "lint": {"status": "ok"}})
+        warning = ("---\n⚠️ Security guidance — 1 pattern matched (xml_unsafe_parse)\n\n"
+                   "⚠️ Security Warning: Use defusedxml.ElementTree.\n\n"
+                   "Pattern matches can be false positives.")
+        r = namespace["_decode_result"](patch_json + "\n\n" + warning)
+        self.assertIs(r["success"], True)
+        self.assertEqual(r["files_modified"], ["kb-ask.py"])
+        self.assertEqual(r["_appended"], warning)
+
+
 class TestStubSchemaDrift(unittest.TestCase):
     """Verify that _TOOL_STUBS in code_execution_tool.py stay in sync with
     the real tool schemas registered in tools/registry.py.
@@ -882,7 +951,8 @@ class TestRpcTokenAuthorization(unittest.TestCase):
         """Run _rpc_server_loop against a real AF_UNIX socketpair.
 
         Sends each dict in *requests* as a newline-delimited JSON message
-        and returns the list of decoded JSON responses.
+        and returns the list of decoded responses (each line is a JSON string
+        literal wrapping the tool result).
         """
         from tools.code_execution_rpc import _rpc_server_loop
 
@@ -945,7 +1015,7 @@ class TestRpcTokenAuthorization(unittest.TestCase):
                     line, buf = buf.split(b"\n", 1)
                     line = line.strip()
                     if line:
-                        responses.append(json.loads(line.decode()))
+                        responses.append(json.loads(json.loads(line.decode())))
         finally:
             stop_event.set()
             cli.close()

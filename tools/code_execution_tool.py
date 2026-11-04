@@ -228,6 +228,31 @@ def shell_quote(s: str) -> str:
     return shlex.quote(s)
 
 
+def _decode_result(text):
+    """Parse a tool result. Results are dicts; text a plugin appends after the
+    result's JSON (e.g. a security warning) arrives under result["_appended"]."""
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        stripped = text.lstrip()
+        try:
+            result, end = json.JSONDecoder().raw_decode(stripped)
+        except json.JSONDecodeError:
+            return text
+        if not isinstance(result, dict):
+            return text
+        trailer = stripped[end:].strip()
+        if trailer and "_appended" not in result:
+            result["_appended"] = trailer
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except json.JSONDecodeError:
+            return result
+    return result
+
+
 def retry(fn, max_attempts=3, delay=2):
     """Retry a function up to max_attempts times with exponential backoff.
     Use for transient failures (network errors, API rate limits):
@@ -319,14 +344,9 @@ def _call(tool_name, args):
                 _sock = None
                 if _attempt + 1 >= _attempts:
                     raise
-    raw = buf.decode().strip()
-    result = json.loads(raw)
-    if isinstance(result, str):
-        try:
-            return json.loads(result)
-        except (json.JSONDecodeError, TypeError):
-            return result
-    return result
+    # The server sends each result as one JSON string literal (newline framing).
+    envelope = json.loads(buf.decode().strip())
+    return _decode_result(envelope) if isinstance(envelope, str) else envelope
 
 '''
 
@@ -389,13 +409,7 @@ def _call(tool_name, args):
     except OSError:
         pass
 
-    result = json.loads(raw)
-    if isinstance(result, str):
-        try:
-            return json.loads(result)
-        except (json.JSONDecodeError, TypeError):
-            return result
-    return result
+    return _decode_result(raw)
 
 '''
 

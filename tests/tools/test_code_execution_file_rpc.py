@@ -26,16 +26,29 @@ CALLS = {
 }
 
 
+class _Shell:
+    """The remote env the poller drives, as a real local shell."""
+
+    def __init__(self):
+        from pm.shell import bash
+        shell = bash()
+        assert shell
+        self.shell = shell
+
+    def execute(self, command, cwd=None, timeout=None, stdin_data=None):
+        result = subprocess.run([self.shell, "-c", command], cwd=cwd, timeout=timeout,
+                                env=dict(os.environ), input=stdin_data or "", capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+        return {"output": result.stdout}
+
+
 @pytest.mark.platforms("posix")
 def test_generated_file_rpc_kwargs_correlation_and_authority(tmp_path, monkeypatch):
-    from pm.shell import bash
     from tools.registry import registry
     import tools.file_tools
     import tools.web_tools
     import tools.terminal_tool
 
-    shell = bash()
-    assert shell
     rpc = tmp_path / "rpc with spaces"
     rpc.mkdir()
     monkeypatch.delenv("HERMES_RPC_DIR", raising=False)
@@ -55,16 +68,9 @@ def test_generated_file_rpc_kwargs_correlation_and_authority(tmp_path, monkeypat
 
     monkeypatch.setattr("model_tools.handle_function_call", dispatch)
 
-    class Shell:
-        def execute(self, command, cwd=None, timeout=None, stdin_data=None):
-            result = subprocess.run([shell, "-c", command], cwd=cwd, timeout=timeout,
-                                    env=dict(os.environ), input=stdin_data or "", capture_output=True, text=True, check=False)
-            assert result.returncode == 0, result.stderr
-            return {"output": result.stdout}
-
     stop = threading.Event()
     budget = len(CALLS) + 8
-    poller = threading.Thread(target=_rpc_poll_loop, args=(Shell(), str(rpc), "owner", log, counter,
+    poller = threading.Thread(target=_rpc_poll_loop, args=(_Shell(), str(rpc), "owner", log, counter,
                                budget, frozenset(CALLS), stop, "right-token"), daemon=True)
     poller.start()
     try:
@@ -93,6 +99,31 @@ def test_generated_file_rpc_kwargs_correlation_and_authority(tmp_path, monkeypat
         assert "not available" in namespace["_call"]("unauthorized-tool", {})["error"]
         assert "limit reached" in namespace["terminal"]("over-budget")["error"]
         assert counter == [budget] and len(seen) == len(log) == budget
+    finally:
+        stop.set()
+        poller.join(timeout=10)
+        assert not poller.is_alive()
+
+
+@pytest.mark.platforms("posix")
+def test_file_rpc_result_with_appended_text(tmp_path, monkeypatch):
+    """Regression for t_fc266f65 on the file transport: text a plugin appends after the
+    result JSON arrives under ``_appended``; a non-JSON result stays a plain str."""
+    monkeypatch.setenv("HERMES_RPC_DIR", str(tmp_path))
+    monkeypatch.setenv("HERMES_RPC_TOKEN", "tok")
+    results = {"appended": '{"success": true}\n\n---\n⚠️ Security guidance — x\n', "plain": "not json"}
+    monkeypatch.setattr("model_tools.handle_function_call",
+                        lambda name, args, **kw: results[args["command"]])
+    namespace = {}
+    exec(generate_hermes_tools_module(["terminal"], transport="file"), namespace)
+    stop = threading.Event()
+    poller = threading.Thread(target=_rpc_poll_loop, args=(_Shell(), str(tmp_path), "owner", [], [0],
+                               10, frozenset({"terminal"}), stop, "tok"), daemon=True)
+    poller.start()
+    try:
+        r = namespace["terminal"]("appended")
+        assert r["success"] is True and "Security guidance" in r["_appended"]
+        assert namespace["terminal"]("plain") == "not json"
     finally:
         stop.set()
         poller.join(timeout=10)
