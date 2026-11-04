@@ -95,3 +95,47 @@ def test_default_probe_retires_once_the_checkout_moves_past_the_boot_revision(tm
     start_code_skew_watchdog(moved, update_probe=lambda: False, fence=fence,
                              poll_s=0.01, max_polls=4).join(timeout=5)
     assert moved.should_exit is True
+
+
+def _run_held(skews, holds, **kwargs):
+    """``holds[i]`` is the hold reason on poll i (missing → no hold)."""
+    server, fence = _Server(), _Fence(idle=True)
+    seq, hold_seq = iter(skews), iter(holds)
+    polls = []
+
+    def skew_fn():
+        polls.append(len(polls) + 1)
+        return next(seq, None)
+
+    thread = start_code_skew_watchdog(
+        server, skew_fn=skew_fn, update_probe=lambda: False, fence=fence, poll_s=0.01,
+        max_polls=len(skews), hold_fn=lambda: next(hold_seq, None), **kwargs)
+    thread.join(timeout=5)
+    return server, fence, len(polls)
+
+
+def test_hold_resets_confirmations():
+    # An open shell on every poll: a stale dashboard stays up rather than killing it.
+    server, fence, _ = _run_held([_SKEW] * 3, ["pty:1"] * 3)
+    assert server.should_exit is False and fence.committed is False
+    # A hold on poll 2 restarts the count: exit needs two fresh confirmations (polls 3 and 4).
+    server, fence, polls = _run_held([_SKEW] * 4, [None, "pty:1", None, None])
+    assert server.should_exit is True and fence.committed is True
+    assert polls == 4
+
+
+def test_hold_fn_none_keeps_old_behaviour(caplog):
+    with caplog.at_level("WARNING", logger="hermes_cli.web_server_skew_exit"):
+        assert _run(_Fence(idle=True), [_SKEW, _SKEW]).should_exit is True
+    assert caplog.records[-1].getMessage().startswith("SSH-isolated backend")
+    assert "its client respawns it" in caplog.records[-1].getMessage()
+
+
+def test_supervised_label_in_log(caplog):
+    with caplog.at_level("WARNING", logger="hermes_cli.web_server_skew_exit"):
+        server, _, _ = _run_held([_SKEW, _SKEW], [], label="supervised dashboard",
+                                 respawner="its service supervisor", thread_name="supervised-skew-watchdog")
+    assert server.should_exit is True
+    message = caplog.records[-1].getMessage()
+    assert "supervised dashboard loaded aaaaaaaaaa" in message
+    assert "its service supervisor" in message

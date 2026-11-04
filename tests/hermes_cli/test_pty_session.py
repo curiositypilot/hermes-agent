@@ -542,6 +542,18 @@ async def test_same_key_reattaches_same_session():
 
 
 @pytest.mark.asyncio
+async def test_live_count_tracks_open_shells():
+    """The supervised dashboard's skew watchdog holds retirement while this is non-zero."""
+    reg = make_registry()
+    assert reg.live_count() == 0
+    await reg.attach_or_spawn("tok", spawn=lambda: FakeBridge([b"", b""]))
+    await reg.attach_or_spawn("tok", spawn=lambda: FakeBridge([]))  # reattach: still one shell
+    assert reg.live_count() == 1
+    await reg.close_all()
+    assert reg.live_count() == 0
+
+
+@pytest.mark.asyncio
 async def test_new_key_at_capacity_raises_when_none_reapable():
     reg = make_registry(max_sessions=1)
     b = FakeBridge([b"", b""])

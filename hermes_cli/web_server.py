@@ -1170,6 +1170,44 @@ def _publish_host_rendezvous(host: str, port: int) -> None:
     hr.cleanup_on_exit(role)
 
 
+def _supervised_skew_retirement(*, ssh_isolated: bool, desktop_owned: bool, dashboard_cfg: dict) -> bool:
+    """Opt-in code-skew retirement for a dashboard its service supervisor restarts on a clean exit
+    (systemd ``Restart=always``). Only a literal ``dashboard.retire_on_code_skew: true`` arms it (the
+    string "false" stays off); SSH-isolated and Desktop-owned backends keep their own branch."""
+    return not (ssh_isolated or desktop_owned) and dashboard_cfg.get("retire_on_code_skew") is True
+
+
+def _supervised_pty_hold(state, chat_registry):
+    """Hold retirement while a host-terminal or chat PTY shell is open: the supervisor stops the whole
+    cgroup on exit, so leaving would kill the shell. The dashboard surface never sets
+    ``state.host_terminals``; an absent registry is not a hold."""
+    from hermes_cli.web_server_skew_exit import pty_shell_hold
+
+    return pty_shell_hold(
+        lambda: [r for r in (getattr(state, "host_terminals", None), chat_registry) if r is not None])
+
+
+def _arm_supervised_skew_retirement(server) -> None:
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+
+    try:
+        dashboard_cfg = load_config().get("dashboard") or {}
+    except (OSError, ConfigBackendUnavailable) as exc:  # load_config already absorbs bad YAML
+        _log.warning("dashboard config unreadable (%s); retire_on_code_skew stays off", exc)
+        return
+    if not _supervised_skew_retirement(
+        ssh_isolated=getattr(app.state, "ssh_isolated_clients", None) is not None,
+        desktop_owned=is_desktop_owned_backend(),
+        dashboard_cfg=dashboard_cfg if isinstance(dashboard_cfg, dict) else {},
+    ):
+        return
+    from hermes_cli.web_server_skew_exit import start_code_skew_watchdog
+
+    start_code_skew_watchdog(
+        server, label="supervised dashboard", respawner="its service supervisor",
+        thread_name="supervised-skew-watchdog", hold_fn=_supervised_pty_hold(app.state, PTY_REGISTRY))
+
+
 def _on_server_started(
     server,
     *,
@@ -1229,6 +1267,7 @@ def _on_server_started(
         from hermes_cli.web_server_skew_exit import start_code_skew_watchdog
 
         start_code_skew_watchdog(server)
+    _arm_supervised_skew_retirement(server)  # dashboard.retire_on_code_skew (systemd dashboard)
     if getattr(app.state, "ssh_isolated_clients", None) is not None and ssh_lock_path and _SSH_OWNER_NONCE:
         # A reconnect that cannot prove this pid is its own drops the lock without signalling us
         # and spawns a new nonce (#132034); retire (between turns) once the lock names that spawn.

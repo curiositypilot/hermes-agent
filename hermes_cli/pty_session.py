@@ -419,6 +419,10 @@ class PtySessionRegistry:
         # Retain ownership of removed sessions until helper-process shutdown completes.
         self._background_closes: set[asyncio.Task] = set()
 
+    def live_count(self) -> int:
+        # Read from the skew watchdog's thread: len() of a dict is one GIL-atomic read, no lock.
+        return len(self._sessions)
+
     async def attach_or_spawn(
         self, key: str, *, spawn: Callable[[], object], active_session_file: Optional[Path] = None,
     ) -> tuple[PtySession, bool]:
