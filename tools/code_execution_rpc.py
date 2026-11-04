@@ -183,7 +183,10 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
                         max_tool_calls=max_tool_calls, dispatch=dispatch, tool_call_log=tool_call_log,
                         call_start=call_start, where="sandbox",
                     ) if _rpc_token_ok(request, rpc_token) else tool_error("Unauthorized RPC request")
-                conn.sendall((resp + "\n").encode())
+                # One JSON string literal per line: a result may span lines (a plugin's
+                # transform_tool_result can append a text block), which would break the
+                # newline framing and hand the tail to the next call.
+                conn.sendall((json.dumps(resp) + "\n").encode())
     except TimeoutError:
         logger.debug("RPC listener socket timeout")
     except OSError as e:
