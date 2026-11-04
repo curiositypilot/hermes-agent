@@ -45,7 +45,7 @@ def lookup_session_title(hermes_home: Any, session_id: str) -> str:
         finally:
             conn.close()
         return first_line(row[0]) if row and row[0] else ""
-    except Exception:
+    except (sqlite3.Error, OSError, ValueError):  # unreadable/non-sqlite db, relative home (as_uri)
         logger.debug("Hindsight envelope: session title lookup failed", exc_info=True)
         return ""
 
