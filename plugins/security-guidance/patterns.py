@@ -196,7 +196,8 @@ SECURITY_PATTERNS = [
     _rule("shelve_open", _UNSAFE_DESERIALIZATION_REMINDER, regex=r"\bshelve\.open\s*\("),
     _rule("xml_unsafe_parse",
           "⚠️ Security Warning: Use defusedxml.ElementTree. Python's stdlib XML parsers are vulnerable to XXE (external entity) and billion-laughs attacks by default.",
-          regex=r"\b(xml\.etree\.ElementTree|ElementTree|ET)\.(parse|fromstring|XML)\s*\(|\bminidom\.(parse|parseString)\s*\(|\bxml\.sax\.(parse|make_parser)\b"),
+          # (?<!defusedxml\.): the recommended replacement must not trip its own warning.
+          regex=r"(?<!defusedxml\.)\b(xml\.etree\.ElementTree|ElementTree|ET)\.(parse|fromstring|XML)\s*\(|(?<!defusedxml\.)\bminidom\.(parse|parseString)\s*\(|\bxml\.sax\.(parse|make_parser)\b"),
     _rule("pickle_variants_load", _UNSAFE_DESERIALIZATION_REMINDER, regex=r"\b(cPickle|cloudpickle|dill)\.(load|loads)\s*\("),
     _rule("outerHTML_xss",
           "⚠️ Security Warning: Use textContent or sanitize with DOMPurify. outerHTML assignment is an XSS sink equivalent to innerHTML.",

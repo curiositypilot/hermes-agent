@@ -114,6 +114,21 @@ class TestScanContent:
         findings = mod._scan_content("/tmp/foo.py", "result = eval(user_input)\n")
         assert "eval_injection" in [n for n, _ in findings]
 
+    def test_xml_unsafe_parse_spares_defusedxml(self):
+        """The rule's own recommended fix (defusedxml) must not warn; stdlib calls still do."""
+        mod = _load_plugin_init()
+        safe = (
+            "root = defusedxml.ElementTree.fromstring(body)\n"
+            "doc = defusedxml.minidom.parseString(body)\n"
+        )
+        assert "xml_unsafe_parse" not in [n for n, _ in mod._scan_content("/x/app.py", safe)]
+        for unsafe in (
+            "root = xml.etree.ElementTree.fromstring(body)\n",
+            "root = ET.parse(path)\n",
+            "doc = xml.dom.minidom.parseString(body)\n",
+        ):
+            assert "xml_unsafe_parse" in [n for n, _ in mod._scan_content("/x/app.py", unsafe)]
+
     def test_subprocess_shell_true_warns(self):
         mod = _load_plugin_init()
         findings = mod._scan_content(
