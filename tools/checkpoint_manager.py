@@ -59,9 +59,9 @@ import tempfile
 import time
 from pathlib import Path, PurePosixPath
 from hermes_constants import get_hermes_home
-from hermes_cli._subprocess_compat import selected_git_env, windows_hide_flags
-from hermes_cli.gitlock import clear_stale_tmp_packs
-from typing import Dict, List, Optional, Set, Tuple
+from hermes_cli._subprocess_compat import IS_WINDOWS, kill_process_tree, selected_git_env, windows_hide_flags
+from hermes_cli.gitlock import STALE_LOCK_MIN_AGE_SECONDS, clear_stale_tmp_packs
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from utils import env_int, rmtree_readonly
 
@@ -354,6 +354,71 @@ def _git_env(
     return env
 
 
+# SIGTERM-to-SIGKILL grace for a timed-out checkpoint git: git deletes its index.lock only from
+# its signal handlers, which SIGKILL never runs.
+_GIT_KILL_GRACE = 5.0
+
+
+def _clear_stale_index_lock(index_file: Path) -> bool:
+    """Remove ``<index>.lock`` stranded by a git that died without cleanup (SIGKILL, OOM, crash).
+
+    While the lock exists git refuses every command on that index, so checkpoints of the
+    directory failed with "File exists" until someone deleted it by hand. Removed only when it
+    is older than any checkpoint git call can run and no process has it open; an unknowable
+    answer keeps it. Windows skips the probe: it refuses to unlink a file another process has open.
+    """
+    lock = index_file.with_name(index_file.name + ".lock")
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except OSError:
+        return False
+    if age <= STALE_LOCK_MIN_AGE_SECONDS:
+        return False
+    if not IS_WINDOWS:
+        from hermes_cli._early_recovery import _held_open
+
+        if _held_open(lock) is not False:
+            return False
+    try:
+        lock.unlink(missing_ok=True)
+    except OSError:
+        return False
+    logger.warning("Removed stale checkpoint index lock %s (age %ds)", lock, age)
+    return True
+
+
+def _communicate_git(cmd: list[str], env: dict, cwd: str, timeout: int, text_options: dict) -> tuple[int, Any, Any]:
+    """Run *cmd* to completion; on timeout (or any interruption) SIGTERM its group, then re-raise.
+
+    ``subprocess.run(timeout=)`` SIGKILLs the child, which strands git's ``index.lock``.
+    """
+    # detached-spawn: ok — awaited with a hard timeout that tree-kills the group; the group only lets SIGTERM reach git's filter/hook children
+    group_kw: dict = {} if IS_WINDOWS else {"process_group": 0}
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        env=env,
+        cwd=cwd,
+        # Checkpoints fire several bare git calls per turn from the console-less desktop/gateway
+        # backend; suppress the per-call conhost flash on Windows (no-op on POSIX).
+        creationflags=windows_hide_flags(),
+        **text_options,
+        **group_kw,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except BaseException:
+        kill_process_tree(proc, grace=_GIT_KILL_GRACE)
+        try:
+            proc.communicate(timeout=2)
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass  # a descendant still holds the pipes; the tree kill already ran
+        raise
+    return proc.returncode, stdout, stderr
+
+
 def _run_git(
     args: list[str],
     store: Path,
@@ -379,6 +444,8 @@ def _run_git(
         logger.error("Git command skipped: %s (%s)", " ".join(["git"] + list(args)), msg)
         return False, "", msg
 
+    if index_file is not None:
+        _clear_stale_index_lock(index_file)
     env = _git_env(store, str(normalized_working_dir), index_file=index_file)
     if extra_env:
         env.update(extra_env)
@@ -391,27 +458,15 @@ def _run_git(
     try:
         # NUL-delimited git output contains literal filenames, not text lines.
         text_options = {} if "-z" in args else {"text": True, "encoding": "utf-8", "errors": "replace"}
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            **text_options,
-            timeout=timeout,
-            env=env,
-            cwd=str(normalized_working_dir),
-            stdin=subprocess.DEVNULL,
-            # Checkpoints fire several bare git calls per turn from the
-            # console-less desktop/gateway backend; suppress the per-call
-            # conhost flash on Windows (no-op on POSIX).
-            creationflags=windows_hide_flags(),
-            check=False,
-        )
-        ok = result.returncode == 0
-        stdout = os.fsdecode(result.stdout) if "-z" in args else result.stdout.strip()
-        stderr = result.stderr.decode("utf-8", errors="replace").strip() if "-z" in args else result.stderr.strip()
-        if not ok and result.returncode not in allowed_returncodes:
+        returncode, raw_out, raw_err = _communicate_git(
+            cmd, env, str(normalized_working_dir), timeout, text_options)
+        ok = returncode == 0
+        stdout = os.fsdecode(raw_out) if "-z" in args else raw_out.strip()
+        stderr = raw_err.decode("utf-8", errors="replace").strip() if "-z" in args else raw_err.strip()
+        if not ok and returncode not in allowed_returncodes:
             logger.error(
                 "Git command failed: %s (rc=%d) stderr=%s",
-                " ".join(cmd), result.returncode, stderr,
+                " ".join(cmd), returncode, stderr,
             )
         return ok, stdout, stderr
     except subprocess.TimeoutExpired:
