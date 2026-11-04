@@ -167,10 +167,15 @@ def run_live_checks(issues: list[str]) -> list[ProbeResult]:
     results.append(_run_one("Browser", lambda: _probe_browser(timeout), issues))
     servers = config.get("mcp_servers") or {}
     if isinstance(servers, dict) and servers:
+        from tools.mcp_tool_common import mcp_server_enabled
         for name in sorted(servers):
             def _probe(n=name, e=servers[name]) -> ProbeResult:
                 if not isinstance(e, dict):
                     return ProbeResult(f"MCP: {n}", "skip", "(malformed config entry)")
+                if not mcp_server_enabled(e):
+                    # A disabled OAuth server would otherwise run a full auth flow (refresh, DCR) and
+                    # re-create the token files its owner removed to disconnect it.
+                    return ProbeResult(f"MCP: {n}", "skip", "(disabled)")
                 return ProbeResult(f"MCP: {n}", "pass", f"({len(_probe_mcp_server(n, e, timeout))} tool(s))")
             results.append(_run_one(f"MCP: {name}", _probe, issues))
     else:

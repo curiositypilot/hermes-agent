@@ -101,6 +101,9 @@ def _ready_for_token_requests(provider):
         "token_type": "Bearer",
         "refresh_token": "rt",
     })
+    # A refreshing provider's pair came from its tokens file; with the file absent the refresh is
+    # refused as a removed (disconnected) server.
+    asyncio.run(provider.context.storage.set_tokens(provider.context.current_tokens))
 
 
 def _build_provider_via(builder, monkeypatch, tmp_path, cfg):

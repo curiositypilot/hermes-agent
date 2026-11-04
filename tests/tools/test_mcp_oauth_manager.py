@@ -871,3 +871,136 @@ async def test_refresh_400_recovery_rejects_disk_pair_from_another_issuer(tmp_pa
     assert recovered is False
     assert provider.context.current_tokens is None
     assert (await storage.get_tokens()).refresh_token is None, "foreign refresh token must not survive on disk"
+
+
+# ---------------------------------------------------------------------------
+# A removed tokens file is a disconnect (intake t_53c1ac88): the in-memory pair must
+# never be refreshed and written back, and no other OAuth state may be re-created.
+# ---------------------------------------------------------------------------
+
+
+def _stub_entry(mgr, tokens):
+    from tools.mcp_oauth_manager import _ProviderEntry
+
+    provider = SimpleNamespace(context=SimpleNamespace(current_tokens=tokens), _initialized=True)
+    mgr._entries[mgr._key("srv")] = _ProviderEntry(
+        server_url="https://example.com/mcp", oauth_config=None, provider=provider,
+    )
+    return provider
+
+
+@pytest.mark.asyncio
+async def test_removed_tokens_file_drops_in_memory_tokens(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    tokens_file = tmp_path / "mcp-tokens" / "srv.json"
+    tokens_file.parent.mkdir(parents=True)
+    tokens_file.write_text(json.dumps({"access_token": "A1"}), encoding="utf-8")
+    mgr = MCPOAuthManager()
+    provider = _stub_entry(mgr, object())
+    assert await mgr.invalidate_if_disk_changed("srv") is False  # seeds the baseline (version recorded)
+
+    tokens_file.unlink()
+    assert await mgr.invalidate_if_disk_changed("srv") is False
+    assert provider.context.current_tokens is None
+    assert provider._initialized is False
+    assert mgr.tokens_removed("srv") is True
+
+    # A new login lands: reload, and stop refusing.
+    tokens_file.write_text(json.dumps({"access_token": "A2"}), encoding="utf-8")
+    assert await mgr.invalidate_if_disk_changed("srv") is True
+    assert mgr.tokens_removed("srv") is False
+
+
+@pytest.mark.asyncio
+async def test_missing_file_never_seen_keeps_state(tmp_path, monkeypatch):
+    """No file from the start (first login in progress): state kept, flows not refused."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    mgr = MCPOAuthManager()
+    tokens = object()
+    provider = _stub_entry(mgr, tokens)
+    assert await mgr.invalidate_if_disk_changed("srv") is False
+    assert provider.context.current_tokens is tokens
+    assert provider._initialized is True
+    assert mgr.tokens_removed("srv") is False
+
+
+async def _seed_logged_in_state(storage, endpoint):
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthMetadata
+
+    await storage.set_tokens(_token("A1", "R1"))
+    await storage.set_client_info(OAuthClientInformationFull.model_validate(
+        {"client_id": "client-id", "redirect_uris": ["http://localhost/cb"]}))
+    storage.save_oauth_metadata(OAuthMetadata(
+        issuer="https://idp.example.com", authorization_endpoint="https://idp.example.com/authorize",
+        token_endpoint=endpoint))
+
+
+@pytest.mark.asyncio
+async def test_refresh_does_not_resurrect_removed_tokens_file(tmp_path, monkeypatch):
+    """Incident replay with fake tokens: a provider holds a pair whose access token expired 159 s
+    ago, and the disconnect moved every state file away. The next request must not POST the
+    in-memory refresh token, must not register a client, and must create no state file, so a
+    failed reauth's ``only_if_absent`` rollback still restores the backup."""
+    from tools.mcp_oauth import HermesTokenStorage, OAuthNonInteractiveError
+    from tools.mcp_oauth_manager import get_manager, reset_manager_for_tests
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_manager_for_tests()
+    endpoint = "https://idp.example.com/oauth/token"
+    storage = HermesTokenStorage("srv")
+    await _seed_logged_in_state(storage, endpoint)
+
+    mgr = get_manager()
+    provider = mgr.get_or_build_provider("srv", "https://mcp.example.com", {})
+    await provider._initialize()
+    provider._initialized = True
+    assert provider.context.current_tokens.refresh_token == "R1"
+    await mgr.invalidate_if_disk_changed("srv", hermes_home=provider._hermes_home)  # this process saw the file
+
+    backup = storage.snapshot()
+    storage.remove()  # the disconnect: tokens, client and metadata moved away
+    provider.context.token_expiry_time = time.time() - 159
+
+    sent = []
+
+    def responder(request):
+        sent.append(request)
+        if request.method == "POST":
+            body = json.dumps(_token("A2", "R2").model_dump(mode="json", exclude_none=True)).encode()
+            return _fake_response(200, endpoint, body)
+        return _fake_response(200, str(request.url), b"{}")
+
+    with pytest.raises(OAuthNonInteractiveError, match="tokens file was removed"):
+        await _drive_flow(provider, responder)
+    with pytest.raises(OAuthNonInteractiveError):  # still refused on the next request
+        await _drive_flow(provider, responder)
+
+    assert sent == [], [f"{r.method} {r.url}" for r in sent]
+    assert not any(p.exists() for p in storage._state_paths())
+    assert provider.context.current_tokens is None
+
+    storage.restore(backup, only_if_absent=True)
+    assert (await storage.get_tokens()).refresh_token == "R1"
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_aborts_when_tokens_file_absent(tmp_path, monkeypatch):
+    """Backstop below the disk watch (file gone before this process ever saw it): under the
+    fence, an absent tokens file aborts the refresh. No POST, no write, fence released."""
+    from tools.mcp_oauth import OAuthNonInteractiveError
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _fenced_provider(tmp_path, monkeypatch, "https://idp.example.com/oauth/token")
+    tokens_path = provider.context.storage._tokens_path()
+    assert not tokens_path.exists()
+
+    with pytest.raises(OAuthNonInteractiveError):
+        await provider._refresh_token()
+
+    assert provider.context.current_tokens is None
+    assert provider._hermes_fence is None
+    assert not tokens_path.exists()

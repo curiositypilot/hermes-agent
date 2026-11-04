@@ -72,6 +72,17 @@ def _with_discovery_context(exc: Exception, failures: list[str]):
 class _RefreshCompletedByPeer(Exception):
     """Restart the SDK auth flow: a peer rotated the grant we were about to present."""
 
+
+def tokens_removed_error(server_name: str):
+    """The refusal raised when a tokens file this process relied on was deleted (a disconnect or a
+    reauth in progress): an auth error, so the server parks as needing reauth instead of refreshing
+    from memory or re-registering, either of which would re-create the removed state files."""
+    from tools.mcp_oauth import OAuthNonInteractiveError
+    return OAuthNonInteractiveError(
+        f"MCP OAuth for '{server_name}': its tokens file was removed (disconnected, or a re-login is in "
+        f"progress); run `hermes mcp login {server_name}` to reconnect.")
+
+
 class HermesProviderMixin:
     """Token-endpoint fixes layered over the SDK's ``OAuthClientProvider`` (must precede it in
     the MRO; subclasses set ``_hermes_logger`` to keep their own logger name).
@@ -313,6 +324,11 @@ class HermesProviderMixin:
             # the provider will still accept, so install it even when its access
             # token has already expired (the POST we build needs the new grant).
             candidate = await self._hermes_rotated_candidate()
+            if candidate is None and self._hermes_tokens_file_absent():
+                # The pair we hold came from a file that is gone: refreshing it from memory and saving the
+                # result would undo the removal. Abort (no POST, no write); never restart into the 401 branch.
+                self.context.current_tokens = None
+                raise tokens_removed_error(getattr(self, "_hermes_server_name", "") or "server")
             if candidate is not None:
                 if not self._hermes_install_disk_pair(candidate):
                     # Issuer binding stripped the peer's refresh token: nothing
@@ -329,6 +345,13 @@ class HermesProviderMixin:
             # Never hold the fence when no POST will follow.
             await self._hermes_release_refresh_fence()
             raise
+
+    def _hermes_tokens_file_absent(self) -> bool:
+        """True when Hermes storage backs this provider and its tokens file does not exist. A pair in
+        memory always came from that file or was written to it, so absence means it was removed."""
+        from tools.mcp_oauth import HermesTokenStorage
+        storage = self.context.storage
+        return isinstance(storage, HermesTokenStorage) and not storage._tokens_path().exists()
 
     def _hermes_live_ttl(self) -> bool:
         """True when the installed token is not known to be past due.

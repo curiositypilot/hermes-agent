@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -144,6 +146,31 @@ def _owner_secret_scope():
         reset_secret_scope(token)
 
 
+def _connect_caller() -> str:
+    """``module:function`` of the first frame outside ``tools.mcp_tool_*`` and asyncio. The awaiting
+    coroutines are on the ``f_back`` chain, so a probe scheduled onto the MCP loop still names its
+    origin (``hermes_cli.mcp_config:_probe``) rather than the event loop."""
+    frame = sys._getframe(1)
+    while frame is not None:
+        module = frame.f_globals.get("__name__", "")
+        if not module.startswith(("tools.mcp_tool_", "asyncio", "contextlib")):
+            return f"{module}:{frame.f_code.co_name}"
+        frame = frame.f_back
+    return "unknown"
+
+
+def _log_disabled_connect(name: str, config: dict) -> None:
+    """Diagnostic only: name the process and caller that connects a server disabled in config.
+    Not a refusal — `hermes mcp test|login` on a disabled entry is an explicit user action — but an
+    unattributed connect of a disabled OAuth server once re-created the token files its owner had
+    removed to disconnect it (intake t_53c1ac88)."""
+    entry = config if not mcp_server_enabled(config) else _config._load_mcp_config().get(name)
+    if entry is None or mcp_server_enabled(entry):
+        return
+    logger.info("MCP server '%s' is disabled in config; connecting anyway (pid %d, caller %s)",
+                name, os.getpid(), _connect_caller())
+
+
 async def _connect_server(name: str, config: dict) -> _core.MCPServerTask:
     """Create an MCPServerTask, start it, return once ready (tear down with ``server.shutdown()``
     on the same loop). Raises on bad config, missing HTTP support or connect failure."""
@@ -156,6 +183,7 @@ async def _connect_server(name: str, config: dict) -> _core.MCPServerTask:
     scope_token = None
     try:
         scope_token = await _install_owner_secret_scope()
+        _log_disabled_connect(name, config)  # after the scope: the on-disk read renders ${VAR} refs
         # The config was rendered at load time (a lazy server's at boot): re-render under the
         # owner's fresh scope so a ref left literal before its secret source answered resolves
         # now, and refuse to send one that still does not.
