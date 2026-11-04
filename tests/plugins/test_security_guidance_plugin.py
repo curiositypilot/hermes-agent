@@ -12,11 +12,13 @@ Covers ``plugins/security-guidance/``:
   * Hooks — ``transform_tool_result`` appends a warning block in warn
     mode and stays out of error results; ``pre_tool_call`` blocks
     writes when ``SECURITY_GUIDANCE_BLOCK=1`` and stays silent
-    otherwise.
+    otherwise. ``skill_manage`` is scanned per operation, including the
+    legacy flat shape.
   * Bundled-plugin discovery via ``PluginManager.discover_and_load``.
 """
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -266,3 +268,164 @@ class TestPluginDiscovery:
         mod.register(HookContext())
         assert set(manifest["provides_hooks"]) == set(registered)
         assert "hooks" not in manifest
+
+
+# ---------------------------------------------------------------------------
+# skill_manage — operations[] batch (and the legacy flat shape)
+# ---------------------------------------------------------------------------
+
+_PICKLE_PY = "x = pickle.loads(b)\n"
+_EVAL_PY = "x = eval(user_input)"
+_CLEAN_PY = "x = json.loads(b)\n"
+
+
+def _write_file_op(content: str, file_path: str = "scripts/a.py") -> dict:
+    return {
+        "action": "write_file",
+        "name": "x",
+        "file_path": file_path,
+        "file_content": content,
+    }
+
+
+class TestSkillManageScan:
+    def test_operations_write_file_warns(self):
+        mod = _load_plugin_init()
+        result = mod._on_transform_tool_result(
+            tool_name="skill_manage",
+            args={"operations": [_write_file_op(_PICKLE_PY)]},
+            result='{"success": true}',
+        )
+        assert isinstance(result, str)
+        assert "pickle_deserialization" in result
+
+    def test_operations_patch_new_string_warns(self):
+        mod = _load_plugin_init()
+        result = mod._on_transform_tool_result(
+            tool_name="skill_manage",
+            args={
+                "operations": [
+                    {
+                        "action": "patch",
+                        "name": "x",
+                        "file_path": "scripts/a.py",
+                        "new_string": _EVAL_PY,
+                    }
+                ]
+            },
+            result='{"success": true}',
+        )
+        assert isinstance(result, str)
+        assert "eval_injection" in result
+
+    def test_skill_md_targets_recorded(self, monkeypatch):
+        """create/patch with no file_path target SKILL.md. Path filters must not matter."""
+        mod = _load_plugin_init()
+        recorded: list[tuple[str, str]] = []
+
+        def recorder(path, content):
+            recorded.append((path, content))
+            return []
+
+        monkeypatch.setattr(mod, "_scan_content", recorder)
+        create_body = "---\nname: x\n---\nbody\n"
+        rewrite = "full rewrite\n"
+        patched = "one patched line\n"
+        mod._scan_args(
+            "skill_manage",
+            {"operations": [{"action": "create", "name": "x", "content": create_body}]},
+        )
+        mod._scan_args(
+            "skill_manage",
+            {"operations": [{"action": "patch", "name": "x", "content": rewrite}]},
+        )
+        mod._scan_args(
+            "skill_manage",
+            {"operations": [{"action": "patch", "name": "x", "new_string": patched}]},
+        )
+        assert recorded == [
+            ("SKILL.md", create_body),
+            ("SKILL.md", rewrite),
+            ("SKILL.md", patched),
+        ]
+
+    def test_legacy_flat_write_file_still_warns(self):
+        mod = _load_plugin_init()
+        result = mod._on_transform_tool_result(
+            tool_name="skill_manage",
+            args={
+                "action": "write_file",
+                "file_path": "scripts/a.py",
+                "file_content": _PICKLE_PY,
+            },
+            result='{"success": true}',
+        )
+        assert isinstance(result, str)
+        assert "pickle_deserialization" in result
+
+    def test_legacy_flat_create_recorded(self, monkeypatch):
+        mod = _load_plugin_init()
+        recorded: list[tuple[str, str]] = []
+
+        def recorder(path, content):
+            recorded.append((path, content))
+            return []
+
+        monkeypatch.setattr(mod, "_scan_content", recorder)
+        body = "---\nname: x\n---\nflat create\n"
+        mod._scan_args(
+            "skill_manage",
+            {"action": "create", "name": "x", "content": body},
+        )
+        assert recorded == [("SKILL.md", body)]
+
+    def test_stringified_operations_warns(self):
+        mod = _load_plugin_init()
+        result = mod._on_transform_tool_result(
+            tool_name="skill_manage",
+            args={"operations": json.dumps([_write_file_op(_PICKLE_PY)])},
+            result='{"success": true}',
+        )
+        assert isinstance(result, str)
+        assert "pickle_deserialization" in result
+
+    def test_bad_operations_json_returns_empty(self):
+        mod = _load_plugin_init()
+        assert mod._scan_args("skill_manage", {"operations": "not json"}) == []
+
+    def test_dedupes_rule_across_ops(self):
+        mod = _load_plugin_init()
+        findings = mod._scan_args(
+            "skill_manage",
+            {
+                "operations": [
+                    _write_file_op(_PICKLE_PY, "scripts/a.py"),
+                    _write_file_op(_PICKLE_PY, "scripts/b.py"),
+                ]
+            },
+        )
+        names = [name for name, _ in findings]
+        assert names.count("pickle_deserialization") == 1
+
+    def test_non_content_and_clean_ops_return_empty(self):
+        mod = _load_plugin_init()
+        cases = [
+            {"operations": [{"action": "delete", "name": "x"}]},
+            {"operations": [{"action": "remove_file", "name": "x", "file_path": "scripts/a.py"}]},
+            {"operations": [_write_file_op(_CLEAN_PY)]},
+            {"operations": []},
+            {"operations": [None, 3]},
+        ]
+        for args in cases:
+            assert mod._scan_args("skill_manage", args) == [], args
+
+    def test_block_mode_refuses_batch(self, monkeypatch):
+        mod = _load_plugin_init()
+        monkeypatch.setenv("SECURITY_GUIDANCE_BLOCK", "1")
+        out = mod._on_pre_tool_call(
+            tool_name="skill_manage",
+            args={"operations": [_write_file_op(_PICKLE_PY)]},
+        )
+        assert isinstance(out, dict)
+        assert out["action"] == "block"
+        assert "pickle_deserialization" in out["message"]

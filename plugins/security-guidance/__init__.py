@@ -2,7 +2,8 @@
 
 Scans content written by ``write_file`` / ``patch`` / ``skill_manage`` for known dangerous patterns
 and appends a ``⚠️ Security guidance`` block to the tool result; the file is still written and the
-model self-corrects next turn. Warn (not block) by default because patterns have a real false-positive
+model self-corrects next turn. ``skill_manage`` is scanned per operation (the ``operations[]`` batch,
+or one legacy flat op). Warn (not block) by default because patterns have a real false-positive
 rate (``eval(`` in a tokenizer, ECB in a test fixture); ``SECURITY_GUIDANCE_BLOCK=1`` refuses the write
 instead, ``SECURITY_GUIDANCE_DISABLE=1`` is a kill switch. Pattern data: ``patterns.py`` (Apache-2.0 fork).
 """
@@ -20,11 +21,11 @@ from . import patterns as _patterns
 logger = logging.getLogger(__name__)
 
 # tool name -> (path_arg_name, content_arg_names). Every populated content field is scanned
-# (patch's new_string vs raw patch text; skill_manage's file_path is the path inside the skill dir).
+# (patch's new_string vs raw patch text). skill_manage is not here: its schema is operations[],
+# scanned per op by _skill_manage_writes (legacy flat args are one op).
 _TARGET_TOOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "write_file": ("path", ("content",)),
     "patch": ("path", ("new_string", "patch")),
-    "skill_manage": ("file_path", ("file_content", "new_string")),
 }
 
 # Above this we skip: matching a multi-MB blob has poor signal and slows the agent loop.
@@ -77,10 +78,62 @@ def _scan_content(path: str, content: str) -> list[tuple[str, str]]:
     return [(e["ruleName"], e["reminder"]) for e in _COMPILED if _rule_matches(e, path, content)]
 
 
+# Per-op content keys on skill_manage. create/edit/full-rewrite use ``content``;
+# write_file uses ``file_content``; a SKILL.md or supporting-file patch uses ``new_string``.
+_SKILL_CONTENT_KEYS = ("content", "file_content", "new_string")
+
+
+def _skill_manage_writes(args: Any) -> list[tuple[str, str]]:
+    """``(path, content)`` pairs from one skill_manage call.
+
+    The advertised schema is ``operations[]``. A missing key is the legacy flat
+    shape (one op). A string value is JSON from a caller that stringified the
+    array; bad JSON is ignored. ``file_path`` is the path inside the skill dir;
+    create / full-rewrite / a SKILL.md patch omit it and target ``SKILL.md``.
+    """
+    if not isinstance(args, dict):
+        return []
+    if "operations" not in args:
+        ops: Any = [args]
+    else:
+        ops = args["operations"]
+        if isinstance(ops, str):
+            try:
+                ops = json.loads(ops)
+            except (ValueError, TypeError):
+                return []
+        if not isinstance(ops, list):
+            return []
+    writes: list[tuple[str, str]] = []
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        raw_path = op.get("file_path")
+        path = raw_path if isinstance(raw_path, str) and raw_path else "SKILL.md"
+        for key in _SKILL_CONTENT_KEYS:
+            val = op.get(key)
+            if isinstance(val, str) and val:
+                writes.append((path, val))
+    return writes
+
+
 def _scan_args(tool_name: str, args: Any) -> list[tuple[str, str]]:
     """Shared scan for both hooks (block mode via pre_tool_call, warn mode via transform)."""
+    if _env_flag("SECURITY_GUIDANCE_DISABLE") or not isinstance(args, dict):
+        return []
+    if tool_name == "skill_manage":
+        # One batch can hit the same rule in several ops; the warning block names each rule once.
+        seen: set[str] = set()
+        findings: list[tuple[str, str]] = []
+        for path, content in _skill_manage_writes(args):
+            for finding in _scan_content(path, content):
+                if finding[0] in seen:
+                    continue
+                seen.add(finding[0])
+                findings.append(finding)
+        return findings
     spec = _TARGET_TOOLS.get(tool_name)
-    if _env_flag("SECURITY_GUIDANCE_DISABLE") or spec is None or not isinstance(args, dict):
+    if spec is None:
         return []
     path_key, content_keys = spec
     path = raw_path if isinstance(raw_path := args.get(path_key), str) else ""
