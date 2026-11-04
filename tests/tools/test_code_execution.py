@@ -483,7 +483,7 @@ _SHAPED_RESULTS = {
 }
 
 
-@unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
+@pytest.mark.platforms("posix")
 class TestRpcResultFraming(unittest.TestCase):
     """Regression for t_fc266f65: a tool result with text appended after its JSON (a
     plugin transform) crashed the stub's json.loads although the tool had run, and its
