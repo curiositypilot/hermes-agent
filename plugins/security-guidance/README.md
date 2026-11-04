@@ -30,12 +30,19 @@ under Apache-2.0. Categories:
 | Supply chain | `<script src="https://..."` without `integrity=` SRI hash |
 | CI/CD injection | GitHub Actions workflow files using `${{ github.event.* }}` in `run:` |
 
-The pattern data uses Python regex + literal-substring matching. Each rule
-carries a per-extension `path_filter` lambda — Python-only rules skip `.js`,
-JS rules skip `.py`, all rules skip `.md/.txt/.rst/.json/.yaml`. Lookbehind
-assertions exclude method calls (so `model.eval()` and `redis.eval()` don't
-trip the `eval(` rule). False-positive rate is mediocre but tolerable; the
-plugin is warn-by-default precisely because of that.
+The pattern data uses Python regex + literal-substring matching. Some rules
+carry a per-extension `path_filter` (Python-only rules skip `.js`, JS rules
+skip `.py`); every other content rule skips doc/prose files
+(`.md/.mdx/.txt/.rst/.json/.yaml/.yml`) by default. The GitHub Actions rule
+fires on the workflow path alone. On `.py`/`.pyi` writes, string literals and
+comments are blanked before matching, so a docstring, comment or test fixture
+that quotes `yaml.load(` does not warn; a rule's `scan_literals` arm still
+reads them, for matches whose text is itself a literal (`<script src=...>`
+template HTML, `'aes-256-ecb'`, `NODE_TLS_REJECT_UNAUTHORIZED="0"`). A V4A
+`patch` is scanned per `*** Update/Add File:` section with that file's path.
+Lookbehind assertions exclude method calls (so `model.eval()` and
+`redis.eval()` don't trip the `eval(` rule). False-positive rate is mediocre
+but tolerable; the plugin is warn-by-default precisely because of that.
 
 ## Enabling
 

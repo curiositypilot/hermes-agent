@@ -20,9 +20,10 @@ Forked from Anthropic's claude-plugins-official repository
   See the License for the specific language governing permissions and
   limitations under the License.
 
-NousResearch modifications: pattern data unchanged from upstream; the upstream RuleId
-telemetry table (Claude Code PostToolUse metrics) is dropped — Hermes has no consumer.
-Hermes-side wiring lives in __init__.py.
+NousResearch modifications: content rules without an explicit filter skip doc/prose files
+(``_rule`` defaults ``path_filter=_NOT_DOCS``); arms whose match text is a quoted literal moved
+from ``regex`` to ``scan_literals`` (see below); the upstream RuleId telemetry table (Claude Code
+PostToolUse metrics) is dropped — Hermes has no consumer. Hermes-side wiring lives in __init__.py.
 """
 _JS_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts", ".vue", ".svelte")
 _PY_EXTS = (".py", ".pyi", ".ipynb")
@@ -133,8 +134,16 @@ Additionally, validate user inputs:
 
 
 def _rule(name, reminder, **triggers):
-    """Build one rule dict; only the trigger keys given (regex / substrings /
-    path_filter / path_check) are present, so consumers can test with ``in``."""
+    """Build one rule dict; only the trigger keys given (regex / substrings / scan_literals /
+    path_filter / path_check) are present, so consumers can test with ``in``.
+
+    A content rule with neither ``path_check`` nor ``path_filter`` gets ``_NOT_DOCS``: language
+    rules matching prose in .md/.yaml/.json is noise, not signal. ``regex``/``substrings`` match
+    code; on Python files string literals and comments are blanked first (``__init__.py``).
+    ``scan_literals`` is a regex for arms whose match text IS a string literal (an HTML script
+    tag, a cipher name, an env value); it always runs on the raw content."""
+    if "path_check" not in triggers and "path_filter" not in triggers:
+        triggers["path_filter"] = _NOT_DOCS
     return {"ruleName": name, "reminder": reminder, **triggers}
 
 
@@ -178,10 +187,11 @@ SECURITY_PATTERNS = [
           regex=r"\bcrypto\.(createCipher|createDecipher)\b"),
     _rule("aes_ecb_mode",
           "⚠️ Security Warning: Use AES-GCM or AES-CBC with HMAC. ECB mode leaks plaintext structure (identical blocks encrypt to identical ciphertext).",
-          regex=r"\bAES\.MODE_ECB\b|\bmodes\.ECB\s*\(|[\x22\x27]aes-\d+-ecb[\x22\x27]"),
+          regex=r"\bAES\.MODE_ECB\b|\bmodes\.ECB\s*\(", scan_literals=r"[\x22\x27]aes-\d+-ecb[\x22\x27]"),
     _rule("tls_verification_disabled",
           "⚠️ Security Warning: Don't disable TLS verification. This allows MITM attacks. For self-signed dev certs, add the CA to your trust store or use a properly-issued cert.",
-          regex=r"\bverify\s*=\s*False\b|rejectUnauthorized\s*:\s*false|InsecureSkipVerify\s*:\s*true|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*[\x22\x27]?0|ssl\._create_unverified_context|check_hostname\s*=\s*False"),
+          regex=r"\bverify\s*=\s*False\b|rejectUnauthorized\s*:\s*false|InsecureSkipVerify\s*:\s*true|ssl\._create_unverified_context|check_hostname\s*=\s*False",
+          scan_literals=r"NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*[\x22\x27]?0"),
     _rule("marshal_loads", _UNSAFE_DESERIALIZATION_REMINDER, regex=r"\bmarshal\.loads?\s*\("),
     _rule("shelve_open", _UNSAFE_DESERIALIZATION_REMINDER, regex=r"\bshelve\.open\s*\("),
     _rule("xml_unsafe_parse",
@@ -196,7 +206,7 @@ SECURITY_PATTERNS = [
           substrings=[".insertAdjacentHTML("]),
     _rule("script_src_without_sri",
           '⚠️ Security Warning: Add integrity="sha384-..." crossorigin="anonymous" to external script tags. Loading scripts without Subresource Integrity exposes you to CDN compromise.',
-          regex=r"<script\s+(?![^>]{0,400}integrity\s*=)[^>]{0,200}src\s*=\s*[\x22\x27](?:https?:)?//[^\x22\x27]{1,300}[\x22\x27][^>]{0,100}>"),
+          scan_literals=r"<script\s+(?![^>]{0,400}integrity\s*=)[^>]{0,200}src\s*=\s*[\x22\x27](?:https?:)?//[^\x22\x27]{1,300}[\x22\x27][^>]{0,100}>"),
     _rule("torch_unsafe_load", _UNSAFE_TORCH_LOAD_REMINDER, regex=r"(?:\btorch\.load|\.torch_load)\s*\((?![^)\n]{0,200}weights_only\s*=\s*True)"),
     _rule("yaml_unsafe_load_variants", _UNSAFE_YAML_LOAD_REMINDER, regex=r"(?:\byaml\.unsafe_load|\.yaml_unsafe_load)\s*\("),
     _rule("pickle_wrapper_load", _UNSAFE_DESERIALIZATION_REMINDER,
