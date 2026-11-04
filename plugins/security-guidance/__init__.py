@@ -14,6 +14,7 @@ reads the raw text. A V4A ``patch`` blob is scanned per ``*** Update/Add File:``
 
 from __future__ import annotations
 
+import bisect
 import io
 import json
 import logging
@@ -72,11 +73,11 @@ _LITERAL_TOKENS = frozenset(
 _MASKED_EXTS = (".py", ".pyi")  # not .ipynb: that is JSON
 
 
-def _mask_python_literals(content: str) -> str:
-    """``content`` with every string literal and comment overwritten by spaces (line breaks kept, so
-    same-line regexes and offsets still work). Fragments that do not tokenize (patch hunks, open
-    brackets, odd dedents) keep the masks found so far; an unterminated string is blanked from its
-    start to the end of its line (single-quoted) or of the text (triple-quoted). Never raises."""
+def _literal_spans(content: str) -> tuple[list[tuple[int, int]], bool]:
+    """(spans, clean): ``(start, end)`` offsets of every literal/comment token in ``content``, and
+    False when tokenize raised ``SyntaxError`` (the spans are then the ones found before it). An
+    unterminated string spans from its start to the end of its line (single-quoted) or of the text
+    (triple-quoted)."""
     starts = [0] + [i + 1 for i, ch in enumerate(content) if ch == "\n"]
     spans: list[tuple[int, int]] = []
     last_end = 0
@@ -93,8 +94,46 @@ def _mask_python_literals(content: str) -> str:
         if "string" in msg:
             stop = len(content) if "multi-line" in msg or "triple" in msg else content.find("\n", last_end)
             spans.append((last_end, len(content) if stop < 0 else stop))
-    except SyntaxError:  # IndentationError included
-        pass
+    except SyntaxError:  # IndentationError, TabError included
+        return spans, False
+    return spans, True
+
+
+def _unindented_literal_spans(content: str) -> tuple[list[tuple[int, int]], bool]:
+    """``_literal_spans`` of ``content`` with leading `` \\t\\f`` stripped from every line, mapped back
+    to offsets in ``content``. Indentation never decides which characters are string or comment
+    tokens, and a flat copy cannot raise an indentation error. Lines split on ``\\n`` only, as
+    tokenize's readline does, so rows match the original."""
+    flat_parts: list[str] = []
+    flat_starts: list[int] = []
+    shift: list[int] = []  # characters stripped up to and including each line
+    flat_len = stripped = 0
+    for line in content.split("\n"):
+        body = line.lstrip(" \t\f")
+        stripped += len(line) - len(body)
+        flat_starts.append(flat_len)
+        shift.append(stripped)
+        flat_parts.append(body)
+        flat_len += len(body) + 1
+    spans, clean = _literal_spans("\n".join(flat_parts))
+
+    def to_original(offset: int) -> int:
+        return offset + shift[bisect.bisect_right(flat_starts, offset) - 1]
+
+    return [(to_original(b), to_original(e)) for b, e in spans], clean
+
+
+def _mask_python_literals(content: str) -> str:
+    """``content`` with every string literal and comment overwritten by spaces (line breaks kept, so
+    same-line regexes and offsets still work). Odd dedents (patch fragments that start deeper than
+    they end) are masked in full by re-tokenizing an indentation-free copy; other fragments that do
+    not tokenize (open brackets) keep the masks found so far; an unterminated string is blanked from
+    its start to the end of its line (single-quoted) or of the text (triple-quoted). Never raises."""
+    spans, clean = _literal_spans(content)
+    if not clean:
+        retry, retry_clean = _unindented_literal_spans(content)
+        if retry_clean:
+            spans = retry
     if not spans:
         return content
     chars = list(content)

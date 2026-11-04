@@ -541,6 +541,37 @@ class TestPythonLiteralMasking:
         assert masked.count("\n") == src.count("\n") and masked.count("\r") == src.count("\r")
         assert masked.endswith("b = 1\n") and "x" not in masked and "#" not in masked
 
+    # Patch fragments that start deeper than they end (t_23823b99): tokenize raises IndentationError
+    # at the first unmatched dedent; literals after it must still be masked.
+    def test_deeper_first_line_fragment_is_masked(self):
+        mod = _load_plugin_init()
+        src = '        return x\n\n    def test_y(self):\n        s = "ET.fromstring(body)"\n'
+        assert "xml_unsafe_parse" not in _names(mod, "/x/test_y.py", src)
+        masked = mod._mask_python_literals(src)
+        assert "ET.fromstring" not in masked
+        assert len(masked) == len(src) and masked.count("\n") == src.count("\n")
+
+    def test_fragment_triple_quote_after_bad_dedent_is_masked(self):
+        mod = _load_plugin_init()
+        src = '        return x\n    def f():\n        s = """a\n   ET.parse(q)\n"""  # c\n        ET.parse(real)\n'
+        masked = mod._mask_python_literals(src)
+        assert "ET.parse(q)" not in masked
+        assert masked.find("ET.parse(real)") == src.find("ET.parse(real)")
+        assert "xml_unsafe_parse" in _names(mod, "/x/app.py", src)
+
+    def test_code_after_bad_dedent_still_matches(self):
+        mod = _load_plugin_init()
+        assert "xml_unsafe_parse" in _names(mod, "/x/app.py", "        x = 1\n    ET.parse(f)\n")
+
+    def test_mixed_tabs_spaces_fragment_is_masked(self):
+        mod = _load_plugin_init()
+        assert "xml_unsafe_parse" not in _names(mod, "/x/app.py", '\tif a:\n  b = "ET.parse(f)"\n')
+
+    def test_unterminated_single_quote_after_bad_dedent(self):
+        mod = _load_plugin_init()
+        masked = mod._mask_python_literals('        x = 1\n    y = "ET.parse(f)\n    ET.parse(g)\n')
+        assert "ET.parse(f)" not in masked and "ET.parse(g)" in masked
+
 
 class TestV4APatchSections:
     def test_pathless_patch_uses_section_path(self):
