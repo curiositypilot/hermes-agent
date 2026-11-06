@@ -665,6 +665,7 @@ class LSPService:
             server_id=srv.server_id, workspace_root=spec.workspace_root, command=spec.command, env=spec.env,
             cwd=spec.cwd, initialization_options=spec.initialization_options,
             seed_diagnostics_on_first_push=spec.seed_diagnostics_on_first_push or srv.seed_first_push,
+            await_quiescence=srv.await_quiescence,
         )
         try:
             await client.start()

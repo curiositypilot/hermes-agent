@@ -6,6 +6,10 @@ describes, so a slow server's leftovers never masquerade as a verdict on the
 current content ("ghost diagnostics").  Whole-document sync is always sent, every
 ``open_file`` also fires ``didChangeWatchedFiles`` (clangd/eslint only re-scan on
 it), and ``ContentModified`` (-32801) errors are retried with exponential backoff.
+
+A server that reports ``experimental/serverStatus`` (rust-analyzer) answers diagnostics with ``[]``
+while it is still loading its workspace -- a false "clean".  Nothing it publishes or answers while it
+reports ``quiescent: false`` counts as a verdict; the pull is re-sent once it reports quiescent.
 """
 from __future__ import annotations
 
@@ -73,6 +77,7 @@ _CLIENT_CAPABILITIES: dict[str, Any] = {
         "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
     },
     "general": {"positionEncodings": ["utf-16"]},
+    "experimental": {"serverStatusNotification": True},  # rust-analyzer's quiescence report
 }
 
 
@@ -153,7 +158,7 @@ class LSPClient:
     def __init__(self, *, server_id: str, workspace_root: str, command: list[str],
                  env: Optional[dict[str, str]] = None, cwd: Optional[str] = None,
                  initialization_options: Optional[dict[str, Any]] = None,
-                 seed_diagnostics_on_first_push: bool = False) -> None:
+                 seed_diagnostics_on_first_push: bool = False, await_quiescence: bool = False) -> None:
         self.server_id = server_id
         self.workspace_root = workspace_root
         # Roots this server serves.  Single-root servers only ever hold ``workspace_root``;
@@ -164,6 +169,13 @@ class LSPClient:
         self._cwd = cwd or workspace_root
         self._init_options = initialization_options or {}
         self._seed_first_push = seed_diagnostics_on_first_push
+        # Last ``experimental/serverStatus`` quiescent flag; None = the server never reported one.
+        # ``await_quiescence`` starts it False, so a server known to report it (rust-analyzer) gives no
+        # verdict before its first report: its empty answer can arrive before it says it is loading.
+        self._quiescent: Optional[bool] = False if await_quiescence else None
+        self._settled = asyncio.Event()
+        if not await_quiescence:
+            self._settled.set()
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
@@ -189,6 +201,7 @@ class LSPClient:
         self._notification_handlers: dict[str, Callable[[Any], None]] = {
             "textDocument/publishDiagnostics": self._handle_publish_diagnostics,
             "$/progress": self._handle_progress,
+            "experimental/serverStatus": self._handle_server_status,
         }
         # Work-done progress the server has begun and not ended (indexing, project loading): navigation
         # waits for it before a workspace-wide query.  ``_folder_since`` = when each root was attached.
@@ -609,6 +622,9 @@ class LSPClient:
             # First push is baseline data only: it predates any didChange we sent,
             # so it's stored WITHOUT a freshness tag and never satisfies a waiter.
             return
+        if self._quiescent is False:
+            doc.push_version = -1  # published mid-load: not a verdict on any version
+            return
         # Tag with the echoed version when provided; otherwise credit the current
         # version (a push observed after our change describes it or newer).  doc.version
         # is -1 for never-opened paths (relatedDocuments spillover), keeping them unfresh.
@@ -648,6 +664,21 @@ class LSPClient:
         owners = [f for f in self._folder_since if path == f or path.startswith(f.rstrip(os.sep) + os.sep)]
         since = self._folder_since.get(max(owners, key=len) if owners else self.workspace_root)
         return math.inf if since is None else asyncio.get_running_loop().time() - since
+
+    def _handle_server_status(self, params: Any) -> None:
+        if not isinstance(params, dict) or "quiescent" not in params:
+            return
+        self._quiescent = bool(params["quiescent"])
+        (self._settled.set if self._quiescent else self._settled.clear)()
+
+    async def wait_settled(self, timeout: float) -> bool:
+        """Wait until a server that reports quiescence (rust-analyzer) says it is loaded; immediate for
+        the rest.  True iff settled in time (navigation before that answers from a half-read workspace)."""
+        try:
+            await asyncio.wait_for(self._settled.wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+        return True
 
     # ---- public file-sync API ----
 
@@ -728,6 +759,7 @@ class LSPClient:
         abs_path = os.path.abspath(path)
         doc = self._docs.get(abs_path)
         sent_version = doc.version if doc else -1
+        settled_at_send = self._quiescent is not False
         try:
             result = await self._send_request_with_retry(
                 "textDocument/diagnostic", {"textDocument": {"uri": file_uri(abs_path)}},
@@ -740,6 +772,8 @@ class LSPClient:
             return
         if not isinstance(result, dict):
             return
+        if not (settled_at_send and self._quiescent is not False):
+            return  # asked or answered mid-load: rust-analyzer answers [] before reading the crate graph
         related = result.get("relatedDocuments")
         reports = [(abs_path, result, sent_version)]
         if isinstance(related, dict):
@@ -769,7 +803,7 @@ class LSPClient:
         # (push-only servers such as typescript-language-server reject it at once) is NOT re-sent:
         # re-sending it spun this loop hundreds of thousands of times per wait.  The push wait alone
         # then runs to the deadline.
-        pull = asyncio.create_task(self._pull_document_diagnostics(abs_path)) if self._pull_supported else None
+        pull = asyncio.create_task(self._pull_once_settled(abs_path)) if self._pull_supported else None
         push = asyncio.create_task(self._wait_for_fresh_push(abs_path, version, timeout))
         try:
             while True:
@@ -788,6 +822,15 @@ class LSPClient:
             for t in pending:
                 t.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _pull_once_settled(self, path: str) -> None:
+        """Pull once the server is not loading; pull again when it started loading mid-request
+        (that answer was dropped).  The caller's deadline cancels a server that never settles."""
+        while True:
+            await self._settled.wait()
+            await self._pull_document_diagnostics(path)
+            if self._quiescent is not False:
+                return
 
     async def _await_push(self, timeout: float) -> bool:
         """Block until the next publishDiagnostics or ``timeout``; True iff a push woke us."""

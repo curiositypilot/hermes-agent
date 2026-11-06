@@ -77,6 +77,8 @@ class ServerDef:
     multi_root: bool = False
     # didOpen languageId; "" = derive from LANGUAGE_BY_EXT (custom servers name theirs in config).
     language_id: str = ""
+    # Server reports ``experimental/serverStatus``: no verdict until it says it is quiescent (see client).
+    await_quiescence: bool = False
 
     def matches(self, file_path: str) -> bool:
         return _file_ext_or_basename(file_path) in self.extensions
@@ -401,13 +403,14 @@ def _server(server_id: str, extensions: tuple[str, ...], description: str, *,
             resolve_root: Optional[_RootFn] = None, build_spawn: Optional[_SpawnFn] = None,
             which: Sequence[str] = (), args: Sequence[str] = (), install_pkg: Optional[str] = None,
             base_init: Optional[dict[str, Any]] = None, seed: bool = False,
-            untrusted_init: Optional[dict[str, Any]] = None, multi_root: bool = False) -> ServerDef:
+            untrusted_init: Optional[dict[str, Any]] = None, multi_root: bool = False,
+            await_quiescence: bool = False) -> ServerDef:
     """Registry entry factory: defaults to marker-based root + single-binary spawn."""
     return ServerDef(
         server_id, extensions,
         resolve_root or _markers_root(markers, excludes),
         build_spawn or _simple_spawn(server_id, which or (server_id,), args, install_pkg, base_init, seed, untrusted_init),
-        seed_first_push=seed, description=description, multi_root=multi_root,
+        seed_first_push=seed, description=description, multi_root=multi_root, await_quiescence=await_quiescence,
     )
 
 
@@ -426,7 +429,9 @@ SERVERS: list[ServerDef] = [
     _server("astro-language-server", (".astro",), "Astro — @astrojs/language-server", resolve_root=_root_typescript,
             which=("astro-ls", "astro-language-server"), args=("--stdio",), install_pkg="@astrojs/language-server"),
     _server("gopls", (".go",), "Go — gopls", markers=["go.work", "go.mod", "go.sum"], install_pkg="gopls"),
-    _server("rust-analyzer", (".rs",), "Rust — rust-analyzer", markers=["Cargo.toml", "Cargo.lock"], install_pkg="rust-analyzer"),
+    # A cold workspace answers [] for minutes (build scripts, proc macros, indexing) before the real verdict.
+    _server("rust-analyzer", (".rs",), "Rust — rust-analyzer", markers=["Cargo.toml", "Cargo.lock"], install_pkg="rust-analyzer",
+            await_quiescence=True),
     _server("clangd", (".c", ".cpp", ".cc", ".cxx", ".h", ".hh", ".hpp", ".hxx"), "C/C++ — clangd",
             markers=["compile_commands.json", "compile_flags.txt", ".clangd"],
             args=("--background-index", "--clang-tidy"), install_pkg="clangd"),

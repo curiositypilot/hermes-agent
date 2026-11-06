@@ -184,6 +184,7 @@ async def _query_async(svc: Any, abs_path: str, method: str, params: dict[str, A
     disk = _read_text(abs_path)
     if client.document_text(abs_path) != disk:
         await client.open_file(abs_path, language_id=language_id_for(abs_path, svc._server_for(abs_path)))
+    await client.wait_settled(REQUEST_TIMEOUT)  # rust-analyzer: no answers from a half-loaded crate graph
     if method in _WORKSPACE_WIDE:
         if (settle := WORKSPACE_SETTLE - client.folder_age(abs_path)) > 0:
             await asyncio.sleep(settle)
