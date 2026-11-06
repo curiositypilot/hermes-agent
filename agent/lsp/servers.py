@@ -79,6 +79,9 @@ class ServerDef:
     language_id: str = ""
     # Server reports ``experimental/serverStatus``: no verdict until it says it is quiescent (see client).
     await_quiescence: bool = False
+    # ``$/progress`` token prefix of a second, slower diagnostic producer on the same server
+    # (rust-analyzer's flycheck = ``cargo check`` on save): a saved verdict waits for it (see client).
+    check_progress_prefix: str = ""
 
     def matches(self, file_path: str) -> bool:
         return _file_ext_or_basename(file_path) in self.extensions
@@ -404,14 +407,24 @@ def _server(server_id: str, extensions: tuple[str, ...], description: str, *,
             which: Sequence[str] = (), args: Sequence[str] = (), install_pkg: Optional[str] = None,
             base_init: Optional[dict[str, Any]] = None, seed: bool = False,
             untrusted_init: Optional[dict[str, Any]] = None, multi_root: bool = False,
-            await_quiescence: bool = False) -> ServerDef:
+            await_quiescence: bool = False, check_progress_prefix: str = "") -> ServerDef:
     """Registry entry factory: defaults to marker-based root + single-binary spawn."""
     return ServerDef(
         server_id, extensions,
         resolve_root or _markers_root(markers, excludes),
         build_spawn or _simple_spawn(server_id, which or (server_id,), args, install_pkg, base_init, seed, untrusted_init),
         seed_first_push=seed, description=description, multi_root=multi_root, await_quiescence=await_quiescence,
+        check_progress_prefix=check_progress_prefix,
     )
+
+
+def check_prefix_for(srv: ServerDef, initialization_options: Optional[dict[str, Any]]) -> str:
+    """``srv.check_progress_prefix`` unless the spawn turned that check off (rust-analyzer
+    ``checkOnSave: false``, or the older ``checkOnSave: {"enable": false}``): no check is coming then."""
+    check = (initialization_options or {}).get("checkOnSave")
+    if check is False or (isinstance(check, dict) and check.get("enable") is False):
+        return ""
+    return srv.check_progress_prefix
 
 
 SERVERS: list[ServerDef] = [
@@ -429,9 +442,10 @@ SERVERS: list[ServerDef] = [
     _server("astro-language-server", (".astro",), "Astro — @astrojs/language-server", resolve_root=_root_typescript,
             which=("astro-ls", "astro-language-server"), args=("--stdio",), install_pkg="@astrojs/language-server"),
     _server("gopls", (".go",), "Go — gopls", markers=["go.work", "go.mod", "go.sum"], install_pkg="gopls"),
-    # A cold workspace answers [] for minutes (build scripts, proc macros, indexing) before the real verdict.
+    # A cold workspace answers [] for minutes (build scripts, proc macros, indexing) before the real verdict;
+    # rustc-only errors (borrow check, lifetimes) arrive later still, from cargo check on save.
     _server("rust-analyzer", (".rs",), "Rust — rust-analyzer", markers=["Cargo.toml", "Cargo.lock"], install_pkg="rust-analyzer",
-            await_quiescence=True),
+            await_quiescence=True, check_progress_prefix="rust-analyzer/flycheck/"),
     _server("clangd", (".c", ".cpp", ".cc", ".cxx", ".h", ".hh", ".hpp", ".hxx"), "C/C++ — clangd",
             markers=["compile_commands.json", "compile_flags.txt", ".clangd"],
             args=("--background-index", "--clang-tidy"), install_pkg="clangd"),

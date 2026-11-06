@@ -30,7 +30,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
-from agent.lsp import eventlog, sync_diagnostics
+from agent.lsp import deferred, eventlog, sync_diagnostics
 from agent.lsp.client import _diagnostic_key, as_disk_read
 from agent.lsp.servers import language_id_for
 
@@ -46,6 +46,7 @@ WRITE_BUDGET = 0.08
 INLINE_GRACE = 0.08
 _VERDICT_CAP = 256  # per-file last verdicts kept for baseline reuse
 _SPAWN_CEILING = 60.0  # outer bound on one check beyond its two waits (cold spawn + initialize)
+_HOLD_SLACK = 2.0  # a turn end waits this much past a cargo-check hold's cap (resync + report)
 
 _Diags = list[dict[str, Any]]
 
@@ -162,8 +163,10 @@ async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str], p
                                prev_result.baseline_text if prev_result else baseline_text, True)
         budget = svc._wait_budget(abs_path)
         try:
-            diags = await asyncio.wait_for(_check(svc, abs_path, baseline_text, post_text, budget),
-                                           timeout=2 * budget + _SPAWN_CEILING)
+            # The post-edit verdict may also wait out the server's save-triggered check (CHECK_WAIT):
+            # without that headroom a slow cargo check would mark rust-analyzer broken.
+            diags = await asyncio.wait_for(_check(svc, abs_path, baseline_text, post_text, budget, owner),
+                                           timeout=2 * budget + _SPAWN_CEILING + svc._check_ceiling(abs_path))
         except asyncio.CancelledError:
             raise
         except Exception as e:  # timeout / dead server: same treatment as the old blocking path
@@ -190,7 +193,7 @@ async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str], p
 
 
 async def _check(svc: LSPService, abs_path: str, baseline_text: Optional[str], post_text: Optional[str],
-                 budget: float) -> Optional[_Diags]:
+                 budget: float, owner: Optional[str] = None) -> Optional[_Diags]:
     """Verdict on ``post_text`` (the bytes this edit wrote) first; only when it has diagnostics, the
     verdict on ``baseline_text`` (cached from an earlier check when that text was checked before) to drop
     the pre-existing ones.  The server is left holding the file's current disk content afterwards.
@@ -219,7 +222,8 @@ async def _check(svc: LSPService, abs_path: str, baseline_text: Optional[str], p
             checks.remember(abs_path, baseline_text, seed)
     version = await client.open_file(abs_path, language_id=language_id, text=post_text)
     await client.save_file(abs_path)
-    diags = await _verdict(svc, client, abs_path, version, budget, use_sync)
+    on_hold = (lambda deadline: deferred.hold_until(owner, deadline + _HOLD_SLACK)) if owner else None
+    diags = await _verdict(svc, client, abs_path, version, budget, use_sync, on_hold)
     svc._touch(client)
     if diags is None:
         await _resync_disk(svc, client, abs_path, language_id)
@@ -238,6 +242,9 @@ async def _check(svc: LSPService, abs_path: str, baseline_text: Optional[str], p
             base = await _verdict(svc, client, abs_path, base_version, budget, use_sync)
             if base is not None:
                 baseline = base
+            # The unsaved baseline sync gets no cargo-check diagnostics (that check reads the disk): the
+            # last check pushed before this edit's save describes the pre-edit file, if it read those bytes.
+            baseline += client.pre_save_check_diagnostics(abs_path, baseline_text)
         from agent.lsp.range_shift import build_line_shift, shift_baseline
         seen = {_diagnostic_key(d) for d in shift_baseline(baseline, build_line_shift(baseline_text, synced))}
         diags = [d for d in diags if _diagnostic_key(d) not in seen]
@@ -262,10 +269,11 @@ async def _resync_disk(svc: LSPService, client: Any, abs_path: str, language_id:
 
 
 async def _verdict(svc: LSPService, client: Any, abs_path: str, version: int, budget: float,
-                   use_sync: bool) -> Optional[_Diags]:
+                   use_sync: bool, on_hold: Optional[Any] = None) -> Optional[_Diags]:
     """Diagnostics on the text synced at ``version``: a synchronous request where the server has one
     (``agent.lsp.sync_diagnostics``, ~10ms, so the write can report it inline), else the push/pull
-    wait.  None = no verdict within ``budget``."""
+    wait (on a saved version it also waits for rust-analyzer's cargo check; ``on_hold`` hears its
+    deadline).  None = no verdict within ``budget``."""
     if use_sync:
         try:
             diags = await sync_diagnostics.request(client, abs_path, timeout=budget)
@@ -273,7 +281,8 @@ async def _verdict(svc: LSPService, client: Any, abs_path: str, version: int, bu
             return None
         if diags is not None:
             return diags
-    if not await client.wait_for_diagnostics(abs_path, version, mode=svc._wait_mode, timeout=budget):
+    if not await client.wait_for_diagnostics(abs_path, version, mode=svc._wait_mode, timeout=budget,
+                                             on_check_wait=on_hold):
         return None
     return list(client.diagnostics_for(abs_path, fresh_only=True))
 

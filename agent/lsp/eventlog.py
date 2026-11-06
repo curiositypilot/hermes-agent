@@ -105,6 +105,13 @@ def log_timeout(server_id: str, file_path: str, kind: str = "diagnostics") -> No
     _emit(server_id, logging.WARNING, f"{kind} timed out for {_short_path(file_path)}")
 
 
+def log_check_wait_expired(server_id: str, file_path: str, cap: float) -> None:
+    """A save-triggered check (rust-analyzer's cargo check) did not end within ``cap``: the native
+    verdict is reported without its rustc-only errors.  WARNING every time."""
+    _emit(server_id, logging.WARNING, f"check wait expired after {cap:.0f}s for {_short_path(file_path)} "
+                                      "(native verdict kept)")
+
+
 def log_server_error(server_id: str, file_path: str, exc: BaseException) -> None:
     """An unexpected exception bubbled out of the LSP layer.  WARNING."""
     _emit(server_id, logging.WARNING, f"unexpected error for {_short_path(file_path)}: {type(exc).__name__}: {exc}")

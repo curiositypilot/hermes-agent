@@ -50,6 +50,9 @@ Concretely, on every successful `write_file` or `patch`:
    up to 5 s for it. Any problems it finds go to the model as a new
    message before the answer is accepted, so a one-shot `hermes chat -q`
    run still sees them. Earlier messages are never rewritten.
+4. Rust verdicts also wait for rust-analyzer's `cargo check`, which
+   reports rustc-only errors (borrow check, lifetimes), capped at 60 s;
+   the turn-end wait above extends to match.
 
 If the same file is edited again before its check finishes, the newer
 check runs against the older edit's baseline. Errors the first edit
