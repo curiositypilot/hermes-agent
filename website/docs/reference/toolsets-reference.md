@@ -64,7 +64,7 @@ Or in-session:
 | `discord_admin` | `discord_admin` | Discord moderation (bans, role changes, channel management). Active on the `hermes-discord` toolset; requires the bot to hold the relevant Discord permissions. |
 | `feishu_doc` | `feishu_doc_read` | Read Feishu/Lark document content. Used by the Feishu document-comment intelligent-reply handler. |
 | `feishu_drive` | `feishu_drive_add_comment`, `feishu_drive_list_comments`, `feishu_drive_list_comment_replies`, `feishu_drive_reply_comment` | Feishu/Lark drive comment operations. Scoped to the comment agent; not exposed on `hermes-cli` or other messaging toolsets. |
-| `file` | `patch`, `read_file`, `search_files`, `write_file` | File reading, writing, searching, and editing. |
+| `file` | `lsp`, `patch`, `read_file`, `search_files`, `write_file` | File reading, writing, searching, editing, and LSP code navigation. |
 | `computer_use` | `computer_use` | Background desktop control via cua-driver — does not steal cursor/focus. Works with any tool-capable model. macOS, Windows, and Linux; requires `cua-driver` on `$PATH`. |
 | `context_engine` | (varies) | Runtime tools exposed by the active context-engine plugin (empty until a plugin populates it). |
 | `image_gen` | `image_generate` | Text-to-image generation via FAL.ai (with opt-in OpenAI / xAI backends). |

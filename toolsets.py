@@ -11,7 +11,7 @@ from typing import Dict, List, Any, Set, Optional, Tuple
 _HERMES_CORE_TOOLS = [
     "web_search", "web_extract",
     "terminal", "process_manage",
-    "read_file", "write_file", "patch", "search_files",
+    "read_file", "write_file", "patch", "search_files", "lsp",
     "vision_analyze", "image_generate",
     "skills_list", "skill_view", "skill_manage",
     "browser_exec",  # THE browser: Python over CDP (browser-harness)
@@ -125,9 +125,9 @@ TOOLSETS = {
         ["cronjob_manage"],
     ),
     "file": _ts(
-        "File manipulation tools: read, write, patch (with fuzzy matching), and "
-        "search (content + files)",
-        ["read_file", "write_file", "patch", "search_files"],
+        "File manipulation tools: read, write, patch (with fuzzy matching), "
+        "search (content + files), and LSP code navigation",
+        ["read_file", "write_file", "patch", "search_files", "lsp"],
     ),
     "tts": _ts("Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI", ["text_to_speech"]),
     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),

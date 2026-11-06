@@ -33,6 +33,7 @@ _NEVER_PARALLEL_TOOLS = frozenset({"clarify", "manage_connections", "manage_cata
 _PARALLEL_SAFE_TOOLS = frozenset({
     "connectors__execute",  # pure remote batches have per-dispatch idempotency keys
     "image_generate",
+    "lsp",
     "read_file",
     "search_files",
     "session_search",

@@ -142,6 +142,29 @@ lsp:
     - ~/code/my-app
 ```
 
+## Code navigation (`lsp` tool)
+
+The same language servers answer navigation queries through the `lsp` tool (in the `file`
+toolset), so the agent finds code by meaning instead of by text:
+
+| Action | Input | Answer |
+|---|---|---|
+| `definition` | `path`, `symbol`, optional 1-based `line` | where the identifier is defined |
+| `references` | `path`, `symbol`, optional `line` | every use, declaration included |
+| `hover` | `path`, `symbol`, optional `line` | the server's type/signature/doc text |
+| `symbols` | `path` + `query` | workspace-wide symbol search (exact and prefix matches first) |
+| `symbols` | `path` only | an outline of the file (classes and their members) |
+
+Results are `path:line:col` plus the source line, capped at 50 with a count of the rest.
+Without `line`, the symbol's first occurrence in the file is used; a symbol one or two lines
+off the given line is still found. The tool uses the gate the diagnostics use (`lsp.enabled`,
+the git workspace, `lsp.exclude_roots`, workspace trust): in an untrusted checkout only the
+servers that never load project code answer, and every refusal is a one-line reason. On a
+freshly started server, `references` and `symbols` wait until the server has listed the
+workspace's files (and finished any indexing progress it reports), so a cold answer is not a
+partial one; a cold workspace symbol search on a large repo can take up to a minute once.
+Local terminal backends only: the servers run on the host.
+
 ## Supported languages
 
 | Language | Server | Auto-install |

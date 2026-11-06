@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import sys
 from dataclasses import dataclass, field
@@ -196,11 +197,18 @@ class LSPClient:
             "workspace/workspaceFolders": self._handle_workspace_folders,
             "workspace/diagnostic/refresh": self._handle_null,
         }
-        # Server → client notifications; others (showMessage, $/progress) are dropped.
+        # Server → client notifications; others (showMessage, logMessage) are dropped.
         self._notification_handlers: dict[str, Callable[[Any], None]] = {
             "textDocument/publishDiagnostics": self._handle_publish_diagnostics,
+            "$/progress": self._handle_progress,
             "experimental/serverStatus": self._handle_server_status,
         }
+        # Work-done progress the server has begun and not ended (indexing, project loading): navigation
+        # waits for it before a workspace-wide query.  ``_folder_since`` = when each root was attached.
+        self._progress_open: set = set()
+        self._progress_idle = asyncio.Event()
+        self._progress_idle.set()
+        self._folder_since: dict[str, float] = {}
 
         self._docs: dict[str, _DocState] = {}  # keyed by absolute path (NOT URI)
         self._state: str = "stopped"
@@ -243,6 +251,7 @@ class LSPClient:
             if not self._connection_is_open():
                 raise LSPProtocolError("server connection closed during initialization")
             self._state = "running"
+            self._folder_since[self.workspace_root] = asyncio.get_running_loop().time()
         except BaseException as e:
             self._state = "error"
             # Reap the server now so the failure report can name the exit status (a Node heap
@@ -395,6 +404,7 @@ class LSPClient:
         if root in self.workspace_folders:
             return
         self.workspace_folders.append(root)
+        self._folder_since[root] = asyncio.get_running_loop().time()
         await self._send_notification(
             "workspace/didChangeWorkspaceFolders", {"event": {"added": [_folder(root)], "removed": []}},
         )
@@ -405,6 +415,7 @@ class LSPClient:
         if root not in self.workspace_folders:
             return
         self.workspace_folders.remove(root)
+        self._folder_since.pop(root, None)
         await self._send_notification(
             "workspace/didChangeWorkspaceFolders", {"event": {"added": [], "removed": [_folder(root)]}},
         )
@@ -519,6 +530,11 @@ class LSPClient:
                     raise
                 await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
 
+    async def request(self, method: str, params: Any, *, timeout: float) -> Any:
+        """A client → server request (navigation: definition, references, hover, symbols); the
+        result, ``ContentModified`` retried.  Raises on error, timeout or a closed connection."""
+        return await self._send_request_with_retry(method, params, timeout=timeout)
+
     async def _send_notification(self, method: str, params: Any) -> None:
         self._require_open(method)
         try:
@@ -618,11 +634,51 @@ class LSPClient:
         self._push_counter += 1
         self._push_event.set()
 
+    def _handle_progress(self, params: Any) -> None:
+        """Track work-done progress: ``begin`` opens a token, ``end`` closes it."""
+        if not isinstance(params, dict) or not isinstance(params.get("value"), dict):
+            return
+        token, kind = params.get("token"), params["value"].get("kind")
+        if not isinstance(token, (str, int)):
+            return
+        if kind == "begin":
+            self._progress_open.add(token)
+            self._progress_idle.clear()
+        elif kind == "end":
+            self._progress_open.discard(token)
+            if not self._progress_open:
+                self._progress_idle.set()
+
+    async def wait_progress_idle(self, timeout: float) -> bool:
+        """Wait until no server work-done progress is open (indexing finished); True iff idle in time."""
+        try:
+            await asyncio.wait_for(self._progress_idle.wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+        return True
+
+    def folder_age(self, path: str) -> float:
+        """Seconds since the workspace folder holding ``path`` was attached (the client's start for its
+        own root): a server enumerates a fresh root's files first, and answers workspace-wide queries
+        from only the files it knows until then."""
+        owners = [f for f in self._folder_since if path == f or path.startswith(f.rstrip(os.sep) + os.sep)]
+        since = self._folder_since.get(max(owners, key=len) if owners else self.workspace_root)
+        return math.inf if since is None else asyncio.get_running_loop().time() - since
+
     def _handle_server_status(self, params: Any) -> None:
         if not isinstance(params, dict) or "quiescent" not in params:
             return
         self._quiescent = bool(params["quiescent"])
         (self._settled.set if self._quiescent else self._settled.clear)()
+
+    async def wait_settled(self, timeout: float) -> bool:
+        """Wait until a server that reports quiescence (rust-analyzer) says it is loaded; immediate for
+        the rest.  True iff settled in time (navigation before that answers from a half-read workspace)."""
+        try:
+            await asyncio.wait_for(self._settled.wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+        return True
 
     # ---- public file-sync API ----
 

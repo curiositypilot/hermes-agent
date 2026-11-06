@@ -2,7 +2,8 @@
 
 Real language servers (pyright, gopls, ...) run as subprocesses and their
 ``publishDiagnostics`` feed the post-write lint delta filter of ``write_file`` /
-``patch`` (wiring: ``FileOperations._check_lint_delta``).  LSP is **gated on git
+``patch`` (wiring: ``FileOperations._check_lint_delta``) and answer the ``lsp`` navigation tool
+(definition / references / hover / symbols: ``agent.lsp.navigation``).  LSP is **gated on git
 workspace detection** so user-home cwd's (e.g. Telegram gateway chats) never
 spawn daemons; ``get_service()`` returns the singleton or ``None`` when disabled.
 """
