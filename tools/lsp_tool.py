@@ -39,11 +39,11 @@ LSP_SCHEMA = {
 
 
 def _check_lsp_reqs() -> bool:
-    """File tools available and LSP not switched off for this profile (``lsp.enabled``)."""
+    """LSP not switched off for this profile (``lsp.enabled``).  Deliberately no backend probe: the
+    file tools' probe already answers for the terminal backend, and the call refuses a non-local one."""
     from hermes_cli.config import load_config_readonly
-    from tools import check_file_requirements
     lsp_cfg = load_config_readonly().get("lsp")
-    return check_file_requirements() and not (isinstance(lsp_cfg, dict) and lsp_cfg.get("enabled") is False)
+    return not (isinstance(lsp_cfg, dict) and lsp_cfg.get("enabled") is False)
 
 
 def _int_or_none(value: Any, name: str) -> Optional[int]:
