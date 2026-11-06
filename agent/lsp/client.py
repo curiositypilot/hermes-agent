@@ -10,6 +10,12 @@ it), and ``ContentModified`` (-32801) errors are retried with exponential backof
 A server that reports ``experimental/serverStatus`` (rust-analyzer) answers diagnostics with ``[]``
 while it is still loading its workspace -- a false "clean".  Nothing it publishes or answers while it
 reports ``quiescent: false`` counts as a verdict; the pull is re-sent once it reports quiescent.
+
+rust-analyzer also has a second, slower producer: flycheck (``cargo check`` on didSave) pushes the
+rustc-only errors (borrow check, lifetimes) seconds after the native verdict, under ``$/progress``
+tokens named ``check_progress_prefix``.  A verdict on a saved version waits for that check to end
+(:meth:`LSPClient._await_check_settled`, capped at ``CHECK_WAIT``).  Check diagnostics describe the
+file on DISK, so they count only for a synced version that was saved and still equals the disk.
 """
 from __future__ import annotations
 
@@ -19,6 +25,7 @@ import logging
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
@@ -27,6 +34,7 @@ from urllib.parse import quote, unquote
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.process_identity import own_process_groups, register_child, release_process_group_once_empty
 
+from agent.lsp import eventlog
 from agent.lsp.protocol import (
     ERROR_CONTENT_MODIFIED, ERROR_METHOD_NOT_FOUND, LSPProtocolError, LSPRequestError, classify_message,
     encode_message, make_error_response, make_notification, make_request, make_response, read_message,
@@ -45,6 +53,14 @@ DIAGNOSTICS_FULL_WAIT = 10.0
 DIAGNOSTICS_REQUEST_TIMEOUT = 3.0
 PUSH_DEBOUNCE = 0.15
 SHUTDOWN_GRACE = 1.0  # seconds after `exit` before SIGTERM, and between SIGTERM and SIGKILL
+# Save-triggered check (rust-analyzer flycheck): no prefixed ``begin`` within CHECK_START_GRACE of the
+# latest of the save, quiescence and the last check end = no check coming.  The whole hold is capped at
+# CHECK_WAIT from the moment the native verdict is fresh; at expiry the native verdict stands.
+CHECK_START_GRACE = 2.0
+CHECK_WAIT = 60.0
+# ``source`` of the check's diagnostics, and of the native ones a check duplicate is matched against.
+CHECK_SOURCES = frozenset({"rustc", "clippy"})
+NATIVE_SOURCE = "rust-analyzer"
 # Retry policy for transient ContentModified errors: 0.5, 1.0, 2.0s.
 MAX_CONTENT_MODIFIED_RETRIES = 3
 RETRY_BASE_DELAY = 0.5
@@ -131,6 +147,18 @@ class _DocState:
     push_version: int = -1
     pull_version: int = -1
     seed_seen: bool = False
+    # Save-triggered check state (clients with a ``check_progress_prefix``): the version a didSave was
+    # sent at, the client's check-begin counter and loop time then, the check diagnostics last pushed for
+    # the file (``disk_check``: they describe the disk) and their copy at that save (the pre-edit disk's
+    # check, a baseline), and whether the disk differed from the synced text when the check settled.
+    saved_version: int = -1
+    save_check_begins: int = 0
+    saved_at: float = 0.0
+    disk_check: list[dict[str, Any]] = field(default_factory=list)
+    disk_check_text: Optional[str] = None  # the disk when ``disk_check`` arrived (None: unknown / no diags)
+    pre_save_check: list[dict[str, Any]] = field(default_factory=list)
+    pre_save_check_text: Optional[str] = None
+    check_disk_differs: bool = False
 
     def fresh_push(self, version: Optional[int] = None) -> bool:
         return self.push_version >= (self.version if version is None else version)
@@ -158,7 +186,8 @@ class LSPClient:
     def __init__(self, *, server_id: str, workspace_root: str, command: list[str],
                  env: Optional[dict[str, str]] = None, cwd: Optional[str] = None,
                  initialization_options: Optional[dict[str, Any]] = None,
-                 seed_diagnostics_on_first_push: bool = False, await_quiescence: bool = False) -> None:
+                 seed_diagnostics_on_first_push: bool = False, await_quiescence: bool = False,
+                 check_progress_prefix: str = "") -> None:
         self.server_id = server_id
         self.workspace_root = workspace_root
         # Roots this server serves.  Single-root servers only ever hold ``workspace_root``;
@@ -176,6 +205,15 @@ class LSPClient:
         self._settled = asyncio.Event()
         if not await_quiescence:
             self._settled.set()
+        self._quiescent_since = 0.0  # loop time of the last quiescent=true report
+        # Save-triggered check (``$/progress`` tokens with this prefix): active tokens, a begin counter
+        # (a save records it; a higher value = a check begun since), the loop time of the last end, and
+        # an event set on every begin/end.
+        self._check_prefix = check_progress_prefix
+        self._checks_active: set[str] = set()
+        self._check_begins = 0
+        self._check_last_end = 0.0
+        self._check_event = asyncio.Event()
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
@@ -618,6 +656,9 @@ class LSPClient:
         is_seed = self._seed_first_push and not doc.seed_seen
         doc.seed_seen = True
         doc.push = diagnostics if isinstance(diagnostics, list) else []
+        if self._check_prefix:
+            doc.disk_check = [d for d in doc.push if _is_check_diag(d)]
+            doc.disk_check_text = _read_disk(uri_to_path(params["uri"])) if doc.disk_check else None
         if is_seed:
             # First push is baseline data only: it predates any didChange we sent,
             # so it's stored WITHOUT a freshness tag and never satisfies a waiter.
@@ -648,6 +689,19 @@ class LSPClient:
             self._progress_open.discard(token)
             if not self._progress_open:
                 self._progress_idle.set()
+        if self._check_prefix and isinstance(token, str) and token.startswith(self._check_prefix):
+            self._track_check(token, kind)
+
+    def _track_check(self, token: str, kind: Any) -> None:
+        if kind == "begin":
+            self._checks_active.add(token)
+            self._check_begins += 1
+        elif kind == "end":
+            self._checks_active.discard(token)
+            self._check_last_end = asyncio.get_running_loop().time()
+        else:
+            return
+        self._check_event.set()
 
     async def wait_progress_idle(self, timeout: float) -> bool:
         """Wait until no server work-done progress is open (indexing finished); True iff idle in time."""
@@ -668,7 +722,9 @@ class LSPClient:
     def _handle_server_status(self, params: Any) -> None:
         if not isinstance(params, dict) or "quiescent" not in params:
             return
-        self._quiescent = bool(params["quiescent"])
+        was_quiescent, self._quiescent = self._quiescent, bool(params["quiescent"])
+        if self._quiescent and not was_quiescent:
+            self._quiescent_since = asyncio.get_running_loop().time()
         (self._settled.set if self._quiescent else self._settled.clear)()
 
     async def wait_settled(self, timeout: float) -> bool:
@@ -707,9 +763,11 @@ class LSPClient:
             "workspace/didChangeWatchedFiles", {"changes": [{"uri": uri, "type": 1 if doc is None else 2}]}
         )
         if doc is None:
-            # Fresh state: anything a pre-open push stashed under this path (relatedDocuments spillover) is discarded.
-            self._docs.pop(abs_path, None)
-            self._docs[abs_path] = _DocState(version=0, text=text)
+            # Fresh state: anything a pre-open push stashed under this path (relatedDocuments spillover) is
+            # discarded, except the check diagnostics it carried: they describe the disk (a baseline).
+            stash = self._docs.pop(abs_path, None)
+            self._docs[abs_path] = _DocState(version=0, text=text, disk_check=stash.disk_check if stash else [],
+                                             disk_check_text=stash.disk_check_text if stash else None)
             await self._send_notification(
                 "textDocument/didOpen",
                 {"textDocument": {"uri": uri, "languageId": language_id, "version": 0, "text": text}},
@@ -744,11 +802,30 @@ class LSPClient:
                 await self._send_notification("textDocument/didClose", {"textDocument": {"uri": file_uri(old_path)}})
 
     async def save_file(self, path: str) -> None:
-        """Send didSave for ``path``.  Some linters re-scan only on save."""
+        """Send didSave for ``path``.  Some linters re-scan only on save; rust-analyzer starts its
+        check, which the verdict on this version then waits for (:meth:`_await_check_settled`)."""
         if self.is_running:
-            await self._send_notification(
-                "textDocument/didSave", {"textDocument": {"uri": file_uri(os.path.abspath(path))}}
-            )
+            await self._send_notification("textDocument/didSave", {"textDocument": {"uri": self._record_save(path)}})
+
+    def _record_save(self, path: str) -> str:
+        """Start a save epoch for ``path`` (see ``_DocState``); return its URI."""
+        abs_path = os.path.abspath(path)
+        doc = self._docs.get(abs_path)
+        if doc is not None and doc.version >= 0:
+            doc.saved_version, doc.save_check_begins = doc.version, self._check_begins
+            doc.saved_at = asyncio.get_running_loop().time()
+            doc.pre_save_check, doc.pre_save_check_text = list(doc.disk_check), doc.disk_check_text
+            doc.check_disk_differs = False
+        return file_uri(abs_path)
+
+    def pre_save_check_diagnostics(self, path: str, text: str) -> list[dict[str, Any]]:
+        """The check diagnostics last pushed for ``path`` before its latest didSave, when the disk then
+        held ``text`` (the pre-edit content): a baseline the unsaved baseline sync cannot get.  [] when
+        that check read other bytes (a write landed mid-check: its errors may be the edit's own)."""
+        doc = self._docs.get(os.path.abspath(path))
+        if doc is None or doc.pre_save_check_text is None or doc.pre_save_check_text != as_disk_read(text):
+            return []
+        return list(doc.pre_save_check)
 
     # ---- diagnostics: pull + wait ----
 
@@ -787,16 +864,20 @@ class LSPClient:
                 d.pull_version = d.version if tag is None else tag
 
     async def wait_for_diagnostics(self, path: str, version: int, *, mode: str = "document",
-                                   timeout: Optional[float] = None) -> bool:
+                                   timeout: Optional[float] = None,
+                                   on_check_wait: Optional[Callable[[float], None]] = None) -> bool:
         """Wait for fresh diagnostics for ``path`` at ``version``; True iff fresh data arrived in budget.
 
         ``mode`` is ``"document"`` (5s) or ``"full"`` (10s); ``timeout`` overrides the budget (how
         ``lsp.wait_timeout`` reaches the loop).  Callers must treat False as "no data", NOT "no errors" —
         the stores may still hold stale entries.  Never throws for servers lacking pull support.
+        A fresh native verdict on a saved version then waits for the save-triggered check (rust-analyzer's
+        cargo check), up to ``CHECK_WAIT`` beyond ``timeout``; ``on_check_wait`` is called with that hold's
+        ``time.monotonic()`` deadline when it starts (the turn end waits for the verdict that long).
         """
         if not (timeout is not None and timeout > 0):
             timeout = DIAGNOSTICS_FULL_WAIT if mode == "full" else DIAGNOSTICS_DOCUMENT_WAIT
-        now = asyncio.get_event_loop().time
+        now = asyncio.get_running_loop().time
         deadline = now() + timeout
         abs_path = os.path.abspath(path)
         # Document pull + push wait run concurrently.  A pull that settles without a fresh verdict
@@ -811,7 +892,7 @@ class LSPClient:
                     raise LSPProtocolError("server connection closed while waiting for diagnostics")
                 doc = self._docs.get(abs_path)
                 if doc and doc.fresh(version):
-                    return True
+                    break
                 remaining = deadline - now()
                 live = {t for t in (pull, push) if t is not None and not t.done()}
                 if remaining <= 0 or not live:
@@ -822,6 +903,50 @@ class LSPClient:
             for t in pending:
                 t.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+        await self._await_check_settled(path, version, on_check_wait)
+        return True
+
+    async def _await_check_settled(self, path: str, version: int,
+                                   on_hold: Optional[Callable[[float], None]] = None) -> None:
+        """Hold a native verdict on a saved ``version`` until the check that save started has ended:
+        a prefixed check begun since the save, none still active, then ``PUSH_DEBOUNCE`` of quiet.  No
+        begin within ``CHECK_START_GRACE`` of the latest of the save, quiescence and the last check end
+        = none coming.  Capped at ``CHECK_WAIT``; the native verdict stands either way.  Returns at once
+        without a check prefix or when ``version`` was not saved (a snapshot or baseline sync)."""
+        abs_path, doc = self._saved_doc(path, version)
+        if doc is None:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CHECK_WAIT
+        if on_hold is not None:
+            on_hold(time.monotonic() + CHECK_WAIT)
+        while self._connection_is_open():
+            now = loop.time()
+            if self._check_begins > doc.save_check_begins and not self._checks_active:
+                while loop.time() < deadline and await self._await_push(PUSH_DEBOUNCE):
+                    pass  # the check's last push may trail its end
+                break
+            if now >= deadline:
+                eventlog.log_check_wait_expired(self.server_id, abs_path, CHECK_WAIT)
+                break
+            wake = deadline
+            if not self._checks_active:  # nothing begun since the save, nothing running
+                start_by = max(doc.saved_at, self._quiescent_since, self._check_last_end) + CHECK_START_GRACE
+                if now >= start_by:
+                    break
+                wake = min(wake, start_by)
+            self._check_event.clear()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._check_event.wait(), timeout=wake - now)
+        doc.check_disk_differs = _disk_differs(abs_path, doc.text)
+
+    def _saved_doc(self, path: str, version: int) -> tuple[str, Optional[_DocState]]:
+        """``path``'s absolute form and its state when a check may follow ``version`` (a check prefix,
+        and ``version`` was saved), else None."""
+        abs_path = os.path.abspath(path)
+        doc = self._docs.get(abs_path)
+        ok = self._check_prefix and doc is not None and doc.saved_version == version
+        return abs_path, doc if ok else None
 
     async def _pull_once_settled(self, path: str) -> None:
         """Pull once the server is not loading; pull again when it started loading mid-request
@@ -901,7 +1026,41 @@ class LSPClient:
             return []
         push = doc.push if not fresh_only or doc.fresh_push() else []
         pull = doc.pull if not fresh_only or doc.fresh_pull() else []
-        return _dedupe(push, pull)
+        merged = _dedupe(push, pull)
+        return _check_filtered(doc, merged) if self._check_prefix else merged
+
+
+def _is_check_diag(d: Any) -> bool:
+    return isinstance(d, dict) and d.get("source") in CHECK_SOURCES
+
+
+def _code_at_start(d: dict[str, Any]) -> tuple[str, int, int]:
+    start = (d.get("range") or {}).get("start") or {}
+    return str(d.get("code")), start.get("line", 0), start.get("character", 0)
+
+
+def _check_filtered(doc: _DocState, diags: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Check diagnostics describe the file on disk: keep them only for a synced version that was saved
+    and still matched the disk when the check settled (another writer's errors, or a baseline sync's
+    unsaved text, are not this text's).  Drop a check diagnostic duplicating a native one (same code
+    at the same start: rustc and rust-analyzer both report E0308)."""
+    if doc.saved_version != doc.version or doc.check_disk_differs:
+        return [d for d in diags if not _is_check_diag(d)]
+    native = {_code_at_start(d) for d in diags if d.get("source") == NATIVE_SOURCE}
+    return [d for d in diags if not (_is_check_diag(d) and _code_at_start(d) in native)]
+
+
+def _read_disk(abs_path: str) -> Optional[str]:
+    """The file as ``open_file`` reads it; None when unreadable."""
+    try:
+        return Path(abs_path).read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return None
+
+
+def _disk_differs(abs_path: str, synced: str) -> bool:
+    """True when the file on disk is not the synced text (or cannot be read)."""
+    return _read_disk(abs_path) != synced
 
 
 def _dedupe(*lists: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -929,4 +1088,5 @@ def _diagnostic_key(d: dict[str, Any]) -> str:
     ])
 
 
-__all__ = ["DIAGNOSTICS_DOCUMENT_WAIT", "DIAGNOSTICS_FULL_WAIT", "INITIALIZE_TIMEOUT", "LSPClient", "file_uri", "uri_to_path"]
+__all__ = ["CHECK_START_GRACE", "CHECK_WAIT", "DIAGNOSTICS_DOCUMENT_WAIT", "DIAGNOSTICS_FULL_WAIT", "INITIALIZE_TIMEOUT",
+           "LSPClient", "file_uri", "uri_to_path"]

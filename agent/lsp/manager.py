@@ -21,10 +21,11 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.lsp import eventlog
-from agent.lsp.client import DIAGNOSTICS_DOCUMENT_WAIT, LSPClient, _diagnostic_key as _diag_key
+from agent.lsp.client import CHECK_WAIT, DIAGNOSTICS_DOCUMENT_WAIT, LSPClient, _diagnostic_key as _diag_key
 from agent.lsp.edit_check import EditChecks
 from agent.lsp.servers import (
-    SERVERS, UNTRUSTED_SAFE_SERVERS, ServerContext, ServerDef, custom_servers, find_server_for_file, language_id_for,
+    SERVERS, UNTRUSTED_SAFE_SERVERS, ServerContext, ServerDef, check_prefix_for, custom_servers, find_server_for_file,
+    language_id_for,
 )
 from agent.lsp.workspace import clear_cache, is_trusted_workspace, operator_workspace_roots, resolve_workspace_for_file
 
@@ -411,7 +412,7 @@ class LSPService:
         server_id = self._server_for(file_path).server_id  # enabled_for guarantees a match
         try:
             budget = self._wait_budget(file_path)
-            t = timeout if timeout is not None else budget + 2.0
+            t = timeout if timeout is not None else budget + 2.0 + self._check_ceiling(file_path)
             diags = self._loop.run(self._open_and_wait_async(file_path, budget=budget), timeout=t)
         except Exception as e:
             if isinstance(e, asyncio.TimeoutError):
@@ -435,6 +436,13 @@ class LSPService:
         else:
             eventlog.log_clean(server_id, file_path)
         return diags
+
+    def _check_ceiling(self, file_path: str) -> float:
+        """Extra outer budget for a saved verdict that waits on the server's save-triggered check
+        (rust-analyzer's cargo check, ``client.CHECK_WAIT``): without it a slow check would time the
+        outer join out and mark a live server broken."""
+        srv = self._server_for(file_path)
+        return CHECK_WAIT if srv is not None and srv.check_progress_prefix else 0.0
 
     def _apply_delta(self, file_path: str, diags: _Diags, line_shift: Optional[Callable[[int], Optional[int]]]) -> _Diags:
         """Drop diagnostics present in the pre-write baseline, then roll the baseline forward."""
@@ -666,6 +674,7 @@ class LSPService:
             cwd=spec.cwd, initialization_options=spec.initialization_options,
             seed_diagnostics_on_first_push=spec.seed_diagnostics_on_first_push or srv.seed_first_push,
             await_quiescence=srv.await_quiescence,
+            check_progress_prefix=check_prefix_for(srv, spec.initialization_options),
         )
         try:
             await client.start()

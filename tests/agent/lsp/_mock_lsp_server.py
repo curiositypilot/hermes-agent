@@ -41,6 +41,15 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
   exists it pushes EMPTY diagnostics on every open/change and answers pulls with ``[]``; then it sends
   ``experimental/serverStatus`` quiescent=true and the real diagnostics (one error) by push and pull.
   ``MOCK_LSP_STATUS_EARLY=1`` also sends quiescent=false right after ``initialized``.
+- ``"flycheck"`` — models rust-analyzer's two producers.  Native diagnostics by pull only: an E0308
+  (source ``rust-analyzer``) at 0:0 iff the synced text contains ``native_bad``.  On didSave, after
+  ``MOCK_LSP_CHECK_START_DELAY`` (default 0) a ``$/progress`` begin on ``MOCK_LSP_CHECK_TOKEN`` (default
+  ``rust-analyzer/flycheck/0``), then after ``MOCK_LSP_CHECK_DELAY`` (default 1.0) a push of what cargo
+  check finds in the file ON DISK (rustc E0502 at ``borrow_bad``'s line, column 4; a rustc E0308 at 0:0
+  iff ``native_bad``), then the ``end``.  ``MOCK_LSP_CHECK_BEGIN=0``: no check at all;
+  ``MOCK_LSP_CHECK_END=0``: the check never ends.  Checks run one at a time (a save queues behind a
+  running one).  ``MOCK_LSP_OPEN_CHECK=<s>``: the first didOpen starts a check of that duration that
+  pushes nothing (a check already running when the edit is saved).
 - ``"incremental"`` — apply ranged edits as UTF-16 and expose the server's
   document mirror through hover, for synchronization contract tests.
 - ``"nav"`` — answers definition / references / hover / workspace symbol / document symbol with
@@ -245,6 +254,90 @@ def _nav_initialized(_msg):
     return True
 
 
+_FLYCHECK_DOCS = {}  # ``flycheck``: uri -> (version, synced text)
+
+
+def _fly_diag(line, character, code, source, message):
+    return {"range": {"start": {"line": line, "character": character},
+                      "end": {"line": line, "character": character + 3}},
+            "severity": 1, "code": code, "source": source, "message": message}
+
+
+def _fly_sync(msg):
+    td = msg["params"]["textDocument"]
+    changes = msg["params"].get("contentChanges")
+    first_open = not _FLYCHECK_DOCS and msg["method"] == "textDocument/didOpen"
+    _FLYCHECK_DOCS[td["uri"]] = (td.get("version", 0), changes[-1]["text"] if changes else td["text"])
+    if first_open and os.environ.get("MOCK_LSP_OPEN_CHECK"):
+        _FLY_CHECK_LOCK.acquire()
+        _fly_progress(_fly_token(), "begin")
+        threading.Thread(target=_fly_open_check, args=(float(os.environ["MOCK_LSP_OPEN_CHECK"]),), daemon=True).start()
+    return True
+
+
+def _fly_pull(msg):
+    text = _FLYCHECK_DOCS.get(msg["params"]["textDocument"]["uri"], (0, ""))[1]
+    items = [_fly_diag(0, 0, "E0308", "rust-analyzer", "mismatched types")] if "native_bad" in text else []
+    write_message({"jsonrpc": "2.0", "id": msg["id"], "result": {"kind": "full", "items": items}})
+    return True
+
+
+def _fly_progress(token, kind):
+    write_message({"jsonrpc": "2.0", "method": "$/progress",
+                   "params": {"token": token, "value": {"kind": kind, "title": "cargo check"}}})
+
+
+def _fly_cargo_check(uri):
+    """What ``cargo check`` reports for the file: it reads the disk, not the synced text."""
+    try:
+        with open(uri[len("file://"):], encoding="utf-8") as fh:
+            disk = fh.read()
+    except OSError:
+        disk = ""
+    diags = [_fly_diag(0, 0, "E0308", "rustc", "mismatched types")] if "native_bad" in disk else []
+    if "borrow_bad" in disk:
+        line = next(i for i, text in enumerate(disk.splitlines()) if "borrow_bad" in text)
+        diags.append(_fly_diag(line, 4, "E0502", "rustc", "cannot borrow `v` as immutable"))
+    return diags
+
+
+_FLY_CHECK_LOCK = threading.Lock()  # one cargo check at a time; a later save's check queues behind it
+
+
+def _fly_token():
+    return os.environ.get("MOCK_LSP_CHECK_TOKEN", "rust-analyzer/flycheck/0")
+
+
+def _fly_run_check(uri):
+    with _FLY_CHECK_LOCK:
+        # health: allow HX013 -- the delays ARE the behaviour under test (cargo check starting and running)
+        time.sleep(float(os.environ.get("MOCK_LSP_CHECK_START_DELAY", "0")))
+        _fly_progress(_fly_token(), "begin")
+        time.sleep(float(os.environ.get("MOCK_LSP_CHECK_DELAY", "1.0")))  # health: allow HX013 -- as above
+        version = _FLYCHECK_DOCS.get(uri, (0, ""))[0]
+        write_message({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+                       "params": {"uri": uri, "version": version, "diagnostics": _fly_cargo_check(uri)}})
+        if os.environ.get("MOCK_LSP_CHECK_END", "1") != "0":
+            _fly_progress(_fly_token(), "end")
+
+
+def _fly_open_check(seconds):
+    """``MOCK_LSP_OPEN_CHECK``: the running check started at didOpen (holds the lock taken there)."""
+    try:
+        time.sleep(seconds)  # health: allow HX013 -- the check's duration is the behaviour under test
+        _fly_progress(_fly_token(), "end")
+    finally:
+        _FLY_CHECK_LOCK.release()
+
+
+def _fly_save(msg):
+    if os.environ.get("MOCK_LSP_CHECK_BEGIN", "1") != "0":
+        threading.Thread(target=_fly_run_check, args=(msg["params"]["textDocument"]["uri"],), daemon=True).start()
+    return True
+
+
+_SCRIPT_HOOKS.update({("flycheck", "textDocument/didOpen"): _fly_sync, ("flycheck", "textDocument/didChange"): _fly_sync,
+                      ("flycheck", "textDocument/diagnostic"): _fly_pull, ("flycheck", "textDocument/didSave"): _fly_save})
 _SCRIPT_HOOKS.update({("nav", method): _nav_answer for method in _NAV_ANSWERS})
 _SCRIPT_HOOKS[("nav", "initialized")] = _nav_initialized
 

@@ -12,12 +12,14 @@ older baseline, so an error the first edit introduced is still reported unless t
 A verdict must not be lost when the edit was the turn's last tool call (a one-shot ``-q`` run has no
 next turn): checks still running are tracked per session (:func:`track_pending`), and before the turn's
 final answer is accepted :func:`settle_for_agent` waits for them (bounded) and returns every verdict
-still undelivered, which ``agent.turn_stop_gates`` hands to the model as a new message.
+still undelivered, which ``agent.turn_stop_gates`` hands to the model as a new message.  A check held
+for rust-analyzer's cargo check (:func:`hold_until`) extends that bound to the hold's own deadline.
 """
 from __future__ import annotations
 
 import contextlib
 import threading
+import time
 from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -42,6 +44,8 @@ class _Note:
 _QUEUED: OrderedDict[str, OrderedDict[str, _Note]] = OrderedDict()
 # owner -> tokens of its checks still running (their verdict lands in _QUEUED or nowhere)
 _PENDING: dict[str, set[object]] = {}
+# owner -> latest ``time.monotonic()`` deadline of a running check's cargo-check hold
+_HOLD_UNTIL: dict[str, float] = {}
 
 
 @contextlib.contextmanager
@@ -119,6 +123,19 @@ def settled(owner: str, token: object) -> None:
             tokens.discard(token)
             if not tokens:
                 del _PENDING[owner]
+                _HOLD_UNTIL.pop(owner, None)
+        _SETTLED.notify_all()
+
+
+def hold_until(owner: str, deadline: float) -> None:
+    """A check of ``owner``'s waits for a save-triggered check (rust-analyzer's cargo check) until
+    ``deadline`` (``time.monotonic()``): a turn end waits for its verdict that long, not just
+    ``TURN_END_WAIT``, or a last-edit borrow error would reach no one (a one-shot has no next turn)."""
+    with _SETTLED:
+        now = time.monotonic()
+        for stale in [o for o, until in _HOLD_UNTIL.items() if until <= now]:
+            del _HOLD_UNTIL[stale]
+        _HOLD_UNTIL[owner] = max(deadline, _HOLD_UNTIL.get(owner, 0.0))
         _SETTLED.notify_all()
 
 
@@ -128,13 +145,19 @@ def _owners(agent: Any) -> tuple[Optional[str], ...]:
 
 
 def settle_for_agent(agent: Any, timeout: float = TURN_END_WAIT) -> list[tuple[str, str]]:
-    """Turn end: wait up to ``timeout`` for ``agent``'s running checks, then pop every undelivered
-    ``(path, text)`` verdict.  Returns at once when nothing is running."""
+    """Turn end: wait up to ``timeout`` (or a running check's later :func:`hold_until` deadline) for
+    ``agent``'s running checks, then pop every undelivered ``(path, text)`` verdict.  Returns at once
+    when nothing is running."""
     owners = [o for o in dict.fromkeys(_owners(agent)) if o]
     if not owners:
         return []
+    end = time.monotonic() + timeout
     with _SETTLED:
-        _SETTLED.wait_for(lambda: not any(_PENDING.get(o) for o in owners), timeout=timeout)
+        while any(_PENDING.get(o) for o in owners):
+            remaining = max([end, *(_HOLD_UNTIL.get(o, 0.0) for o in owners)]) - time.monotonic()
+            if remaining <= 0:
+                break
+            _SETTLED.wait(remaining)
     return pop_notes(*owners)
 
 
@@ -149,5 +172,5 @@ def forward_to_agent(agent: Any) -> None:
         queue_plugin_notice(agent, f"lsp:{path}", text)
 
 
-__all__ = ["TURN_END_WAIT", "bind_owner", "current_owner", "forward_to_agent", "pop_notes", "post", "restore",
-           "settle_for_agent", "settled", "take", "track_pending"]
+__all__ = ["TURN_END_WAIT", "bind_owner", "current_owner", "forward_to_agent", "hold_until", "pop_notes", "post",
+           "restore", "settle_for_agent", "settled", "take", "track_pending"]
