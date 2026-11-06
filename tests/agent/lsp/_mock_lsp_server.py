@@ -37,6 +37,10 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
 - ``"by_content"`` — push-only; pushes one error iff the synced text contains ``bad``, else empty
   diagnostics.  Holds every push until the file named by ``MOCK_LSP_GATE`` exists (a server slower
   than the write, released by the test), else after ``MOCK_LSP_PUSH_DELAY`` (default 0.4s).
+- ``"loading"`` — models rust-analyzer in a cold workspace: until the file named by ``MOCK_LSP_GATE``
+  exists it pushes EMPTY diagnostics on every open/change and answers pulls with ``[]``; then it sends
+  ``experimental/serverStatus`` quiescent=true and the real diagnostics (one error) by push and pull.
+  ``MOCK_LSP_STATUS_EARLY=1`` also sends quiescent=false right after ``initialized``.
 - ``"incremental"`` — apply ranged edits as UTF-16 and expose the server's
   document mirror through hover, for synchronization contract tests.
 - ``"clean_eof"`` — closes stdout after ``didOpen`` but keeps the
@@ -55,6 +59,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -88,6 +93,61 @@ def _push_slow(params, is_change, error_diag):
 
 
 _PUSH_HANDLERS = {"by_content": _push_by_content, "slow_push": _push_slow}
+_WRITE_LOCK = threading.Lock()
+_MOCK_ERROR = [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+                "severity": 1, "code": "MOCK001", "source": "mock-lsp", "message": "synthetic error from mock-lsp"}]
+_LOADING = {"loaded": False, "docs": {}}  # ``loading`` script: load state, uri -> last synced version
+
+
+def _status(quiescent):
+    write_message({"jsonrpc": "2.0", "method": "experimental/serverStatus",
+                   "params": {"health": "ok", "quiescent": quiescent}})
+
+
+def _loading_verdict(error_diag):
+    return error_diag if _LOADING["loaded"] else []
+
+
+def _finish_loading_when_gated(error_diag):
+    """``loading``: once MOCK_LSP_GATE exists, report quiescent and publish the real diagnostics."""
+    gate = os.environ["MOCK_LSP_GATE"]
+    while not os.path.exists(gate):
+        # health: allow HX013 -- a separate process can only poll the test's gate file
+        time.sleep(0.01)
+    with _WRITE_LOCK:
+        _LOADING["loaded"] = True
+        _status(True)
+        for uri, version in _LOADING["docs"].items():
+            write_message({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+                           "params": {"uri": uri, "version": version, "diagnostics": error_diag}})
+
+
+def _push_loading(params, is_change, error_diag):
+    td = params.get("textDocument") or {}
+    with _WRITE_LOCK:
+        _LOADING["docs"][td.get("uri", "")] = td.get("version", 0)
+        write_message({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+                       "params": {"uri": td.get("uri", ""), "version": td.get("version", 0),
+                                  "diagnostics": _loading_verdict(error_diag)}})
+
+
+def _start_loading(_msg):
+    if os.environ.get("MOCK_LSP_STATUS_EARLY") == "1":
+        _status(False)
+    threading.Thread(target=_finish_loading_when_gated, args=(_MOCK_ERROR,), daemon=True).start()
+    return True
+
+
+def _pull_loading(msg):
+    with _WRITE_LOCK:
+        write_message({"jsonrpc": "2.0", "id": msg["id"],
+                       "result": {"kind": "full", "items": _loading_verdict(_MOCK_ERROR)}})
+    return True
+
+
+_PUSH_HANDLERS["loading"] = _push_loading
+# (script, method) -> handler run before the generic dispatch; True = the message is handled.
+_SCRIPT_HOOKS = {("loading", "initialized"): _start_loading, ("loading", "textDocument/diagnostic"): _pull_loading}
 
 
 def read_message():
@@ -109,9 +169,13 @@ def read_message():
 
 def write_message(obj):
     body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
-    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
-    sys.stdout.buffer.write(body)
-    sys.stdout.buffer.flush()
+    with _FRAME_LOCK:  # the ``loading`` script also writes from its gate thread
+        sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
+        sys.stdout.buffer.write(body)
+        sys.stdout.buffer.flush()
+
+
+_FRAME_LOCK = threading.Lock()
 
 
 def main():
@@ -189,13 +253,11 @@ def main():
                 return 0
             continue
 
-        if msg.get("method") == "initialized":
+        hook = _SCRIPT_HOOKS.get((script, msg.get("method")))
+        if hook is not None and hook(msg):
             continue
 
-        if msg.get("method") == "workspace/didChangeConfiguration":
-            continue
-
-        if msg.get("method") == "workspace/didChangeWatchedFiles":
+        if msg.get("method") in {"initialized", "workspace/didChangeConfiguration", "workspace/didChangeWatchedFiles"}:
             continue
 
         if msg.get("method") == "workspace/didChangeWorkspaceFolders":
@@ -236,18 +298,7 @@ def main():
                 while read_message() is not None:
                     pass
                 return 0
-            error_diag = [
-                {
-                    "range": {
-                        "start": {"line": 0, "character": 0},
-                        "end": {"line": 0, "character": 5},
-                    },
-                    "severity": 1,
-                    "code": "MOCK001",
-                    "source": "mock-lsp",
-                    "message": "synthetic error from mock-lsp",
-                }
-            ]
+            error_diag = _MOCK_ERROR
             if script == "silent":
                 # Never publishes diagnostics and the pull endpoint is
                 # rejected (below).  Models a slow server that only

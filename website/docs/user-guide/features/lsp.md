@@ -417,6 +417,10 @@ server's initial program build; give large projects room with
 `lsp.warmup_timeout` (only that first, cold request uses it — the
 steady-state budget is unchanged) rather than raising `wait_timeout`,
 which would let every later edit block for the cold-build duration.
+rust-analyzer answers "no errors" while it is still loading a workspace
+(build scripts, proc macros, indexing), so Hermes takes nothing it reports
+as a verdict until it says it is quiescent; in a cold Rust workspace the
+first edit's diagnostics therefore arrive late, within `warmup_timeout`.
 
 A server that fails for a workspace — spawn error, or a request that
 outran its budget — marks that `(server, root)` pair broken and every
