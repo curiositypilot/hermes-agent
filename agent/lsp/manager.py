@@ -263,22 +263,32 @@ class LSPService:
     def enabled_for(self, file_path: str) -> bool:
         """True iff LSP should run for this file: registered non-disabled server, git workspace,
         and pair not broken (a failed server costs nothing until ``hermes lsp restart`` / exit)."""
-        srv = self._server_for(file_path) if self._enabled else None
-        if srv is None or srv.server_id in self._disabled_servers:
-            return False
+        return self.gate_reason(file_path) is None
+
+    def gate_reason(self, file_path: str) -> Optional[str]:
+        """``None`` when LSP may run for ``file_path``, else why not, in one line (the one gate
+        :meth:`enabled_for` and the ``lsp`` navigation tool share)."""
+        if not self._enabled:
+            return "LSP is disabled (lsp.enabled: false)"
+        srv = self._server_for(file_path)
+        if srv is None:
+            return f"no language server handles {os.path.splitext(file_path)[1] or 'extensionless'} files"
+        if srv.server_id in self._disabled_servers:
+            return f"the {srv.server_id} server is disabled (lsp.servers.{srv.server_id}.disabled)"
         key = self._broken_key(srv, file_path)
         if key is None:
-            return False
+            return "the file is not inside a git worktree"
         if self._root_excluded(key[1]):
             eventlog.log_root_excluded(srv.server_id, key[1], file_path, invalid=self._exclude_roots is None)
-            return False
+            return f"{key[1]} matches lsp.exclude_roots"
         self._note_operator_roots()
         if self._untrusted_denied(srv, key[1], file_path, self._trusted(key[1])):
-            return False
+            return (f"{key[1]} is not a trusted workspace (lsp.trusted_workspaces), and {srv.server_id} "
+                    "would load project code")
         if self._is_broken(key):
             eventlog.log_skipped_broken(srv.server_id, key[1], file_path, retry_in=self._broken_retry_in(key))
-            return False
-        return True
+            return f"{srv.server_id} failed to start for {key[1]} (see `hermes lsp status`)"
+        return None
 
     def _note_operator_roots(self) -> None:
         """Remember this thread's ``operator_workspace_roots``.  Called where a tool thread enters (it sees

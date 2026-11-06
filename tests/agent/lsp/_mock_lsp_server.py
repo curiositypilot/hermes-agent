@@ -39,6 +39,9 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
   than the write, released by the test), else after ``MOCK_LSP_PUSH_DELAY`` (default 0.4s).
 - ``"incremental"`` — apply ranged edits as UTF-16 and expose the server's
   document mirror through hover, for synchronization contract tests.
+- ``"nav"`` — answers definition / references / hover / workspace symbol / document symbol with
+  canned locations in ``MOCK_LSP_NAV_TARGET`` (see ``_NAV_ANSWERS``); logs each request to
+  ``MOCK_LSP_REQUESTS_LOG``; ``MOCK_LSP_INDEX_SECONDS`` keeps an indexing progress open that long.
 - ``"clean_eof"`` — closes stdout after ``didOpen`` but keeps the
   process and stdin alive.
 - ``"malformed_frame"`` — writes an invalid frame after ``didOpen``,
@@ -55,6 +58,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -90,6 +94,97 @@ def _push_slow(params, is_change, error_diag):
 _PUSH_HANDLERS = {"by_content": _push_by_content, "slow_push": _push_slow}
 
 
+def _nav_log(method, params):
+    """``nav``: append each navigation request to ``MOCK_LSP_REQUESTS_LOG`` (position assertions)."""
+    if log_path := os.environ.get("MOCK_LSP_REQUESTS_LOG"):
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"method": method, "params": params}) + "\n")
+
+
+def _nav_loc(path, line, character=0):
+    uri = "file://" + path
+    return {"uri": uri, "range": {"start": {"line": line, "character": character},
+                                  "end": {"line": line, "character": character + 1}}}
+
+
+def _nav_targets():
+    """``MOCK_LSP_NAV_TARGET`` (the answer file) and optional ``MOCK_LSP_NAV_FOREIGN`` (a sibling worktree)."""
+    return os.environ["MOCK_LSP_NAV_TARGET"], os.environ.get("MOCK_LSP_NAV_FOREIGN")
+
+
+def _nav_definition(params):
+    _nav_log("textDocument/definition", params)
+    target, _ = _nav_targets()
+    loc = _nav_loc(target, 1, 6)
+    return [{"targetUri": loc["uri"], "targetRange": loc["range"], "targetSelectionRange": loc["range"]}]
+
+
+_INDEXED = threading.Event()
+_INDEXED.set()
+
+
+def _nav_start_indexing(seconds):
+    """``MOCK_LSP_INDEX_SECONDS``: a work-done progress open for that long; references answered
+    before it ends cover the open file only (one hit), like a server still listing its files."""
+    _INDEXED.clear()
+    write_message({"jsonrpc": "2.0", "method": "$/progress",
+                   "params": {"token": "index", "value": {"kind": "begin", "title": "Indexing"}}})
+
+    def done():
+        _INDEXED.set()
+        write_message({"jsonrpc": "2.0", "method": "$/progress", "params": {"token": "index", "value": {"kind": "end"}}})
+    threading.Timer(seconds, done).start()
+
+
+def _nav_references(params):
+    _nav_log("textDocument/references", params)
+    target, foreign = _nav_targets()
+    count = int(os.environ.get("MOCK_LSP_NAV_REFS", "3")) if _INDEXED.is_set() else 1
+    refs = [_nav_loc(target, i) for i in reversed(range(count))]
+    return refs + ([_nav_loc(foreign, 0)] if foreign else [])
+
+
+def _nav_hover(params):
+    _nav_log("textDocument/hover", params)
+    return {"contents": {"kind": "markdown", "value": "```python\nclass Brain\n```\nThe robot's brain."}}
+
+
+def _nav_workspace_symbol(params):
+    _nav_log("workspace/symbol", params)
+    target, foreign = _nav_targets()
+    found = [{"name": params["query"], "kind": 5, "location": _nav_loc(target, 1, 6), "containerName": "brain_node"}]
+    return found + ([{"name": params["query"], "kind": 5, "location": _nav_loc(foreign, 1, 6)}] if foreign else [])
+
+
+def _nav_document_symbol(params):
+    _nav_log("textDocument/documentSymbol", params)
+    rng = {"start": {"line": 1, "character": 6}, "end": {"line": 1, "character": 11}}
+    child = {"start": {"line": 2, "character": 8}, "end": {"line": 2, "character": 12}}
+    return [{"name": "Brain", "kind": 5, "range": rng, "selectionRange": rng,
+             "children": [{"name": "tick", "kind": 6, "range": child, "selectionRange": child}]}]
+
+
+_NAV_ANSWERS = {
+    "textDocument/definition": _nav_definition, "textDocument/references": _nav_references,
+    "textDocument/hover": _nav_hover, "workspace/symbol": _nav_workspace_symbol,
+    "textDocument/documentSymbol": _nav_document_symbol,
+}
+_IGNORED_NOTIFICATIONS = frozenset({
+    "initialized", "workspace/didChangeConfiguration", "workspace/didChangeWatchedFiles", "textDocument/didSave",
+})
+
+
+def _nav_dispatch(msg):
+    """``nav``: answer a navigation request (True = handled); start indexing on ``initialized``."""
+    method = msg.get("method")
+    if method == "initialized" and os.environ.get("MOCK_LSP_INDEX_SECONDS"):
+        _nav_start_indexing(float(os.environ["MOCK_LSP_INDEX_SECONDS"]))
+    if method not in _NAV_ANSWERS:
+        return False
+    write_message({"jsonrpc": "2.0", "id": msg["id"], "result": _NAV_ANSWERS[method](msg["params"])})
+    return True
+
+
 def read_message():
     """Read one Content-Length framed JSON-RPC message from stdin."""
     headers = {}
@@ -107,11 +202,15 @@ def read_message():
     return json.loads(body.decode("utf-8"))
 
 
+_WRITE_LOCK = threading.Lock()  # the ``nav`` indexing timer writes from its own thread
+
+
 def write_message(obj):
     body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
-    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
-    sys.stdout.buffer.write(body)
-    sys.stdout.buffer.flush()
+    with _WRITE_LOCK:
+        sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
+        sys.stdout.buffer.write(body)
+        sys.stdout.buffer.flush()
 
 
 def main():
@@ -189,13 +288,10 @@ def main():
                 return 0
             continue
 
-        if msg.get("method") == "initialized":
+        if script == "nav" and _nav_dispatch(msg):
             continue
 
-        if msg.get("method") == "workspace/didChangeConfiguration":
-            continue
-
-        if msg.get("method") == "workspace/didChangeWatchedFiles":
+        if msg.get("method") in _IGNORED_NOTIFICATIONS:
             continue
 
         if msg.get("method") == "workspace/didChangeWorkspaceFolders":
@@ -309,9 +405,6 @@ def main():
                     "result": {"kind": "full", "items": []},
                 }
             )
-            continue
-
-        if msg.get("method") == "textDocument/didSave":
             continue
 
         if msg.get("method") == "shutdown":
