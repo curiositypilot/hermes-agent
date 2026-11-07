@@ -54,7 +54,9 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
   document mirror through hover, for synchronization contract tests.
 - ``"nav"`` — answers definition / references / hover / workspace symbol / document symbol with
   canned locations in ``MOCK_LSP_NAV_TARGET`` (see ``_NAV_ANSWERS``); logs each request to
-  ``MOCK_LSP_REQUESTS_LOG``; ``MOCK_LSP_INDEX_SECONDS`` keeps an indexing progress open that long.
+  ``MOCK_LSP_REQUESTS_LOG``; ``MOCK_LSP_INDEX_SECONDS`` keeps an indexing progress open that long;
+  ``MOCK_LSP_NAV_NO_OUTLINE=1`` answers documentSymbol with ``[]``; ``MOCK_LSP_NAV_DEAD_LINES`` (0-based
+  csv) answers definition / references / hover at those lines with ``[]`` / ``null``.
 - ``"clean_eof"`` — closes stdout after ``didOpen`` but keeps the
   process and stdin alive.
 - ``"malformed_frame"`` — writes an invalid frame after ``didOpen``,
@@ -68,6 +70,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -180,10 +183,28 @@ def _nav_targets():
     return os.environ["MOCK_LSP_NAV_TARGET"], os.environ.get("MOCK_LSP_NAV_FOREIGN")
 
 
+def _nav_class_at():
+    """``(line0, char)`` of the first ``class <name>`` identifier in ``MOCK_LSP_NAV_TARGET``."""
+    target, _ = _nav_targets()
+    with open(target, encoding="utf-8") as fh:
+        for line0, src in enumerate(fh.read().split("\n")):
+            if m := re.match(r"\s*class (\w+)", src):
+                return line0, m.start(1)
+    return 1, 6
+
+
+def _nav_dead(params):
+    """``MOCK_LSP_NAV_DEAD_LINES`` (0-based csv): positions on those lines have nothing to answer."""
+    dead = {int(x) for x in os.environ.get("MOCK_LSP_NAV_DEAD_LINES", "").split(",") if x.strip()}
+    return params["position"]["line"] in dead
+
+
 def _nav_definition(params):
     _nav_log("textDocument/definition", params)
+    if _nav_dead(params):
+        return []
     target, _ = _nav_targets()
-    loc = _nav_loc(target, 1, 6)
+    loc = _nav_loc(target, *_nav_class_at())
     return [{"targetUri": loc["uri"], "targetRange": loc["range"], "targetSelectionRange": loc["range"]}]
 
 
@@ -206,6 +227,8 @@ def _nav_start_indexing(seconds):
 
 def _nav_references(params):
     _nav_log("textDocument/references", params)
+    if _nav_dead(params):
+        return []
     target, foreign = _nav_targets()
     count = int(os.environ.get("MOCK_LSP_NAV_REFS", "3")) if _INDEXED.is_set() else 1
     refs = [_nav_loc(target, i) for i in reversed(range(count))]
@@ -214,20 +237,26 @@ def _nav_references(params):
 
 def _nav_hover(params):
     _nav_log("textDocument/hover", params)
+    if _nav_dead(params):
+        return None
     return {"contents": {"kind": "markdown", "value": "```python\nclass Brain\n```\nThe robot's brain."}}
 
 
 def _nav_workspace_symbol(params):
     _nav_log("workspace/symbol", params)
     target, foreign = _nav_targets()
-    found = [{"name": params["query"], "kind": 5, "location": _nav_loc(target, 1, 6), "containerName": "brain_node"}]
+    found = [{"name": params["query"], "kind": 5, "location": _nav_loc(target, *_nav_class_at()),
+              "containerName": "brain_node"}]
     return found + ([{"name": params["query"], "kind": 5, "location": _nav_loc(foreign, 1, 6)}] if foreign else [])
 
 
 def _nav_document_symbol(params):
     _nav_log("textDocument/documentSymbol", params)
-    rng = {"start": {"line": 1, "character": 6}, "end": {"line": 1, "character": 11}}
-    child = {"start": {"line": 2, "character": 8}, "end": {"line": 2, "character": 12}}
+    if os.environ.get("MOCK_LSP_NAV_NO_OUTLINE") == "1":
+        return []
+    line0, char = _nav_class_at()
+    rng = {"start": {"line": line0, "character": char}, "end": {"line": line0, "character": char + 5}}
+    child = {"start": {"line": line0 + 1, "character": 8}, "end": {"line": line0 + 1, "character": 12}}
     return [{"name": "Brain", "kind": 5, "range": rng, "selectionRange": rng,
              "children": [{"name": "tick", "kind": 6, "range": child, "selectionRange": child}]}]
 

@@ -159,7 +159,9 @@ toolset), so the agent finds code by meaning instead of by text:
 | `symbols` | `path` only | an outline of the file (classes and their members) |
 
 Results are `path:line:col` plus the source line, capped at 50 with a count of the rest.
-Without `line`, the symbol's first occurrence in the file is used; a symbol one or two lines
+Without `line`, the symbol's declaration in the file's outline is used; a symbol the file only
+imports or uses is tried at its occurrences in order (up to 10) until the server answers, so a
+first mention in a docstring or comment does not empty the answer. A symbol one or two lines
 off the given line is still found. The tool uses the gate the diagnostics use (`lsp.enabled`,
 the git workspace, `lsp.exclude_roots`, workspace trust): in an untrusted checkout only the
 servers that never load project code answer, and every refusal is a one-line reason. On a

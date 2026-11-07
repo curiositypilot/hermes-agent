@@ -17,12 +17,15 @@ from tools.registry import registry
 
 _MOCK = os.path.join(os.path.dirname(__file__), "..", "agent", "lsp", "_mock_lsp_server.py")
 _SOURCE = "import os\nclass Brain:\n    def tick(self): s = '😀'; return Brain\n"
+# The first text match is a docstring mention the server has nothing to say about.
+_DOC_FIRST = '"""Brain docs."""\nimport os\nclass Brain:\n    def tick(self): return Brain\n'
 
 
 @pytest.fixture
 def nav_env(tmp_path, monkeypatch):
     """A git workspace holding ``brain_node.nav`` served by the mock ``nav`` server; returns a
-    ``configure(trusted=True, enabled=True, refs=3)`` that writes config.yaml and yields paths."""
+    ``configure(trusted=True, enabled=True, refs=3, ...)`` that writes config.yaml (and, given ``source``,
+    the target file) and yields paths; ``no_outline`` / ``dead_lines`` drive the mock's nav knobs."""
     import tools.lsp_tool  # registers the tool
     from agent.lsp import shutdown_service
 
@@ -37,11 +40,18 @@ def nav_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")  # no operator-trusted roots: only the config decides
     monkeypatch.setattr("agent.lsp.navigation.WORKSPACE_SETTLE", 0.0)  # the mock lists no files
 
-    def configure(*, trusted=True, enabled=True, refs=3, index_seconds=None):
+    def configure(*, trusted=True, enabled=True, refs=3, index_seconds=None, source=None, no_outline=False,
+                  dead_lines=()):
+        if source is not None:
+            target.write_text(source, encoding="utf-8")
         env = {"MOCK_LSP_SCRIPT": "nav", "MOCK_LSP_NAV_TARGET": str(target), "MOCK_LSP_REQUESTS_LOG": str(log),
                "MOCK_LSP_NAV_REFS": str(refs)}
         if index_seconds is not None:
             env["MOCK_LSP_INDEX_SECONDS"] = str(index_seconds)
+        if no_outline:
+            env["MOCK_LSP_NAV_NO_OUTLINE"] = "1"
+        if dead_lines:
+            env["MOCK_LSP_NAV_DEAD_LINES"] = ",".join(map(str, dead_lines))
         (home / "config.yaml").write_text(json.dumps({"lsp": {
             "enabled": enabled, "install_strategy": "manual", "idle_timeout": 0,
             "trusted_workspaces": [str(ws)] if trusted else [],
@@ -139,3 +149,45 @@ def test_failures_are_one_line_reasons(nav_env, tmp_path):
     assert "no language server handles .zzz" in _call(action="hover", path=str(other), line=1)["error"]
     assert "unknown action" in _call(action="rename", path=str(target))["error"]
     assert "does not occur" in _call(action="definition", path=str(target), symbol="Nope")["error"]
+
+
+def _positions(log, method):
+    return [r["params"]["position"] for r in _requests(log) if r["method"] == method]
+
+
+@pytest.mark.timeout(90)
+def test_symbol_without_line_resolves_to_its_declaration_not_a_docstring_mention(nav_env):
+    target, log = nav_env(source=_DOC_FIRST)
+    out = _call(action="references", path=str(target), symbol="Brain")
+    assert out["at"] == "brain_node.nav:3" and out["total"] == 3, out
+    methods = [r["method"] for r in _requests(log)]
+    assert methods == ["textDocument/documentSymbol", "textDocument/references"]
+    assert _positions(log, "textDocument/references") == [{"line": 2, "character": 6}]
+
+
+@pytest.mark.timeout(90)
+def test_symbol_without_outline_entry_probes_occurrences_until_one_answers(nav_env):
+    target, log = nav_env(source=_DOC_FIRST, no_outline=True, dead_lines=[0])
+    out = _call(action="references", path=str(target), symbol="Brain")
+    assert out["at"] == "brain_node.nav:3" and out["total"] == 3, out
+    assert [p["line"] for p in _positions(log, "textDocument/references")] == [0, 2]
+
+
+@pytest.mark.timeout(90)
+def test_symbol_with_no_answering_occurrence_names_the_lines_tried(nav_env):
+    target, _ = nav_env(source=_DOC_FIRST, no_outline=True, dead_lines=[0, 2, 3])
+    out = _call(action="references", path=str(target), symbol="Brain")
+    assert out["total"] == 0 and out["at"] == "brain_node.nav:1", out
+    assert out["note"] == "no results at lines 1, 3, 4; give line"
+    hover = _call(action="hover", path=str(target), symbol="Brain")
+    assert hover["hover"] == "(no hover information)" and "lines 1, 3, 4" in hover["note"]
+
+
+@pytest.mark.timeout(90)
+def test_given_line_is_used_as_is_without_outline_or_probes(nav_env):
+    target, log = nav_env(source=_DOC_FIRST, dead_lines=[0])
+    out = _call(action="references", path=str(target), symbol="Brain", line=1)
+    assert out["total"] == 0 and out["at"] == "brain_node.nav:1", out
+    requests = _requests(log)
+    assert [r["method"] for r in requests] == ["textDocument/references"]
+    assert requests[0]["params"]["position"]["line"] == 0
