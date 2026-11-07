@@ -85,15 +85,20 @@ def gateway_kanban_runs(gateway_pid: int) -> Optional[list[dict[str, Any]]]:
 
     The gateway's ``active_work`` reports managed runs under its own pid, so the board is the only
     place that names them. Each DB is opened read-only; a missing board DB has no runs. None when a
-    board DB cannot be read: callers treat that as "no identifiable blocker" and keep today's hold.
+    board DB cannot be read, or lies outside a pinned caller's Kanban fence: callers treat that as
+    "no identifiable blocker" and keep today's hold.
     """
     from hermes_cli import kanban_db, kanban_db_boards
+    from hermes_cli.kanban_db_pin_guard import KanbanBoardFenced
 
     lock = f"{kanban_db._host_prefix()}{int(gateway_pid)}"
     runs: list[dict[str, Any]] = []
     for board in kanban_db_boards.list_boards(include_archived=False):
         slug = board["slug"]
-        path = kanban_db.kanban_db_path(board=slug)
+        try:
+            path = kanban_db.kanban_db_path(board=slug)
+        except KanbanBoardFenced:
+            return None
         if not path.is_file():
             continue
         try:

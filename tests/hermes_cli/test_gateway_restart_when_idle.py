@@ -324,6 +324,29 @@ def test_unreadable_db_keeps_holding(env, tmp_path):
     assert not hold.hold_path().exists()
 
 
+def test_board_outside_a_pinned_callers_fence_keeps_holding(env, board, monkeypatch, capsys):
+    """A delegated child of a worker carries the board pin and the fence marker, so every other board
+    raises KanbanBoardFenced; the call must not crash on its first progress line, and it fails toward
+    today's hold."""
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+    from hermes_cli.kanban_db import kanban_db_path, kanban_home
+    from hermes_cli.kanban_db_boards import create_board
+
+    create_board("other")
+    board.run("t_long", -3600)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_db_path(board="default")))
+    monkeypatch.setenv(DELEGATED_CHILD_ENV_MARKER, str(kanban_home()))
+
+    with pytest.raises(SystemExit) as exc:
+        gw._cmd_restart(_args(idle_timeout=1200))
+
+    assert exc.value.code == 1 and env.service == []
+    assert all(held for _, held in _held_after_start(env)), "a fenced board fails toward holding"
+    assert when_idle.gateway_kanban_runs(GATEWAY_PID) is None
+    assert "waiting 0s: 1 live unit(s), new Kanban work held" in capsys.readouterr().out
+    assert not hold.hold_path().exists()
+
+
 def test_hold_window_zero_keeps_old_behaviour(env, board):
     board.run("t_long", -3600)
 
