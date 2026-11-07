@@ -4,7 +4,10 @@ Rides the diagnostics service (:class:`agent.lsp.manager.LSPService`): the same 
 (``gate_reason``: enabled flag, git workspace, ``exclude_roots``, workspace trust, broken set), the same
 clients and the same loop.  A query first waits out any unfinished post-write check of the queried file
 (``agent.lsp.edit_check`` syncs its own snapshots), then syncs the file's disk content only when the
-server holds something else, so navigation never moves a document under a write's verdict.  Results are
+server holds something else, so navigation never moves a document under a write's verdict.  A symbol
+given without a line resolves to its declaration in the file's outline (``textDocument/documentSymbol``),
+else to the first of its occurrences the server answers for: the first text match is often a docstring
+or comment the server has nothing to say about.  Results are
 ``path:line:col`` plus the source line, capped at :data:`MAX_RESULTS`.  Never marks a server broken: a
 slow answer (a cold workspace index) is not a dead server.
 """
@@ -14,7 +17,7 @@ import asyncio
 import os
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from agent.lsp.client import file_uri, uri_to_path
 from agent.lsp.protocol import LSPProtocolError, LSPRequestError
@@ -36,6 +39,7 @@ _SNIPPET_CHARS = 160
 _HOVER_CHARS = 1500
 _SNIPPET_MAX_BYTES = 4 * 1024 * 1024
 _NEARBY_LINES = 3  # a symbol not on the given line is looked for this many lines around it
+_MAX_PROBES = 10  # no line, no outline match: occurrences (one per line) tried until one answers
 
 _POSITION_METHODS = {
     "definition": "textDocument/definition",
@@ -67,11 +71,12 @@ def run(svc: Any, action: str, path: str, *, symbol: Optional[str] = None, line:
         raise NavigationError(f"{path} is not a file")
     if (reason := svc.gate_reason(abs_path)) is not None:
         raise NavigationError(f"LSP unavailable for {path}: {reason}")
-    method, params, at_line = _request(action, abs_path, symbol=symbol, line=line, column=column, query=query)
+    method, params, at_line, lookup = _request(action, abs_path, symbol=symbol, line=line, column=column, query=query)
     server_id = svc._server_for(abs_path).server_id  # gate_reason guarantees a server
     try:
-        raw, folders = svc._loop.run(_query_async(svc, abs_path, method, params),
-                                     timeout=REQUEST_TIMEOUT + SPAWN_ALLOWANCE)
+        raw, folders, at_line, empty_note = svc._loop.run(
+            _query_async(svc, abs_path, method, params, at_line=at_line, lookup=lookup),
+            timeout=REQUEST_TIMEOUT + SPAWN_ALLOWANCE)
     except NavigationError:
         raise
     except TimeoutError:
@@ -88,6 +93,8 @@ def run(svc: Any, action: str, path: str, *, symbol: Optional[str] = None, line:
     if action == "hover":
         text = _hover_text(raw)
         payload["hover"] = text or "(no hover information)"
+        if not text and empty_note:
+            payload["note"] = empty_note
         return payload
     if action == "symbols" and not query:
         rows = [(abs_path, ln, ch, label) for ln, ch, label in _outline(raw)]
@@ -103,35 +110,61 @@ def run(svc: Any, action: str, path: str, *, symbol: Optional[str] = None, line:
     if len(rows) > MAX_RESULTS:
         payload["note"] = f"{len(rows) - MAX_RESULTS} more not shown; narrow the query"
     elif not rows:
-        payload["note"] = "no results"
+        payload["note"] = empty_note or "no results"
     return payload
 
 
 # ---- request building ----
 
+class _SymbolLookup(NamedTuple):
+    """A symbol given without a line: resolved on the loop side, once the server holds the file."""
+    symbol: str
+    lines: list[str]
+    occurrences: list[tuple[dict[str, int], int]]  # (LSP position, 1-based line), one per line, file order
+
+
 def _request(action: str, abs_path: str, *, symbol: Optional[str], line: Optional[int], column: Optional[int],
-             query: Optional[str]) -> tuple[str, dict[str, Any], Optional[int]]:
-    """``(method, params, 1-based line queried)`` for one action."""
+             query: Optional[str]) -> tuple[str, dict[str, Any], Optional[int], Optional[_SymbolLookup]]:
+    """``(method, params, 1-based line queried, lookup)`` for one action.  ``lookup`` is set (and
+    ``params`` has no position yet) for a symbol given without a line; the line is then its first
+    occurrence, the fallback the loop side replaces with the position it actually used."""
     doc = {"uri": file_uri(abs_path)}
     if action == "symbols":
         if query:
-            return "workspace/symbol", {"query": query}, None
-        return "textDocument/documentSymbol", {"textDocument": doc}, None
-    position, at_line = _position(_read_text(abs_path), symbol=symbol, line=line, column=column)
-    params: dict[str, Any] = {"textDocument": doc, "position": position}
+            return "workspace/symbol", {"query": query}, None, None
+        return "textDocument/documentSymbol", {"textDocument": doc}, None, None
+    text = _read_text(abs_path)
+    position, at_line = _position(text, symbol=symbol, line=line, column=column)
+    params: dict[str, Any] = {"textDocument": doc}
     if action == "references":
         params["context"] = {"includeDeclaration": True}
-    return _POSITION_METHODS[action], params, at_line
+    lookup = None
+    if line is None:  # _position raised unless the symbol occurs
+        sym = (symbol or "").strip()
+        lines = text.split("\n")
+        lookup = _SymbolLookup(sym, lines, _occurrences(lines, _symbol_re(sym)))
+    else:
+        params["position"] = position
+    return _POSITION_METHODS[action], params, at_line, lookup
 
 
 def _symbol_re(symbol: str) -> re.Pattern:
     return re.compile(rf"(?<![\w$]){re.escape(symbol)}(?![\w$])")
 
 
+def _utf16_position(line_text: str, line0: int, idx: int) -> dict[str, int]:
+    return {"line": line0, "character": len(line_text[:idx].encode("utf-16-le")) // 2}
+
+
+def _occurrences(lines: list[str], pattern: re.Pattern) -> list[tuple[dict[str, int], int]]:
+    """``(LSP position, 1-based line)`` of the first match on each line that has one, in file order."""
+    return [(_utf16_position(src, i, m.start()), i + 1) for i, src in enumerate(lines) if (m := pattern.search(src))]
+
+
 def _position(text: str, *, symbol: Optional[str], line: Optional[int], column: Optional[int]) -> tuple[dict[str, int], int]:
     """LSP position (0-based line, UTF-16 character) for a 1-based ``line`` and either a 1-based
     ``column`` or the ``symbol`` occurring on (or within a few lines of) that line; without ``line``
-    the symbol's first occurrence in the file."""
+    the symbol's first text occurrence (the caller resolves the declaration through the server)."""
     lines = text.split("\n")
     symbol = (symbol or "").strip() or None
     pattern = _symbol_re(symbol) if symbol else None
@@ -150,8 +183,7 @@ def _position(text: str, *, symbol: Optional[str], line: Optional[int], column: 
     else:
         src = lines[line - 1]
         idx = len(src) - len(src.lstrip())
-    prefix = lines[line - 1][:idx]
-    return {"line": line - 1, "character": len(prefix.encode("utf-16-le")) // 2}, line
+    return _utf16_position(lines[line - 1], line - 1, idx), line
 
 
 def _nearest_occurrence(lines: list[str], line: int, pattern: re.Pattern, symbol: str) -> tuple[int, int]:
@@ -173,8 +205,11 @@ def _read_text(abs_path: str) -> str:
 
 # ---- loop side ----
 
-async def _query_async(svc: Any, abs_path: str, method: str, params: dict[str, Any]) -> tuple[Any, list[str]]:
-    """Send one request through the file's client: ``(result, the client's workspace folders)``."""
+async def _query_async(svc: Any, abs_path: str, method: str, params: dict[str, Any], *, at_line: Optional[int],
+                       lookup: Optional[_SymbolLookup] = None) -> tuple[Any, list[str], Optional[int], Optional[str]]:
+    """Send the request through the file's client: ``(result, the client's workspace folders, 1-based
+    line queried, note when every probed occurrence answered empty)``.  With ``lookup`` the position
+    is resolved here (:func:`_resolve_and_request`); the settle waits run once, before any request."""
     client = await svc._get_or_spawn(abs_path)
     if client is None:
         raise NavigationError("the language server could not start (see `hermes lsp status`)")
@@ -190,9 +225,73 @@ async def _query_async(svc: Any, abs_path: str, method: str, params: dict[str, A
             await asyncio.sleep(settle)
         await client.wait_progress_idle(REQUEST_TIMEOUT)
     try:
-        return await client.request(method, params, timeout=REQUEST_TIMEOUT), list(client.workspace_folders)
+        if lookup is not None:
+            raw, at_line, note = await _resolve_and_request(client, method, params, lookup)
+        else:
+            raw, note = await client.request(method, params, timeout=REQUEST_TIMEOUT), None
+        return raw, list(client.workspace_folders), at_line, note
     finally:
         svc._touch(client)
+
+
+async def _resolve_and_request(client: Any, method: str, params: dict[str, Any],
+                               lookup: _SymbolLookup) -> tuple[Any, int, Optional[str]]:
+    """``(result, 1-based line used, note)`` for a symbol given without a line: at its declaration in
+    the outline, else at the first of up to :data:`_MAX_PROBES` occurrences that answers non-empty."""
+    doc = params["textDocument"]
+    try:
+        outline = await client.request("textDocument/documentSymbol", {"textDocument": doc}, timeout=REQUEST_TIMEOUT)
+    except LSPRequestError:  # no documentSymbol support: probe the occurrences
+        outline = None
+    if (decl := _declaration(outline, lookup.symbol, lookup.lines)) is not None:
+        position, line = decl
+        return await client.request(method, {**params, "position": position}, timeout=REQUEST_TIMEOUT), line, None
+    raw, tried = None, []
+    for position, line in lookup.occurrences[:_MAX_PROBES]:
+        raw = await client.request(method, {**params, "position": position}, timeout=REQUEST_TIMEOUT)
+        if _hover_text(raw) if method == "textDocument/hover" else _locations(raw):
+            return raw, line, None
+        tried.append(line)
+    return raw, lookup.occurrences[0][1], f"no results at lines {', '.join(map(str, tried))}; give line"
+
+
+def _declaration(outline: Any, symbol: str, lines: list[str]) -> Optional[tuple[dict[str, int], int]]:
+    """``(LSP position, 1-based line)`` of ``symbol``'s declaration in a ``textDocument/documentSymbol``
+    answer (exact name; the shallowest, then the earliest), or None.  ``DocumentSymbol`` gives the
+    identifier as ``selectionRange``; flat ``SymbolInformation`` gives the whole declaration's range
+    (decorators included), searched for the identifier."""
+    found: list[tuple[int, int, int]] = []  # (depth, line0, utf16 char)
+    pattern = _symbol_re(symbol)
+
+    def walk(items: Any, depth: int) -> None:
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("name") == symbol:
+                hit = _symbol_info_hit(item, pattern, lines) if "location" in item else (
+                    depth, *_start(item.get("selectionRange") or item.get("range")))
+                if hit is not None:
+                    found.append(hit)
+            walk(item.get("children"), depth + 1)
+    walk(outline, 0)
+    if not found:
+        return None
+    _, line0, char = min(found)
+    return {"line": line0, "character": char}, line0 + 1
+
+
+def _symbol_info_hit(item: dict[str, Any], pattern: re.Pattern, lines: list[str]) -> Optional[tuple[int, int, int]]:
+    """``(depth, line0, utf16 char)`` of the identifier inside a ``SymbolInformation`` range (depth 1
+    when the server names a container), or None when the range does not hold it."""
+    rng = (item.get("location") or {}).get("range")
+    start_line, start_char = _start(rng)
+    end_line = max(_start({"start": rng.get("end")})[0] if isinstance(rng, dict) else 0, start_line)
+    for line0 in range(start_line, min(end_line, len(lines) - 1) + 1):
+        src = lines[line0]
+        offset = _utf16_to_index(src, start_char) if line0 == start_line else 0
+        if m := pattern.search(src, offset):
+            return (1 if item.get("containerName") else 0), line0, _utf16_position(src, line0, m.start())["character"]
+    return None
 
 
 # ---- result shaping ----
