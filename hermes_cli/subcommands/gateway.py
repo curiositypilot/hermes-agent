@@ -158,6 +158,10 @@ def build_gateway_parser(
         "(exit 1 on --idle-timeout); for scripts and retry loops"))
     gateway_restart.add_argument("--idle-timeout", dest="idle_timeout", type=int, default=3600, metavar="S",
         help="With --when-idle: seconds to wait for live work to finish (default: 3600)")
+    gateway_restart.add_argument("--hold-window", dest="hold_window", type=int, default=600, metavar="S",
+        help=("With --when-idle: seconds to hold new Kanban work before releasing it while Kanban runs "
+              "older than the hold keep going; re-held when they end (default: 600; 0 = hold until "
+              "--idle-timeout; a window at or above --idle-timeout never releases)"))
 
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
     _flag(gateway_status, "--deep", help="Deep status check")
