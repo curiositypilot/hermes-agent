@@ -192,6 +192,20 @@ os.environ["HERMES_TEST_ISOLATION"] = os.environ.get("HERMES_HOME", "") or "1"
 # on whether botocore was importable yet.
 os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 
+# Children whose env a test rebuilt from an allowlist lose that switch. In a self-managed
+# checkout (install-stamp.json updateMechanism: self) each such child that carries HERMES_HOME
+# then syncs a whole dependency generation into the test's temp home with an empty uv cache
+# (t_7b2d2135; t_eafb4023 fixed only child_env()). Guard every Popen centrally, at import so
+# collection-time children are covered; envs that carry HERMES_TEST_ISOLATION (copied from
+# os.environ) or an explicit switch value are left as the test built them. No stamp (worktrees,
+# CI): nothing is installed.
+from tests._fixtures.lazy_install_child_env import self_managed_checkout, wrap_popen_init
+
+if self_managed_checkout(Path(__file__).resolve().parents[1]):
+    import subprocess
+
+    subprocess.Popen.__init__ = wrap_popen_init(subprocess.Popen.__init__)
+
 #: HERMES_HOME as it stood when conftest was imported - i.e. before any test
 #: module could import code that configures logging. Recorded so the guard in
 #: tests/test_log_isolation.py can assert the sandbox existed AT THAT MOMENT.
