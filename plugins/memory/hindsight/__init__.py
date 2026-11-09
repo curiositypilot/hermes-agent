@@ -300,21 +300,21 @@ _RECALL_FACT_TYPES = ("world", "experience", "observation")
 _PROJECT_SLUGS_TTL = 3600.0
 
 _TAGS_PARAM = {"type": "array", "items": {"type": "string"}, "description": (
-    "Optional tag filter, e.g. [\"project:<slug>\"] to scope to one project. Consolidated "
-    "observations carry ONLY \"scope:personal\"; with 'any'/'any_strict' they are kept next to "
-    "the project's facts automatically. Valid slugs are the 'project' entity-label values in "
-    "the bank config. Omit to use the configured default filter."
+    "Tag filter, e.g. [\"project:<slug>\"] to scope to one project; valid slugs are the 'project' "
+    "entity-label values in the bank config. Consolidated observations carry ONLY \"scope:personal\"; "
+    "with 'any'/'any_strict' they are kept next to the project's facts automatically. Omit to use the "
+    "configured default filter."
 )}
 _TAGS_MATCH_PARAM = {"type": "string", "enum": list(_TAGS_MATCH_MODES), "description": (
-    "How tags match (default 'any'). 'any'/'all' also return untagged memories; "
+    "Default 'any'. 'any'/'all' also return untagged memories; "
     "'any_strict'/'all_strict' exclude them; 'exact' requires the exact tag set."
 )}
 
 RECALL_SCHEMA = {
     "name": "hindsight_recall",
     "description": (
-        "Search long-term memory for specific facts. Returns memories ranked by relevance using "
-        "semantic search, keyword matching, entity graph traversal, and reranking. For broad "
+        "Search long-term memory for specific facts. Returns memories ranked by relevance (semantic "
+        "search, keyword matching, entity graph traversal, reranking). For broad "
         "questions (what are my preferences/plans/criteria for X) use hindsight_reflect instead. "
         "Before asking the user a question or stating a plan or status, run one recall per thing "
         "it names (max 3), phrased 'the user decided or changed about <thing>: current status', "
@@ -325,7 +325,7 @@ RECALL_SCHEMA = {
         "tags": _TAGS_PARAM,
         "tags_match": _TAGS_MATCH_PARAM,
         "types": {"type": "array", "items": {"type": "string", "enum": list(_RECALL_FACT_TYPES)},
-                  "description": "Optional fact types to return (default: configured recall_types)."},
+                  "description": "Fact types to return (default: configured recall_types)."},
     }},
 }
 
