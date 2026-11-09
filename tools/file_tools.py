@@ -7,6 +7,7 @@ staleness state).
 """
 
 import base64
+import copy
 import errno
 import json
 import logging
@@ -63,6 +64,13 @@ def _get_max_read_chars() -> int:
         val = None
     valid = isinstance(val, (int, float)) and val > 0
     return int(val) if valid else _DEFAULT_MAX_READ_CHARS
+
+
+def _render_char_budget(n: int) -> str:
+    """Schema wording for ``file_read_max_chars``. ``100_000`` is ``~100K``."""
+    if n % 1000 == 0:
+        return f"~{n // 1000}K"
+    return f"~{n:,}"
 
 
 def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bool]:
@@ -1245,11 +1253,12 @@ READ_FILE_SCHEMA = {
     # Document formats are stated unconditionally: firecrawl-anydoc is a
     # core dependency (bundled), so its absence is a broken install, not a
     # configuration — the teaching error in read_extract handles that rare
-    # case with the PM repair hint. The ONE dynamic word: "PDF (text
-    # layer)" upgrades to "PDF (scanned or text)" when hosted OCR has a
-    # route we trust (_read_file_schema_overrides). Scanned-page coverage
-    # teaching lives in the response-time NEEDS-OCR warning
-    # (read_extract.py); the schema doesn't pre-teach it.
+    # case with the PM repair hint. Dynamic words live in
+    # _read_file_schema_overrides: "PDF (text layer)" upgrades to
+    # "PDF (scanned or text)" when hosted OCR has a trusted route, and
+    # "~100K" tracks file_read_max_chars when it is not the default.
+    # Scanned-page coverage teaching lives in the response-time NEEDS-OCR
+    # warning (read_extract.py); the schema doesn't pre-teach it.
     "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. A single line longer than ~2K chars is clamped at '... [truncated]' and listed in clamped_lines with a hint naming the command that reads its remainder (offset cannot reach it). Documents auto-extract to readable text: .ipynb, Office (.docx/.xlsx/.pptx and legacy .doc/.ppt/.xls), PDF (text layer), OpenDocument, RTF, EPUB, SQLite (.db/.sqlite: schema, row counts, first rows). Cannot read images/binary — use vision_analyze for images.",
     "parameters": {
         "type": "object",
@@ -1478,24 +1487,48 @@ def _handle_search_files(args, **kw):
 
 
 def _read_file_schema_overrides():
-    """One-word capability upgrade: "PDF (text layer)" → "PDF (scanned or
-    text)" when hosted OCR has a trusted route (see
-    read_extract.hosted_ocr_available). Config/env probe only — no
-    network at schema-build time. Compaction's tool refresh (#97073)
-    picks up a key added mid-session.
+    """Capability and cap wording that config can change after import.
+
+    "PDF (text layer)" → "PDF (scanned or text)" when hosted OCR has a
+    trusted route (read_extract.hosted_ocr_available). "~100K" tracks
+    ``file_read_max_chars`` when it is not the default, so the schema the
+    model plans with matches the truncation it will hit. Config/env probe
+    only — no network at schema-build time. The registry merges this dict
+    shallowly, so a changed cap returns a deepcopy of ``parameters`` and
+    never mutates ``READ_FILE_SCHEMA``. Compaction's tool refresh (#97073)
+    picks up a key added mid-session; the registry memo is keyed on
+    config.yaml mtime+size, so a cap edit refreshes the text.
     """
+    overrides = {}
+    description = READ_FILE_SCHEMA["description"]
+    changed_description = False
+
+    cap = _get_max_read_chars()
+    if cap != _DEFAULT_MAX_READ_CHARS:
+        rendered = _render_char_budget(cap)
+        description = description.replace("~100K characters", f"{rendered} characters")
+        changed_description = True
+        parameters = copy.deepcopy(READ_FILE_SCHEMA["parameters"])
+        limit = parameters["properties"]["limit"]
+        limit["description"] = limit["description"].replace(
+            "~100K-character", f"{rendered}-character"
+        )
+        overrides["parameters"] = parameters
+
     try:
         from tools.read_extract import hosted_ocr_available
 
         if hosted_ocr_available():
-            return {
-                "description": READ_FILE_SCHEMA["description"].replace(
-                    "PDF (text layer)", "PDF (scanned or text)"
-                )
-            }
+            description = description.replace(
+                "PDF (text layer)", "PDF (scanned or text)"
+            )
+            changed_description = True
     except Exception:
         pass
-    return {}
+
+    if changed_description:
+        overrides["description"] = description
+    return overrides
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000, dynamic_schema_overrides=_read_file_schema_overrides)
