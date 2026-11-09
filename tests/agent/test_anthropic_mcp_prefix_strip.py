@@ -304,3 +304,35 @@ class TestAnthropicOAuthClassifierAlias:
         assert kwargs["tools"][0]["name"] == "session_search"
         assert "session_search" in kwargs["tools"][0]["description"]
 
+
+
+class TestOAuthDescribeResultAlias:
+    """A tool_describe/tool_search result carries the raw schema, which is one of the two
+    triggers of the OAuth billing classifier. Only those results are rewritten."""
+
+    def _build(self, messages):
+        from agent.anthropic_adapter import build_anthropic_kwargs
+        return build_anthropic_kwargs(
+            model="claude-sonnet-4-6", messages=messages, tools=None,
+            max_tokens=4096, reasoning_config=None, is_oauth=True)
+
+    def test_describe_result_is_aliased_and_other_results_are_not(self):
+        schema = '{"name": "session_search", "description": "Use session_search to recall."}'
+        kwargs = self._build([
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "tu_describe", "type": "function",
+                 "function": {"name": "tool_describe", "arguments": "{}"}},
+                {"id": "tu_read", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "tu_describe", "content": schema},
+            {"role": "tool", "tool_call_id": "tu_read",
+             "content": "file mentions session_search on line 3"},
+        ])
+        results = [b for m in kwargs["messages"] for b in (m.get("content") or [])
+                   if isinstance(b, dict) and b.get("type") == "tool_result"]
+        by_id = {b["tool_use_id"]: b["content"] for b in results}
+        import re
+        assert "chat_history_lookup" in by_id["tu_describe"]
+        assert not re.search(r"\bsession_search\b", by_id["tu_describe"])
+        assert "session_search" in by_id["tu_read"]  # must-not-match: other results are user data

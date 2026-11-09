@@ -991,3 +991,93 @@ class TestBridgeSchemaFreeformObjects:
         arguments = params["properties"]["calls"]["items"]["properties"]["arguments"]
         assert arguments["type"] == "object"
         assert arguments["additionalProperties"] is True
+
+
+# ---------------------------------------------------------------------------
+# kanban.worker_defer_tools — extra deferral only inside a dispatcher-owned worker.
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerDeferTools:
+
+    def _cfg(self, kanban):
+        from tools.tool_search import _worker_defer_tools_from, ToolSearchConfig, dataclass_replace
+        config = ToolSearchConfig.from_raw({"defer": ["memory"]})
+        loaded = {"tools": {"tool_search": {"defer": ["memory"]}}, "kanban": kanban}
+        return dataclass_replace(config, worker_defer_tools=_worker_defer_tools_from(loaded))
+
+    def test_worker_defer_tools_owned_worker(self, monkeypatch):
+        monkeypatch.setattr("agent.delegation_context.owned_kanban_task", lambda: "t_x")
+        assert self._cfg({}).effective_defer_tools == {"memory", "delegate_task", "session_search"}
+
+    def test_worker_defer_tools_not_worker(self, monkeypatch):
+        # The must-not-match case: a delegated child (and any other context) inherits
+        # HERMES_KANBAN_TASK without owning the task, so it keeps the chat surface.
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_x")
+        monkeypatch.setattr("agent.delegation_context.owned_kanban_task", lambda: "")
+        assert self._cfg({}).effective_defer_tools == {"memory"}
+
+    def test_worker_defer_tools_explicit_empty_and_scalar(self, monkeypatch, caplog):
+        monkeypatch.setattr("agent.delegation_context.owned_kanban_task", lambda: "t_x")
+        assert self._cfg({"worker_defer_tools": []}).effective_defer_tools == {"memory"}
+        with caplog.at_level("WARNING", logger="tools.tool_search"):
+            got = self._cfg({"worker_defer_tools": "delegate_task"}).effective_defer_tools
+        assert got == {"memory", "delegate_task", "session_search"}
+        assert any(r.levelname == "WARNING" and "worker_defer_tools" in r.message for r in caplog.records)
+
+    def test_assemble_defers_session_search_for_worker(self, monkeypatch):
+        from model_tools import get_tool_definitions
+        from tools.tool_search import assemble_tool_defs, build_catalog, load_config_readonly
+
+        raw = get_tool_definitions(skip_tool_search_assembly=True)
+        raw_names = {td["function"]["name"] for td in raw}
+        assert {"session_search", "delegate_task"} <= raw_names
+
+        monkeypatch.setattr("agent.delegation_context.owned_kanban_task", lambda: "t_x")
+        worker = assemble_tool_defs(raw, config=load_config_readonly())
+        worker_names = {td["function"]["name"] for td in worker.tool_defs}
+        assert not ({"session_search", "delegate_task"} & worker_names)
+        # The catalog is rebuilt from the deferrable subset: the names assembly removed.
+        deferred = [td for td in raw if td["function"]["name"] not in worker_names]
+        catalog_names = {entry.name for entry in build_catalog(deferred)}
+        assert {"session_search", "delegate_task"} <= catalog_names
+
+        # Outside a worker the same two tools stay visible. The live config may defer one of
+        # them globally (this fork defers delegate_task), so compare against a config whose only
+        # extra deferral is the worker set.
+        from tools.tool_search import ToolSearchConfig, dataclass_replace
+        chat_config = dataclass_replace(
+            ToolSearchConfig.from_raw({"enabled": "on", "defer": ["memory"]}),
+            worker_defer_tools=frozenset({"delegate_task", "session_search"}))
+        monkeypatch.setattr("agent.delegation_context.owned_kanban_task", lambda: "")
+        chat = assemble_tool_defs(raw, config=chat_config)
+        chat_names = {td["function"]["name"] for td in chat.tool_defs}
+        assert {"session_search", "delegate_task"} <= chat_names
+
+
+class TestOAuthAliasRoundTrip:
+
+    def test_resolve_underlying_call_accepts_wire_alias(self):
+        from tools.tool_search import resolve_underlying_call
+        name, args, err = resolve_underlying_call(
+            {"name": "chat_history_lookup", "arguments": {"query": "x"}})
+        assert err is None and name == "session_search" and args == {"query": "x"}
+
+    def test_describe_accepts_wire_aliases_and_rejects_unknown(self, monkeypatch):
+        import json
+        from model_tools import get_tool_definitions
+        from tools.tool_search import ToolSearchConfig, dataclass_replace, dispatch_tool_describe
+        raw = get_tool_definitions(skip_tool_search_assembly=True)
+        # Describe resolves against the session's deferrable subset, so both tools must be
+        # deferred here — the live config may not defer them.
+        monkeypatch.setattr("agent.delegation_context.owned_kanban_task", lambda: "t_x")
+        config = dataclass_replace(
+            ToolSearchConfig.from_raw({"enabled": "on", "defer": ["memory", "session_search"]}),
+            worker_defer_tools=frozenset({"memory", "session_search"}))
+        monkeypatch.setattr("tools.tool_search.load_config_readonly", lambda: config)
+        described = json.loads(dispatch_tool_describe(
+            {"names": ["chat_history_lookup", "context_notes", "not_a_real_tool_xyz"]},
+            current_tool_defs=raw, config=config))
+        assert "session_search" in described["tools"] and described["tools"]["session_search"]["parameters"]
+        assert "memory" in described["tools"]
+        assert "not_a_real_tool_xyz" in described["not_found"]

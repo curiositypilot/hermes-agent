@@ -13,7 +13,7 @@ import json
 import logging
 import math
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_cli.config_defaults import DEFAULT_CONFIG
@@ -24,7 +24,8 @@ from tools.tool_search_catalog import (
     CatalogEntry, _fn, _listing_group_label, _registry_entry, _registry_toolset,
     build_catalog, build_catalog_listing_with_form, search_catalog)
 from tools.tool_search_validation import (
-    local_batch_error, normalize_tool_call_entries, not_deferrable_error, session_unavailable_error,
+    local_batch_error, normalize_tool_call_entries, not_deferrable_error, resolve_registered_tool_name,
+    session_unavailable_error,
     unavailable_in_session_reason, validate_deferred_call_args)
 from tools.connectors import CONNECTOR_BATCH_SENTINEL, is_connector_name
 from tools.connectors.search import (
@@ -52,10 +53,19 @@ class ToolSearchConfig:
     listing_max_tokens: int = 4000  # budget = min(this, threshold_pct% of context)
     # None = curated default; an explicit list replaces it wholesale ([] = defer no core tools).
     defer_tools: Optional[frozenset] = None
+    # Extra tools deferred only inside a dispatcher-owned worker (kanban.worker_defer_tools).
+    # Empty unless _config_from_loader filled it; direct construction stays empty.
+    worker_defer_tools: frozenset = frozenset()
 
     @property
     def effective_defer_tools(self) -> frozenset:
-        return _DEFAULT_DEFERRED_TOOLS if self.defer_tools is None else self.defer_tools
+        base = _DEFAULT_DEFERRED_TOOLS if self.defer_tools is None else self.defer_tools
+        if not self.worker_defer_tools:
+            return base
+        # Process-state gate, not the env var: delegate children, cron runs inside a worker and
+        # non_dispatcher_owned_context inherit HERMES_KANBAN_TASK without owning the task.
+        from agent.delegation_context import owned_kanban_task
+        return base | self.worker_defer_tools if owned_kanban_task() else base
 
     @classmethod
     def from_raw(cls, raw: Any) -> ToolSearchConfig:
@@ -110,13 +120,41 @@ def _safe_float(value: Any, fallback: float) -> float:
         return fallback
 
 
+def _worker_defer_tools_from(config: Any) -> frozenset:
+    """``kanban.worker_defer_tools`` as a name set. Absent key → the DEFAULT_CONFIG list; a
+    scalar → a warning plus that default (same contract as ``tools.tool_search.defer``)."""
+    default = frozenset(DEFAULT_CONFIG["kanban"]["worker_defer_tools"])
+    kanban_cfg = config.get("kanban") if isinstance(config, dict) else None
+    if not isinstance(kanban_cfg, dict) or "worker_defer_tools" not in kanban_cfg:
+        return default
+    raw = kanban_cfg.get("worker_defer_tools")
+    if raw is not None and not isinstance(raw, (list, tuple, set, str)):
+        logger.warning(
+            "kanban.worker_defer_tools is %r, expected a YAML list of tool names "
+            "(e.g. [delegate_task, session_search]; [] defers nothing extra for workers) - "
+            "using the default set.", raw)
+        return default
+    from agent.skill_utils import parse_config_string_list
+    names = parse_config_string_list(raw)
+    if isinstance(raw, str) and not raw.strip().startswith("["):
+        # A bare scalar string is a config typo (one name, not a list), not an opt-in.
+        logger.warning(
+            "kanban.worker_defer_tools is %r, expected a YAML list of tool names "
+            "(e.g. [delegate_task, session_search]; [] defers nothing extra for workers) - "
+            "using the default set.", raw)
+        return default
+    return frozenset(n for n in names if n)
+
+
 def _config_from_loader(loader_name: str) -> ToolSearchConfig:
     """Tool-search config via ``hermes_cli.config.<loader_name>`` (defaults on any failure)."""
     try:
         import hermes_cli.config as _cfg_mod
-        tools_cfg = (getattr(_cfg_mod, loader_name)() or {}).get("tools")
+        loaded = getattr(_cfg_mod, loader_name)() or {}
+        tools_cfg = loaded.get("tools") if isinstance(loaded, dict) else None
         tools_cfg = tools_cfg if isinstance(tools_cfg, dict) else {}
-        return ToolSearchConfig.from_raw(tools_cfg.get("tool_search"))
+        config = ToolSearchConfig.from_raw(tools_cfg.get("tool_search"))
+        return dataclass_replace(config, worker_defer_tools=_worker_defer_tools_from(loaded))
     except Exception as e:
         logger.debug("Failed to load tool-search config: %s", e)
         return ToolSearchConfig.from_raw(None)
@@ -501,8 +539,8 @@ def dispatch_tool_describe(args: dict[str, Any], *, current_tool_defs: list[dict
     names, err = _string_list_arg(
         args, "names", dedupe=True, max_items=_MAX_DESCRIBE_NAMES_PER_CALL,
         retry_hint="Retry with fewer names per call.")
-    if err:
-        return err
+    if err or names is None:
+        return err or tool_error("names is required and must be an array of strings")
     deferrable = _deferrable_in(current_tool_defs)
     by_name = {name: _fn(td) for td, name in zip(deferrable, _tool_def_names(deferrable)) if name}
     remote_schemas, hosted_failure = remote_schemas_for(names, current_tool_defs, connector_describe, call=call)
@@ -512,7 +550,8 @@ def dispatch_tool_describe(args: dict[str, Any], *, current_tool_defs: list[dict
     undescribed: list[str] = []
     errors: dict[str, str] = {}
     session_names = session_tool_names(current_tool_defs)
-    for name in names:
+    for raw_name in names:
+        name = resolve_registered_tool_name(raw_name)
         fn = by_name.get(name)
         remote_fn = remote_schemas.get(name)
         if fn is not None:
@@ -601,6 +640,7 @@ def resolve_underlying_call(args: dict[str, Any], session_tool_names: Optional[I
     entries, err = normalize_tool_call_entries(args)
     if err:
         return None, {}, err
+    entries = [{**entry, "name": resolve_registered_tool_name(entry["name"])} for entry in entries]
 
     if len(entries) > 1 and any(not is_connector_name(e["name"]) for e in entries):
         return None, {}, local_batch_error(entries)
