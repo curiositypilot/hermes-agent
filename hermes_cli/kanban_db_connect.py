@@ -886,7 +886,7 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
-    # S|M|L label for kanban.routing tier selection; NULL = unlabeled.
+    # S|M|L|XL label for kanban.routing tier selection; NULL = unlabeled.
     ("complexity", "complexity TEXT"),
     # Dated ``scheduled`` cards (kanban_db_schedule): wake time (epoch) + mode start|ask.
     ("scheduled_until", "scheduled_until INTEGER"),

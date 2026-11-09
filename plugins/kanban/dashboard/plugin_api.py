@@ -428,7 +428,7 @@ class CreateTaskBody(BaseModel):
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     reasoning_effort: Optional[str] = None  # none|minimal|…|ultra; None inherits the profile's level
-    complexity: Optional[str] = None  # S|M|L; drives kanban.routing tier selection
+    complexity: Optional[str] = None  # S|M|L|XL; drives kanban.routing tier selection
     project_id: Optional[str] = None  # None inherits the board's scoped project (if any)
 
 
@@ -549,7 +549,7 @@ class UpdateTaskBody(BaseModel):
     clear_model_override: bool = False
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
-    complexity: Optional[str] = None  # S|M|L; "none" or clear_complexity=True clears
+    complexity: Optional[str] = None  # S|M|L|XL; "none" or clear_complexity=True clears
     clear_complexity: bool = False
 
 

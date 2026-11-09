@@ -521,10 +521,11 @@ KANBAN_CREATE_SCHEMA = _schema(
         )),
         "complexity": {
             "type": "string",
-            "enum": ["S", "M", "L"],
+            "enum": ["S", "M", "L", "XL"],
             "description": (
                 "Size label for model routing: 'S' (small, localized "
-                "change), 'M' (multi-file), 'L' (broad or ambiguous). "
+                "change), 'M' (multi-file), 'L' (broad or ambiguous), "
+                "'XL' (research or architecture, not implementation). "
                 "When the board has tier routing enabled and no 'model' "
                 "is pinned, the dispatcher picks the worker model for "
                 "this tier and skips rate-limited providers. Set it on "

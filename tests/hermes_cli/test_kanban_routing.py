@@ -93,10 +93,12 @@ def test_normalize_complexity():
     assert kb.normalize_complexity("s") == "S"
     assert kb.normalize_complexity(" Medium ") == "M"
     assert kb.normalize_complexity("LARGE") == "L"
+    assert kb.normalize_complexity("xl") == "XL"
+    assert kb.normalize_complexity("X-Large") == "XL"
     for empty in (None, "", "none", "-", "NULL"):
         assert kb.normalize_complexity(empty) is None
     with pytest.raises(ValueError):
-        kb.normalize_complexity("XL")
+        kb.normalize_complexity("XXL")
 
 
 def test_create_and_set_complexity(conn):
@@ -136,12 +138,12 @@ def test_config_parses_tiers_and_drops_bad_entries():
         "enabled": True, "unlabeled": "m", "on_exhausted": "bogus", "cooldown_seconds": "60",
         "tiers": {
             "s": [{"model": "a", "provider": "p"}, {"provider": "no-model"}, "junk"],
-            "XL": [{"model": "ignored"}],
+            "XXL": [{"model": "ignored"}],
             "L": {"model": "single", "reasoning": "not-a-level"},
         },
     }})
     assert [c.model for c in cfg.tiers["S"]] == ["a"]
-    assert "XL" not in cfg.tiers
+    assert "XXL" not in cfg.tiers and set(cfg.tiers) == {"S", "L"}
     assert cfg.tiers["L"][0].model == "single" and cfg.tiers["L"][0].reasoning is None
     assert cfg.unlabeled == "M" and cfg.on_exhausted == "wait" and cfg.cooldown_seconds == 60
     assert cfg.review == ()
@@ -295,6 +297,44 @@ def test_decide_escalates_then_waits_or_falls_back(conn, monkeypatch):
     assert kr.RoutingContext(conn, _cfg()).decide(_task(complexity="S")).source == "exhausted"
     fb = kr.RoutingContext(conn, _cfg(on_exhausted="profile")).decide(_task(complexity="S"))
     assert fb.source == "profile" and fb.note == "all tier candidates unavailable"
+
+
+XL_TIER = [{"model": "deep-1", "provider": "prov-d", "reasoning": "high"},
+           {"model": "big-1", "provider": "prov-c", "reasoning": "high"}]
+
+
+def test_xl_label_routes_to_xl_tier_first_entry(conn, monkeypatch):
+    _pool(monkeypatch)
+    d = kr.RoutingContext(conn, _cfg(tiers={**TIERS, "XL": XL_TIER})).decide(_task(complexity="XL"))
+    assert d.source == "tier" and d.tier == "XL" and d.requested_tier == "XL"
+    assert (d.candidate.model, d.candidate.provider, d.candidate.reasoning) == ("deep-1", "prov-d", "high")
+
+
+def test_l_escalates_to_xl_only_when_l_is_exhausted(conn, monkeypatch):
+    cfg = _cfg(tiers={**TIERS, "XL": XL_TIER})
+    _pool(monkeypatch)
+    assert kr.RoutingContext(conn, cfg).decide(_task(complexity="L")).tier == "L"
+    _pool(monkeypatch, {"prov-c": "x"})
+    d = kr.RoutingContext(conn, cfg).decide(_task(complexity="L"))
+    assert d.source == "tier" and d.tier == "XL" and d.requested_tier == "L"
+    assert d.candidate.model == "deep-1" and "escalated from L" in d.label()
+    # XL is the top tier: nothing above it to escalate into.
+    _pool(monkeypatch, {"prov-c": "x", "prov-d": "x"})
+    assert kr.RoutingContext(conn, cfg).decide(_task(complexity="XL")).source == "exhausted"
+
+
+def test_estimator_never_assigns_xl(monkeypatch):
+    from types import SimpleNamespace
+
+    from agent import auxiliary_client
+
+    def fake_llm(**_kw):
+        msg = SimpleNamespace(content='{"est_tokens": 9, "complexity": "XL", "rationale": "deep"}')
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg)], model="aux")
+
+    monkeypatch.setattr(auxiliary_client, "call_llm", fake_llm)
+    out = kr.estimate_complexity("research the thing", None, task_id=None)
+    assert out["ok"] is True and out["complexity"] is None
 
 
 def test_decide_unlabeled_tier_and_empty_tier(conn, monkeypatch):
@@ -848,7 +888,13 @@ def test_cli_create_set_and_route(kanban_home, monkeypatch, capsys):
     assert run("route", tid, "--json") == 0
     out = json.loads(capsys.readouterr().out)
     assert out["enabled"] is True and out["task"]["model"] == "big-1"
-    assert run("set-complexity", tid, "XL") == 2
+    assert run("set-complexity", tid, "XXL") == 2
+    assert run("set-complexity", tid, "xl") == 0
+    capsys.readouterr()
+    with kbc.connect_closing() as c:
+        assert kb.get_task(c, tid).complexity == "XL"
+    assert run("set-complexity", tid, "L") == 0
+    capsys.readouterr()
 
     monkeypatch.setattr(kcli, "_kanban_config", lambda: {"routing": {"enabled": True, "tiers": TIERS,
                                                                     "review": REVIEW}})
@@ -867,7 +913,8 @@ def test_kanban_create_tool_accepts_complexity(kanban_home, monkeypatch):
     from tools import kanban_tools as kt
     from tools.kanban_tools_schemas import KANBAN_CREATE_SCHEMA
 
-    assert KANBAN_CREATE_SCHEMA["parameters"]["properties"]["complexity"]["enum"] == ["S", "M", "L"]
+    assert KANBAN_CREATE_SCHEMA["parameters"]["properties"]["complexity"]["enum"] == list(kb.VALID_COMPLEXITIES)
+    assert "XL" in kb.VALID_COMPLEXITIES
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     out = json.loads(kt._handle_create({"title": "tool card", "assignee": "w", "complexity": "m"}))
     assert out.get("ok") is not False, out

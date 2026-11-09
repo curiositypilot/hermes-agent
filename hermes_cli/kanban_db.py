@@ -116,18 +116,19 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 # Complexity labels driving ``kanban.routing`` tier selection (S = small/localized,
-# M = multi-file, L = broad or ambiguous); NULL = unlabeled.
-VALID_COMPLEXITIES = ("S", "M", "L")
+# M = multi-file, L = broad or ambiguous, XL = research/architecture/deep reasoning,
+# hand-labelled only: the estimator never assigns it); NULL = unlabeled.
+VALID_COMPLEXITIES = ("S", "M", "L", "XL")
 
 
 def normalize_complexity(value: Optional[str]) -> Optional[str]:
-    """``S``/``M``/``L`` (case-insensitive; ``small``/``medium``/``large`` accepted);
+    """``S``/``M``/``L``/``XL`` (case-insensitive; ``small``/``medium``/``large``/``xlarge`` accepted);
     empty/None/``none`` = unlabeled. Anything else raises so a typo never silently
     routes a card to the unlabeled path."""
     raw = str(value or "").strip().upper()
     if not raw or raw in {"NONE", "-", "NULL"}:
         return None
-    raw = {"SMALL": "S", "MEDIUM": "M", "LARGE": "L"}.get(raw, raw)
+    raw = {"SMALL": "S", "MEDIUM": "M", "LARGE": "L", "XLARGE": "XL", "X-LARGE": "XL"}.get(raw, raw)
     if raw in VALID_COMPLEXITIES:
         return raw
     raise ValueError(f"complexity must be one of {', '.join(VALID_COMPLEXITIES)} (or none), got {value!r}")
@@ -893,7 +894,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
-    -- Complexity label (S|M|L). When ``kanban.routing`` is enabled and the task
+    -- Complexity label (S|M|L|XL). When ``kanban.routing`` is enabled and the task
     -- has no model_override, the dispatcher picks the worker model from the
     -- label's tier list, skipping providers that are currently rate-limited.
     -- NULL = unlabeled (``kanban.routing.unlabeled`` decides).
@@ -1225,7 +1226,7 @@ def create_task(
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
     worker model (provider requires model); ``reasoning_effort`` is independent.
-    ``complexity`` (S|M|L) selects the ``kanban.routing`` tier when no model is pinned.
+    ``complexity`` (S|M|L|XL) selects the ``kanban.routing`` tier when no model is pinned.
     ``scheduled_until`` (``YYYY-MM-DD[THH:MM]`` or epoch) + ``scheduled_then``
     (start|ask) create the card already ``scheduled`` (see ``schedule_task``).
     ``creator_task_id``: inherit durable session/subscriptions independently of
@@ -1663,7 +1664,7 @@ def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optiona
 
 
 def set_complexity(conn: sqlite3.Connection, task_id: str, complexity: Optional[str], *, source: str = "user") -> bool:
-    """Set (empty/``none`` clears) the task's S|M|L label. Applies on the next
+    """Set (empty/``none`` clears) the task's S|M|L|XL label. Applies on the next
     dispatch, so settable while running. ``source`` (``user`` | ``estimator``)
     is recorded on the event so auto-labels stay distinguishable."""
     complexity = normalize_complexity(complexity)
