@@ -397,8 +397,8 @@ KANBAN_ATTACHMENTS_SCHEMA = _schema(
 KANBAN_CREATE_SCHEMA = _schema(
     "kanban_create",
     (
-        "Create a kanban task, optionally as a child of the current one "
-        "(pass the current task id in ``parents``). Orchestrators fan out "
+        "Create a kanban task, optionally as a child of the current one. "
+        "Pass the current task id in ``parents``. Orchestrators fan out "
         "with it: child tasks with specific assignees, linked into a "
         "pipeline, then complete your own task. The dispatcher picks new "
         "tasks up on its next tick and spawns the assigned profiles."

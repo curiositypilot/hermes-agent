@@ -16,8 +16,8 @@ from tools.registry import registry, tool_error
 LSP_SCHEMA = {
     "name": "lsp",
     "description": (
-        "Navigate code through the project's language server (pyright, tsserver, rust-analyzer, clangd, ...; "
-        "local git checkouts). Answers by meaning, not text: no hits from comments, strings or same-named "
+        "Navigate code through the project's language server. "
+        "Servers: pyright, tsserver, rust-analyzer, clangd (local git checkouts). Answers by meaning, not text: no hits from comments, strings or same-named "
         "symbols. definition / references / hover: give path and symbol (the identifier), plus the 1-based "
         "line it is on (omit line to use the symbol's declaration in the file, else the first occurrence the "
         "server resolves). symbols: with query, find a name "
