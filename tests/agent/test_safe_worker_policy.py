@@ -196,7 +196,7 @@ def test_safe_worker_bypasses_rule_readers_even_without_cli_flags(tmp_path, mode
         soul = load_soul_md()
         skills = build_skills_system_prompt()
         preloaded = build_preloaded_skills_prompt(["probe"])
-        hints = SubdirectoryHintTracker(str(project)).check_tool_call("read_file", {"path": str(sub / "file.py")})
+        hints = SubdirectoryHintTracker(str(project)).check_tool_call("patch", {"path": str(sub / "file.py")})
         from agent.agent_init import _init_memory, _select_context_engine
         from types import SimpleNamespace
         agent = SimpleNamespace(enabled_toolsets=["memory"], disabled_toolsets=[])
