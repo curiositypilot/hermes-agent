@@ -321,7 +321,7 @@ hermes kanban list
 hermes kanban stats
 ```
 
-When the dispatcher picks up `t_abcd` and spawns the `researcher` profile, the very first thing that worker's model does is call `kanban_show()` to read its task. It doesn't run `hermes kanban show t_abcd`.
+When the dispatcher picks up `t_abcd` and spawns the `researcher` profile, the first message that worker's model sees is its task card (`build_worker_context`); it calls `kanban_show()` only to re-read after a compaction, to read events or run history, or to inspect another card. It doesn't run `hermes kanban show t_abcd`.
 
 ### Gateway-embedded dispatcher (default)
 
@@ -483,7 +483,7 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 
 | Tool | Purpose | Required params |
 |---|---|---|
-| `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
+| `kanban_show` | Read a task (full pre-formatted `worker_context`, events, runs). Defaults to the env's task id. A worker's first message already carries its card, so the reply omits the body, comments and run text that `worker_context` renders in full (named in `deduped`; heartbeat events become `heartbeats`); text past a `worker_context` cap stays raw. `raw: true` returns the unreduced payload. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
@@ -585,7 +585,7 @@ does exist, such as source URLs, issue ids, or manual review steps.
 
 Every profile that works kanban tasks automatically gets the worker lifecycle — it's injected into the worker's system prompt at spawn (the `KANBAN_GUIDANCE` block), so there is **nothing to install or configure**. It teaches the worker the full lifecycle in **tool calls**, not CLI commands:
 
-1. On spawn, call `kanban_show()` to read title + body + parent handoffs + prior attempts + full comment thread.
+1. On spawn, read the card in your first message: title + body + completion contract + parent handoffs + prior attempts + comment thread + child ids.
 2. `cd $HERMES_KANBAN_WORKSPACE` (via the terminal tool) and do the work there.
 3. Call `kanban_heartbeat(note="...")` every few minutes during long operations. **If your work may run longer than 1 hour, call `kanban_heartbeat` at least once an hour** — the dispatcher reclaims tasks that have been running past `kanban.dispatch_stale_timeout_seconds` (default 4 h) with no heartbeat in the last hour, on the assumption the worker crashed without cleanup. A reclaim is benign (the task goes back to `ready` for re-dispatch without a failure-counter tick) but you lose your current run's progress.
 4. Complete with `kanban_complete(summary="...", metadata={...})`, hand a code change off for same-card review with `kanban_request_review(summary="...")`, or `kanban_block(reason="...")` if stuck.

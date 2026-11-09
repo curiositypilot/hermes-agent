@@ -84,7 +84,58 @@ def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
     )
 
 
-def _ctx_header(lines: list[str], task: Task) -> None:
+_CTX_MAX_CHILDREN = 20  # first N child ids shown in the header; the rest is "(+N more)"
+
+
+def _ctx_children_line(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """``Children: t_x (status, title up to 60 chars), ...`` — first 20, then ``(+N more)``."""
+    child_ids = _kb.child_ids(conn, task_id)
+    if not child_ids:
+        return None
+    shown = child_ids[:_CTX_MAX_CHILDREN]
+    parts = []
+    for cid in shown:
+        ct = _kb.get_task(conn, cid)
+        if ct:
+            title = (ct.title or "")[:60]
+            parts.append(f"{cid} ({ct.status}, {title})")
+        else:
+            parts.append(cid)
+    line = "Children: " + ", ".join(parts)
+    omitted = len(child_ids) - len(shown)
+    if omitted:
+        line += f" (+{omitted} more)"
+    return line
+
+
+def ctx_renders_in_full(task: Task, comments: list, runs: list) -> set[str]:
+    """Which of ``task.body`` / ``comments`` / ``runs`` ``build_worker_context`` renders
+    uncut, so a caller that also returns the worker_context can send that text once.
+
+    Mirrors the caps above: a body over ``_CTX_MAX_BODY_BYTES``, more than
+    ``_CTX_MAX_COMMENTS`` comments or one over ``_CTX_MAX_COMMENT_BYTES``, more than
+    ``_CTX_MAX_PRIOR_ATTEMPTS`` ended runs or a run field over ``_CTX_MAX_FIELD_BYTES`` is
+    cut or dropped there, so it is left out of the set and the caller keeps the raw text.
+    """
+    full: set[str] = set()
+    if task.body and len(task.body.strip()) <= _CTX_MAX_BODY_BYTES:
+        full.add("task.body")
+    if len(comments) <= _CTX_MAX_COMMENTS and all(
+        len((c.body or "").strip()) <= _CTX_MAX_COMMENT_BYTES for c in comments
+    ):
+        full.add("comments")
+    ended = [r for r in runs if r.ended_at is not None]
+    if len(ended) <= _CTX_MAX_PRIOR_ATTEMPTS and all(
+        len((r.summary or "").strip()) <= _CTX_MAX_FIELD_BYTES
+        and len((r.error or "").strip()) <= _CTX_MAX_FIELD_BYTES
+        and len(json.dumps(r.metadata or {}, ensure_ascii=False, sort_keys=True)) <= _CTX_MAX_FIELD_BYTES
+        for r in ended
+    ):
+        full.add("runs")
+    return full
+
+
+def _ctx_header(lines: list[str], task: Task, conn: sqlite3.Connection) -> None:
     lines.append(f"# Kanban task {task.id}: {task.title}")
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
@@ -102,6 +153,11 @@ def _ctx_header(lines: list[str], task: Task) -> None:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    if task.completion_contract:
+        lines.append(f"Completion contract: {task.completion_contract}")
+    children_line = _ctx_children_line(conn, task.id)
+    if children_line:
+        lines.append(children_line)
     lines.append("")
     if task.body and task.body.strip():
         lines.append("## Body")
