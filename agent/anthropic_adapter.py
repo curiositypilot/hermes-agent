@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from utils import normalize_proxy_env_vars
 
 from agent.anthropic_credentials import _is_oauth_token, anthropic_route_is_oauth, is_native_anthropic_host
+from tools.tool_search_catalog import TOOL_DESCRIBE_NAME, TOOL_SEARCH_NAME
 from agent.anthropic_endpoints import (
     _base_url_needs_context_1m_beta, _is_azure_anthropic_endpoint, _is_kimi_coding_endpoint,
     _is_minimax_anthropic_endpoint, _is_nous_portal_endpoint, _is_opencode_endpoint,
@@ -607,11 +608,50 @@ def _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_
             tool["name"] = to_wire(tool["name"])
         if isinstance(tool.get("description"), str):
             tool["description"] = _apply_oauth_prose_aliases(tool["description"])  # prose-safe aliases only
+    describe_ids: set = set()
     for msg in anthropic_messages:
+        # tool_result blocks land in the FOLLOWING user message, so the ids are collected
+        # across the whole request, not per message.
+        describe_ids |= _bridge_describe_tool_use_ids(msg)
         for block in msg.get("content") if isinstance(msg.get("content"), list) else []:
             if isinstance(block, dict) and block.get("type") == "tool_use" and "name" in block:
                 block["name"] = to_wire(block["name"])  # tool_result pairs by id, not name
+    for msg in anthropic_messages:
+        for block in msg.get("content") if isinstance(msg.get("content"), list) else []:
+            if (isinstance(block, dict) and block.get("type") == "tool_result"
+                    and block.get("tool_use_id") in describe_ids):
+                # A describe/search result carries the raw schema, including the two names the
+                # OAuth billing classifier fingerprints. Only these two results are rewritten:
+                # every other tool_result is user data.
+                _alias_tool_result_text(block)
     return system
+
+
+def _bridge_describe_tool_use_ids(msg: dict) -> set:
+    """Ids of ``tool_use`` blocks in ``msg`` whose underlying tool is tool_search/tool_describe.
+
+    Matched before the rename so a wire-aliased replay still pairs; the mcp__ prefix the OAuth
+    path adds is stripped the same way normalize_response strips it.
+    """
+    ids = set()
+    for block in msg.get("content") if isinstance(msg.get("content"), list) else []:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        name = str(block.get("name") or "").removeprefix(_MCP_TOOL_PREFIX)
+        name = _OAUTH_TOOL_NAME_REVERSE_ALIASES.get(name, name)
+        if name in (TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME) and block.get("id"):
+            ids.add(block["id"])
+    return ids
+
+
+def _alias_tool_result_text(block: dict) -> None:
+    """Rewrite prose-safe tool-name tokens inside one tool_result block, both content shapes."""
+    if isinstance(block.get("content"), str):
+        block["content"] = _apply_oauth_prose_aliases(block["content"])
+    elif isinstance(block.get("content"), list):
+        for part in block["content"]:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                part["text"] = _apply_oauth_prose_aliases(part["text"])
 
 
 def _thinking_kwargs(reasoning_config: dict[str, Any], model: str, effective_max_tokens: int) -> dict[str, Any]:

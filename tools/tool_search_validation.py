@@ -210,6 +210,21 @@ def local_batch_error(entries: list[dict[str, Any]]) -> str:
     )
 
 
+def resolve_registered_tool_name(name: str) -> str:
+    """The registry name behind ``name``: itself when registered, else the OAuth wire-alias
+    reverse map (``chat_history_lookup`` → ``session_search``, ``context_notes`` → ``memory``).
+
+    The OAuth wire renames tools in tools[] and prose, but bridge arguments travel inside
+    ``tool_call``/``tool_describe`` payloads the adapter never rewrites, so a model that saw the
+    wire name must still resolve. Unregistered and unaliased names pass through unchanged.
+    """
+    if _registry_entry(name) is not None:
+        return name
+    from agent.anthropic_adapter import _OAUTH_TOOL_NAME_REVERSE_ALIASES
+    underlying = _OAUTH_TOOL_NAME_REVERSE_ALIASES.get(name)
+    return underlying if underlying and _registry_entry(underlying) is not None else name
+
+
 def unavailable_in_session_reason(name: str) -> str:
     """Why a registered tool absent from THIS session cannot be reached, whatever its door.
 
