@@ -210,7 +210,8 @@ _SPECS = [
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
         _arg("--complexity", type=str.upper, choices=list(kb.VALID_COMPLEXITIES),
-             help="Complexity label (S=small/localized, M=multi-file, L=broad/ambiguous). "
+             help="Complexity label (S=small/localized, M=multi-file, L=broad/ambiguous, "
+                  "XL=research/architecture). "
                   "With kanban.routing enabled and no --model pin, the dispatcher picks the "
                   "worker model from this tier's list, skipping rate-limited providers."),
         _arg("--completion-contract", metavar="CONTRACT",
@@ -278,7 +279,7 @@ _SPECS = [
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
     _cmd("set-complexity", [
         _TASK_ID,
-        _arg("complexity", help="S, M, L (or 'none' to clear)"),
+        _arg("complexity", help="S, M, L, XL (or 'none' to clear)"),
     ], help="Set or clear a task's complexity label (drives kanban.routing tier selection on the next dispatch)"),
     _cmd("route", [
         _arg("task_id", nargs="?", help="Show the routing decision for this task (omit for tier availability only)"),
