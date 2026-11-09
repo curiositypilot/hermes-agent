@@ -1692,3 +1692,94 @@ class TestDefaultTaskId:
         assert kt._default_task_id("") == worker_env
         assert kt._default_task_id("   ") == worker_env
         assert kt._default_task_id(None) == worker_env
+
+
+# ---------------------------------------------------------------------------
+# kanban_show dedup: send text once (worker_context), keep anything it cuts
+# ---------------------------------------------------------------------------
+
+def _seed_show(worker_env, *, body=None, comments=(), ended_run=None, events=()):
+    """Write the given card state; ``ended_run`` = kwargs for ``_end_run``."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    try:
+        if body is not None:
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, worker_env))
+        for text in comments:
+            kb.add_comment(conn, worker_env, author="w", body=text)
+        with kb.write_txn(conn):
+            for kind in events:
+                kb._append_event(conn, worker_env, kind)
+            if ended_run:
+                kb._end_run(conn, worker_env, **ended_run)
+    finally:
+        conn.close()
+
+
+def _show(args=None):
+    from tools import kanban_tools as kt
+    return json.loads(kt._handle_show(args or {}))
+
+
+def test_show_omits_text_worker_context_renders_in_full(worker_env):
+    _seed_show(worker_env, body="short body", comments=("comment one", "comment two"),
+               ended_run={"outcome": "crashed", "summary": "run summary text", "error": "run error text",
+                          "metadata": {"k": "run-meta-value"}})
+    out = _show()
+    assert "body" not in out["task"]
+    assert out["comments"] == []
+    ended = [r for r in out["runs"] if r["ended_at"] is not None]
+    assert ended and all(not ({"summary", "error", "metadata"} & r.keys()) for r in ended)
+    assert ended[0]["outcome"] == "crashed" and ended[0]["id"]
+    assert {"task.body", "comments", "runs.summary/error/metadata"} <= set(out["deduped"])
+    for text in ("short body", "comment one", "comment two", "run summary text",
+                 "run error text", "run-meta-value"):
+        assert text in out["worker_context"]
+
+
+@pytest.mark.parametrize("what", ["body", "comment", "comment_count", "run_summary", "run_metadata"])
+def test_show_keeps_text_worker_context_cuts(worker_env, what):
+    big = 9 * 1024
+    seeds = {
+        "body": dict(body="B" * big),
+        "comment": dict(comments=("C" * (3 * 1024),)),
+        "comment_count": dict(comments=tuple(f"c{i}" for i in range(31))),
+        "run_summary": dict(ended_run={"outcome": "crashed", "summary": "S" * (5 * 1024)}),
+        "run_metadata": dict(ended_run={"outcome": "crashed", "metadata": {"m": "M" * (5 * 1024)}}),
+    }
+    _seed_show(worker_env, **seeds[what])
+    out = _show()
+    ended = [r for r in out["runs"] if r["ended_at"] is not None]
+    if what == "body":
+        assert out["task"]["body"] == "B" * big and "task.body" not in out.get("deduped", [])
+    elif what == "comment":
+        assert out["comments"][0]["body"] == "C" * (3 * 1024)
+    elif what == "comment_count":
+        assert [c["body"] for c in out["comments"]] == [f"c{i}" for i in range(31)]
+    elif what == "run_summary":
+        assert ended[0]["summary"] == "S" * (5 * 1024)
+    else:
+        assert ended[0]["metadata"]["m"] == "M" * (5 * 1024)
+
+
+def test_show_raw_returns_full_payload(worker_env):
+    _seed_show(worker_env, body="short body", comments=("a comment",), events=("heartbeat",),
+               ended_run={"outcome": "crashed", "summary": "finished"})
+    out = _show({"raw": True})
+    assert out["task"]["body"] == "short body"
+    assert [c["body"] for c in out["comments"]] == ["a comment"]
+    assert [r["summary"] for r in out["runs"] if r["ended_at"] is not None] == ["finished"]
+    assert any(e["kind"] == "heartbeat" for e in out["events"])
+    assert "deduped" not in out and "heartbeats" not in out
+
+
+def test_show_heartbeats_leave_events(worker_env):
+    _seed_show(worker_env, events=("heartbeat",) * 3 + ("unblocked",))
+    out = _show()
+    assert out["heartbeats"]["count"] == 3 and out["heartbeats"]["last_at"]
+    assert not any(e["kind"] == "heartbeat" for e in out["events"])
+    assert any(e["kind"] == "unblocked" for e in out["events"])
+    assert "events.heartbeat" in out["deduped"]

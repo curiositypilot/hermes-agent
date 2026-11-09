@@ -118,6 +118,19 @@ def test_kanban_guidance_says_background_work_ends_with_the_run():
     assert "persist_on_release" in KANBAN_GUIDANCE
 
 
+def test_kanban_guidance_card_is_first_message_but_reread_stays():
+    """The dispatcher puts the card in the first message; the guidance must not order a
+    redundant opening call, yet still name the re-read cases (compaction, truncation
+    markers the card shows, events/runs)."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "first message is the card" in KANBAN_GUIDANCE
+    assert "`kanban_show()` first" not in KANBAN_GUIDANCE
+    assert "kanban_show()" in KANBAN_GUIDANCE and "compaction" in KANBAN_GUIDANCE
+    for marker in ("[truncated", "earlier comments omitted", "(+N more)"):
+        assert marker in KANBAN_GUIDANCE
+
+
 @pytest.mark.parametrize("stores", [(True, True), (False, True), (True, False), (False, False)])
 @pytest.mark.parametrize("names", [
     set(), {"memory"}, {"memory", "skill_view", "skills_list"},
