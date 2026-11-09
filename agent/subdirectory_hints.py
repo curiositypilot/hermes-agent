@@ -7,12 +7,14 @@ CWD-only loading in ``prompt_builder.py``."""
 import hashlib
 import logging
 import os
+import re
 import shlex
 from pathlib import Path
 from typing import Dict, Any, Optional, Set
 
 from agent.prompt_builder import _read_text_with_timeout, _scan_context_content, _truncate_content
 from agent.search_policy import SEARCH_PRUNE_DIR_NAMES
+from agent.tool_result_classification import FILE_MUTATING_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,72 @@ def _nav_targets(cmd: str) -> list:
     return targets
 
 
+# A look (read, search, `ls`) gets a one-line pointer; a write gets the file. A `terminal` command writes when it
+# edits in place, applies a patch, tees, redirects to a real file, or runs inline Python that writes. `execute_code`
+# takes no path argument, so it yields no directory here and is never a write-path call.
+_INPLACE_FLAG = {"sed": re.compile(r"^(?:-[nEersuz]*i|--in-place)"), "perl": re.compile(r"^-[pnla]*i")}
+_GIT_WRITE_SUBCOMMANDS = frozenset({"apply", "am", "cherry-pick", "merge", "restore"})
+_GIT_OPTIONS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
+_REDIRECT_OPERATORS = frozenset({">", ">>", "&>", "&>>", ">|", ">&"})
+_PYTHON_WRITE_MARKERS = ("write_text(", ".write(")
+
+
+def _git_writes(args: list) -> bool:
+    """True for `git [-C dir] apply|am|cherry-pick|merge|restore|stash pop|stash apply`."""
+    rest = iter(args)
+    for token in rest:
+        if token in _GIT_OPTIONS_WITH_VALUE:
+            next(rest, None)
+        elif not token.startswith("-"):
+            if token == "stash":
+                return next((t for t in rest if not t.startswith("-")), "") in ("pop", "apply")
+            return token in _GIT_WRITE_SUBCOMMANDS
+    return False
+
+
+def _redirect_writes(operator: str, following: list) -> bool:
+    """`>`/`>>` to anything but /dev/null; `2>&1` and `>&2` duplicate a descriptor, not a file."""
+    target = following[0] if following else ""
+    if operator == ">&" and (target.isdigit() or target == "-"):
+        return False
+    return target != "/dev/null"
+
+
+def _segment_writes(segment: list) -> bool:
+    for idx, token in enumerate(segment):
+        name = token.rsplit("/", 1)[-1]
+        if name in _INPLACE_FLAG and any(_INPLACE_FLAG[name].match(t) for t in segment[idx + 1:]):
+            return True
+        if name == "tee" and (idx == 0 or segment[idx - 1] in ("sudo", "xargs")):
+            return True
+        if name == "git" and _git_writes(segment[idx + 1:]):
+            return True
+        if token in _REDIRECT_OPERATORS and _redirect_writes(token, segment[idx + 1:idx + 2]):
+            return True
+    return False
+
+
+def _command_writes(cmd: str) -> bool:
+    """Whether a shell command changes files. Redirects are judged on lexer tokens, so a quoted `'a>b'` is prose."""
+    if any(marker in cmd for marker in _PYTHON_WRITE_MARKERS):
+        return True
+    lexer = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    segment: list = []
+    for token in tokens + [";"]:
+        if token not in _SHELL_OPERATORS:
+            segment.append(token)
+        elif segment:
+            if _segment_writes(segment):
+                return True
+            segment = []
+    return False
+
+
 # A container cwd is not a host path: a docker/local session whose working dir is the backend
 # container's default /home (or /root) home must not start hint discovery either — the same
 # vacuous-containment hazard as the desktop home pin, just container-shaped (#76902).
@@ -155,6 +223,9 @@ class SubdirectoryHintTracker:
         self._home_is_working_dir = _is_home_like_working_dir(self.working_dir)
         # The working dir is pre-marked loaded (startup context handles it).
         self._loaded_dirs: set[Path] = {self.working_dir}
+        # Directories whose hint file was named by a one-line pointer but not delivered. A later write
+        # promotes them to loaded (the file arrives once); nothing demotes a loaded directory.
+        self._pointed_dirs: set[Path] = set()
         # Content digests already injected: the same file reached through
         # symlinks/hardlinks/copies is never re-sent. Seeded with the CWD hint
         # file prompt_builder already loaded.
@@ -179,35 +250,55 @@ class SubdirectoryHintTracker:
         # Fresh anchor, fresh bookkeeping: the new project's directories get their
         # own first-visit hints (startup never loaded context files for it).
         self._loaded_dirs = {self.working_dir}
+        self._pointed_dirs = set()
         self._loaded_digests = set()
         found = _first_hint_file(self.working_dir)
         if found and found[1]:
             self._loaded_digests.add(_digest(found[1]))
 
     def check_tool_call(self, tool_name: str, tool_args: dict[str, Any]) -> Optional[str]:
-        """Return formatted hint text for newly visited directories, or None."""
+        """Hint text for newly visited directories, or None. A write (``patch``/``write_file``, or a
+        ``terminal`` command that edits files) delivers each directory's file once; any other call
+        appends a one-line pointer per directory. A write touching several unvisited ancestor levels
+        delivers every file (each at most once per session, ``_MAX_HINT_CHARS`` apiece)."""
         from agent.safe_worker_policy import safe_worker_enabled
 
         if not self.enabled or safe_worker_enabled():
             return None
         if self._home_is_working_dir:
             return None
-        all_hints = [h for d in self._extract_directories(tool_name, tool_args) if (h := self._load_hints_for_directory(d))]
-        return "\n\n" + "\n\n".join(all_hints) if all_hints else None
+        write = self._is_write_call(tool_name, tool_args)
+        directories = sorted(self._extract_directories(tool_name, tool_args, write), key=str)
+        all_hints = [h for d in directories if (h := self._load_hints_for_directory(d, deliver=write))]
+        return "\n\n" + ("\n\n" if write else "\n").join(all_hints) if all_hints else None
 
-    def _extract_directories(self, tool_name: str, args: dict[str, Any]) -> list:
-        """Extract directory paths from tool call arguments."""
+    @staticmethod
+    def _is_write_call(tool_name: str, args: dict[str, Any]) -> bool:
+        if tool_name in FILE_MUTATING_TOOL_NAMES:
+            return True
+        cmd = args.get("command") if tool_name in _COMMAND_TOOLS else None
+        return isinstance(cmd, str) and _command_writes(cmd)
+
+    def _extract_directories(self, tool_name: str, args: dict[str, Any], write: bool = False) -> list:
+        """Extract directory paths from tool call arguments. A look skips pointed directories (already
+        named); a write keeps them, because the file is still owed."""
         candidates: set[Path] = set()
+        skip = self._loaded_dirs if write else self._loaded_dirs | self._pointed_dirs
         for key in _PATH_ARG_KEYS:
             val = args.get(key)
             if isinstance(val, str) and val.strip():
-                self._add_path_candidate(val, candidates)
+                self._add_path_candidate(val, candidates, skip)
+        if tool_name in FILE_MUTATING_TOOL_NAMES:
+            # V4A patches carry their targets in the patch body, not in a path argument.
+            from agent.tool_dispatch_helpers import _extract_file_mutation_targets
+            for target in _extract_file_mutation_targets(tool_name, args):
+                self._add_path_candidate(target, candidates, skip)
         cmd = args.get("command", "") if tool_name in _COMMAND_TOOLS else None
         if isinstance(cmd, str):
-            self._extract_paths_from_command(cmd, candidates)
+            self._extract_paths_from_command(cmd, candidates, skip)
         return list(candidates)
 
-    def _add_path_candidate(self, raw_path: str, candidates: set[Path]):
+    def _add_path_candidate(self, raw_path: str, candidates: set[Path], skip: Optional[set[Path]] = None):
         """Add a raw path's directory and its ancestors (up to ``_MAX_ANCESTOR_WALK``
         levels, stopping at the first already-loaded dir) so reading
         ``project/src/main.py`` still discovers ``project/AGENTS.md``."""
@@ -218,8 +309,9 @@ class SubdirectoryHintTracker:
             p = p.resolve()
             if p.suffix or (p.exists() and p.is_file()):
                 p = p.parent
+            skip = self._loaded_dirs if skip is None else skip
             for _ in range(_MAX_ANCESTOR_WALK):
-                if p in self._loaded_dirs:
+                if p in skip:
                     break
                 if self._is_valid_subdir(p):
                     candidates.add(p)
@@ -229,7 +321,7 @@ class SubdirectoryHintTracker:
         except (OSError, ValueError, RuntimeError):
             pass
 
-    def _extract_paths_from_command(self, cmd: str, candidates: set[Path]):
+    def _extract_paths_from_command(self, cmd: str, candidates: set[Path], skip: Optional[set[Path]] = None):
         """Extract path-like tokens (contain / or .; not flags or URLs) from a shell command."""
         try:
             tokens = shlex.split(cmd)
@@ -240,11 +332,11 @@ class SubdirectoryHintTracker:
         # START of a shell segment counts (`echo cd backend` is prose); punctuation-aware tokenizing keeps
         # a quoted `'backend;'` literal while splitting bare `backend;ls` at the operator.
         for target in _nav_targets(cmd):
-            self._add_path_candidate(target, candidates)
+            self._add_path_candidate(target, candidates, skip)
         for token in tokens:
             if token.startswith(("-", "http://", "https://", "git@")) or ("/" not in token and "." not in token):
                 continue
-            self._add_path_candidate(token, candidates)
+            self._add_path_candidate(token, candidates, skip)
 
     def _within_working_dir(self, path: Path) -> bool:
         """Reject paths outside the working-dir tree: loading ~/.codex/AGENTS.md
@@ -277,9 +369,11 @@ class SubdirectoryHintTracker:
             return True  # outside the tree — already rejected upstream
         return any(part in _EXCLUDED_DIR_NAMES for part in rel_parts)
 
-    def _load_hints_for_directory(self, directory: Path) -> Optional[str]:
-        """Load the first hint file in *directory*; formatted text or None."""
-        self._loaded_dirs.add(directory)
+    def _load_hints_for_directory(self, directory: Path, deliver: bool = True) -> Optional[str]:
+        """Load the first hint file in *directory*: formatted text, or with ``deliver=False`` a one-line
+        pointer (the file stays owed, so a later write still delivers it). None when nothing is owed."""
+        self._pointed_dirs.discard(directory)
+        self._loaded_dirs.add(directory)  # decided, unless a pointer is returned below
         if self._home_is_working_dir or not self._within_working_dir(directory):
             logger.debug("Skipping hint files in %s — outside working_dir %s", directory, self.working_dir)
             return None
@@ -300,6 +394,11 @@ class SubdirectoryHintTracker:
                 if digest in self._loaded_digests:
                     logger.debug("Skipping duplicate hint content at %s (digest %s)", hint_path, digest[:12])
                     return None
+                if not deliver:
+                    line = self._pointer_line(directory, filename, target)
+                    self._loaded_dirs.discard(directory)
+                    self._pointed_dirs.add(directory)
+                    return line
                 self._loaded_digests.add(digest)
                 # Same security scan as startup context loading.
                 content = _scan_context_content(content, filename)
@@ -312,6 +411,12 @@ class SubdirectoryHintTracker:
             except Exception as exc:
                 logger.debug("Could not read %s: %s", hint_path, exc)
         return None
+
+    def _pointer_line(self, directory: Path, filename: str, target: Path) -> str:
+        """The look-path stand-in for a hint file. It must tell the worker to read the file first: an edit
+        made through `terminal` that names no directory sees only this line."""
+        size_kb = target.stat().st_size / 1024
+        return f"[{filename} in {self._display_path(directory)}/ ({size_kb:.1f} KB): read it before changing or running code there]"
 
     def _display_path(self, hint_path: Path) -> str:
         """Working-dir-relative, else ``~/``-relative (POSIX rendering so Windows

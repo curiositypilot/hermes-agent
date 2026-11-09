@@ -52,7 +52,7 @@ class TestSubdirectoryHintTracker:
         """Frontend CLAUDE.md should be discovered."""
         tracker = SubdirectoryHintTracker(working_dir=str(project))
         result = tracker.check_tool_call(
-            "read_file", {"path": str(project / "frontend" / "index.ts")}
+            "patch", {"path": str(project / "frontend" / "index.ts")}
         )
         assert result is not None
         assert "Frontend rules" in result
@@ -61,18 +61,18 @@ class TestSubdirectoryHintTracker:
         """A session that skips context files (cron without a workdir) must not have the same
         files spliced into tool results, where they leak into exact-output deliveries (#9441)."""
         tracker = SubdirectoryHintTracker(working_dir=str(project), enabled=False)
-        assert tracker.check_tool_call("read_file", {"path": str(project / "frontend" / "index.ts")}) is None
+        assert tracker.check_tool_call("patch", {"path": str(project / "frontend" / "index.ts")}) is None
 
     def test_no_duplicate_loading(self, project):
         """Same directory should not be loaded twice."""
         tracker = SubdirectoryHintTracker(working_dir=str(project))
         result1 = tracker.check_tool_call(
-            "read_file", {"path": str(project / "frontend" / "a.ts")}
+            "patch", {"path": str(project / "frontend" / "a.ts")}
         )
         assert result1 is not None
 
         result2 = tracker.check_tool_call(
-            "read_file", {"path": str(project / "frontend" / "b.ts")}
+            "patch", {"path": str(project / "frontend" / "b.ts")}
         )
         assert result2 is None  # already loaded
 
@@ -84,7 +84,7 @@ class TestSubdirectoryHintTracker:
         """`cd backend` has no `/` or `.` yet names a subdirectory; its AGENTS.md must load (#11032)."""
         tracker = SubdirectoryHintTracker(working_dir=str(project))
         result = tracker.check_tool_call("terminal", {"command": command})
-        assert result is not None and "Backend-specific instructions" in result
+        assert result is not None and "AGENTS.md in backend/" in result
 
     @pytest.mark.parametrize("command", ["echo cd backend", "printf '%s %s' cd backend", "cd 'backend;'"])
     def test_cd_as_an_argument_or_a_quoted_other_name_is_not_navigation(self, project, command):
@@ -97,7 +97,7 @@ class TestSubdirectoryHintTracker:
         """Relative paths resolved against working_dir."""
         tracker = SubdirectoryHintTracker(working_dir=str(project))
         result = tracker.check_tool_call(
-            "read_file", {"path": "frontend/index.ts"}
+            "patch", {"path": "frontend/index.ts"}
         )
         assert result is not None
         assert "Frontend rules" in result
@@ -113,7 +113,7 @@ class TestSubdirectoryHintTracker:
             "terminal", {"command": "ls", "workdir": str(project / "frontend")}
         )
         assert result is not None
-        assert "Frontend rules" in result
+        assert "CLAUDE.md in frontend/" in result
 
 
 
@@ -130,7 +130,7 @@ class TestSubdirectoryHintTracker:
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
         drain_truncation_warnings()
         with caplog.at_level(logging.WARNING, logger="agent.prompt_builder"):
-            result = tracker.check_tool_call("read_file", {"path": str(sub / "file.py")})
+            result = tracker.check_tool_call("patch", {"path": str(sub / "file.py")})
         assert result is not None
         assert "HEAD-MARKER" in result and "TAIL-MARKER" in result
         assert "truncated AGENTS.md" in result and str(Path("bigdir") / "AGENTS.md") in result
@@ -148,14 +148,14 @@ class TestSubdirectoryHintTracker:
         body = "# Gateway rules\n" + ("- rule\n" * 1500)   # ~12k chars: over the OLD 8k cap, under the new one
         (sub / "AGENTS.md").write_text(body, encoding="utf-8")
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
-        result = tracker.check_tool_call("read_file", {"path": str(sub / "run.py")})
+        result = tracker.check_tool_call("patch", {"path": str(sub / "run.py")})
         assert result is not None and "truncated" not in result.lower()
         assert result.endswith(body.strip())
 
     def test_empty_args(self, project):
         """Empty args should not crash."""
         tracker = SubdirectoryHintTracker(working_dir=str(project))
-        assert tracker.check_tool_call("read_file", {}) is None
+        assert tracker.check_tool_call("patch", {}) is None
         assert tracker.check_tool_call("terminal", {"command": ""}) is None
 
 
@@ -185,7 +185,7 @@ class TestSubdirectoryHintTracker:
         start = time.monotonic()
         with caplog.at_level("WARNING", logger="agent.prompt_builder"):
             result = tracker.check_tool_call(
-                "read_file", {"path": str(project / "backend" / "src" / "main.py")}
+                "patch", {"path": str(project / "backend" / "src" / "main.py")}
             )
         elapsed = time.monotonic() - start
 
@@ -223,7 +223,7 @@ class TestPermissionErrorHandling:
         with patch.object(Path, "is_dir", patched_is_dir):
             # Should not raise — gracefully skip the inaccessible directory
             result = tracker.check_tool_call(
-                "read_file", {"path": str(project / "backend" / "src" / "main.py")}
+                "patch", {"path": str(project / "backend" / "src" / "main.py")}
             )
             # Result may be None (backend skipped) — the key point is no crash
             assert result is None or isinstance(result, str)
@@ -260,8 +260,8 @@ class TestContentDeduplication:
         (mirror / "AGENTS.md").symlink_to(real / "AGENTS.md")
 
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
-        first = tracker.check_tool_call("read_file", {"path": str(real / "x.py")})
-        second = tracker.check_tool_call("read_file", {"path": str(mirror / "y.py")})
+        first = tracker.check_tool_call("patch", {"path": str(real / "x.py")})
+        second = tracker.check_tool_call("patch", {"path": str(mirror / "y.py")})
 
         assert first is not None
         assert "Shared workspace instructions" in first
@@ -277,8 +277,8 @@ class TestContentDeduplication:
         (b / "AGENTS.md").write_text("Same content", encoding="utf-8")
 
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
-        assert tracker.check_tool_call("read_file", {"path": str(a / "f.py")}) is not None
-        assert tracker.check_tool_call("read_file", {"path": str(b / "f.py")}) is None
+        assert tracker.check_tool_call("patch", {"path": str(a / "f.py")}) is not None
+        assert tracker.check_tool_call("patch", {"path": str(b / "f.py")}) is None
 
     def test_differing_content_still_injected(self, tmp_path):
         """Dedupe must not suppress genuinely different context."""
@@ -290,8 +290,8 @@ class TestContentDeduplication:
         (b / "AGENTS.md").write_text("Beta rules", encoding="utf-8")
 
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
-        first = tracker.check_tool_call("read_file", {"path": str(a / "f.py")})
-        second = tracker.check_tool_call("read_file", {"path": str(b / "f.py")})
+        first = tracker.check_tool_call("patch", {"path": str(a / "f.py")})
+        second = tracker.check_tool_call("patch", {"path": str(b / "f.py")})
 
         assert first is not None and "Alpha rules" in first
         assert second is not None and "Beta rules" in second
@@ -304,7 +304,7 @@ class TestContentDeduplication:
         (elsewhere / "AGENTS.md").write_text("Root instructions", encoding="utf-8")
 
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
-        assert tracker.check_tool_call("read_file", {"path": str(elsewhere / "f.py")}) is None
+        assert tracker.check_tool_call("patch", {"path": str(elsewhere / "f.py")}) is None
 
 
 class TestExcludedDirectories:
@@ -320,7 +320,7 @@ class TestExcludedDirectories:
         (target / "AGENTS.md").write_text("Stale archived instructions", encoding="utf-8")
 
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
-        assert tracker.check_tool_call("read_file", {"path": str(target / "f.py")}) is None
+        assert tracker.check_tool_call("patch", {"path": str(target / "f.py")}) is None
 
     def test_excluded_ancestor_blocks_descendant(self, tmp_path):
         """A hint nested under an excluded ancestor is still skipped."""
@@ -329,7 +329,7 @@ class TestExcludedDirectories:
         (deep / "AGENTS.md").write_text("Archived", encoding="utf-8")
 
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
-        assert tracker.check_tool_call("read_file", {"path": str(deep / "f.py")}) is None
+        assert tracker.check_tool_call("patch", {"path": str(deep / "f.py")}) is None
 
     def test_working_dir_inside_excluded_name_still_works(self, tmp_path):
         """If the user works inside e.g. vendor/, its own subdirs stay eligible."""
@@ -340,7 +340,7 @@ class TestExcludedDirectories:
         (sub / "AGENTS.md").write_text("Package rules", encoding="utf-8")
 
         tracker = SubdirectoryHintTracker(working_dir=str(root))
-        result = tracker.check_tool_call("read_file", {"path": str(sub / "f.py")})
+        result = tracker.check_tool_call("patch", {"path": str(sub / "f.py")})
         assert result is not None and "Package rules" in result
 
     def test_normal_directory_unaffected(self, tmp_path):
@@ -349,7 +349,7 @@ class TestExcludedDirectories:
         (normal / "AGENTS.md").write_text("Backend rules", encoding="utf-8")
 
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
-        result = tracker.check_tool_call("read_file", {"path": str(normal / "f.py")})
+        result = tracker.check_tool_call("patch", {"path": str(normal / "f.py")})
         assert result is not None and "Backend rules" in result
 
     def test_agents_override_md_wins_in_subdirectory(self, tmp_path):
@@ -360,7 +360,7 @@ class TestExcludedDirectories:
         (sub / "AGENTS.override.md").write_text("Personal backend override", encoding="utf-8")
 
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
-        result = tracker.check_tool_call("read_file", {"path": str(sub / "f.py")})
+        result = tracker.check_tool_call("patch", {"path": str(sub / "f.py")})
         assert result is not None
         assert "Personal backend override" in result
         assert "Committed backend rules" not in result
@@ -388,8 +388,8 @@ class TestSymlinkedHintTargets:
 
         tracker = SubdirectoryHintTracker(working_dir=str(workspace))
         assert tracker._loaded_digests == set()
-        assert tracker.check_tool_call("read_file", {"path": str(sub / "f.py")}) is None
-        assert tracker.check_tool_call("read_file", {"path": str(envlink / "f.py")}) is None
+        assert tracker.check_tool_call("patch", {"path": str(sub / "f.py")}) is None
+        assert tracker.check_tool_call("patch", {"path": str(envlink / "f.py")}) is None
         assert SubdirectoryHintTracker(working_dir=str(workspace)).check_tool_call(
             "terminal", {"command": f"cd {sub}"}) is None
 
@@ -407,9 +407,9 @@ class TestSymlinkedHintTargets:
         (plain / "AGENTS.md").write_text("Legit subdirectory rules", encoding="utf-8")
 
         tracker = SubdirectoryHintTracker(working_dir=str(workspace))
-        result = tracker.check_tool_call("read_file", {"path": str(linked / "f.py")})
+        result = tracker.check_tool_call("patch", {"path": str(linked / "f.py")})
         assert result is not None and "Shared in-tree instructions" in result
-        result = tracker.check_tool_call("read_file", {"path": str(plain / "f.py")})
+        result = tracker.check_tool_call("patch", {"path": str(plain / "f.py")})
         assert result is not None and "Legit subdirectory rules" in result
 
 
@@ -435,7 +435,7 @@ class TestHomeWorkingDirGuard:
     def test_home_cwd_never_injects_subtree_hints(self, home_tree):
         tracker = self._home_tracker(home_tree)
         assert tracker.check_tool_call(
-            "read_file", {"path": str(home_tree / ".hermes" / "skills" / "s1" / "x.py")}
+            "patch", {"path": str(home_tree / ".hermes" / "skills" / "s1" / "x.py")}
         ) is None
         assert tracker.check_tool_call(
             "terminal", {"command": f"cat {home_tree / 'notes' / 'AGENTS.md'}"}
@@ -456,10 +456,10 @@ class TestHomeWorkingDirGuard:
         (project / "src" / "AGENTS.md").write_text("App src rules", encoding="utf-8")
 
         tracker = self._home_tracker(home_tree)
-        assert tracker.check_tool_call("read_file", {"path": str(project / "src" / "f.py")}) is None
+        assert tracker.check_tool_call("patch", {"path": str(project / "src" / "f.py")}) is None
         tracker.rebind_working_dir(str(project))
         assert tracker.working_dir == project.resolve()
-        result = tracker.check_tool_call("read_file", {"path": str(project / "src" / "f.py")})
+        result = tracker.check_tool_call("patch", {"path": str(project / "src" / "f.py")})
         assert result is not None and "App src rules" in result
 
     def test_rebound_tracker_stays_inside_the_project(self, home_tree):
@@ -472,7 +472,7 @@ class TestHomeWorkingDirGuard:
         tracker = self._home_tracker(home_tree)
         tracker.rebind_working_dir(str(project))
         assert tracker.check_tool_call(
-            "read_file", {"path": str(home_tree / ".hermes" / "skills" / "s1" / "x.py")}
+            "patch", {"path": str(home_tree / ".hermes" / "skills" / "s1" / "x.py")}
         ) is None
 
     def test_real_project_cwd_keeps_discovery(self, home_tree):
@@ -483,5 +483,139 @@ class TestHomeWorkingDirGuard:
         (sub / "AGENTS.md").write_text("Package rules", encoding="utf-8")
 
         tracker = SubdirectoryHintTracker(working_dir=str(project))
-        result = tracker.check_tool_call("read_file", {"path": str(sub / "f.py")})
+        result = tracker.check_tool_call("patch", {"path": str(sub / "f.py")})
         assert result is not None and "Package rules" in result
+
+
+class TestPointerUntilWrite:
+    """A look appends one pointer line per directory; the first write delivers the file once."""
+
+    BACKEND = "Backend-specific instructions"
+
+    @pytest.fixture
+    def tracker(self, project):
+        return SubdirectoryHintTracker(working_dir=str(project))
+
+    @pytest.mark.parametrize(
+        "tool, args",
+        [
+            ("terminal", {"command": "ls backend/"}),
+            ("read_file", {"path": "backend/src/main.py"}),
+            ("search_files", {"path": "backend", "pattern": "x"}),
+        ],
+    )
+    def test_look_returns_one_pointer_line_once(self, tracker, tool, args):
+        result = tracker.check_tool_call(tool, args)
+        assert result is not None and self.BACKEND not in result
+        line = result.strip()
+        assert "\n" not in line
+        assert line.startswith("[AGENTS.md in backend/ (") and " KB): read it before changing or running code there]" in line
+        assert tracker.check_tool_call(tool, args) is None
+
+    def test_pointer_reports_the_real_size(self, tracker, project):
+        size_kb = (project / "backend" / "AGENTS.md").stat().st_size / 1024
+        assert f"({size_kb:.1f} KB)" in tracker.check_tool_call("read_file", {"path": "backend/x.py"})
+
+    @pytest.mark.parametrize("tool", ["patch", "write_file"])
+    def test_write_on_a_fresh_dir_delivers_the_body_once(self, tracker, tool):
+        args = {"path": "backend/new.py"}
+        result = tracker.check_tool_call(tool, args)
+        assert result is not None and self.BACKEND in result and "read it before" not in result
+        assert tracker.check_tool_call(tool, args) is None
+
+    def test_v4a_patch_targets_are_write_targets(self, tracker):
+        body = "*** Begin Patch\n*** Update File: backend/src/main.py\n@@\n-a\n+b\n*** End Patch"
+        result = tracker.check_tool_call("patch", {"mode": "patch", "patch": body})
+        assert result is not None and self.BACKEND in result
+
+    def test_look_then_write_delivers_the_line_then_the_body(self, tracker):
+        first = tracker.check_tool_call("read_file", {"path": "backend/main.py"})
+        assert "AGENTS.md in backend/" in first and self.BACKEND not in first
+        second = tracker.check_tool_call("patch", {"path": "backend/main.py"})
+        assert second is not None and self.BACKEND in second
+        assert tracker.check_tool_call("patch", {"path": "backend/main.py"}) is None
+        assert tracker.check_tool_call("read_file", {"path": "backend/main.py"}) is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "sed -i 's/a/b/' backend/f.py",
+            "sed -n -i.bak 's/a/b/' backend/f.py",
+            "perl -pi -e 's/a/b/' backend/f.py",
+            "git apply backend/x.patch",
+            "git -C . am backend/x.patch",
+            "git cherry-pick backend/abc",
+            "git merge backend/topic",
+            "git restore backend/f.py",
+            "git stash pop backend/f.py",
+            "echo x | tee backend/f.py",
+            "echo x > backend/f.py",
+            "echo x >> backend/f.py",
+            "cd backend && python3 -c \"open('f','w').write('x')\"",
+            "cd backend && python3 -c \"from pathlib import Path; Path('f').write_text('x')\"",
+            "cd backend && sed -i 's/a/b/' f",
+        ],
+    )
+    def test_terminal_writes_deliver_the_body(self, tracker, command):
+        result = tracker.check_tool_call("terminal", {"command": command})
+        assert result is not None and self.BACKEND in result, command
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo x >/dev/null backend/f.py",
+            "grep x backend/f.py 2>&1 | head",
+            "grep x backend/f.py 2>/dev/null",
+            "grep x backend/f.py > /dev/null",
+            "cat backend/f.py &>/dev/null",
+            "ls backend/",
+            "git status backend/f.py",
+            "git log -- backend/f.py",
+            "git stash list backend/f.py",
+            "grep 'a>b' backend/f.py",
+            "sed -n 5p backend/f.py",
+        ],
+    )
+    def test_terminal_looks_get_only_the_pointer(self, tracker, command):
+        result = tracker.check_tool_call("terminal", {"command": command})
+        assert result is not None and self.BACKEND not in result and "AGENTS.md in backend/" in result, command
+
+    def test_terminal_edit_naming_no_directory_gets_nothing_new(self, tracker):
+        """The working dir is already loaded and the bare `f` names no directory."""
+        assert tracker.check_tool_call("terminal", {"command": "sed -i 's/a/b/' f"}) is None
+
+    def test_one_command_naming_four_dirs_returns_four_lines_and_no_body(self, tmp_path):
+        for name in ("a", "b", "c", "d"):
+            (tmp_path / name).mkdir()
+            (tmp_path / name / "AGENTS.md").write_text(f"{name} rules", encoding="utf-8")
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        result = tracker.check_tool_call("terminal", {"command": "ls a/x b/x c/x d/x"})
+        lines = result.strip().splitlines()
+        assert len(lines) == 4 and all("read it before" in line for line in lines)
+        assert "rules" not in result.replace("AGENTS.md", "")
+
+    def test_reading_the_hint_file_itself_returns_the_line(self, tracker):
+        result = tracker.check_tool_call("read_file", {"path": "backend/AGENTS.md"})
+        assert "AGENTS.md in backend/" in result and self.BACKEND not in result
+
+    def test_dir_without_a_hint_file_returns_nothing_on_a_look_and_a_later_patch(self, tracker):
+        assert tracker.check_tool_call("read_file", {"path": "docs/README.md"}) is None
+        assert tracker.check_tool_call("patch", {"path": "docs/README.md"}) is None
+
+    def test_duplicate_of_a_delivered_file_gets_no_pointer(self, tmp_path):
+        for name in ("a", "b"):
+            (tmp_path / name).mkdir()
+            (tmp_path / name / "AGENTS.md").write_text("same rules", encoding="utf-8")
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        assert "same rules" in tracker.check_tool_call("patch", {"path": "a/f.py"})
+        assert tracker.check_tool_call("read_file", {"path": "b/f.py"}) is None
+
+    def test_rebind_forgets_pointed_dirs(self, tmp_path):
+        first, second = tmp_path / "one", tmp_path / "two"
+        for root in (first, second):
+            (root / "sub").mkdir(parents=True)
+            (root / "sub" / "AGENTS.md").write_text("rules", encoding="utf-8")
+        tracker = SubdirectoryHintTracker(working_dir=str(first))
+        assert tracker.check_tool_call("read_file", {"path": "sub/f.py"}) is not None
+        tracker.rebind_working_dir(str(second))
+        assert tracker.check_tool_call("read_file", {"path": "sub/f.py"}) is not None

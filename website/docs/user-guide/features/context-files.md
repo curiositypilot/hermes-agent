@@ -65,7 +65,7 @@ This approach has two advantages over loading everything at startup:
 - **No system prompt bloat** — subdirectory hints only appear when needed
 - **Prompt cache preservation** — the system prompt stays stable across turns
 
-Each subdirectory is checked at most once per session. The discovery also walks up parent directories, so reading `backend/src/main.py` will discover `backend/AGENTS.md` even if `backend/src/` has no context file of its own.
+Looking is cheap, writing delivers: a read, search or `ls` of a directory appends one pointer line (`[AGENTS.md in backend/ (3.2 KB): read it before changing or running code there]`), and the first `patch`, `write_file` or file-changing `terminal` command (`sed -i`, `git apply`, `tee`, a redirect to a file) under it appends the whole file once. Each subdirectory is pointed at most once and delivered at most once per session. The discovery also walks up parent directories, so reading `backend/src/main.py` will discover `backend/AGENTS.md` even if `backend/src/` has no context file of its own.
 
 :::info
 Subdirectory context files go through the same [security scan](#security-prompt-injection-protection) as startup context files. Malicious files are blocked.
