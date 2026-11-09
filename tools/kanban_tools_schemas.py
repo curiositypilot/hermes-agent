@@ -47,16 +47,15 @@ def _schema(name: str, description: str, properties: dict[str, Any], required: l
 KANBAN_SHOW_SCHEMA = _schema(
     "kanban_show",
     (
-        "Read a task's full state: body, assignee, parent handoffs, attempts, comments. "
-        "It also carries the title and recent events. Use this to (re)orient yourself before "
-        "starting work, especially on retries. The response includes a "
-        "pre-formatted ``worker_context`` string suitable for inclusion "
-        "verbatim in your reasoning. Outside a dispatcher-spawned worker "
-        "there is no default task: a bare call returns a pointer to "
-        "``kanban_list`` instead of task state."
+        "Read a task's state. The card is already in your first message; call this "
+        "to re-read after a compaction, to inspect another card, or with `raw: true` "
+        "for the full payload (body, comments, runs, heartbeat events). The response "
+        "includes a pre-formatted `worker_context` string. Outside a dispatcher-spawned "
+        "worker there is no default task: a bare call returns a pointer to `kanban_list`."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "raw": _prop("boolean", "Return the full payload unchanged (body, comments, runs, heartbeat events). Default false: omits what worker_context already renders."),
     },
     [],
 )

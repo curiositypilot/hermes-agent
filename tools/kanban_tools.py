@@ -736,6 +736,39 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 # --- Handlers ---
 
+_SHOW_EVENT_CAP = 50  # events returned; heartbeat rows leave first, so the cap counts the others
+
+
+def _dedup_show_payload(payload: dict, full: set[str]) -> None:
+    """Drop from a kanban_show reply the text its own ``worker_context`` renders in full.
+
+    ``full`` is ``ctx_renders_in_full(...)`` (the caps live there); a field over a cap is
+    absent from it and stays raw. Heartbeat rows leave ``events`` for ``heartbeats``.
+    Names what was omitted in ``deduped`` so the model can tell absent from empty.
+    """
+    deduped: list[str] = []
+    if "task.body" in full and payload["task"].pop("body", None):
+        deduped.append("task.body")
+    if "comments" in full and payload["comments"]:
+        payload["comments"] = []
+        deduped.append("comments")
+    ended = [r for r in payload["runs"] if r["ended_at"] is not None]
+    if "runs" in full and ended:
+        for run in ended:
+            for name in ("summary", "error", "metadata"):
+                del run[name]
+        deduped.append("runs.summary/error/metadata")
+    heartbeats = [e for e in payload["events"] if e["kind"] == "heartbeat"]
+    if heartbeats:
+        payload["events"] = [e for e in payload["events"] if e["kind"] != "heartbeat"]
+        payload["heartbeats"] = {
+            "count": len(heartbeats), "last_at": max(e["created_at"] or 0 for e in heartbeats)}
+        deduped.append("events.heartbeat")
+    payload["events"] = payload["events"][-_SHOW_EVENT_CAP:]
+    if deduped:
+        payload["deduped"] = deduped
+
+
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
     """Full task state: row, parents, children, comments, runs, last 50 events."""
@@ -756,7 +789,9 @@ def _handle_show(args: dict, **kw) -> str:
         from agent.provider_policy import resolve_data_class
         task_fields = _fields(task, _TASK_FIELDS)
         task_fields["data_class_resolved"] = resolve_data_class(task)
-        return json.dumps({
+        comment_rows = kb.list_comments(conn, tid)
+        run_rows = kb.list_runs(conn, tid)
+        payload = {
             "task": task_fields,
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
@@ -764,12 +799,17 @@ def _handle_show(args: dict, **kw) -> str:
             "unsatisfied_parents": [
                 {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
             "children": kb.child_ids(conn, tid),
-            "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
-            # Capped; full log via CLI.
-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
-            "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
+            "comments": [_fields(c, _COMMENT_FIELDS) for c in comment_rows],
+            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)],
+            "runs": [_fields(r, _RUN_FIELDS) for r in run_rows],
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+            "worker_context": kb.build_worker_context(conn, tid)}
+        if args.get("raw"):
+            payload["events"] = payload["events"][-_SHOW_EVENT_CAP:]  # capped; full log via CLI
+        else:
+            from hermes_cli.kanban_db_context import ctx_renders_in_full
+            _dedup_show_payload(payload, ctx_renders_in_full(task, comment_rows, run_rows))
+        return json.dumps(payload)
 
 
 @_kanban_handler("kanban_list")
