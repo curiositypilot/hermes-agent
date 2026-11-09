@@ -131,6 +131,20 @@ def test_kanban_guidance_card_is_first_message_but_reread_stays():
         assert marker in KANBAN_GUIDANCE
 
 
+def test_kanban_guidance_keeps_rules_no_other_text_carries():
+    """The protocol is the only copy for profiles without the kanban-orchestrator skill,
+    and each Do NOT bullet must stand on its own (intake t_125e8cdc, QA row 7)."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    for rule in ("## Orchestrator mode", "**Decision ownership.**", "BOTH card bodies",
+                 "workers cannot see sibling context", "git worktree add",
+                 "your implementation phase is done",
+                 "so the task surfaces on the board as needing input"):
+        assert rule in KANBAN_GUIDANCE, rule
+    bullets = [ln for ln in KANBAN_GUIDANCE.split("## Do NOT", 1)[1].splitlines() if ln.startswith("- ")]
+    assert bullets and all(ln.startswith("- Do not ") for ln in bullets), bullets
+
+
 @pytest.mark.parametrize("stores", [(True, True), (False, True), (True, False), (False, False)])
 @pytest.mark.parametrize("names", [
     set(), {"memory"}, {"memory", "skill_view", "skills_list"},
