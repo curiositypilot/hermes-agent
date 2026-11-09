@@ -899,6 +899,13 @@ _TOOL_DOC_LINES = [
 ]
 
 
+def _render_output_bytes(n: int) -> str:
+    """Schema wording for ``tool_output.max_bytes``. ``50_000`` is ``50KB``."""
+    if n % 1000 == 0:
+        return f"{n // 1000}KB"
+    return f"{n:,} bytes"
+
+
 def build_execute_code_schema(enabled_sandbox_tools: set | None = None,
                               mode: str | None = None) -> dict:
     """execute_code schema listing only *enabled_sandbox_tools* — a disabled tool (e.g. web off)
@@ -908,6 +915,14 @@ def build_execute_code_schema(enabled_sandbox_tools: set | None = None,
     if mode is None:
         mode = _get_execution_mode()
     tool_lines = "\n".join(doc for name, doc in _TOOL_DOC_LINES if name in enabled_sandbox_tools)
+    # terminal() is cut by tool_output.max_bytes (same cache as truncation).
+    # Stdout's 50KB is MAX_STDOUT_BYTES, a constant — leave that sentence.
+    from tools.tool_output_limits import DEFAULT_MAX_BYTES, get_max_bytes
+    cap_bytes = get_max_bytes()
+    if cap_bytes != DEFAULT_MAX_BYTES:
+        tool_lines = tool_lines.replace(
+            "Over 50KB", f"Over {_render_output_bytes(cap_bytes)}", 1
+        )
     import_examples = [n for n in ("web_search", "terminal") if n in enabled_sandbox_tools]
     import_examples = import_examples or sorted(enabled_sandbox_tools)[:2]
     import_str = ", ".join(import_examples) + ", ..." if import_examples else "..."
