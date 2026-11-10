@@ -6,19 +6,20 @@ from typing import Any
 from hermes_cli.kanban_workflow import ARCHIVED, DEFAULT_WORKFLOW
 
 _DESC_TASK_ID_DEFAULT = (
-    "Task id. If omitted, defaults to HERMES_KANBAN_TASK from the env — the "
-    "task the dispatcher spawned you to work on. That default only exists for "
-    "a dispatcher-spawned worker; any other caller has no default and must "
-    "pass an explicit task_id (use kanban_list to discover ids)."
+    "Task id. If omitted, defaults to HERMES_KANBAN_TASK from the env. That "
+    "default only exists for a dispatcher-spawned worker; any other caller has "
+    "no default and must pass an explicit task_id (use kanban_list to discover ids)."
+)
+
+_DESC_TASK_ID_SHOW = (
+    "Defaults to HERMES_KANBAN_TASK, your own task, for dispatcher-spawned workers "
+    "only; any other caller has no default and must pass an id (find ids with kanban_list)."
 )
 
 _DESC_BOARD = (
-    "Kanban board slug to target. When omitted, the call resolves the "
-    "active board the usual way: HERMES_KANBAN_DB env → "
-    "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "Omit to use the active board (HERMES_KANBAN_DB env, else HERMES_KANBAN_BOARD "
+    "env, else the 'current' symlink under the kanban home, else 'default'); pass "
+    "a slug only to override it for this one call."
 )
 
 
@@ -54,7 +55,7 @@ KANBAN_SHOW_SCHEMA = _schema(
         "worker there is no default task: a bare call returns a pointer to `kanban_list`."
     ),
     {
-        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "task_id": _prop("string", _DESC_TASK_ID_SHOW),
         "raw": _prop("boolean", "Return the full payload unchanged (body, comments, runs, heartbeat events). Default false: omits what worker_context already renders."),
     },
     [],
@@ -156,7 +157,8 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "on disk at completion. Files inside a managed scratch "
                 "workspace are copied to durable task attachments before "
                 "cleanup; a missing declared scratch artifact keeps the "
-                "task in-flight so you can fix the path and retry."
+                "task in-flight so you can fix the path and retry. "
+                "Paths in metadata are not uploaded."
             ),
         },
     },
@@ -320,7 +322,9 @@ KANBAN_COMMENT_SCHEMA = _schema(
         "Append a comment to a task's thread. Use for durable notes "
         "that should outlive this run (questions for the next worker, "
         "partial findings, rationale). Ephemeral reasoning doesn't "
-        "belong here — use your normal response instead."
+        "belong here — use your normal response instead. A file others "
+        "should download goes through kanban_attach or kanban_attach_url, "
+        "not a link here."
     ),
     {
         "task_id": _prop("string", (
@@ -342,7 +346,8 @@ KANBAN_ATTACH_SCHEMA = _schema(
         "be able to download — generated reports, images, exports. The "
         "file is stored as a real attachment (not a comment link) under "
         "the task's attachments dir, capped at 25 MB. Prefer "
-        "kanban_attach_url when you only have a URL."
+        "kanban_attach_url when you only have a URL. A worker can attach "
+        "only to its own task."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
@@ -406,7 +411,10 @@ KANBAN_CREATE_SCHEMA = _schema(
         "title": _prop("string", "Short task title (required)."),
         "assignee": _prop("string", (
                 "Profile name that executes this task (e.g. 'researcher-a', "
-                "'reviewer'). Required: a task without one is never dispatched."
+                "'reviewer'). Required: a task without one is never dispatched. "
+                "An unknown profile is silently never dispatched (the card sits "
+                "in 'ready' forever): take the name from hermes profile list, "
+                "or ask the user."
         )),
         "body": _prop("string", (
                 "Opening post: full spec, acceptance criteria, links. "

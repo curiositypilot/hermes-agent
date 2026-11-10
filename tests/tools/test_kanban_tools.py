@@ -153,6 +153,22 @@ def test_kanban_task_id_descriptions_state_the_non_worker_case():
     assert "kanban_show" in seen
 
 
+def test_kanban_schemas_carry_the_rules_moved_out_of_the_protocol():
+    """Rules cut from KANBAN_GUIDANCE now live only in the tool schemas (intake t_125e8cdc)."""
+    from tools import kanban_tools_schemas as kts
+
+    props = kts.KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]
+    assert "Paths in metadata are not uploaded" in props["artifacts"]["description"]
+    assert "only to its own task" in kts.KANBAN_ATTACH_SCHEMA["description"]
+    assert "kanban_attach" in kts.KANBAN_COMMENT_SCHEMA["description"]
+    assignee = kts.KANBAN_CREATE_SCHEMA["parameters"]["properties"]["assignee"]["description"]
+    assert "hermes profile list" in assignee
+    for attr, schema in vars(kts).items():
+        if attr.startswith("KANBAN_") and attr.endswith("_SCHEMA"):
+            board = schema["parameters"]["properties"]["board"]["description"]
+            assert "HERMES_KANBAN_DB" in board and "HERMES_KANBAN_BOARD" in board, attr
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
