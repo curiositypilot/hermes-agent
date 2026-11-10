@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import filecmp
 import importlib.util
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -83,3 +85,42 @@ def test_summary_names_the_surface_and_tool_that_changed(tmp_path):
     assert "| cli.claude |" in summary and "+# Finish every job" in summary
     assert "`write_file`: description +" in summary
     assert prompt_surface.summarize(base, base) == ""
+
+
+def test_child_pythonpath_is_root_only_for_venv_interpreter(monkeypatch, tmp_path):
+    """A venv interpreter keeps its own site-packages. Always appending the committed generation
+    would shadow it (and can move snapshot bytes), so this must stay exactly ``ROOT``."""
+    import pm.environments
+
+    monkeypatch.setattr(prompt_surface.sys, "prefix", str(tmp_path / "venv-prefix"))
+    monkeypatch.setattr(prompt_surface.sys, "base_prefix", str(tmp_path / "base-prefix"))
+    version = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    venv = tmp_path / "committed-venv"
+    (venv / "lib" / f"python{version}" / "site-packages").mkdir(parents=True)
+    monkeypatch.setattr(pm.environments, "committed_venv", lambda _root: venv)
+
+    result = prompt_surface._child_pythonpath()
+
+    assert result == str(prompt_surface.ROOT)
+    assert os.pathsep not in result
+
+
+def test_child_pythonpath_adds_committed_site_packages_for_store_interpreter(monkeypatch, tmp_path):
+    """The store interpreter has no third-party packages. Restore the committed generation after
+    ``ROOT``, and do not inherit the parent's PYTHONPATH."""
+    import pm.environments
+
+    store = str(tmp_path / "store")
+    monkeypatch.setattr(prompt_surface.sys, "prefix", store)
+    monkeypatch.setattr(prompt_surface.sys, "base_prefix", store)
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    monkeypatch.setattr(pm.environments, "committed_venv", lambda _root: tmp_path / "venv")
+    monkeypatch.setattr(pm.environments, "site_packages", lambda _venv: site)
+    poison = str(tmp_path / "poison-pythonpath")
+    monkeypatch.setenv("PYTHONPATH", poison)
+
+    result = prompt_surface._child_pythonpath()
+
+    assert result == os.pathsep.join((str(prompt_surface.ROOT), str(site)))
+    assert poison not in result

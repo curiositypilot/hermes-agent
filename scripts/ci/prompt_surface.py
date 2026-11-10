@@ -194,6 +194,27 @@ def _write_snapshot(out: Path, prompts: dict[str, dict[str, str]], tools_by_surf
     (out / MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _child_pythonpath() -> str:
+    """PYTHONPATH for the render child: the checkout, plus committed site-packages on the store interpreter.
+
+    The documented command runs the PM store ``python`` (``sys.prefix == sys.base_prefix``), which
+    owns no third-party packages. ``ROOT`` alone dies at ``hermes_yaml`` (``No module named
+    'ruamel'``). A venv interpreter already has its own site-packages; appending the committed
+    generation would shadow it and can move snapshot bytes. Never copy the parent's PYTHONPATH.
+    """
+    if sys.prefix != sys.base_prefix:
+        return str(ROOT)
+    from pm.environments import committed_venv, site_packages
+
+    environment = committed_venv(ROOT)
+    if environment is None:
+        return str(ROOT)
+    site = site_packages(environment)
+    if not site.is_dir():
+        return str(ROOT)
+    return os.pathsep.join((str(ROOT), str(site)))
+
+
 def render(out: Path) -> int:
     """Render into *out* from a fresh child process and home, so nothing from the caller's
     environment, config or imported modules reaches the bytes.
@@ -209,7 +230,7 @@ def render(out: Path) -> int:
         staging = Path(tmp) / "out"
         env = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(home), "HERMES_HOME": str(home / ".hermes"),
-            "TZ": "UTC", "LANG": "C.UTF-8", "PYTHONHASHSEED": "0", "PYTHONPATH": str(ROOT),
+            "TZ": "UTC", "LANG": "C.UTF-8", "PYTHONHASHSEED": "0", "PYTHONPATH": _child_pythonpath(),
             "TMPDIR": tmp, "PYTHONDONTWRITEBYTECODE": "1",
         }
         for key in ("HERMES_RUNTIME_DIR", "SYSTEMROOT"):
