@@ -68,3 +68,48 @@ def test_auth_and_billing_failures_stay_credential_wide(pool, status_code, failu
     assert pool.entries()[0].last_status == STATUS_EXHAUSTED
     assert not pool.entries()[0].model_cooldowns
     assert pool.select(model=MODEL_B) is None
+
+
+SONNET, OPUS, FABLE = "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-2"
+OAUTH_TOKEN = "sk-ant-oat01-" + "x" * 40
+
+
+@pytest.fixture
+def oauth_pool(pool, tmp_path):
+    """One manual OAuth row with per-model cooldowns: sonnet's lapsed, opus/fable active (the 21:19 incident)."""
+    import time
+    now = time.time()
+    auth = tmp_path / "hermes-root" / "auth.json"
+    auth.write_text(json.dumps({"credential_pool": {"anthropic": [{
+        "id": "oauth-1", "label": "oauth-1", "auth_type": "oauth", "priority": 0, "source": "manual",
+        "access_token": OAUTH_TOKEN, "refresh_token": "rt-" + "y" * 20,
+        "expires_at_ms": int((now + 86400) * 1000),
+        "model_cooldowns": {SONNET: now - 86400, OPUS: now + 3000, FABLE: now + 3000},
+    }]}}))
+    return now
+
+
+def test_pool_token_follows_requested_model_replay(oauth_pool, monkeypatch):
+    """A cooldown on Opus/Fable must not bench the shared OAuth row for Sonnet (t_155f5ad6)."""
+    import time
+    from agent.anthropic_credentials import resolve_anthropic_token
+
+    assert resolve_anthropic_token(model=SONNET) == OAUTH_TOKEN
+    assert resolve_anthropic_token(model=OPUS) is None
+    assert resolve_anthropic_token(model=FABLE) is None
+    assert resolve_anthropic_token() is None  # model-less diagnostics stay conservative
+
+    monkeypatch.setattr(time, "time", lambda: oauth_pool + 4000)
+    for model in (SONNET, OPUS, FABLE):
+        assert resolve_anthropic_token(model=model) == OAUTH_TOKEN
+
+
+def test_pool_token_refuses_model_with_its_own_cooldown(oauth_pool, tmp_path):
+    from agent.anthropic_credentials import resolve_anthropic_token
+
+    auth = tmp_path / "hermes-root" / "auth.json"
+    data = json.loads(auth.read_text())
+    data["credential_pool"]["anthropic"][0]["model_cooldowns"][SONNET] = oauth_pool + 3000
+    auth.write_text(json.dumps(data))
+    assert resolve_anthropic_token(model=SONNET) is None
+    assert resolve_anthropic_token(model=MODEL_B) == OAUTH_TOKEN
