@@ -1,22 +1,22 @@
 {
-  "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Documents auto-extract to readable text: .ipynb, Office (.docx/.xlsx/.pptx and legacy .doc/.ppt/.xls), PDF (text layer), OpenDocument, RTF, EPUB, SQLite (.db/.sqlite: schema, row counts, first rows). Cannot read images/binary — use vision_analyze for images.",
+  "description": "Read a text file with line numbers; paginate large files with offset and limit. Use instead of cat/head/tail in terminal. Output: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Reads over ~100K characters are truncated on a line boundary and return a next_offset; continue from it with offset. A line longer than ~2K chars is clamped at '... [truncated]' and listed in clamped_lines with a hint naming the command that reads its remainder (offset cannot reach it). Documents auto-extract to text: .ipynb, Office (.docx/.xlsx/.pptx and legacy .doc/.ppt/.xls), PDF (text layer), OpenDocument, RTF, EPUB, SQLite (.db/.sqlite: schema, row counts, first rows). Cannot read images/binary; use vision_analyze for images.",
   "name": "read_file",
   "parameters": {
     "properties": {
       "limit": {
         "default": 2000,
-        "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.",
+        "description": "Max lines to read (max 2000), also capped at a ~100K-character budget with a next_offset continuation.",
         "maximum": 2000,
         "type": "integer"
       },
       "offset": {
         "default": 1,
-        "description": "Line number to start reading from (1-indexed, default: 1)",
+        "description": "First line to read (1-indexed).",
         "minimum": 1,
         "type": "integer"
       },
       "path": {
-        "description": "Path to the file to read (absolute, relative, or ~/path)",
+        "description": "Absolute, relative or ~/path.",
         "type": "string"
       }
     },

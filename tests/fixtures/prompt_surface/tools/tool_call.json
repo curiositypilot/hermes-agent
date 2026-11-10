@@ -8,6 +8,7 @@
         "items": {
           "properties": {
             "arguments": {
+              "additionalProperties": true,
               "description": "Arguments matching the tool schema.",
               "type": "object"
             },
