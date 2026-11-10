@@ -13,6 +13,8 @@ from __future__ import annotations
 import filecmp
 import importlib.util
 import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -42,6 +44,27 @@ def test_committed_prompt_surface_is_current(tmp_path):
         "    scripts/run-in-hermes-env python scripts/ci/prompt_surface.py render\n"
         + "\n".join(differences[:20])
     )
+
+
+def test_render_ignores_enclosing_git_repo(tmp_path, monkeypatch):
+    """An ambient temp dir inside a git repo must not leak a Workspace block.
+
+    Worker scratch lives under ``~/.hermes``, which is a repo. ``render`` used to
+    honor that ``TMPDIR``, so plain cli prompts gained a machine-specific
+    ``- Root:`` line the committed snapshot (rendered outside a repo) rejects.
+    """
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    # A bare ``git init`` is not a coding workspace (``_has_code_files``). The
+    # worker leak is ``~/.hermes``, a repo that holds ``.py`` files.
+    (outer / "probe.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init", str(outer)], check=True, capture_output=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(outer))
+    rendered = tmp_path / "rendered"
+    assert prompt_surface.render(rendered) == 0
+    text = (rendered / "prompts" / "cli.claude.txt").read_text(encoding="utf-8")
+    assert "- Root:" not in text
+    assert "Workspace (snapshot" not in text
 
 
 def test_summary_names_the_surface_and_tool_that_changed(tmp_path):

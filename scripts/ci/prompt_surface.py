@@ -196,8 +196,14 @@ def _write_snapshot(out: Path, prompts: dict[str, dict[str, str]], tools_by_surf
 
 def render(out: Path) -> int:
     """Render into *out* from a fresh child process and home, so nothing from the caller's
-    environment, config or imported modules reaches the bytes."""
-    with tempfile.TemporaryDirectory(prefix="prompt-surface-") as tmp:
+    environment, config or imported modules reaches the bytes.
+
+    ``_git_root`` / ``_marker_root`` walk parents for ``.git`` and project markers and do not
+    honor ``GIT_CEILING_DIRECTORIES``. An ambient ``TMPDIR`` inside a repo (worker scratch
+    under ``~/.hermes``) would stamp a machine-specific Workspace block into the snapshot, so
+    the temp dir is created under ``/var/tmp``, which is not a repo.
+    """
+    with tempfile.TemporaryDirectory(prefix="prompt-surface-", dir="/var/tmp") as tmp:
         home = Path(tmp) / "home"
         home.mkdir()
         staging = Path(tmp) / "out"
