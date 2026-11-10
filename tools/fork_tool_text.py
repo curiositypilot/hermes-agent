@@ -54,7 +54,7 @@ EDITS: dict[str, list[tuple[Path, str, str]]] = {
         (_param("questions"), "The question(s). Each: question text (options excluded), optional choices "
                               "(recommended first; omit for free-text), optional multi_select. Responses come back "
                               "in question order with the question text echoed.",
-         "The questions; a single question is a one-entry array."),
+         "1-5 questions; a single question is a one-entry array."),
     ],
     "delegate_task": [
         (_DESC, "Each gets its own conversation, terminal session, and toolset, and only its final summary returns "
@@ -260,7 +260,7 @@ EDITS: dict[str, list[tuple[Path, str, str]]] = {
         (("parameters", "properties", "operations", "items", "anyOf", 1, "properties", "old_string", "description"),
          "Text to find (same matching semantics as the patch tool).", "Text to find (matching as in the patch tool)."),
         (("parameters", "properties", "operations", "items", "anyOf", 1, "properties", "replace_all", "description"),
-         "Replace all occurrences (default false).", "Replace all occurrences."),
+         "Replace all occurrences (default false).", "Default false."),
         (("parameters", "properties", "operations", "items", "anyOf", 2, "properties", "content", "description"),
          "Full SKILL.md rewrite (REPLACES the whole file; last resort).",
          "Full SKILL.md that REPLACES the whole file; last resort. Read the file via skill_view() first."),
