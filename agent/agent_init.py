@@ -658,7 +658,6 @@ def _print_key_banner(key, label: str, warn_missing: bool = False) -> None:
 def _init_anthropic_client(agent, api_key, base_url, _provider_timeout):
     """anthropic_messages: native Anthropic SDK (or AnthropicBedrock for Bedrock+Claude)."""
     from agent.anthropic_adapter import build_anthropic_client
-    from agent.anthropic_credentials import resolve_anthropic_token
     agent.client = None
     agent._client_kwargs = {}
     agent._anthropic_base_url = base_url
@@ -672,8 +671,14 @@ def _init_anthropic_client(agent, api_key, base_url, _provider_timeout):
     # ANTHROPIC_TOKEN fallback only for native Anthropic — other anthropic_messages providers
     # must use their own key or Anthropic credentials leak to third-party endpoints.
     # Falling back would send Anthropic credentials to third-party endpoints (Fixes #1739, #minimax-401).
+    # A missing native key is a login or a model bench, not an empty bearer: building the
+    # client anyway makes the SDK raise "Could not resolve authentication method".
     _is_native_anthropic = agent.provider == "anthropic"
-    effective_key = api_key or (resolve_anthropic_token(model=getattr(agent, "model", None)) if _is_native_anthropic else None) or ""
+    if _is_native_anthropic and not api_key:
+        from hermes_cli.runtime_provider import _anthropic_token_or_raise
+        effective_key = _anthropic_token_or_raise(model=agent.model)
+    else:
+        effective_key = api_key or ""
 
     # MiniMax OAuth tokens live ~15 min and the SDK freezes api_key at construction, so use a
     # callable provider: build_anthropic_client mints a fresh bearer per request (re-reading
