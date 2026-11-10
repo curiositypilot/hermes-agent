@@ -491,6 +491,18 @@ def _apply_dynamic_schemas(tool_defs: list[dict[str, Any]]) -> list[dict[str, An
     return out
 
 
+def _apply_fork_tool_text(tool_defs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fork-owned shorter core tool wording (tools/fork_tool_text.py). Runs after the rewriters above,
+    which rebuild execute_code and string-match delegate_task, and before sanitize/tool-search so
+    deferred schemas carry the same text. Never breaks tool loading."""
+    try:
+        from tools.fork_tool_text import apply_fork_tool_text
+        return apply_fork_tool_text(tool_defs)
+    except Exception:
+        logger.warning("Fork tool text overlay skipped", exc_info=True)
+        return tool_defs
+
+
 _TOOL_SEARCH_LISTING_FORMS = {
     "full": "catalog listing embedded",
     "names": "names-only listing embedded",
@@ -509,6 +521,7 @@ def _compute_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disa
     from tools.kanban_toolset_context import scoped_kanban_toolset_selection
     with scoped_kanban_toolset_selection(enabled_toolsets):
         filtered_tools = _apply_dynamic_schemas(registry.get_definitions(tools_to_include, quiet=quiet_mode))
+    filtered_tools = _apply_fork_tool_text(filtered_tools)
     global _last_resolved_tool_names
     _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
 
