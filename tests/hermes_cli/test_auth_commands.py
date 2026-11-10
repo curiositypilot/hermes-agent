@@ -269,6 +269,93 @@ def test_auth_list_includes_non_registry_configured_provider(
     assert "private-groq" in capsys.readouterr().out
 
 
+def test_auth_list_marks_unhydrated_api_key_row(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "oauth1",
+                        "label": "claude-max",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "oauth-token-present",
+                    },
+                    {
+                        "id": "2c315c",
+                        "label": "ANTHROPIC_API_KEY",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "env:ANTHROPIC_API_KEY",
+                    },
+                ]
+            },
+        },
+    )
+
+    from hermes_cli.auth_commands import auth_list_command
+
+    auth_list_command(type("Args", (), {"provider": None})())
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("  #")]
+    assert len(lines) >= 2
+    assert "no key" in lines[1]
+    assert "id=2c315c" in lines[1]
+    oauth_line = next(line for line in lines if "id=oauth1" in line)
+    assert "no key" not in oauth_line
+
+
+def test_auth_list_does_not_mark_hydrated_api_key_or_tokenless_oauth(
+    tmp_path, monkeypatch, capsys
+):
+    from agent.credential_pool import PooledCredential
+    from hermes_cli.auth_commands import _format_unhydrated_status, auth_list_command
+
+    hydrated = PooledCredential.from_dict(
+        "anthropic",
+        {"auth_type": "api_key", "source": "manual", "access_token": "secret"},
+    )
+    tokenless_oauth = PooledCredential.from_dict(
+        "anthropic", {"auth_type": "oauth", "source": "manual"},
+    )
+    assert _format_unhydrated_status(hydrated) == ""
+    assert _format_unhydrated_status(tokenless_oauth) == ""
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "manual1",
+                        "label": "pasted-key",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "secret",
+                    }
+                ]
+            },
+        },
+    )
+
+    auth_list_command(type("Args", (), {"provider": None})())
+
+    manual_line = next(
+        line for line in capsys.readouterr().out.splitlines() if "id=manual1" in line
+    )
+    assert "no key" not in manual_line
+
+
 def test_interactive_auth_add_normalizes_display_name_to_provider_key(
     tmp_path, monkeypatch
 ):
