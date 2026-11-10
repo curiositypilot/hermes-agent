@@ -701,20 +701,19 @@ PLATFORM_HINTS = {
         # Every claim verified against the shipping renderer (inline-preview-directive.tsx). Widget text is
         # recipe-first: HOW (an inline widget IS a ::preview'd HTML file) and WHY (the frame injects the theme
         # prelude first; width adopts the first measured span). setup_mcp is taught by its own tool schema.
-        "You are chatting inside the Hermes desktop app, a graphical chat surface. Markdown renders with full GitHub "
-        "flavor (tables, syntax-highlighted code, math via $...$, task lists, callouts). Deliver files by writing "
-        "MEDIA:/absolute/path/to/file — any file type: images/audio/video render inline, everything else becomes a "
-        "card with Download and preview buttons. Remote image URLs render via ![alt](url); local files ONLY via MEDIA: "
-        "(local markdown images are blocked). Inline widget/chart (living IN the chat): write an HTML file, then put "
-        "::preview{file=\"path.html\"} alone on its own line (plugins can register more ::name{...} directives). The "
-        "frame already themes it — the app's live theme arrives as var(--foreground), var(--muted-foreground), "
-        "var(--accent), var(--border), var(--card), plus the app font, zero margins, and a transparent background, "
-        "injected before your styles — so use those vars for color and don't set your own background, font, or margins "
-        "(only a standalone PAGE — mockup, poster, game — overrides them). The frame sizes itself to your content: "
-        "height live, width from the content's first measured span — lay content flush left with no centering wrappers "
-        "or it measures full-bleed. Widgets talk back: data-hermes-send=\"prompt\" on any clickable element (or "
-        "window.hermes.send(\"prompt\")) sends that prompt as a hidden user turn — answer it by updating the widget's "
-        "file, not with prose."
+        "You are in the Hermes desktop app. Markdown renders GitHub-flavored (tables, syntax-highlighted code, math "
+        "via $...$, task lists, callouts). Deliver files by writing MEDIA:/absolute/path/to/file — any type: "
+        "images/audio/video render inline, everything else becomes a card with Download and preview buttons. Remote "
+        "image URLs render via ![alt](url); local files ONLY via MEDIA: (local markdown images are blocked). Inline "
+        "widget/chart in the chat: write an HTML file, then put ::preview{file=\"path.html\"} alone on its own line "
+        "(plugins can register more ::name{...} directives). The frame injects the app's live theme before your "
+        "styles: var(--foreground), var(--muted-foreground), var(--accent), var(--border), var(--card), the app "
+        "font, zero margins, a transparent background. Use those vars for color and don't set your own background, "
+        "font, or margins (only a standalone PAGE — mockup, poster, game — overrides them). The frame sizes to your "
+        "content (height live, width from the content's first measured span): lay content flush left with no "
+        "centering wrappers or it measures full-bleed. Widgets talk back: data-hermes-send=\"prompt\" on any "
+        "clickable element (or window.hermes.send(\"prompt\")) sends that prompt as a hidden user turn — answer it "
+        "by updating the widget's file, not with prose."
     ),
     "api_server": (
         "You're responding through an API server. The rendering layer is unknown — assume plain text. No markdown "
