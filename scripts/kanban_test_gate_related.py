@@ -6,7 +6,9 @@ module ``<dir>/<stem>.py``, the ``test_<stem>*.py`` files under the nearest mirr
 ``tests/<dir>/`` recursively, and if nothing matches walk up one level at a time (``tests/<parent>/``,
 ..., ``tests/``) and stop at the first level with a match. Stem matches under an ``integration``,
 ``e2e`` or ``docker`` directory are dropped: those suites have their own CI jobs and need sandboxes or
-images. The full suite (~50 min) is too slow to gate every card; CI still runs it. Base ref:
+images. The full suite (~50 min) is too slow to gate every card; CI still runs it. A change that can
+alter the rendered prompt or tool schemas also selects ``tests/ci/test_prompt_surface.py`` (its stem
+never matches a changed module). Base ref:
 ``KANBAN_TEST_BASE`` or ``main``. No related tests -> exit 0 with a note (docs-only diffs). Runs
 through ``scripts/run_tests.sh`` so CI isolation rules apply.
 """
@@ -38,6 +40,36 @@ CROSS_DIR_TESTS: dict[str, tuple[str, ...]] = {
         "tests/cron/test_restart_safe_worker.py",
     ),
 }
+
+
+# The snapshot test's stem never matches a changed module, so select it explicitly.
+PROMPT_SURFACE_TEST = "tests/ci/test_prompt_surface.py"
+# Trailing slash: directory prefix. Code dirs select non-test .py only; the snapshot tree
+# selects any file. Bare names are exact paths.
+PROMPT_SURFACE_PREFIXES = (
+    "agent/",
+    "tools/",
+    "plugins/",
+    "hermes_cli/",
+    "tests/fixtures/prompt_surface/",
+    "scripts/ci/prompt_surface.py",
+    "toolsets.py",
+    "run_agent.py",
+    "model_tools.py",
+)
+
+
+def _affects_prompt_surface(path: str) -> bool:
+    for prefix in PROMPT_SURFACE_PREFIXES:
+        if prefix.endswith("/"):
+            if not path.startswith(prefix):
+                continue
+            if prefix.startswith("tests/"):
+                return True
+            return path.endswith(".py") and not PurePosixPath(path).name.startswith("test_")
+        if path == prefix:
+            return True
+    return False
 
 
 def _git(*args: str) -> list[str]:
@@ -77,6 +109,8 @@ def related_tests(files: set[str]) -> list[str]:
             for target in mapped:
                 if not SKIP_PARTS.intersection(PurePosixPath(target).parts) and (ROOT / target).is_file():
                     tests.add(target)
+    if any(_affects_prompt_surface(f) for f in files) and (ROOT / PROMPT_SURFACE_TEST).is_file():
+        tests.add(PROMPT_SURFACE_TEST)
     return sorted(tests)
 
 

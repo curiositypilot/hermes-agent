@@ -1,10 +1,10 @@
 {
-  "description": "Create, update or delete skills: your procedural memory for recurring tasks. The call is an operations array (a single edit is a list of one); it applies atomically — any failure rolls every touched skill back. Ops: create (full SKILL.md; lands in the profile's skills directory or configured skills.create_dir; must precede that skill's other ops), patch (targeted old_string/new_string fix — preferred; content alone REPLACES the whole file, read it via skill_view() first), write_file/remove_file (supporting files), delete (sole op only). Existing skills are modified wherever they live. Description: max 60 chars, 'Use when <trigger>. <behavior>.', never the category name (the index shows it). Write lessons, not logs: imperative rule + why, no PR numbers/dates/incident narration, one rule per lesson, references/ named by topic (extend before adding). skill_view() shows format conventions.",
+  "description": "Create, update or delete skills, your procedural memory for recurring tasks. The operations apply atomically: any failure rolls every touched skill back. Ops: create (lands in the profile's skills directory or configured skills.create_dir; must precede that skill's other ops), patch (old_string/new_string preferred, or a full content rewrite), write_file/remove_file (supporting files), delete (sole op only). Existing skills are modified wherever they live. Skill description: max 60 chars, 'Use when <trigger>. <behavior>.', never the category name (the index shows it). Write lessons, not logs: imperative rule + why, no PR numbers/dates/incident narration, one rule per lesson, references/ named by topic (extend before adding). skill_view() shows format conventions.",
   "name": "skill_manage",
   "parameters": {
     "properties": {
       "operations": {
-        "description": "Ordered ops; each names its target skill (lowercase, hyphens/underscores, max 64 chars). Each action is its own shape; another action's text slot is invalid.",
+        "description": "Ordered ops (a single edit is a list of one); each names its target skill (lowercase, hyphens/underscores, max 64 chars). Each action is its own shape; another action's text slot is invalid.",
         "items": {
           "anyOf": [
             {
@@ -17,7 +17,7 @@
                   "type": "string"
                 },
                 "category": {
-                  "description": "Optional category subdir (e.g. 'devops').",
+                  "description": "Category subdir (e.g. 'devops').",
                   "type": "string"
                 },
                 "content": {
@@ -45,7 +45,7 @@
                   "type": "string"
                 },
                 "file_path": {
-                  "description": "Optional supporting file (write_file's shape); default SKILL.md.",
+                  "description": "Supporting file to patch (write_file's shape); default SKILL.md.",
                   "type": "string"
                 },
                 "name": {
@@ -56,11 +56,11 @@
                   "type": "string"
                 },
                 "old_string": {
-                  "description": "Text to find (same matching semantics as the patch tool).",
+                  "description": "Text to find (matching as in the patch tool).",
                   "type": "string"
                 },
                 "replace_all": {
-                  "description": "Replace all occurrences (default false).",
+                  "description": "Default false.",
                   "type": "boolean"
                 }
               },
@@ -82,7 +82,7 @@
                   "type": "string"
                 },
                 "content": {
-                  "description": "Full SKILL.md rewrite (REPLACES the whole file; last resort).",
+                  "description": "Full SKILL.md that REPLACES the whole file; last resort. Read the file via skill_view() first.",
                   "type": "string"
                 },
                 "name": {
@@ -110,7 +110,7 @@
                   "type": "string"
                 },
                 "file_path": {
-                  "description": "Path RELATIVE to the skill's own directory, e.g. 'references/api.md' — no leading slash, never absolute; first segment references/, templates/, scripts/, or assets/.",
+                  "description": "RELATIVE to the skill's own directory, e.g. 'references/api.md': never absolute, no leading slash; first segment references/, templates/, scripts/ or assets/.",
                   "type": "string"
                 },
                 "name": {

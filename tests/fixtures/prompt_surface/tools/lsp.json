@@ -1,0 +1,42 @@
+{
+  "description": "Navigate code through the project's language server. Servers: pyright, tsserver, rust-analyzer, clangd (local git checkouts). Answers by meaning, not text: no hits from comments, strings or same-named symbols. definition / references / hover: give path and symbol (the identifier), plus the 1-based line it is on (omit line to use the symbol's declaration in the file, else the first occurrence the server resolves). symbols: with query, find a name across the workspace (path = any source file of that language in the project); without query, an outline of path. Returns path:line:col plus the source line, at most 50 results.",
+  "name": "lsp",
+  "parameters": {
+    "properties": {
+      "action": {
+        "enum": [
+          "definition",
+          "references",
+          "hover",
+          "symbols"
+        ],
+        "type": "string"
+      },
+      "column": {
+        "description": "1-based column; only when symbol is ambiguous on its line.",
+        "type": "integer"
+      },
+      "line": {
+        "description": "1-based line where symbol occurs.",
+        "type": "integer"
+      },
+      "path": {
+        "description": "Source file to query (absolute, or relative to the working directory).",
+        "type": "string"
+      },
+      "query": {
+        "description": "symbols: name or prefix to search the workspace for.",
+        "type": "string"
+      },
+      "symbol": {
+        "description": "The identifier to look up (definition / references / hover).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "action",
+      "path"
+    ],
+    "type": "object"
+  }
+}
