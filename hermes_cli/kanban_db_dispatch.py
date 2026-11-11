@@ -173,34 +173,6 @@ class DispatchResult:
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
 
 
-def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
-    """One line naming why the tick(s) held ready work back, or ``""``.
-
-    ``active_pr (1), rate_limited (1), memory_pressure (critical)``: respawn-guard
-    reasons counted per task plus tick-level holds, for the "dispatcher stuck"
-    warnings of the CLI daemon and embedded gateway dispatcher (#111910). Never
-    ``reason=value``: the log redactor reads ``<word>_auth=<v>`` as a secret, so
-    ``blocker_auth=1,`` reached the log as ``blocker_auth=***``.
-    """
-    counts: dict[str, int] = {}
-    pressure: Optional[str] = None
-    for res in results:
-        if res is None:
-            continue
-        for _task_id, reason in res.respawn_guarded:
-            counts[reason] = counts.get(reason, 0) + 1
-        if res.rate_limited:
-            counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
-        if res.skipped_locked:
-            counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
-        if res.memory_pressure:
-            pressure = res.memory_pressure
-    parts = [f"{k} ({v})" for k, v in sorted(counts.items())]
-    if pressure:
-        parts.append(f"memory_pressure ({pressure})")
-    return ", ".join(parts)
-
-
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
 # ``dispatch_once`` and read by ``detect_crashed_workers`` to classify a dead-pid
 # task. Entry: ``pid -> (raw_wait_status, reaped_at_epoch)``; raw status kept so
@@ -1823,34 +1795,37 @@ def dispatch_profile_allowlist_summary() -> str:
             "profile, or the config could not be read — omit the key to allow any)")
 
 
-def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
+def _has_spawnable(conn: sqlite3.Connection, status: str, skip: Iterable[str] = ()) -> bool:
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
         (status,),
     ).fetchall()
-    if not rows:
+    skip = frozenset(skip)
+    assignees = {row["assignee"] for row in rows if row["id"] not in skip}
+    if not assignees:
         return False
     profile_exists = _profile_exists_fn()
     if profile_exists is None:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
-    return any(profile_exists(row["assignee"]) for row in rows)
+    return any(profile_exists(a) for a in assignees)
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """True iff a ready+assigned+unclaimed task maps to a real Hermes profile.
+def has_spawnable_ready(conn: sqlite3.Connection, skip: Iterable[str] = ()) -> bool:
+    """True iff a ready+assigned+unclaimed task not in ``skip`` maps to a real Hermes profile.
 
     Lets health telemetry tell "stuck" (``0 spawned`` with spawnable work) from
-    "correctly idle" (only control-plane lanes waiting on ``claim_task``). Falls
-    back to "any assigned" when ``profile_exists`` is unimportable.
+    "correctly idle" (only control-plane lanes waiting on ``claim_task``, or cards
+    the quota gate holds on purpose, passed as ``skip``). Falls back to "any
+    assigned" when ``profile_exists`` is unimportable.
     """
-    return _has_spawnable(conn, "ready")
+    return _has_spawnable(conn, "ready", skip)
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
+def has_spawnable_review(conn: sqlite3.Connection, skip: Iterable[str] = ()) -> bool:
     """:func:`has_spawnable_ready` for the review column."""
-    return _has_spawnable(conn, "review")
+    return _has_spawnable(conn, "review", skip)
 
 
 def review_dispatch_enabled() -> bool:

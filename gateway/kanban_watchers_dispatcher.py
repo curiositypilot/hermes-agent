@@ -216,14 +216,15 @@ class _KanbanDispatcher:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
 
-    def ready_nonempty(self) -> bool:
+    def ready_nonempty(self, skip: frozenset[str] = frozenset()) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
 
         Control-plane lanes (e.g. ``orion-cc``) are pulled by terminals via
         ``claim_task`` and never spawnable — a queue full of those is
         "correctly idle", not "stuck". The review column is probed only when
         review dispatch is on (same gate as the dispatcher): a task waiting
-        for a human reviewer is idle, not stuck.
+        for a human reviewer is idle, not stuck. ``skip``: ids the tick held at
+        the quota gate on purpose (``quota_held_ids``), also not stuck.
         """
         kbd = _kbd()
         _review_probe = kbd.review_dispatch_enabled()
@@ -233,7 +234,7 @@ class _KanbanDispatcher:
                 conn = None
                 try:
                     conn = _kbc().connect(board=slug)
-                    if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
+                    if kbd.has_spawnable_ready(conn, skip) or (_review_probe and kbd.has_spawnable_review(conn, skip)):
                         return True
                 except Exception:
                     continue

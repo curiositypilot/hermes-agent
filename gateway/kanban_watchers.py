@@ -287,6 +287,7 @@ class GatewayKanbanWatchersMixin:
                 # Reap zombies before per-board work so a board DB failure
                 # cannot block cleanup of unrelated workers.
                 from hermes_cli import kanban_db_dispatch as _kbd
+                from hermes_cli import kanban_db_dispatch_holds as _holds
                 pids = await _to_thread_process_service(_kbd.reap_worker_zombies)
                 if pids:
                     logger.info("kanban dispatcher: reaped %d zombie worker(s), pids=%s", len(pids), pids)
@@ -316,11 +317,13 @@ class GatewayKanbanWatchersMixin:
                             logger.exception("kanban auto-label: pre-pass failed; dispatching anyway")
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
-                    ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
+                    # A card the quota gate holds with a retry ahead is a deliberate hold, not stuck.
+                    held_ids = _holds.quota_held_ids(res for _slug, res in (results or []))
+                    ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty, held_ids)
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
-                    held = _kbd.describe_suppression(res for _slug, res in (results or []))
+                    held = _holds.describe_suppression(res for _slug, res in (results or []))
                     logger.warning(
                         "kanban dispatcher stuck: ready queue non-empty for "
                         "%d consecutive ticks but 0 workers spawned.%s Check "

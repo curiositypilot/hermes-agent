@@ -15,6 +15,7 @@ from pathlib import Path
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_dispatch_holds as kbd_holds
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli.kanban_output import _err, _fmt_ts, _print_json
 
@@ -223,17 +224,18 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
     health_state = {"bad_ticks": 0, "last_warn_at": 0}
 
-    def _ready_queue_nonempty() -> bool:
+    def _ready_queue_nonempty(skip: frozenset[str] = frozenset()) -> bool:
         """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
-        Control-plane lanes pulled via ``claim_task`` are correctly idle, not stuck."""
+        Control-plane lanes pulled via ``claim_task`` and cards the quota gate
+        holds with a retry ahead (``skip``) are correctly idle, not stuck."""
         try:
             with kbc.connect_closing() as conn:
-                return kbd.has_spawnable_ready(conn)
+                return kbd.has_spawnable_ready(conn, skip)
         except Exception:
             return False
 
     def _on_tick(res):
-        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
+        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty(kbd_holds.quota_held_ids([res]))
         if ready_pending and not res.spawned:
             health_state["bad_ticks"] += 1
         else:
@@ -242,7 +244,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         if health_state["bad_ticks"] >= HEALTH_WINDOW:
             now = int(time.time())
             if now - health_state["last_warn_at"] >= 300:
-                held = kbd.describe_suppression([res])
+                held = kbd_holds.describe_suppression([res])
                 held = f" Last tick held back: {held}." if held else ""
                 print(
                     f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "

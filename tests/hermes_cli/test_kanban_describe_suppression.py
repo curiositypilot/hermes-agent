@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from agent.redact import redact_sensitive_text
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli.kanban_db_dispatch_holds import describe_suppression
 
 GUARD_REASONS = (
     "active_pr",
@@ -27,7 +28,7 @@ def _held_line() -> str:
         skipped_locked=True,
         memory_pressure="critical",
     )
-    return kbd.describe_suppression([res])
+    return describe_suppression([res])
 
 
 def test_every_reason_passes_the_redactor_unchanged():

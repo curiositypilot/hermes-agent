@@ -10,9 +10,11 @@ Split out of ``hermes_cli.kanban_db_dispatch``; ``kanban_db`` is late-imported (
 from __future__ import annotations
 
 import sqlite3
-from typing import TYPE_CHECKING, Any, Optional
+import time
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 if TYPE_CHECKING:
+    from hermes_cli.kanban_db_dispatch import DispatchResult
     from hermes_cli.kanban_routing import RouteDecision
 
 # Kinds that do not end a hold streak. An unknown future kind is absent on
@@ -59,3 +61,48 @@ def _record_routing_hold(
             _kb._append_event(conn, task_id, "routing_held", payload)
     except sqlite3.Error:
         _kb._log.debug("kanban routing: could not record hold for %s", task_id, exc_info=True)
+
+
+def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
+    """One line naming why the tick(s) held ready work back, or ``""``.
+
+    ``active_pr (1), rate_limited (1), memory_pressure (critical)``: respawn-guard
+    reasons counted per task plus tick-level holds, for the "dispatcher stuck"
+    warnings of the CLI daemon and embedded gateway dispatcher (#111910). Never
+    ``reason=value``: the log redactor reads ``<word>_auth=<v>`` as a secret, so
+    ``blocker_auth=1,`` reached the log as ``blocker_auth=***``.
+    """
+    counts: dict[str, int] = {}
+    pressure: Optional[str] = None
+    for res in results:
+        if res is None:
+            continue
+        for _task_id, reason in res.respawn_guarded:
+            counts[reason] = counts.get(reason, 0) + 1
+        if res.rate_limited:
+            counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.skipped_locked:
+            counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        if res.memory_pressure:
+            pressure = res.memory_pressure
+    parts = [f"{k} ({v})" for k, v in sorted(counts.items())]
+    if pressure:
+        parts.append(f"memory_pressure ({pressure})")
+    return ", ".join(parts)
+
+
+def quota_held_ids(results: Iterable[Optional[DispatchResult]], now: Optional[int] = None) -> frozenset[str]:
+    """Ids the tick(s) held at the quota gate with a retry time still ahead.
+
+    The "dispatcher stuck" probes skip these: a deliberate quota hold is not a
+    dispatcher that fails to spawn (intake t_7933f77e). A hold with no
+    ``retry_at``, or one already passed, is not exempt: stale quota data must
+    still warn. Only ``quota_held`` counts; ``tier_exhausted`` and cooldowns do not.
+    """
+    now = int(time.time()) if now is None else now
+    return frozenset(
+        task_id
+        for res in results if res is not None
+        for task_id, _why, retry_at in res.quota_held
+        if isinstance(retry_at, int) and retry_at > now
+    )
