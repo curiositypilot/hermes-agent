@@ -409,13 +409,27 @@ def _anthropic_cfg_base_url(model_cfg: dict[str, Any]) -> str:
     return cfg_base_url if _anthropic_base_url_override_ok(cfg_base_url) else ""
 
 
+def _anthropic_pool_holds_token() -> bool:
+    """True when the Anthropic pool has a credential, ignoring model cooldowns.
+
+    ``resolve_anthropic_token()`` with no model reads ``_available_entries``, and
+    ``model_cooldown_until(entry, None)`` treats any active cooldown as blocking.
+    A single row benched for one model then looks like a missing login.
+    """
+    return any(
+        str(getattr(entry, "access_token", "") or "").strip()
+        for entry in load_pool("anthropic").entries()
+    )
+
+
 def _anthropic_token_or_raise(*, model: str | None = None) -> str:
     from agent.anthropic_credentials import resolve_anthropic_token
     token = resolve_anthropic_token(model=model)
     if not token:
         # A key the pool benched for *this* model is not a missing credential; telling the
         # user to re-authenticate would send them chasing a cooldown that lifts on its own.
-        if model and resolve_anthropic_token():
+        # Read the pool directly: resolve_anthropic_token() hides that row behind the cooldown.
+        if model and _anthropic_pool_holds_token():
             raise AuthError(f"Anthropic credentials are rate-limited for {model}; "
                             "other Claude models remain available (see `hermes auth list`).")
         raise AuthError(_NO_ANTHROPIC_CREDENTIALS_MSG)
