@@ -9,6 +9,7 @@ engine works on sqlite3.Row objects as well as dataclasses.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -193,6 +194,59 @@ def test_stranded_in_ready_fires_when_age_exceeds_threshold():
     assert stranded[0].severity == "warning"
     assert stranded[0].data["age_seconds"] == 45 * 60
     assert stranded[0].data["assignee"] == "demo"
+
+
+# routing_held: the dispatcher holds the card on purpose (quota/tier), so no
+# stranded_in_ready until retry_at + threshold (intake t_e3768270).
+
+_NOW = 100_000
+_READY_AT = _NOW - 3 * 3600
+
+
+def _stranded(events, now=_NOW):
+    task = _task(status="ready", assignee="demo", claim_lock=None)
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    return [d for d in diags if d.kind == "stranded_in_ready"]
+
+
+def _held(reason="quota_hold", ts=_READY_AT + 60, **payload):
+    payload.setdefault("retry_at", _NOW + 2 * 86400)
+    return _event("routing_held", ts=ts, reason=reason, **payload)
+
+
+@pytest.mark.parametrize("age", [30 * 60, 2 * 3600, int(2.2 * 3600)])
+def test_stranded_in_ready_quiet_while_quota_hold_pending(age):
+    """Replay of t_8f70dc36: warning at 30m, error at 2h and 2.2h were false alarms."""
+    events = [_event("created", ts=_NOW - age), _held(ts=_NOW - age + 43)]
+    assert _stranded(events) == []
+
+
+def test_stranded_in_ready_quiet_while_tier_exhausted_pending():
+    assert _stranded([_event("created", ts=_READY_AT), _held("tier_exhausted")]) == []
+
+
+def test_stranded_in_ready_hold_with_json_string_payload():
+    ev = _held()
+    ev["payload"] = json.dumps(ev["payload"])
+    assert _stranded([_event("created", ts=_READY_AT), ev]) == []
+
+
+def test_stranded_in_ready_hold_survives_noise_events():
+    events = [_event("created", ts=_READY_AT), _held(), _event("commented", ts=_NOW - 60, body="x")]
+    assert _stranded(events) == []
+
+
+@pytest.mark.parametrize("events", [
+    pytest.param([_event("created", ts=_READY_AT)], id="no-hold"),
+    pytest.param([_event("created", ts=_READY_AT), _held(retry_at=_NOW - 31 * 60)], id="retry-overdue"),
+    pytest.param([_event("created", ts=_READY_AT), _held(retry_at=None)], id="no-retry-at"),
+    pytest.param([_event("created", ts=_READY_AT - 3600), _held(ts=_READY_AT - 3000),
+                  _event("unblocked", ts=_READY_AT)], id="hold-streak-ended"),
+    pytest.param([_event("created", ts=_READY_AT),
+                  _event("respawn_guarded", ts=_READY_AT + 60, retry_at=_NOW + 3600)], id="respawn-guarded"),
+])
+def test_stranded_in_ready_still_fires_without_pending_hold(events):
+    assert len(_stranded(events)) == 1
 
 
 
