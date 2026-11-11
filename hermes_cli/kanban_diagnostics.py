@@ -15,6 +15,8 @@ from typing import Any, Callable, Iterable, Optional
 import json
 import time
 
+from hermes_cli.kanban_db_dispatch_holds import _HOLD_STREAK_NOISE
+
 
 # Least → most urgent; sorted outputs put critical first.
 SEVERITY_ORDER = ("warning", "error", "critical")
@@ -679,12 +681,32 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+def _deliberate_hold_retry_at(events, last_ready_ts: int) -> Optional[int]:
+    """``retry_at`` of the dispatcher hold the card is in, else None.
+
+    The dispatcher writes one ``routing_held`` event per hold streak; the streak
+    lasts while the newest event outside ``_HOLD_STREAK_NOISE`` is that hold.
+    A hold without an int ``retry_at`` does not count."""
+    for ev in reversed(list(events)):
+        kind = _event_kind(ev)
+        if kind in _HOLD_STREAK_NOISE:
+            continue
+        if kind != "routing_held" or _event_ts(ev) < last_ready_ts:
+            return None
+        retry_at = _parse_payload(ev).get("retry_at")
+        return retry_at if isinstance(retry_at, int) and not isinstance(retry_at, bool) else None
+    return None
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Assigned, unclaimed, ``ready`` for >= cfg["stranded_threshold_seconds"]
     (default 30 min). Deliberately age-based and identity-agnostic so it
     catches typo'd assignees, deleted profiles, and down external worker
     pools alike without a registry to curate. Unassigned tasks are excluded —
-    the dispatcher's ``skipped_unassigned`` already covers them."""
+    the dispatcher's ``skipped_unassigned`` already covers them. Cards the
+    dispatcher holds on purpose (a ``routing_held`` streak: ``quota_hold``,
+    ``tier_exhausted``) are excluded until ``retry_at`` + threshold; a hold
+    with no ``retry_at`` or one that overran that still fires."""
     threshold_seconds = float(cfg.get("stranded_threshold_seconds", 30 * 60))
     if _task_field(task, "status") != "ready":
         return []
@@ -706,6 +728,9 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
 
     age_seconds = now - last_ready_ts
     if age_seconds < threshold_seconds:
+        return []
+    retry_at = _deliberate_hold_retry_at(events, last_ready_ts)
+    if retry_at is not None and now < retry_at + threshold_seconds:
         return []
 
     age_str = f"{age_seconds / 3600:.1f}h" if age_seconds >= 3600 else f"{int(age_seconds / 60)}m"
