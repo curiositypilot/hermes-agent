@@ -203,6 +203,18 @@ def _format_exhausted_status(entry) -> str:
     return f"{head} ({wait} left)"
 
 
+def _format_unhydrated_status(entry) -> str:
+    """Mark an api_key row the pool skips because it has no secret.
+
+    ``credential_pool._available_entries`` drops ``auth_type == api_key`` rows
+    with an empty ``runtime_api_key``. Listing those as plain logged-in made a
+    metadata-only env row look like a usable fallback.
+    """
+    if entry.auth_type == "api_key" and not entry.runtime_api_key:
+        return " no key (env var unset, skipped)"
+    return ""
+
+
 def _anthropic_oauth_login(args) -> dict:
     from agent import anthropic_credentials as anthropic_mod
     creds = anthropic_mod.run_hermes_oauth_login_pure()
@@ -546,7 +558,7 @@ def auth_list_command(args) -> None:
         print(f"{provider} ({len(entries)} credentials):")
         for idx, entry in enumerate(entries, start=1):
             marker = "← " if current is not None and entry.id == current.id else "  "
-            status = _format_exhausted_status(entry)
+            status = _format_exhausted_status(entry) + _format_unhydrated_status(entry)
             source = _display_source(entry.source)
             row = (
                 f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} "
