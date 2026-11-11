@@ -1759,26 +1759,39 @@ def test_show_omits_text_worker_context_renders_in_full(worker_env):
 @pytest.mark.parametrize("what", ["body", "comment", "comment_count", "run_summary", "run_metadata"])
 def test_show_keeps_text_worker_context_cuts(worker_env, what):
     big = 9 * 1024
-    seeds = {
-        "body": dict(body="B" * big),
-        "comment": dict(comments=("C" * (3 * 1024),)),
-        "comment_count": dict(comments=tuple(f"c{i}" for i in range(31))),
-        "run_summary": dict(ended_run={"outcome": "crashed", "summary": "S" * (5 * 1024)}),
-        "run_metadata": dict(ended_run={"outcome": "crashed", "metadata": {"m": "M" * (5 * 1024)}}),
+    # Table, not an if/elif on ``what`` (HX011). Each row is seed, reader, expected.
+    cases = {
+        "body": (
+            {"body": "B" * big},
+            lambda out, ended: (out["task"]["body"], "task.body" in out.get("deduped", [])),
+            ("B" * big, False),
+        ),
+        "comment": (
+            {"comments": ("C" * (3 * 1024),)},
+            lambda out, ended: out["comments"][0]["body"],
+            "C" * (3 * 1024),
+        ),
+        "comment_count": (
+            {"comments": tuple(f"c{i}" for i in range(31))},
+            lambda out, ended: [c["body"] for c in out["comments"]],
+            [f"c{i}" for i in range(31)],
+        ),
+        "run_summary": (
+            {"ended_run": {"outcome": "crashed", "summary": "S" * (5 * 1024)}},
+            lambda out, ended: ended[0]["summary"],
+            "S" * (5 * 1024),
+        ),
+        "run_metadata": (
+            {"ended_run": {"outcome": "crashed", "metadata": {"m": "M" * (5 * 1024)}}},
+            lambda out, ended: ended[0]["metadata"]["m"],
+            "M" * (5 * 1024),
+        ),
     }
-    _seed_show(worker_env, **seeds[what])
+    seed, read, expected = cases[what]
+    _seed_show(worker_env, **seed)
     out = _show()
     ended = [r for r in out["runs"] if r["ended_at"] is not None]
-    if what == "body":
-        assert out["task"]["body"] == "B" * big and "task.body" not in out.get("deduped", [])
-    elif what == "comment":
-        assert out["comments"][0]["body"] == "C" * (3 * 1024)
-    elif what == "comment_count":
-        assert [c["body"] for c in out["comments"]] == [f"c{i}" for i in range(31)]
-    elif what == "run_summary":
-        assert ended[0]["summary"] == "S" * (5 * 1024)
-    else:
-        assert ended[0]["metadata"]["m"] == "M" * (5 * 1024)
+    assert read(out, ended) == expected
 
 
 def test_show_raw_returns_full_payload(worker_env):

@@ -115,9 +115,8 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
-# Complexity labels driving ``kanban.routing`` tier selection (S = small/localized,
-# M = multi-file, L = broad or ambiguous, XL = research/architecture/deep reasoning,
-# hand-labelled only: the estimator never assigns it); NULL = unlabeled.
+# ``kanban.routing``: S small, M multi-file, L broad, XL research (hand-labelled).
+# NULL = unlabeled; the estimator never assigns XL.
 VALID_COMPLEXITIES = ("S", "M", "L", "XL")
 
 
