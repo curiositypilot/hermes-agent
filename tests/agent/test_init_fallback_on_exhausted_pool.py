@@ -366,3 +366,74 @@ def test_init_fallback_refused_by_data_class(monkeypatch):
         _build(fake_resolve, [{"provider": "anthropic", "model": "claude-sonnet-5-5"}],
                provider="openai-codex", model="gpt-5.4-mini")
     assert seen == ["openai-codex"]
+
+
+_OPENROUTER_NO_FALLBACK = (
+    "Provider 'openrouter' has no API key. Set OPENROUTER_API_KEY and retry. "
+    "This route cannot fall back to another provider."
+)
+
+
+def _clear_fallback_suppressors(monkeypatch):
+    monkeypatch.delenv("HERMES_NO_FALLBACK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_PINNED", raising=False)
+    monkeypatch.delenv("HERMES_DATA_CLASS", raising=False)
+
+
+def test_init_openrouter_no_fallback_names_missing_key(monkeypatch):
+    """``--no-fallback`` with a chain present names the missing openrouter key."""
+    monkeypatch.setenv("HERMES_NO_FALLBACK", "1")
+    monkeypatch.delenv("HERMES_KANBAN_PINNED", raising=False)
+    seen = []
+
+    def fake_resolve(provider, model=None, **_):
+        seen.append(provider)
+        return None, None
+
+    with pytest.raises(RuntimeError) as exc:
+        _build(fake_resolve, [{"provider": "anthropic", "model": "claude-sonnet-5-5"}])
+    assert str(exc.value) == _OPENROUTER_NO_FALLBACK
+    assert "No LLM provider configured" not in str(exc.value)
+    assert seen == ["openrouter"]
+
+
+def test_init_openrouter_fallback_false_names_missing_key(monkeypatch):
+    """A class that allows openrouter and sets ``fallback: false`` names the missing key.
+
+    Stock ``confidential`` denies openrouter as primary, which is a different error.
+    """
+    import os
+    from pathlib import Path
+
+    _clear_fallback_suppressors(monkeypatch)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_DATA_CLASS", "or_locked")
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  data_policies:\n"
+        "    classes:\n"
+        "      or_locked:\n"
+        "        providers: [openrouter]\n"
+        "        fallback: false\n",
+        encoding="utf-8",
+    )
+    seen = []
+
+    def fake_resolve(provider, model=None, **_):
+        seen.append(provider)
+        return None, None
+
+    with pytest.raises(RuntimeError) as exc:
+        _build(fake_resolve, [{"provider": "anthropic", "model": "claude-sonnet-5-5"}])
+    assert str(exc.value) == _OPENROUTER_NO_FALLBACK
+    assert "No LLM provider configured" not in str(exc.value)
+    assert seen == ["openrouter"]
+
+
+def test_init_openrouter_no_chain_keeps_generic_sentence(monkeypatch):
+    """Unpinned openrouter with no chain still gets the generic first-run sentence."""
+    _clear_fallback_suppressors(monkeypatch)
+    with pytest.raises(RuntimeError, match="No LLM provider configured") as exc:
+        _build(lambda provider, model=None, **_: (None, None), None)
+    assert "This route cannot fall back" not in str(exc.value)

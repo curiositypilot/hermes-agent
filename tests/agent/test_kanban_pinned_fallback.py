@@ -296,6 +296,12 @@ def test_pinned_route_skips_init_time_fallback(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_PINNED", "1")
     result, tried = _init_agent(CHAIN)
     assert isinstance(result, RuntimeError), result
+    assert str(result) == (
+        "Provider 'openrouter' has no API key. Set OPENROUTER_API_KEY and retry. "
+        "This route cannot fall back to another provider."
+    )
+    assert "OPENROUTER_API_KEY" in str(result)
+    assert "No LLM provider configured" not in str(result)
     assert "anthropic" not in tried
 
 
