@@ -258,3 +258,49 @@ def test_pinned_billing_ends_turn_and_exits_75(monkeypatch):
     assert verdict.action == "return"
     assert verdict.result["failure_reason"] == "billing"
     assert _single_query_exit_code(verdict.result) == KANBAN_RATE_LIMIT_EXIT_CODE
+
+
+
+# --- init-time fallback walk (intake t_085de9c7) ----------------------------------------------
+
+def _init_agent(chain):
+    """Build a real AIAgent whose primary (openrouter) has no credential; returns (agent|exc, providers tried)."""
+    from types import SimpleNamespace as NS
+    from unittest.mock import MagicMock
+    from run_agent import AIAgent
+    tried = []
+
+    def fake_resolve(provider, model=None, **_):
+        tried.append(provider)
+        if provider == "anthropic":
+            return NS(api_key="ant-test-key", base_url="https://api.anthropic.com",
+                      _default_headers=None), model
+        return None, None
+
+    with patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
+         patch("model_tools.get_tool_definitions", return_value=[]), \
+         patch("model_tools.check_toolset_requirements", return_value={}), \
+         patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+        try:
+            result = AIAgent(provider="openrouter", model="z-ai/glm-5.3-flash", api_key=None, base_url=None,
+                             quiet_mode=True, skip_context_files=True, skip_memory=True, fallback_model=chain)
+        except RuntimeError as exc:
+            result = exc
+    return result, tried
+
+
+def test_pinned_route_skips_init_time_fallback(monkeypatch):
+    """Runs 9812..9862: a critic pinned to openrouter with no openrouter key must fail on its own
+    route, not answer on the chain's anthropic entry (the author's vendor)."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_x")
+    monkeypatch.setenv("HERMES_KANBAN_PINNED", "1")
+    result, tried = _init_agent(CHAIN)
+    assert isinstance(result, RuntimeError), result
+    assert "anthropic" not in tried
+
+
+def test_unpinned_route_still_uses_init_time_fallback(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_x")
+    result, _tried = _init_agent(CHAIN)
+    assert not isinstance(result, RuntimeError), result
+    assert result.provider == "anthropic" and result.api_mode == "anthropic_messages"

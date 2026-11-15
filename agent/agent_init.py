@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
-from agent.agent_init_fallback import _fallback_entries, _init_fallback_chain, recompute_init_fallback_api_mode
+from agent.agent_init_fallback import _init_fallback_chain, walk_init_fallback_chain
 from agent.agent_init_params import _CALLBACK_PARAMS, _GATEWAY_IDENTITY_PARAMS, _PASSTHROUGH_PARAMS
 from agent.agent_runtime_helpers import _ra
 from agent.iteration_budget import IterationBudget, normalize_budget_warning_ratio
@@ -771,9 +771,10 @@ def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> dict
 def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[dict[str, Any]]:
     """OpenAI-client kwargs via the centralized provider router (no explicit creds).
 
-    Falls through to the init-time fallback chain, then raises with the missing-key /
-    no-provider diagnostic. ``None`` when the chain landed on a MoA preset: the facade is
-    already bound and there is no OpenAI client to construct.
+    Falls through to the init-time fallback chain (filtered like the per-turn chain), then
+    raises with the missing-key / no-provider diagnostic. ``None`` when the chain landed on a
+    MoA preset or a native Anthropic/Bedrock entry: the agent is already bound and there is no
+    OpenAI client to construct.
     """
     from agent.auxiliary_client import resolve_provider_client
     _routed_client, _ = resolve_provider_client(
@@ -792,40 +793,9 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     # #17929.
     _explicit = (agent.provider or "").strip().lower()
     _refused_entries = []
-    for _fb in _fallback_entries(fallback_model):
-        _fb_provider = str(_fb["provider"])
-        try:
-            from hermes_cli.fallback_config import resolve_entry_api_key
-            _fb_explicit_key = resolve_entry_api_key(_fb)
-            _fb_client, _fb_model = resolve_provider_client(
-                _fb["provider"], model=_fb["model"], raw_codex=True,
-                explicit_base_url=_fb.get("base_url"), explicit_api_key=_fb_explicit_key,
-            )
-        except Exception as _fb_exc:
-            logger.debug("Init-time fallback entry %s failed: %s", _fb_provider, _fb_exc)
-            # A bare exception (``KeyError()``) stringifies empty; name its type instead.
-            _refused_entries.append((_fb_provider, str(_fb_exc) or type(_fb_exc).__name__))
-            continue
-        if _fb_client is None:
-            # The router returns None when no credentials are usable for the entry — a skip
-            # that leaves no trace otherwise, hiding key-less fallback entries from the log.
-            logger.debug(
-                "Init-time fallback entry %s resolved no usable credentials", _fb_provider
-            )
-            _refused_entries.append((_fb_provider, "no usable credentials"))
-            continue
-        agent._fallback_activated = True
-        if _fb_provider.strip().lower() == "moa":
-            # The chokepoint handed back the preset's aggregator client, which only proves the
-            # preset resolves and its aggregator has credentials. A MoA entry means the preset
-            # itself (same as ``provider: moa`` in config), so bind the facade, not the aggregator.
-            from agent.moa_loop import bind_moa_runtime
-            bind_moa_runtime(agent, _fb["model"])
-            return None
-        agent.provider = agent.requested_provider = _fb["provider"]
-        agent.model = _fb_model or _fb["model"]
-        recompute_init_fallback_api_mode(agent, _fb_client)
-        return _client_kwargs_from_routed(_fb_client, _provider_timeout)
+    _taken, _fb_kwargs = walk_init_fallback_chain(agent, fallback_model, _provider_timeout, _refused_entries)
+    if _taken:
+        return _fb_kwargs
     # A burned credential pool (#119533) is otherwise indistinguishable from missing config,
     # so name it even when no fallback entries are configured.
     _pool_exhausted = False
@@ -915,9 +885,10 @@ def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_time
         client_kwargs = _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout)
     else:
         client_kwargs = _routed_client_kwargs(agent, fallback_model, _provider_timeout)
-        if client_kwargs is None:  # init-time fallback bound the MoA facade
+        if client_kwargs is None:  # init-time fallback bound the MoA facade or a native client
             if not agent.quiet_mode:
-                print(f"🤖 AI Agent initialized with MoA preset: {agent.model}")
+                _kind = "MoA preset" if agent.provider == "moa" else f"fallback model ({agent.provider})"
+                print(f"🤖 AI Agent initialized with {_kind}: {agent.model}")
             return
     from hermes_cli.providers import is_actual_route
     if is_actual_route(agent.provider, client_kwargs.get("base_url", "")):

@@ -225,3 +225,144 @@ def test_init_fallback_keeps_codex_responses_for_openai_codex():
         assert agent.model == "gpt-5.4-mini"
         assert agent._fallback_activated is True
         assert agent.api_mode == "codex_responses"
+
+
+
+# --- init-time walk uses the per-turn chain filters; native clients (intake t_085de9c7) ---------
+
+def _anthropic_client(api_key="ant-test-key"):
+    """What resolve_provider_client hands back for an ``anthropic`` entry: key + base_url."""
+    from types import SimpleNamespace
+    return SimpleNamespace(api_key=api_key, base_url="https://api.anthropic.com", _default_headers=None)
+
+
+def _build(fake_resolve, chain, provider="openrouter", model="z-ai/glm-5.3-flash", **kw):
+    with patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
+         patch("model_tools.get_tool_definitions", return_value=_make_tool_defs()), \
+         patch("model_tools.check_toolset_requirements", return_value={}), \
+         patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+        return AIAgent(provider=provider, model=model, api_key=None, base_url=None, quiet_mode=True,
+                       skip_context_files=True, skip_memory=True, fallback_model=chain, **kw)
+
+
+def test_init_fallback_to_anthropic_builds_anthropic_client():
+    """Incident 2026-11-15 (runs 9812..9862): landing on anthropic used to leave the agent on the
+    OpenAI-wire branch with no ``_anthropic_api_key``, and the primary snapshot raised."""
+    def fake_resolve(provider, model=None, **_):
+        return (_anthropic_client(), "claude-sonnet-5-5") if provider == "anthropic" else (None, None)
+
+    agent = _build(fake_resolve, [{"provider": "anthropic", "model": "claude-sonnet-5-5"}])
+    assert (agent.provider, agent.model) == ("anthropic", "claude-sonnet-5-5")
+    assert agent.api_mode == "anthropic_messages"
+    assert agent._anthropic_client is not None and agent.client is None
+    assert agent._primary_runtime["anthropic_api_key"] == "ant-test-key"
+    assert agent._fallback_activated is True
+
+
+def test_init_fallback_skips_anthropic_entry_without_token():
+    """An anthropic entry whose token lookup raises AuthError is refused like an unresolvable entry."""
+    from hermes_cli.auth_constants import AuthError
+    fb = _mock_client()
+
+    def fake_resolve(provider, model=None, **_):
+        if provider == "anthropic":
+            return _anthropic_client(api_key=""), "claude-sonnet-5-5"
+        if provider == "tencent-token-plan":
+            return fb, "kimi2.5"
+        return None, None
+
+    def no_token(**_):
+        raise AuthError("no Anthropic credentials")
+
+    chain = [{"provider": "anthropic", "model": "claude-sonnet-5-5"},
+             {"provider": "tencent-token-plan", "model": "kimi2.5"}]
+    with patch("hermes_cli.runtime_provider._anthropic_token_or_raise", side_effect=no_token):
+        agent = _build(fake_resolve, chain)
+    assert (agent.provider, agent.model) == ("tencent-token-plan", "kimi2.5")
+    assert agent.api_mode == "chat_completions"
+    assert agent.client is not None and agent._fallback_activated is True
+
+
+def test_init_fallback_native_install_bug_propagates():
+    """A programming error installing the native client must raise, not fall through to the next entry."""
+    def fake_resolve(provider, model=None, **_):
+        if provider == "anthropic":
+            return _anthropic_client(), "claude-sonnet-5-5"
+        if provider == "tencent-token-plan":
+            return _mock_client(), "kimi2.5"
+        return None, None
+
+    chain = [{"provider": "anthropic", "model": "claude-sonnet-5-5"},
+             {"provider": "tencent-token-plan", "model": "kimi2.5"}]
+    with patch("agent.client_lifecycle._swap_fallback_clients", side_effect=AttributeError("half-built")):
+        with pytest.raises(AttributeError, match="half-built"):
+            _build(fake_resolve, chain)
+
+
+def test_init_fallback_resolver_runtime_error_is_refused():
+    """A resolver RuntimeError refuses that entry; the next one still wins."""
+    fb = _mock_client()
+
+    def fake_resolve(provider, model=None, **_):
+        if provider == "anthropic":
+            raise RuntimeError("resolver broke")
+        if provider == "tencent-token-plan":
+            return fb, "kimi2.5"
+        return None, None
+
+    chain = [{"provider": "anthropic", "model": "claude-sonnet-5-5"},
+             {"provider": "tencent-token-plan", "model": "kimi2.5"}]
+    agent = _build(fake_resolve, chain)
+    assert agent.provider == "tencent-token-plan"
+
+
+def test_init_fallback_resolver_bug_propagates():
+    """An AttributeError from the resolver is a bug: it must not be swallowed as a refusal."""
+    def fake_resolve(provider, model=None, **_):
+        if provider == "anthropic":
+            raise AttributeError("half-built resolver")
+        if provider == "tencent-token-plan":
+            return _mock_client(), "kimi2.5"
+        return None, None
+
+    chain = [{"provider": "anthropic", "model": "claude-sonnet-5-5"},
+             {"provider": "tencent-token-plan", "model": "kimi2.5"}]
+    with pytest.raises(AttributeError, match="half-built resolver"):
+        _build(fake_resolve, chain)
+
+
+def test_init_fallback_skips_chat_only_entry_for_kanban():
+    """A ``chat_only`` (pay-per-use) entry stays out of unattended work at init too."""
+    fb = _mock_client()
+    seen = []
+
+    def fake_resolve(provider, model=None, **_):
+        seen.append(provider)
+        if provider in ("paid-relay", "tencent-token-plan"):
+            return fb, model
+        return None, None
+
+    chain = [{"provider": "paid-relay", "model": "big-model", "chat_only": True},
+             {"provider": "tencent-token-plan", "model": "kimi2.5"}]
+    agent = _build(fake_resolve, chain, platform="cron")
+    assert "paid-relay" not in seen
+    assert agent.provider == "tencent-token-plan"
+
+    seen.clear()
+    chat = _build(fake_resolve, chain, platform="cli")  # interactive chat keeps the last resort
+    assert chat.provider == "paid-relay"
+
+
+def test_init_fallback_refused_by_data_class(monkeypatch):
+    """A class with ``fallback: false`` never switches models, at init included."""
+    monkeypatch.setenv("HERMES_DATA_CLASS", "confidential")
+    seen = []
+
+    def fake_resolve(provider, model=None, **_):
+        seen.append(provider)
+        return (_anthropic_client(), model) if provider == "anthropic" else (None, None)
+
+    with pytest.raises(RuntimeError, match="openai-codex"):
+        _build(fake_resolve, [{"provider": "anthropic", "model": "claude-sonnet-5-5"}],
+               provider="openai-codex", model="gpt-5.4-mini")
+    assert seen == ["openai-codex"]
