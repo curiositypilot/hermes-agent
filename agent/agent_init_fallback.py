@@ -172,8 +172,13 @@ def walk_init_fallback_chain(agent, fallback_model, timeout, refused: list) -> t
                 fb["provider"], model=fb["model"], raw_codex=True,
                 explicit_base_url=fb.get("base_url"), explicit_api_key=resolve_entry_api_key(fb),
             )
-        except Exception as fb_exc:  # health: allow BLE001 -- moved verbatim from _routed_client_kwargs: a broken entry is refused, not fatal
-            logger.debug("Init-time fallback entry %s failed: %s", fb_provider, fb_exc)
+        except (ImportError, OSError, TimeoutError, ValueError, KeyError, TypeError, RuntimeError) as fb_exc:
+            # These are the resolver's refusal types (AuthError and ProviderDenied included:
+            # RuntimeError and ValueError). A broken entry is refused, not fatal, same as the
+            # except Exception this replaced (moved from _routed_client_kwargs). Anything else,
+            # notably AttributeError, is a bug and propagates. Logged at error so the exact
+            # exception is not debug-only.
+            logger.error("Init-time fallback entry %s failed: %s", fb_provider, fb_exc)
             # A bare exception (``KeyError()``) stringifies empty; name its type instead.
             refused.append((fb_provider, str(fb_exc) or type(fb_exc).__name__))
             continue

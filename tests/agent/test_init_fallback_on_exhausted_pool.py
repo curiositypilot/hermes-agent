@@ -299,6 +299,38 @@ def test_init_fallback_native_install_bug_propagates():
             _build(fake_resolve, chain)
 
 
+def test_init_fallback_resolver_runtime_error_is_refused():
+    """A resolver RuntimeError refuses that entry; the next one still wins."""
+    fb = _mock_client()
+
+    def fake_resolve(provider, model=None, **_):
+        if provider == "anthropic":
+            raise RuntimeError("resolver broke")
+        if provider == "tencent-token-plan":
+            return fb, "kimi2.5"
+        return None, None
+
+    chain = [{"provider": "anthropic", "model": "claude-sonnet-5-5"},
+             {"provider": "tencent-token-plan", "model": "kimi2.5"}]
+    agent = _build(fake_resolve, chain)
+    assert agent.provider == "tencent-token-plan"
+
+
+def test_init_fallback_resolver_bug_propagates():
+    """An AttributeError from the resolver is a bug: it must not be swallowed as a refusal."""
+    def fake_resolve(provider, model=None, **_):
+        if provider == "anthropic":
+            raise AttributeError("half-built resolver")
+        if provider == "tencent-token-plan":
+            return _mock_client(), "kimi2.5"
+        return None, None
+
+    chain = [{"provider": "anthropic", "model": "claude-sonnet-5-5"},
+             {"provider": "tencent-token-plan", "model": "kimi2.5"}]
+    with pytest.raises(AttributeError, match="half-built resolver"):
+        _build(fake_resolve, chain)
+
+
 def test_init_fallback_skips_chat_only_entry_for_kanban():
     """A ``chat_only`` (pay-per-use) entry stays out of unattended work at init too."""
     fb = _mock_client()
