@@ -189,13 +189,20 @@ def test_execute_failure_line_redacts_the_launch_key(tmp_path, monkeypatch):
     assert launch_key not in line and line.startswith("managed worker execute failed:")
 
 
-def test_execute_failure_helper_never_raises(tmp_path, monkeypatch):
+@pytest.mark.parametrize("error", [sqlite3.OperationalError("database is locked"), RuntimeError("boom"),
+                                   ImportError("no module")])
+def test_execute_failure_helper_never_raises(tmp_path, monkeypatch, error):
     _path, context = _bound_claim(tmp_path, monkeypatch)
 
     def broken(*_args):
-        raise sqlite3.OperationalError("database is locked")
+        raise error
     monkeypatch.setattr(session_kanban, "_record_worker_result", broken)
     session_kanban.record_execute_failure(_execute_frame(context), ValueError("managed_finish_timeout"))
+
+
+@pytest.mark.parametrize("policy", [None, "kanban", ["kanban_json"]])
+def test_execute_failure_helper_ignores_a_non_mapping_policy(policy):
+    session_kanban.record_execute_failure({"policy": policy}, ValueError("managed_attachment_unavailable"))
 
 
 def test_execute_books_failure_then_reraises_the_original(monkeypatch):
