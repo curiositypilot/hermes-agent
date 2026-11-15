@@ -362,6 +362,17 @@ def hydrate_sandbox_env():
 
 
 def execute(frame, channel):
+    """Run one managed worker attempt. A failure outside agent construction and the turns (the
+    attachment check, the finish handshake) books its cause line before ``main()`` logs it."""
+    try:
+        _execute(frame, channel)
+    except Exception as exc:
+        from gateway.session_kanban import record_execute_failure
+        record_execute_failure(frame, exc)
+        raise
+
+
+def _execute(frame, channel):
     # The owner RPC below imports gateway/config modules (hermes_cli.config, providers,
     # hermes_cli.plugins) transitively; the policy must already be frozen when they load.
     bind_worker_policy(frame)

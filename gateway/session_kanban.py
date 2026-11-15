@@ -364,6 +364,28 @@ def record_start_failure(frame, exc):
                           _failure_line(frame, exc, 'start'))
 
 
+def record_execute_failure(frame, exc):
+    """A failure in ``execute()`` outside construction and the turns (attachment restore, the
+    finish handshake) books the cause line too. A start/turn cause line already booked for this
+    attempt stays; an exit-0 reply beside a failed worker is replaced (the owner settles it lost).
+    Never raises: the exception ``main()`` logs must not be replaced by a board failure."""
+    try:
+        context = json.loads(frame['policy'].get('kanban_json') or 'null')
+        if context is None:
+            return
+        booked = worker_result(context['db'], context)
+        if booked.get('exit_code') not in (None, 0) and str(booked.get('last_output') or '').startswith('managed worker '):
+            return
+        from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
+        _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)),
+                              _failure_line(frame, exc, 'execute'))
+    # Every family the body can raise: board I/O (sqlite3.Error, OSError), a malformed frame or context
+    # (LookupError, ValueError, TypeError, AttributeError), late imports (ImportError), helper bugs (RuntimeError).
+    except (sqlite3.Error, OSError, LookupError, ValueError, TypeError, AttributeError, ImportError, RuntimeError):
+        import logging
+        logging.getLogger(__name__).exception('kanban execute-failure record failed')
+
+
 _FAILURE_LINE_MAX = 240
 
 

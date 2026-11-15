@@ -1,6 +1,7 @@
 """Canonical Kanban receipts retain the shared one-shot outcome semantics."""
 import json
 import os
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -132,3 +133,88 @@ def test_turn_exception_books_cause_line(tmp_path, monkeypatch):
     result = session_kanban.worker_result(path, context)
     assert result["last_output"] == "managed worker turn failed: RuntimeError: boom"
     assert result["exit_code"] == 1
+
+
+def _execute_frame(context, api_key=None):
+    return {"policy": {"kanban_json": json.dumps(context)}, "api_key": api_key}
+
+
+def test_execute_failure_books_cause_line_for_missing_attachment(tmp_path, monkeypatch):
+    path, context = _bound_claim(tmp_path, monkeypatch)
+    session_kanban.record_execute_failure(_execute_frame(context), ValueError("managed_attachment_unavailable"))
+    result = session_kanban.worker_result(path, context)
+    assert result["last_output"] == "managed worker execute failed: ValueError: managed_attachment_unavailable"
+    assert result["exit_code"] == 1
+
+
+def test_execute_failure_replaces_booked_exit_zero_reply(tmp_path, monkeypatch):
+    """Finish timeout: the turn booked its reply (exit 0) and the owner never got ``finished``."""
+    path, context = _bound_claim(tmp_path, monkeypatch)
+    session_kanban._record_worker_result(context, 0, "done")
+    session_kanban.record_execute_failure(_execute_frame(context), ValueError("managed_finish_timeout"))
+    result = session_kanban.worker_result(path, context)
+    assert result["last_output"] == "managed worker execute failed: ValueError: managed_finish_timeout"
+    assert result["exit_code"] == 1
+
+
+def test_execute_failure_keeps_earlier_start_and_turn_cause_lines(tmp_path, monkeypatch):
+    from hermes_cli.auth import AuthError
+    from hermes_cli.auth_constants import CODEX_RATE_LIMITED_CODE
+    path, context = _bound_claim(tmp_path, monkeypatch)
+    frame = _execute_frame(context)
+    session_kanban.record_start_failure(frame, AuthError("quota", provider="openai-codex", code=CODEX_RATE_LIMITED_CODE))
+    session_kanban.record_execute_failure(frame, ValueError("managed_attachment_unavailable"))
+    result = session_kanban.worker_result(path, context)
+    assert result["exit_code"] == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert result["last_output"].startswith("managed worker start failed:")
+
+    session_kanban._record_worker_result(context, 1, "managed worker turn failed: RuntimeError: boom")
+    session_kanban.record_execute_failure(frame, ValueError("managed_finish_timeout"))
+    result = session_kanban.worker_result(path, context)
+    assert result["last_output"] == "managed worker turn failed: RuntimeError: boom"
+    assert result["exit_code"] == 1
+
+
+def test_execute_failure_without_kanban_context_books_nothing(tmp_path, monkeypatch):
+    path, context = _bound_claim(tmp_path, monkeypatch)
+    session_kanban.record_execute_failure({"policy": {}}, ValueError("managed_attachment_unavailable"))
+    assert session_kanban.worker_result(path, context) == {}
+
+
+def test_execute_failure_line_redacts_the_launch_key(tmp_path, monkeypatch):
+    path, context = _bound_claim(tmp_path, monkeypatch)
+    launch_key = "launch-key-7f3a9c2e1d0b4a68"
+    session_kanban.record_execute_failure(_execute_frame(context, launch_key), RuntimeError(f"bad {launch_key}"))
+    line = session_kanban.worker_result(path, context)["last_output"]
+    assert launch_key not in line and line.startswith("managed worker execute failed:")
+
+
+@pytest.mark.parametrize("error", [sqlite3.OperationalError("database is locked"), RuntimeError("boom"),
+                                   ImportError("no module")])
+def test_execute_failure_helper_never_raises(tmp_path, monkeypatch, error):
+    _path, context = _bound_claim(tmp_path, monkeypatch)
+
+    def broken(*_args):
+        raise error
+    monkeypatch.setattr(session_kanban, "_record_worker_result", broken)
+    session_kanban.record_execute_failure(_execute_frame(context), ValueError("managed_finish_timeout"))
+
+
+@pytest.mark.parametrize("policy", [None, "kanban", ["kanban_json"]])
+def test_execute_failure_helper_ignores_a_non_mapping_policy(policy):
+    session_kanban.record_execute_failure({"policy": policy}, ValueError("managed_attachment_unavailable"))
+
+
+def test_execute_books_failure_then_reraises_the_original(monkeypatch):
+    from agent import managed_worker
+    seen = []
+
+    def no_attachment(_frame):
+        raise ValueError("managed_attachment_unavailable")
+    monkeypatch.setattr(managed_worker, "bind_worker_policy", no_attachment)
+    monkeypatch.setattr(session_kanban, "record_execute_failure", lambda frame, exc: seen.append((frame, exc)))
+    frame = {"policy": {}}
+
+    with pytest.raises(ValueError, match="managed_attachment_unavailable") as raised:
+        managed_worker.execute(frame, None)
+    assert seen == [(frame, raised.value)]
