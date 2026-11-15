@@ -139,7 +139,9 @@ def _install_native_fallback_client(agent, fb_client, before: dict[str, Any]) ->
     try:
         agent.base_url = str(fb_client.base_url)
         _swap_fallback_clients(agent, fb_client, agent.provider, agent.model, agent.base_url, agent.api_mode)
-    except Exception as exc:  # health: allow BLE001 -- any install failure refuses this entry, like a resolver failure
+    # AuthError (a RuntimeError) = no Anthropic token; ImportError = provider SDK not installed.
+    # Anything else is a bug and propagates.
+    except (RuntimeError, ImportError) as exc:
         logger.debug("Init-time fallback entry %s client install failed: %s", agent.provider, exc)
         for name, value in before.items():
             setattr(agent, name, value)

@@ -230,7 +230,7 @@ def test_init_fallback_keeps_codex_responses_for_openai_codex():
 
 # --- init-time walk uses the per-turn chain filters; native clients (intake t_085de9c7) ---------
 
-def _anthropic_client(api_key="sk-ant-api03-test-key-1234567890"):
+def _anthropic_client(api_key="anthropic-test-credential"):
     """What resolve_provider_client hands back for an ``anthropic`` entry: key + base_url."""
     from types import SimpleNamespace
     return SimpleNamespace(api_key=api_key, base_url="https://api.anthropic.com", _default_headers=None)
@@ -255,7 +255,7 @@ def test_init_fallback_to_anthropic_builds_anthropic_client():
     assert (agent.provider, agent.model) == ("anthropic", "claude-sonnet-5-5")
     assert agent.api_mode == "anthropic_messages"
     assert agent._anthropic_client is not None and agent.client is None
-    assert agent._primary_runtime["anthropic_api_key"] == "sk-ant-api03-test-key-1234567890"
+    assert agent._primary_runtime["anthropic_api_key"] == "anthropic-test-credential"
     assert agent._fallback_activated is True
 
 

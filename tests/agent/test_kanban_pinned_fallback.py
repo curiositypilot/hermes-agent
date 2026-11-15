@@ -273,7 +273,7 @@ def _init_agent(chain):
     def fake_resolve(provider, model=None, **_):
         tried.append(provider)
         if provider == "anthropic":
-            return NS(api_key="sk-ant-api03-test-key-1234567890", base_url="https://api.anthropic.com",
+            return NS(api_key="anthropic-test-credential", base_url="https://api.anthropic.com",
                       _default_headers=None), model
         return None, None
 
