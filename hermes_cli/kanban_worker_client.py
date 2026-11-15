@@ -8,6 +8,7 @@ except ModuleNotFoundError as exc:
         raise
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -146,9 +147,14 @@ async def _await_receipt(client, params, board_db, claim):
 
 def _exit_code(receipt, params, board_db):
     from hermes_cli.gateway_client import GatewayClientError
-    if receipt['status'] == 'unknown':
-        raise GatewayClientError('Kanban execution unknown; retained by owner')
     from gateway.session_kanban import worker_result
+    if receipt['status'] == 'unknown':
+        # A worker that died at start or mid-turn booked its one-line cause: print it so the crash
+        # text quotes it. A failed board read must not mask the refusal.
+        with contextlib.suppress(Exception):
+            if line := worker_result(board_db, params).get('last_output'):
+                print(line)
+        raise GatewayClientError('Kanban execution unknown; retained by owner')
     result = worker_result(board_db, params)
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
     if result.get('last_output'):
