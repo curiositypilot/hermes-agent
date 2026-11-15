@@ -379,7 +379,7 @@ def record_execute_failure(frame, exc):
         from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
         _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)),
                               _failure_line(frame, exc, 'execute'))
-    except Exception:
+    except (sqlite3.Error, OSError, KeyError, ValueError, TypeError):  # board unreachable or a malformed frame
         import logging
         logging.getLogger(__name__).exception('kanban execute-failure record failed')
 
