@@ -156,3 +156,30 @@ def test_managed_worker_child_sees_the_session_flag(tmp_path, monkeypatch):
                     worker_route(policy, {"api_key": None})
             else:  # the fallback entry's route is the agent's own chain's business: no primary overrides
                 assert worker_route(policy, {"api_key": None}) == {}
+
+
+
+def test_no_fallback_session_skips_init_time_fallback(tmp_path):
+    """A ``no_fallback`` session passes the profile chain to AIAgent; a primary with no credential
+    must fail on its route instead of the init-time walk answering on the first entry."""
+    from gateway.session_policy import policy_scope
+    from run_agent import AIAgent
+    tried = []
+
+    def fake_resolve(provider, model=None, **_):
+        tried.append(provider)
+        return (MagicMock(api_key="k", base_url="https://fallback.invalid/v1"), model) \
+            if provider != "antigravity" else (None, None)
+
+    policy = _policy(tmp_path, no_fallback=True)
+    with policy_scope(policy), \
+            patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
+            patch("model_tools.get_tool_definitions", return_value=[]), \
+            patch("model_tools.check_toolset_requirements", return_value={}), \
+            patch("agent.process_bootstrap.OpenAI"):
+        assert fallback_disabled() is True
+        with pytest.raises(RuntimeError, match="antigravity"):
+            AIAgent(api_key=None, base_url=None, provider="antigravity", model=policy.model, quiet_mode=True,
+                    skip_context_files=True, skip_memory=True, platform="cli",
+                    fallback_model=get_fallback_chain(policy.config()))
+    assert tried == ["antigravity"]
