@@ -52,11 +52,30 @@ def _policy_filtered_entries(agent, fallback_model) -> list[dict[str, Any]]:
 def allowed_fallback_entries(agent, fallback_model) -> list[dict[str, Any]]:
     """The entries this agent may fall back to: the one filter for both the init-time walk
     (primary has no credential) and the per-turn chain, so neither can reach an entry the
-    other refuses (Kanban pin, ``--no-fallback``, data-class rules, chat-only entries)."""
-    from hermes_cli.fallback_config import fallback_disabled
+    other refuses (Kanban pin, ``--no-fallback``, data-class rules, chat-only entries).
 
+    Sets ``agent._init_fallback_suppressed`` before returning. The init raise reads it
+    instead of running policy again (``_record_denial`` writes a board event). True when
+    the list is empty because of a pin, ``fallback_disabled()``, or because the caller
+    passed entries and policy dropped all of them. False when the caller passed no
+    entries, or when any entry is returned.
+    """
+    from hermes_cli.fallback_config import drop_chat_only_entries, fallback_disabled
+
+    passed = _fallback_entries(fallback_model)
     chain = _policy_filtered_entries(agent, fallback_model)
-    return [] if _kanban_pinned_route() or fallback_disabled() else chain
+    pinned_or_disabled = _kanban_pinned_route() or fallback_disabled()
+    entries = [] if pinned_or_disabled else chain
+    if entries:
+        suppressed = False
+    elif pinned_or_disabled:
+        suppressed = True
+    else:
+        # Chat-only drops are not a policy denial. Re-filter only; do not call assert_*.
+        offered = drop_chat_only_entries(passed, platform=getattr(agent, "platform", None))
+        suppressed = bool(offered) and not chain
+    agent._init_fallback_suppressed = suppressed
+    return entries
 
 
 def _init_fallback_chain(agent, fallback_model):

@@ -814,13 +814,8 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             "credential pool exhausted" if _pool_exhausted else "no usable credentials",
             "; ".join(f"{_p} ({_r})" for _p, _r in _refused_entries) or "none configured",
         )
-    # A fully-exhausted pool is a billing/quota failure, NOT a config problem: name it for EVERY
-    # explicit provider. ``openrouter`` / ``custom`` have no provider-specific missing-credentials
-    # branch, so a burned override pool there fell through to the generic "No LLM provider
-    # configured" setup message even though the config default was fine (#94785). Prefer a billing
-    # verdict (402 / classifier "billing") and fall back to the existing cooldown wording (which
-    # names the 429 reset time, #56810); raise before the missing-credentials branch so a genuine
-    # 402 is never described as a missing key or a transient rate limit.
+    # A burned pool is billing, not setup (#94785, #56810): name it before the missing-key
+    # branch. A suppressed openrouter route names its missing key, not the first-run sentence.
     if _pool_exhausted:
         from agent.auxiliary_unavailable import (
             ProviderCredentialsExhaustedError,
@@ -840,6 +835,11 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     from hermes_constants import profile_cli_selector
     from agent.auxiliary_unavailable import ProviderNotConfiguredError
     _sel = profile_cli_selector()
+    if _explicit == "openrouter" and not _pool_exhausted and agent._init_fallback_suppressed:
+        raise ProviderNotConfiguredError(
+            "Provider 'openrouter' has no API key. Set OPENROUTER_API_KEY and retry. "
+            "This route cannot fall back to another provider."
+        )
     raise ProviderNotConfiguredError(
         "No LLM provider configured. Run `hermes model` to "
         "select a provider, or run `hermes setup` for first-time "
