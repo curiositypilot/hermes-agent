@@ -989,7 +989,15 @@ def _handle_schedule(args: dict, **kw) -> str:
                "goal_mode tasks cannot be scheduled: use kanban_block with kind "
                f"in {sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} for a genuine external "
                "blocker, or kanban_complete so the completion judge can evaluate it.")
+        # An undated park wakes as a human ask a week later (t_3d253842 sat 7 days
+        # on a 45-min wait); a worker that needs a human has kanban_block.
         # A malformed until/then raises ValueError before any write.
+        from hermes_cli.kanban_db_schedule import resolve_schedule
+        until_ts, _ = resolve_schedule(reason, args.get("until"), args.get("then"))
+        _check(until_ts is not None or not os.environ.get("HERMES_KANBAN_TASK"),
+               "kanban_schedule refused: no wake date. Pass until=\"YYYY-MM-DDTHH:MM\" "
+               "(local time) and then=\"start\" to resume yourself, or use kanban_block "
+               "to wait for a human.")
         ok = kb.schedule_task(
             conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), metadata=metadata,
             until=args.get("until"), then=args.get("then"))
