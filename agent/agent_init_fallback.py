@@ -132,17 +132,19 @@ def _install_native_fallback_client(agent, fb_client, before: dict[str, Any]) ->
 
     ``_build_client`` already took the OpenAI-wire branch from the unreachable primary's mode, so
     ``_init_anthropic_client`` never runs for this entry; install its client the way a per-turn
-    fallback does. ``None`` on success; on failure (e.g. no Anthropic token) the agent's identity
-    is put back to ``before`` and the refusal reason is returned so the walk moves on.
+    fallback does. ``None`` on success. ``AuthError`` (no Anthropic token, raised before
+    ``_swap_fallback_clients`` writes ``api_key`` / ``_anthropic_api_key``) puts the identity back
+    to ``before`` and returns the refusal so the walk moves on. Any other exception is a bug and
+    propagates: swallowing it would answer on the next entry with no record above debug.
     """
     from agent.client_lifecycle import _swap_fallback_clients
+    from hermes_cli.auth_constants import AuthError
     try:
         agent.base_url = str(fb_client.base_url)
         _swap_fallback_clients(agent, fb_client, agent.provider, agent.model, agent.base_url, agent.api_mode)
-    # AuthError (a RuntimeError) = no Anthropic token; ImportError = provider SDK not installed.
-    # Anything else is a bug and propagates.
-    except (RuntimeError, ImportError) as exc:
-        logger.debug("Init-time fallback entry %s client install failed: %s", agent.provider, exc)
+    except AuthError as exc:
+        # Same level as the per-turn path (chat_completion_helpers "Failed to activate fallback").
+        logger.error("Init-time fallback entry %s client install failed: %s", agent.provider, exc)
         for name, value in before.items():
             setattr(agent, name, value)
         agent._fallback_activated = False

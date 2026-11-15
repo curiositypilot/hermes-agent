@@ -230,7 +230,7 @@ def test_init_fallback_keeps_codex_responses_for_openai_codex():
 
 # --- init-time walk uses the per-turn chain filters; native clients (intake t_085de9c7) ---------
 
-def _anthropic_client(api_key="anthropic-test-credential"):
+def _anthropic_client(api_key="ant-test-key"):
     """What resolve_provider_client hands back for an ``anthropic`` entry: key + base_url."""
     from types import SimpleNamespace
     return SimpleNamespace(api_key=api_key, base_url="https://api.anthropic.com", _default_headers=None)
@@ -255,12 +255,13 @@ def test_init_fallback_to_anthropic_builds_anthropic_client():
     assert (agent.provider, agent.model) == ("anthropic", "claude-sonnet-5-5")
     assert agent.api_mode == "anthropic_messages"
     assert agent._anthropic_client is not None and agent.client is None
-    assert agent._primary_runtime["anthropic_api_key"] == "anthropic-test-credential"
+    assert agent._primary_runtime["anthropic_api_key"] == "ant-test-key"
     assert agent._fallback_activated is True
 
 
 def test_init_fallback_skips_anthropic_entry_without_token():
-    """An anthropic entry whose token lookup raises is refused like an unresolvable entry."""
+    """An anthropic entry whose token lookup raises AuthError is refused like an unresolvable entry."""
+    from hermes_cli.auth_constants import AuthError
     fb = _mock_client()
 
     def fake_resolve(provider, model=None, **_):
@@ -271,7 +272,7 @@ def test_init_fallback_skips_anthropic_entry_without_token():
         return None, None
 
     def no_token(**_):
-        raise RuntimeError("no Anthropic credentials")
+        raise AuthError("no Anthropic credentials")
 
     chain = [{"provider": "anthropic", "model": "claude-sonnet-5-5"},
              {"provider": "tencent-token-plan", "model": "kimi2.5"}]
@@ -280,6 +281,22 @@ def test_init_fallback_skips_anthropic_entry_without_token():
     assert (agent.provider, agent.model) == ("tencent-token-plan", "kimi2.5")
     assert agent.api_mode == "chat_completions"
     assert agent.client is not None and agent._fallback_activated is True
+
+
+def test_init_fallback_native_install_bug_propagates():
+    """A programming error installing the native client must raise, not fall through to the next entry."""
+    def fake_resolve(provider, model=None, **_):
+        if provider == "anthropic":
+            return _anthropic_client(), "claude-sonnet-5-5"
+        if provider == "tencent-token-plan":
+            return _mock_client(), "kimi2.5"
+        return None, None
+
+    chain = [{"provider": "anthropic", "model": "claude-sonnet-5-5"},
+             {"provider": "tencent-token-plan", "model": "kimi2.5"}]
+    with patch("agent.client_lifecycle._swap_fallback_clients", side_effect=AttributeError("half-built")):
+        with pytest.raises(AttributeError, match="half-built"):
+            _build(fake_resolve, chain)
 
 
 def test_init_fallback_skips_chat_only_entry_for_kanban():
