@@ -339,10 +339,33 @@ def adoption_scope(scope):
     return {k: v for k, v in scope.items() if k != 'ns_pid'}
 
 
+def hydrate_sandbox_env():
+    """Install the sandbox's Tier-1 keys from its filtered ``.env`` into ``os.environ``.
+
+    The bwrap sandbox hands a worker its Tier-1 secrets only as a filtered ``.env`` copy (bwrap
+    ``--setenv`` values are argv-visible), and a frozen worker config never runs
+    ``load_hermes_dotenv``; without this, ``.env``-only provider keys (OpenRouter) never reach
+    provider resolution. Values already in the env win. Returns the sorted names it set.
+    """
+    from hermes_cli.kanban_sandbox import SANDBOX_BWRAP, SANDBOX_ENV, TIER1_ENV_KEYS
+    if os.environ.get(SANDBOX_ENV) != SANDBOX_BWRAP:
+        return []
+    from agent.secret_scope import load_env_file
+    from hermes_constants import get_hermes_home
+    values = load_env_file(get_hermes_home() / '.env')
+    names = sorted(k for k in TIER1_ENV_KEYS if values.get(k) and not os.environ.get(k))
+    for name in names:
+        os.environ[name] = values[name]
+    if names:
+        logger.info('sandbox env hydrated from .env: %s', ', '.join(names))
+    return names
+
+
 def execute(frame, channel):
     # The owner RPC below imports gateway/config modules (hermes_cli.config, providers,
     # hermes_cli.plugins) transitively; the policy must already be frozen when they load.
     bind_worker_policy(frame)
+    hydrate_sandbox_env()
     from agent.runtime_session_store import RuntimeSessionStore, WorkerRPC, bind_owner_view_pid
     scope = adoption_scope(frame['scope'])
     bind_owner_view_pid(scope['pid'])  # validate_bootstrap matched ns_pid to getpid(): pid is our host pid

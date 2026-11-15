@@ -119,6 +119,60 @@ def test_filter_env_file_keeps_only_tier1_lines():
     assert set(keys) <= kbs.TIER1_ENV_KEYS
 
 
+# --- managed worker reads the filtered .env (intake t_1a897e64) ----------------------------
+
+_HYDRATE_PROBE_KEYS = sorted(kbs.TIER1_ENV_KEYS | {"ANTHROPIC_API_KEY", "SOME_TOKEN"})
+
+
+@pytest.fixture
+def sandbox_home(tmp_path, monkeypatch):
+    """A tmp HERMES_HOME with every probed key absent; hydrate writes os.environ directly, so the
+    keys are set-then-deleted through monkeypatch to have teardown remove whatever it installs."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for key in _HYDRATE_PROBE_KEYS:
+        monkeypatch.setenv(key, "x")
+        monkeypatch.delenv(key)
+    return home
+
+
+def test_hydrate_sandbox_env_sets_tier1_keys(sandbox_home, monkeypatch):
+    from agent.managed_worker import hydrate_sandbox_env
+    (sandbox_home / ".env").write_text("OPENROUTER_API_KEY=a\nGITHUB_PAT=b\nANTHROPIC_API_KEY=c\nSOME_TOKEN=d\n")
+    monkeypatch.setenv(kbs.SANDBOX_ENV, kbs.SANDBOX_BWRAP)
+    assert hydrate_sandbox_env() == ["GITHUB_PAT", "OPENROUTER_API_KEY"]
+    assert os.environ["OPENROUTER_API_KEY"] == "a"
+    assert os.environ["GITHUB_PAT"] == "b"
+    assert "ANTHROPIC_API_KEY" not in os.environ
+    assert "SOME_TOKEN" not in os.environ
+
+
+def test_hydrate_sandbox_env_keeps_existing_value(sandbox_home, monkeypatch):
+    from agent.managed_worker import hydrate_sandbox_env
+    (sandbox_home / ".env").write_text("OPENROUTER_API_KEY=from-file\n")
+    monkeypatch.setenv(kbs.SANDBOX_ENV, kbs.SANDBOX_BWRAP)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "preset")
+    assert hydrate_sandbox_env() == []
+    assert os.environ["OPENROUTER_API_KEY"] == "preset"
+
+
+def test_hydrate_sandbox_env_noop_outside_sandbox(sandbox_home, monkeypatch):
+    from agent.managed_worker import hydrate_sandbox_env
+    (sandbox_home / ".env").write_text("OPENROUTER_API_KEY=a\nGITHUB_PAT=b\n")
+    monkeypatch.delenv(kbs.SANDBOX_ENV, raising=False)
+    assert hydrate_sandbox_env() == []
+    assert "OPENROUTER_API_KEY" not in os.environ
+    assert "GITHUB_PAT" not in os.environ
+
+
+def test_hydrate_sandbox_env_missing_file(sandbox_home, monkeypatch):
+    from agent.managed_worker import hydrate_sandbox_env
+    monkeypatch.setenv(kbs.SANDBOX_ENV, kbs.SANDBOX_BWRAP)
+    assert hydrate_sandbox_env() == []
+    assert not any(key in os.environ for key in _HYDRATE_PROBE_KEYS)
+
+
 # --- argv builder -------------------------------------------------------------------------
 
 def _fake_host(tmp_path: Path):
