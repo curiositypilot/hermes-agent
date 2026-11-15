@@ -347,6 +347,7 @@ def _run_worker_turns(agent, frame, history):
         return result
     except Exception as exc:
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
+        last_output = _failure_line(frame, exc, 'turn')
         raise
     finally:
         _record_worker_result(context, code, last_output)
@@ -359,7 +360,23 @@ def record_start_failure(frame, exc):
     if context is None:
         return
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
-    _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '')
+    _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)),
+                          _failure_line(frame, exc, 'start'))
+
+
+_FAILURE_LINE_MAX = 240
+
+
+def _failure_line(frame, exc, stage):
+    """One redacted line naming the exception, booked as the attempt's ``last_output`` so the card's
+    crash text carries the cause (the stack stays in managed-worker.log). The frame's own secrets are
+    replaced by value first: a launch key has no vendor shape the pattern redactor could match."""
+    from agent.redact import redact_for_egress
+    msg = ' '.join(str(exc).split())
+    secrets = (frame.get('api_key'), (frame.get('scope') or {}).get('secret'))
+    for secret in sorted((s for s in secrets if isinstance(s, str) and s), key=len, reverse=True):
+        msg = msg.replace(secret, '***')
+    return redact_for_egress(f'managed worker {stage} failed: {type(exc).__name__}: {msg}')[:_FAILURE_LINE_MAX]
 
 
 def _record_worker_result(context, code, last_output):

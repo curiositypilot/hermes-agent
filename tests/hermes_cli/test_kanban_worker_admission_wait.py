@@ -90,3 +90,27 @@ async def test_an_owner_that_stalls_after_admitting_fails_the_wait_within_the_lo
             # The outer 5 s guard only stops an unbounded wait from hanging the test.
             await real_wait_for(kanban_worker_client._await_receipt(client, params, str(tmp_path / 'kanban.db'), kanban_worker_client._Claim(answered=0.0)), 5)
     assert budgets == [budget] and [r['method'] for r in owner.sent] == ['kanban.run']
+
+
+@pytest.mark.parametrize('last_output', ['managed worker start failed: AttributeError: x', ''])
+def test_unknown_receipt_prints_worker_last_output(monkeypatch, capsys, last_output):
+    """A worker that died before its result booked a one-line cause; the refusal no longer hides it."""
+    from gateway import session_kanban
+    from hermes_cli.gateway_client import GatewayClientError
+    monkeypatch.setattr(session_kanban, 'worker_result', lambda db, params: {'exit_code': 1, 'last_output': last_output})
+    params = {'board': 'b', 'task_id': 't1', 'run_id': 1, 'claim_lock': 'lock'}
+    with pytest.raises(GatewayClientError, match='Kanban execution unknown; retained by owner'):
+        kanban_worker_client._exit_code({'status': 'unknown'}, params, 'kanban.db')
+    out = capsys.readouterr().out
+    assert out == (last_output + '\n' if last_output else '')
+
+
+def test_unknown_receipt_survives_an_unreadable_board(monkeypatch):
+    from gateway import session_kanban
+    from hermes_cli.gateway_client import GatewayClientError
+
+    def unreadable(db, params):
+        raise OSError('board gone')
+    monkeypatch.setattr(session_kanban, 'worker_result', unreadable)
+    with pytest.raises(GatewayClientError, match='Kanban execution unknown'):
+        kanban_worker_client._exit_code({'status': 'unknown'}, {'run_id': 1, 'task_id': 't1', 'claim_lock': 'l'}, 'x.db')
