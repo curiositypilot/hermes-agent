@@ -1085,8 +1085,14 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _resolve_auto_retain_block(self) -> str | None:
         """Why auto-retain is off for this whole process/session, or None. Evaluated once at
-        initialize(): agent context and process env do not change over a provider's life."""
-        if not _parse_bool_setting(os.environ.get(_AUTO_RETAIN_KILL_SWITCH_ENV), True):
+        initialize(): agent context, process env and a session's client env (frozen at
+        ``session.create``) do not change over a provider's life. The kill switch is on when the
+        process running the turn OR the shell client that started the session (a ``hermes chat``
+        turn runs in the shared gateway) sets it false; either alone would miss the other."""
+        from agent.session_client_env import session_env
+
+        if not (_parse_bool_setting(os.environ.get(_AUTO_RETAIN_KILL_SWITCH_ENV), True)
+                and _parse_bool_setting(session_env(_AUTO_RETAIN_KILL_SWITCH_ENV), True)):
             return f"{_AUTO_RETAIN_KILL_SWITCH_ENV}=0 kill switch"
         if self._agent_context not in self._retain_contexts:
             return f"agent_context={self._agent_context!r} not in retain_contexts {list(self._retain_contexts)}"

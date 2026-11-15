@@ -226,3 +226,20 @@ def _overlapping_terminal_turns(owner, policies):
         thread.join(timeout=120)
     assert not errors, errors
     return outputs
+
+
+@pytest.mark.parametrize('local', [True, False])
+def test_hindsight_auto_retain_switch_travels_as_behaviour_not_tool_env(local, monkeypatch):
+    """``HINDSIGHT_AUTO_RETAIN=0 hermes chat`` must reach the gateway's Hindsight provider
+    (t_248c3f9e): the switch names nothing on the host, so a client not proven local keeps it too.
+    Its look-alikes and the plugin's credentials stay behind; tool subprocesses never get it."""
+    from agent.session_client_env import accept_client_env, client_env_scope, collect_client_env, toolchain_environ
+    shell = {'HINDSIGHT_AUTO_RETAIN': '0', 'HINDSIGHT_API_KEY': 'hs-secret', 'HINDSIGHT_RETAIN_SOURCE': 'x',
+             'HINDSIGHT_AUTO_RETAIN_X': '0', 'PATH': '/usr/bin'}
+    assert {k for k in collect_client_env(shell) if k.startswith('HINDSIGHT')} == {'HINDSIGHT_AUTO_RETAIN'}
+    kept = accept_client_env(shell, {}, local=local)
+    assert {k for k in kept if k.startswith('HINDSIGHT')} == {'HINDSIGHT_AUTO_RETAIN'}
+    assert kept['HINDSIGHT_AUTO_RETAIN'] == '0'
+    monkeypatch.setenv('HINDSIGHT_AUTO_RETAIN', '0')  # the gateway's own switch
+    with client_env_scope(kept, local=local):
+        assert 'HINDSIGHT_AUTO_RETAIN' not in toolchain_environ()

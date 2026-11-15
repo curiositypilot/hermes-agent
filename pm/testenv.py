@@ -16,7 +16,9 @@ from pm.environments import install_state_dir
 NAME = "test-environment"
 # The default developer environment includes the app's normal features.
 # CI lanes pass their wider provider matrix explicitly.
-DEFAULT_TEST_EXTRAS = ("all",)
+# Fork: + `hindsight`, the client of the bundled memory plugin, so the fork e2e
+# (tests/e2e/core/fork/test_hindsight_auto_retain_e2e.py) runs the real client.
+DEFAULT_TEST_EXTRAS = ("all", "hindsight")
 GROUPS = ("dev", "test")
 
 
