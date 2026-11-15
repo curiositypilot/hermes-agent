@@ -506,23 +506,63 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
     from tools import kanban_tools
     from tools.registry import registry
 
-    reason = "SCHEDULED_UNTIL=2026-09-13T00:00:00Z waiting for reconnect"
+    reason = "waiting for reconnect"
     entry = registry.get_entry("kanban_schedule")
     assert entry is not None and entry.toolset == "kanban"
-    out = json.loads(entry.handler({"reason": reason}))
+    out = json.loads(entry.handler({"reason": reason, "until": "2099-01-01"}))
 
     assert out == {
         "ok": True, "task_id": worker_env, "run_id": out["run_id"],
-        "status": "scheduled", "reason": reason,
+        "status": "scheduled", "reason": reason, "until": "2099-01-01", "then": "ask",
     }
     with kbc.connect() as conn:
         assert kb.get_task(conn, worker_env).status == "scheduled"
         run = kb.latest_run(conn, worker_env)
         assert (run.outcome, run.summary) == ("scheduled", reason)
         assert any(
-            event.kind == "scheduled" and event.payload == {"reason": reason}
+            event.kind == "scheduled" and event.payload.get("reason") == reason
             for event in kb.list_events(conn, worker_env)
         )
+
+
+@pytest.mark.parametrize("args", [
+    {},
+    {"reason": "wait"},
+    # t_54e959ad wrote its date in a shape until_from_reason does not parse.
+    {"reason": "SCHEDULED_UNTIL=2026-09-13T00:00:00Z waiting"},
+])
+def test_schedule_worker_without_date_refused_without_parking(worker_env, args):
+    """An undated worker park wakes as a human ask a week later; t_3d253842 sat
+    7 days on a 45-min wait (t_b55e41ec). Workers must date it or block."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools  # registers the tool
+    from tools.registry import registry
+
+    out = json.loads(registry.get_entry("kanban_schedule").handler(args))
+
+    assert "no wake date" in out.get("error", ""), out
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+        assert not any(e.kind == "scheduled" for e in kb.list_events(conn, worker_env))
+
+
+def test_schedule_non_worker_undated_still_parks(monkeypatch, worker_env):
+    """CLI / orchestrator callers (no HERMES_KANBAN_TASK) keep undated parks."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools  # registers the tool
+    from tools.registry import registry
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    out = json.loads(registry.get_entry("kanban_schedule").handler(
+        {"task_id": worker_env, "reason": "wait"}))
+
+    assert out.get("ok") is True, out
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert (task.status, task.scheduled_until) == ("scheduled", None)
 
 
 def test_schedule_until_then_start_wakes_card_ready(worker_env):
