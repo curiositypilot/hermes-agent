@@ -1203,3 +1203,254 @@ def test_unresolved_class_holds_profile_routes(conn, monkeypatch, homes):
         assert d.source == "exhausted" and d.candidate is None
         assert d.note == "data class unresolved: no permitted candidate"
         assert d.skipped[-1]["reason"] == "data class unresolved"
+
+
+# ---------------------------------------------------------------------------
+# Quota gate priority follows open descendants. Stored priority is not written.
+# ---------------------------------------------------------------------------
+
+_HELD = "anthropic headroom 5% < 10% needs P2"
+
+
+def _p2_headroom(path: Path) -> None:
+    path.write_text(json.dumps({
+        "schema": 2,
+        "written_at_epoch": time.time() - 60,
+        "providers": {
+            "anthropic": {"ok": True, "binding": {"name": "session", "headroom": 0.05,
+                                                  "resets_at": "2026-11-21T00:00:00Z"}, "windows": []},
+        },
+    }))
+
+
+def _p2_gate(tmp_path, monkeypatch) -> kr.RoutingConfig:
+    """5% headroom needs P2. One anthropic candidate, so a pass is the gate, not a fallthrough."""
+    path = tmp_path / "headroom.json"
+    _p2_headroom(path)
+    _pool(monkeypatch)
+    return _cfg(
+        tiers={"S": [{"model": "claude-s", "provider": "anthropic"}]},
+        escalate=False,
+        review=[{"model": "rev", "provider": "anthropic"}],
+        quota_gate={"enabled": True, "headroom_file": str(path)},
+    )
+
+
+def _card(conn, title, priority, **kw) -> str:
+    status = kw.pop("status", None)
+    tid = kb.create_task(conn, title=title, assignee="w", priority=priority, **kw)
+    if status is not None:
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        conn.commit()
+    return tid
+
+
+def _status(conn, tid, status) -> None:
+    conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+    conn.commit()
+
+
+def _row(conn, tid):
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    return task
+
+
+def _rename(conn, old: str, new: str) -> None:
+    conn.execute("UPDATE tasks SET id=? WHERE id=?", (new, old))
+    conn.execute("UPDATE task_links SET child_id=? WHERE child_id=?", (new, old))
+    conn.execute("UPDATE task_links SET parent_id=? WHERE parent_id=?", (new, old))
+    conn.commit()
+
+
+def test_gate_priority_open_child_raises_hold(conn, monkeypatch, tmp_path):
+    """Replay: P1 parent, open P2 child, gate that holds P1 and passes P2."""
+    cfg = _p2_gate(tmp_path, monkeypatch)
+    parent = _card(conn, "parent", 1, complexity="S")
+    child = _card(conn, "child", 2)
+    kb.link_tasks(conn, parent, child)
+    other = _card(conn, "other", 1, complexity="S")
+    kb.link_tasks(conn, other, _card(conn, "other-child", 2))
+
+    queries: list[str] = []
+    conn.set_trace_callback(lambda sql: queries.append(sql) if "gate_descendants" in (sql or "") else None)
+    try:
+        ctx = kr.RoutingContext(conn, cfg)
+        decided = ctx.decide(kb.get_task(conn, parent))
+        once = sum("gate_descendants" in q for q in queries)
+        assert once >= 1
+        ctx.decide(kb.get_task(conn, other))
+        assert sum("gate_descendants" in q for q in queries) == once
+    finally:
+        conn.set_trace_callback(None)
+
+    assert decided.source == "tier"
+    assert decided.candidate is not None and decided.candidate.provider == "anthropic"
+    assert _row(conn, parent).priority == 1
+    assert _row(conn, child).priority == 2
+    alone = _card(conn, "alone", 1, complexity="S")
+    held = kr.RoutingContext(conn, cfg).decide(kb.get_task(conn, alone))
+    assert held.source == "quota_held" and held.note == f"{_HELD} (card P1)"
+
+    for status in ("blocked", "scheduled"):
+        held_parent = _card(conn, status, 1, complexity="S")
+        kb.link_tasks(conn, held_parent, _card(conn, f"{status}-c", 2, status=status))
+        assert kr.RoutingContext(conn, cfg).decide(kb.get_task(conn, held_parent)).source == "tier"
+
+    grand_parent = _card(conn, "gp", 1, complexity="S")
+    mid = _card(conn, "mid", 0)
+    grand = _card(conn, "grand", 2)
+    kb.link_tasks(conn, grand_parent, mid)
+    kb.link_tasks(conn, mid, grand)
+    assert kr.RoutingContext(conn, cfg).decide(kb.get_task(conn, grand_parent)).source == "tier"
+    assert kr.RoutingContext(conn, cfg).gate_priority(kb.get_task(conn, grand_parent))[2] == grand
+
+    pinned = _card(conn, "pin", 1, model_override="claude-x", provider_override="anthropic")
+    assert kr.RoutingContext(conn, cfg).decide(kb.get_task(conn, pinned)).source == "quota_held"
+    kb.link_tasks(conn, pinned, _card(conn, "pin-c", 2))
+    assert kr.RoutingContext(conn, cfg).decide(kb.get_task(conn, pinned)).source == "pinned"
+
+    review = _card(conn, "rev", 1)
+    held_review = kr.RoutingContext(conn, cfg).decide_review(_row(conn, review))
+    assert held_review is not None and held_review.source == "quota_held"
+    kb.link_tasks(conn, review, _card(conn, "rev-c", 2))
+    passed_review = kr.RoutingContext(conn, cfg).decide_review(_row(conn, review))
+    assert passed_review is not None and passed_review.source == "review"
+
+
+def test_gate_priority_ignores_done_and_archived(conn, monkeypatch, tmp_path):
+    cfg = _p2_gate(tmp_path, monkeypatch)
+
+    def still_held(tid):
+        d = kr.RoutingContext(conn, cfg).decide(kb.get_task(conn, tid))
+        assert d.source == "quota_held" and d.note == f"{_HELD} (card P1)"
+
+    for status in ("done", "archived"):
+        parent = _card(conn, status, 1, complexity="S")
+        child = _card(conn, f"{status}-c", 3)
+        kb.link_tasks(conn, parent, child)
+        _status(conn, child, status)
+        still_held(parent)
+        assert _row(conn, child).priority == 3
+
+        nest = _card(conn, f"{status}-nest", 1, complexity="S")
+        mid = _card(conn, f"{status}-mid", 0)
+        kb.link_tasks(conn, nest, mid)
+        kb.link_tasks(conn, mid, _card(conn, f"{status}-grand", 3))
+        _status(conn, mid, status)
+        still_held(nest)
+
+    parent = _card(conn, "open", 1, complexity="S")
+    child = _card(conn, "open-c", 2)
+    kb.link_tasks(conn, parent, child)
+    kb.link_tasks(conn, child, _card(conn, "done-grand", 3, status="done"))
+    # link demotes a ready grandchild; pin the done status after the link.
+    _status(conn, conn.execute("SELECT child_id FROM task_links WHERE parent_id=?", (child,)).fetchone()[0], "done")
+    decided = kr.RoutingContext(conn, cfg).decide(kb.get_task(conn, parent))
+    assert decided.source == "tier"
+    assert kr.RoutingContext(conn, cfg).gate_priority(kb.get_task(conn, parent)) == (1, 2, child)
+
+    cyc = _card(conn, "cyc", 1, complexity="S")
+    raiser = _card(conn, "raiser", 3)
+    kb.link_tasks(conn, cyc, raiser)
+    conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (raiser, cyc))
+    conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (cyc, "t_missing_row"))
+    conn.commit()
+    assert kr.RoutingContext(conn, cfg).gate_priority(kb.get_task(conn, cyc))[:2] == (1, 3)
+
+    import sqlite3
+    bare = sqlite3.connect(":memory:")
+    try:
+        assert kr.RoutingContext(bare, cfg).gate_priority(_task(priority=1)) == (1, 1, "")
+    finally:
+        bare.close()
+
+
+def test_gate_priority_via_is_the_raisers(conn, monkeypatch, tmp_path):
+    cfg = _p2_gate(tmp_path, monkeypatch)
+    parent = _card(conn, "p", 0, complexity="S")
+    same = _card(conn, "same", 0)
+    a = _card(conn, "a", 1)
+    b = _card(conn, "b", 1)
+    for cid in (same, a, b):
+        kb.link_tasks(conn, parent, cid)
+    own, eff, via = kr.RoutingContext(conn, cfg).gate_priority(kb.get_task(conn, parent))
+    assert (own, eff, via) == (0, 1, ",".join(sorted((a, b))))
+    assert same not in via
+    held = kr.RoutingContext(conn, cfg).decide(kb.get_task(conn, parent))
+    assert held.source == "quota_held"
+    assert held.note == f"{_HELD} (card P0) (gate P1 via {via})"
+    assert _row(conn, parent).priority == 0
+
+    blocked = _card(conn, "blocked-lower", 1, complexity="S")
+    lower = _card(conn, "p2", 2)
+    higher = _card(conn, "p3", 3)
+    equal = _card(conn, "p1", 1)
+    for cid in (lower, higher, equal):
+        kb.link_tasks(conn, blocked, cid)
+    assert kr.RoutingContext(conn, cfg).gate_priority(kb.get_task(conn, blocked)) == (1, 3, higher)
+
+    many = _card(conn, "many", 0, complexity="S")
+    ids = [_card(conn, f"r{i}", 3) for i in range(4)]
+    for cid in ids:
+        kb.link_tasks(conn, many, cid)
+    ordered = sorted(ids)
+    assert kr.RoutingContext(conn, cfg).gate_priority(kb.get_task(conn, many))[2] == ",".join(ordered[:3]) + " +1"
+
+    full = _card(conn, "full", 0, complexity="S")
+    exact = "t_exactly12c"
+    assert len(exact) == 12
+    _rename(conn, _card(conn, "kid12", 2), exact)
+    kb.link_tasks(conn, full, exact)
+    assert kr.RoutingContext(conn, cfg).gate_priority(kb.get_task(conn, full))[2] == exact
+
+    long_parent = _card(conn, "long", 0, complexity="S")
+    long_id = "t_exactly12cx"
+    assert len(long_id) == 13
+    _rename(conn, _card(conn, "kid13", 2), long_id)
+    kb.link_tasks(conn, long_parent, long_id)
+    assert kr.RoutingContext(conn, cfg).gate_priority(kb.get_task(conn, long_parent))[2] == long_id[:8] + "…"
+
+
+def test_gate_priority_route_view(kanban_home, monkeypatch, tmp_path, capsys):
+    from hermes_cli import kanban as kcli
+    from hermes_cli.kanban_parser import build_parser
+
+    path = tmp_path / "headroom.json"
+    _p2_headroom(path)
+    monkeypatch.setattr(kcli, "_kanban_config", lambda: {"routing": {
+        "enabled": True,
+        "tiers": {"S": [{"model": "claude-s", "provider": "anthropic"}]},
+        "escalate": False,
+        "quota_gate": {"enabled": True, "headroom_file": str(path)},
+    }})
+    _pool(monkeypatch)
+    with kbc.connect_closing() as c:
+        parent = _card(c, "parent", 1, complexity="S")
+        child = _card(c, "child", 2)
+        kb.link_tasks(c, parent, child)
+        alone = _card(c, "alone", 1, complexity="S")
+    parser = argparse.ArgumentParser()
+    build_parser(parser.add_subparsers(dest="cmd"))
+
+    def run(*argv):
+        return kcli.kanban_command(parser.parse_args(["kanban", *argv]))
+
+    assert run("route", parent) == 0
+    out = capsys.readouterr().out
+    assert f"card P1, gate P2 via {child}:" in out
+    anth = next(ln for ln in out.splitlines() if "anthropic:" in ln and "needs P2" in ln)
+    assert anth.strip().startswith("ok ")
+
+    assert run("route", alone) == 0
+    out = capsys.readouterr().out
+    assert "card P1:" in out and "gate P" not in out
+    anth = next(ln for ln in out.splitlines() if "anthropic:" in ln and "needs P2" in ln)
+    assert anth.strip().startswith("-- ")
+
+    assert run("route", parent, "--json") == 0
+    raised = json.loads(capsys.readouterr().out)["quota_gate"]
+    assert raised["card_priority"] == 1 and raised["gate_priority"] == 2 and raised["gate_via"] == child
+    assert run("route", alone, "--json") == 0
+    flat = json.loads(capsys.readouterr().out)["quota_gate"]
+    assert flat["card_priority"] == 1 and flat["gate_priority"] == 1 and flat["gate_via"] == ""
