@@ -1203,3 +1203,257 @@ def test_unresolved_class_holds_profile_routes(conn, monkeypatch, homes):
         assert d.source == "exhausted" and d.candidate is None
         assert d.note == "data class unresolved: no permitted candidate"
         assert d.skipped[-1]["reason"] == "data class unresolved"
+
+
+# ---------------------------------------------------------------------------
+# Quota gate priority follows open descendants. Stored priority is not written.
+# ---------------------------------------------------------------------------
+
+_TIGHT = "anthropic quota mode tight needs P2"
+_RESET = 1795233600  # 2026-11-21T04:00:00Z, the recorded retry_at
+_REPLAY_NOW = 1794860431  # 2026-11-16T20:20:31Z, when the P2 child was linked
+_OPUS = {"model": "claude-opus-5-5", "provider": "anthropic"}
+_REPLAY_TIERS = {"M": [_OPUS], "L": [_OPUS],
+                 "XL": [{"model": "claude-fable-5-2", "provider": "anthropic"}, _OPUS]}
+
+
+def _p2_headroom(path: Path) -> None:
+    path.write_text(json.dumps({
+        "schema": 2,
+        "written_at_epoch": time.time() - 60,
+        "providers": {
+            "anthropic": {"ok": True, "binding": {"name": "session", "headroom": 0.05,
+                                                  "resets_at": "2026-11-21T04:00:00Z"}, "windows": []},
+        },
+    }))
+
+
+def _tight_mode(path: Path, now: float) -> None:
+    path.write_text(json.dumps({"mode": "tight", "written_at_epoch": now - 60, "reason": "test",
+                                "since": "2026-11-16T19:00:00Z", "resets_at": "2026-11-21T04:00:00Z"}))
+
+
+def _tight_gate(tmp_path, monkeypatch, *, now: float | None = None, tiers=None, escalate=False) -> kr.RoutingConfig:
+    """Quota mode tight: anthropic needs P2. Anthropic-only tiers, so a pass is the gate, not a fallthrough."""
+    mode = tmp_path / "mode.json"
+    _tight_mode(mode, time.time() if now is None else now)
+    _pool(monkeypatch)
+    return _cfg(
+        tiers=tiers or {"S": [{"model": "claude-s", "provider": "anthropic"}]},
+        escalate=escalate,
+        review=[{"model": "rev", "provider": "anthropic"}],
+        quota_gate={"enabled": True, "headroom_file": str(tmp_path / "missing.json"), "mode_file": str(mode)},
+    )
+
+
+def _card(conn, title, priority, **kw) -> str:
+    status = kw.pop("status", None)
+    tid = kb.create_task(conn, title=title, assignee="w", priority=priority, **kw)
+    if status is not None:
+        _status(conn, tid, status)
+    return tid
+
+
+def _status(conn, tid, status) -> None:
+    conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+    conn.commit()
+
+
+def _link(conn, parent, child, status=None) -> None:
+    """Link, then pin the child's status (``link_tasks`` demotes a ready child to todo)."""
+    kb.link_tasks(conn, parent, child)
+    if status is not None:
+        _status(conn, child, status)
+
+
+def _row(conn, tid):
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    return task
+
+
+def _rename(conn, old: str, new: str) -> str:
+    conn.execute("UPDATE tasks SET id=? WHERE id=?", (new, old))
+    conn.execute("UPDATE task_links SET child_id=? WHERE child_id=?", (new, old))
+    conn.execute("UPDATE task_links SET parent_id=? WHERE parent_id=?", (new, old))
+    conn.commit()
+    return new
+
+
+def _decide(conn, cfg, tid, **kw):
+    return kr.RoutingContext(conn, cfg, **kw).decide(_row(conn, tid))
+
+
+def test_gate_priority_replay_t_3152e49e(conn, monkeypatch, tmp_path):
+    """2026-11-16 20:20:31Z: P1 parent held in mode tight while its blocked P2 child waited."""
+    cfg = _tight_gate(tmp_path, monkeypatch, now=_REPLAY_NOW, tiers=_REPLAY_TIERS, escalate=True)
+    parent = _rename(conn, _card(conn, "parent", 1, complexity="M"), "t_3152e49e")
+
+    before = _decide(conn, cfg, parent, now=_REPLAY_NOW)
+    assert before.source == "quota_held"
+    assert before.note == f"{_TIGHT} (card P1)" and before.retry_at == _RESET
+    assert [(s["tier"], s["model"]) for s in before.skipped] == [
+        ("M", "claude-opus-5-5"), ("L", "claude-opus-5-5"), ("XL", "claude-fable-5-2"), ("XL", "claude-opus-5-5")]
+
+    child = _rename(conn, _card(conn, "child", 2), "t_b5815f54")
+    grand = _rename(conn, _card(conn, "grand", 2), "t_fe4b8c1c")
+    other = _rename(conn, _card(conn, "other", 1), "t_8fb60c0d")
+    _link(conn, parent, child, status="blocked")
+    _link(conn, child, grand, status="todo")
+    _link(conn, parent, other, status="todo")
+
+    after = _decide(conn, cfg, parent, now=_REPLAY_NOW)
+    assert after.source == "tier"
+    assert after.candidate is not None and after.candidate.model == "claude-opus-5-5"
+    assert kr.RoutingContext(conn, cfg, now=_REPLAY_NOW).gate_priority(_row(conn, parent)) == \
+        (1, 2, ["t_b5815f54", "t_fe4b8c1c"])
+    assert _row(conn, parent).priority == 1  # stored priority is not written
+
+
+def test_gate_priority_still_held_when_descendants_are_lower(conn, monkeypatch, tmp_path):
+    cfg = _tight_gate(tmp_path, monkeypatch)
+    parent = _card(conn, "parent", 1, complexity="S")
+    _link(conn, parent, _card(conn, "child", 1), status="blocked")
+    d = _decide(conn, cfg, parent)
+    assert d.source == "quota_held"
+    assert d.note.endswith("(card P1)")
+    assert "gate P" not in d.note and "via" not in d.note
+
+
+def test_gate_priority_raised_but_still_held(conn, monkeypatch, tmp_path):
+    cfg = _tight_gate(tmp_path, monkeypatch)
+    parent = _card(conn, "parent", 0, complexity="S")
+    child = _card(conn, "child", 1)
+    _link(conn, parent, child, status="blocked")
+    d = _decide(conn, cfg, parent)
+    assert d.source == "quota_held"
+    assert d.note == f"{_TIGHT} (card P0, gate P1 via {child})"
+
+
+def test_gate_priority_done_and_archived_do_not_lift(conn, monkeypatch, tmp_path):
+    cfg = _tight_gate(tmp_path, monkeypatch)
+    parent = _card(conn, "parent", 1, complexity="S")
+    _link(conn, parent, _card(conn, "done", 3), status="done")
+    _link(conn, parent, _card(conn, "archived", 3), status="archived")
+    d = _decide(conn, cfg, parent)
+    assert d.source == "quota_held" and d.note == f"{_TIGHT} (card P1)"
+
+    # The walk goes through a done or archived node: its open child still lifts.
+    for status in ("done", "archived"):
+        top = _card(conn, f"top-{status}", 1, complexity="S")
+        mid = _card(conn, f"mid-{status}", 3)
+        grand = _card(conn, f"grand-{status}", 2)
+        _link(conn, top, mid)
+        _link(conn, mid, grand, status="todo")
+        _status(conn, mid, status)
+        assert kr.RoutingContext(conn, cfg).gate_priority(_row(conn, top)) == (1, 2, [grand])
+        assert _decide(conn, cfg, top).source == "tier"
+
+
+def test_gate_priority_blocked_and_scheduled_lift(conn, monkeypatch, tmp_path):
+    cfg = _tight_gate(tmp_path, monkeypatch)
+    for status in ("blocked", "scheduled", "triage", "todo"):
+        parent = _card(conn, f"parent-{status}", 1, complexity="S")
+        _link(conn, parent, _card(conn, status, 2), status=status)
+        assert _decide(conn, cfg, parent).source == "tier", status
+
+
+def test_gate_priority_transitive_via_is_the_max_only(conn, monkeypatch, tmp_path):
+    cfg = _tight_gate(tmp_path, monkeypatch)
+    card = _card(conn, "card", 1, complexity="S")
+    mid = _card(conn, "mid", 1)
+    grand = _card(conn, "grand", 3)
+    _link(conn, card, mid, status="todo")
+    _link(conn, mid, grand, status="todo")
+    assert kr.RoutingContext(conn, cfg).gate_priority(_row(conn, card)) == (1, 3, [grand])
+
+    # A higher-priority parent of the card does not lift it.
+    lone = _card(conn, "lone", 1, complexity="S")
+    upper = _card(conn, "upper", 3, complexity="S")
+    _link(conn, upper, lone)
+    _status(conn, lone, "ready")
+    assert kr.RoutingContext(conn, cfg).gate_priority(_row(conn, lone)) == (1, 1, [])
+    d = _decide(conn, cfg, lone)
+    assert d.source == "quota_held" and d.note == f"{_TIGHT} (card P1)"
+
+    # A link to a task row that does not exist, and a cycle back to the card, do not raise.
+    conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (lone, "t_missing_row"))
+    conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (grand, card))
+    conn.commit()
+    assert kr.RoutingContext(conn, cfg).gate_priority(_row(conn, lone)) == (1, 1, [])
+    assert kr.RoutingContext(conn, cfg).gate_priority(_row(conn, card)) == (1, 3, [grand])
+
+
+def test_gate_priority_via_cap(conn, monkeypatch, tmp_path):
+    cfg = _tight_gate(tmp_path, monkeypatch)
+    parent = _card(conn, "parent", 0, complexity="S")
+    ids = [_card(conn, f"kid{i}", 1) for i in range(9)]
+    for cid in ids:
+        _link(conn, parent, cid)
+    ordered = sorted(ids)
+    assert kr.RoutingContext(conn, cfg).gate_priority(_row(conn, parent)) == (0, 1, ordered)
+    d = _decide(conn, cfg, parent)
+    assert d.source == "quota_held"
+    assert d.note == f"{_TIGHT} (card P0, gate P1 via {','.join(ordered[:8])},+1)"
+
+
+def test_gate_priority_pinned_and_review(conn, monkeypatch, tmp_path):
+    cfg = _tight_gate(tmp_path, monkeypatch)
+    pinned = _card(conn, "pin", 1, model_override="claude-x", provider_override="anthropic")
+    assert _decide(conn, cfg, pinned).source == "quota_held"
+    _link(conn, pinned, _card(conn, "pin-c", 2), status="blocked")
+    _status(conn, pinned, "ready")
+    assert _decide(conn, cfg, pinned).source == "pinned"
+
+    review = _card(conn, "rev", 1)
+    held = kr.RoutingContext(conn, cfg).decide_review(_row(conn, review))
+    assert held is not None and held.source == "quota_held"
+    _link(conn, review, _card(conn, "rev-c", 2), status="blocked")
+    passed = kr.RoutingContext(conn, cfg).decide_review(_row(conn, review))
+    assert passed is not None and passed.source == "review"
+
+
+def test_gate_priority_route_view(kanban_home, monkeypatch, tmp_path, capsys):
+    from hermes_cli import kanban as kcli
+    from hermes_cli.kanban_parser import build_parser
+
+    path = tmp_path / "headroom.json"
+    _p2_headroom(path)
+    mode = tmp_path / "mode.json"
+    _tight_mode(mode, time.time())
+    monkeypatch.setattr(kcli, "_kanban_config", lambda: {"routing": {
+        "enabled": True,
+        "tiers": {"S": [{"model": "claude-s", "provider": "anthropic"}]},
+        "escalate": False,
+        "quota_gate": {"enabled": True, "headroom_file": str(path), "mode_file": str(mode)},
+    }})
+    _pool(monkeypatch)
+    with kbc.connect_closing() as c:
+        parent = _card(c, "parent", 1, complexity="S")
+        child = _card(c, "child", 2)
+        _link(c, parent, child, status="blocked")
+        alone = _card(c, "alone", 1, complexity="S")
+    parser = argparse.ArgumentParser()
+    build_parser(parser.add_subparsers(dest="cmd"))
+
+    def run(*argv):
+        return kcli.kanban_command(parser.parse_args(["kanban", *argv]))
+
+    assert run("route", parent) == 0
+    out = capsys.readouterr().out
+    assert f"card P1, gate P2 via {child}:" in out
+    anth = next(ln for ln in out.splitlines() if "anthropic:" in ln and "needs P2" in ln)
+    assert anth.strip().startswith("ok ")
+
+    assert run("route", alone) == 0
+    out = capsys.readouterr().out
+    assert "card P1:" in out and "gate P2 via" not in out
+    anth = next(ln for ln in out.splitlines() if "anthropic:" in ln and "needs P2" in ln)
+    assert anth.strip().startswith("-- ")
+
+    assert run("route", parent, "--json") == 0
+    raised = json.loads(capsys.readouterr().out)["quota_gate"]
+    assert raised["card_priority"] == 1 and raised["gate_priority"] == 2 and raised["gate_via"] == child
+    assert run("route", alone, "--json") == 0
+    flat = json.loads(capsys.readouterr().out)["quota_gate"]
+    assert flat["card_priority"] == 1 and flat["gate_priority"] == 1 and flat["gate_via"] == ""

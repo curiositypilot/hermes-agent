@@ -682,6 +682,11 @@ def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
     for name, why in sorted(snap.unknown.items()):
         providers.append({"provider": name, "headroom": None, "required_priority": 0,
                           "band_below": None, "resets_at": None, "unknown": why})
+    if task is None:
+        own, gate_p, via = None, None, ""
+    else:
+        own, gate_p, ids = ctx.gate_priority(task)
+        via = kr.format_gate_via(ids)
     return {
         "mode": {"file": mode.path, "status": mode.status, "mode": mode.mode, "active": mode.active,
                  "min_priority": mode.min_priority, "reason": mode.reason, "since": mode.since,
@@ -691,7 +696,9 @@ def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
         "age_seconds": int(snap.age_seconds) if snap.age_seconds is not None else None,
         "max_age_seconds": gate.max_age_seconds, "payg_providers": list(gate.payg_providers),
         "level_gate": [{"below": below, "min_priority": prio} for below, prio in kr.LEVEL_GATE],
-        "card_priority": kr._task_priority(task) if task is not None else None,
+        "card_priority": own,
+        "gate_priority": gate_p,
+        "gate_via": via,
         "providers": providers,
     }
 
@@ -710,6 +717,17 @@ def _quota_windows_view(snap: Any, provider: str) -> dict:
     return {"windows": rows} if rows else {}
 
 
+def _card_gate_line(q: dict) -> Optional[str]:
+    """``card P{n}:`` or, when a descendant raised the gate, ``card P{own}, gate P{eff} via {ids}:``."""
+    own = q.get("card_priority")
+    if own is None:
+        return None
+    via = q.get("gate_via") or ""
+    if via:
+        return f"card P{own}, gate P{q['gate_priority']} via {via}:"
+    return f"card P{own}:"
+
+
 def _print_quota_gate(q: dict) -> None:
     m = q.get("mode") or {}
     if m:
@@ -726,11 +744,15 @@ def _print_quota_gate(q: dict) -> None:
                                        for lv in q.get("level_gate", [])))
     if q["payg_providers"]:
         print(f"  no paid fallthrough after a gate skip: {', '.join(q['payg_providers'])}")
+    card_line = _card_gate_line(q)
+    if card_line:
+        print(f"  {card_line}")
+    gate_p = q["gate_priority"]
     for p in q["providers"]:
         if p["headroom"] is None:
             print(f"  ?  {p['provider']}: unknown ({p.get('unknown')}) -> gate open")
             continue
-        mark = "ok " if q["card_priority"] is None or q["card_priority"] >= p["required_priority"] else "-- "
+        mark = "ok " if gate_p is None or gate_p >= p["required_priority"] else "-- "
         if p.get("mode"):
             print(f"  {mark}{p['provider']}: headroom {p['headroom'] * 100:.0f}% -> quota mode {p['mode']} "
                   f"needs P{p['required_priority']} (level gate not used)")
@@ -738,7 +760,7 @@ def _print_quota_gate(q: dict) -> None:
         band = f" (< {p['band_below'] * 100:.0f}%)" if p["band_below"] is not None else ""
         print(f"  {mark}{p['provider']}: headroom {p['headroom'] * 100:.0f}%{band} -> needs P{p['required_priority']}")
         for w in p.get("windows", []):
-            wmark = "ok " if q["card_priority"] is None or q["card_priority"] >= w["required_priority"] else "-- "
+            wmark = "ok " if gate_p is None or gate_p >= w["required_priority"] else "-- "
             wband = f" (< {w['band_below'] * 100:.0f}%)" if w["band_below"] is not None else ""
             match = w["match"] if w["match"] == "*" else ", ".join(f"{m}*" for m in w["match"])
             print(f"      {wmark}{w['name']} [{match}]: headroom {w['headroom'] * 100:.0f}%{wband} "

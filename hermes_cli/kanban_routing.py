@@ -34,8 +34,11 @@ Unset, review runs keep the card pin / profile model.
 
 Quota gate (``kanban.routing.quota_gate``): a provider whose live headroom
 (``data/quota/headroom.json``, written by the quota-snapshot cron) is below a
-level only takes cards whose priority meets that level's ``min_priority``
-(``LEVEL_GATE``: < 10% needs P2, < 3% needs P3). A gated candidate is skipped
+level only takes cards whose gate priority meets that level's ``min_priority``
+(``LEVEL_GATE``: < 10% needs P2, < 3% needs P3). Gate priority is the max of
+the card's stored priority and its not-done, not-archived descendants (the
+walk passes through a done or archived node to its children). Stored priority
+is not raised. A gated candidate is skipped
 like an unavailable one, so the card moves to a provider with headroom; when
 every candidate is gated (or rate-limited with at least one gate skip) the card
 is held as ``quota_held`` — no failure counted, ``on_exhausted: profile`` does
@@ -748,11 +751,42 @@ class _ClassCheck:
         return f"data class {self.data_class or 'unresolved'}{CLASS_HELD_SUFFIX}"
 
 
-def _task_priority(task: Any) -> int:
+def _coerce_priority(raw: Any) -> int:
     try:
-        return int(getattr(task, "priority", 0) or 0)
+        return int(raw or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _task_priority(task: Any) -> int:
+    return _coerce_priority(getattr(task, "priority", 0))
+
+
+GATE_VIA_SHOWN = 8
+
+
+def format_gate_via(ids: list[str]) -> str:
+    """``via`` ids comma-joined, no spaces: the first 8, then ``,+N`` for the rest."""
+    extra = len(ids) - GATE_VIA_SHOWN
+    return ",".join(ids[:GATE_VIA_SHOWN]) + (f",+{extra}" if extra > 0 else "")
+
+
+# Descendants of one card. UNION (not UNION ALL) ends a cycle. The walk goes
+# through done/archived nodes; only their own rows are dropped from the max.
+# A link to a missing task row is dropped by the join.
+_DESCENDANT_SQL = """
+WITH RECURSIVE gate_descendants(id) AS (
+    SELECT child_id FROM task_links WHERE parent_id = ?
+    UNION
+    SELECT l.child_id
+    FROM task_links l
+    JOIN gate_descendants d ON d.id = l.parent_id
+)
+SELECT t.id AS id, t.priority AS priority
+FROM gate_descendants d
+JOIN tasks t ON t.id = d.id
+WHERE COALESCE(t.status, '') NOT IN ('done', 'archived')
+"""
 
 
 class RoutingContext:
@@ -766,6 +800,7 @@ class RoutingContext:
         self._memo: dict[tuple[Optional[str], Optional[str], str], Availability] = {}
         self._quota: Optional[QuotaSnapshot] = None
         self._mode: Optional[QuotaMode] = None
+        self._gate_priorities: dict[tuple[str, int], tuple[int, int, list[str]]] = {}
 
     def quota_mode(self) -> QuotaMode:
         """``mode.json``, read once per context (per dispatcher tick)."""
@@ -782,6 +817,33 @@ class RoutingContext:
         if self._quota is None:
             self._quota = read_headroom(self.cfg.quota_gate, now=self.now)
         return self._quota
+
+    def gate_priority(self, task: Any) -> tuple[int, int, list[str]]:
+        """``(own, effective, via)`` for the quota gate.
+
+        ``own`` is the card's stored priority and is never written back.
+        ``effective`` is the max of ``own`` and the priority of the card's
+        descendants that are not done or archived. ``via`` is the sorted ids of
+        the descendants at ``effective`` when ``effective > own``, else ``[]``.
+        One query per card per context.
+        """
+        own = _task_priority(task)
+        task_id = getattr(task, "id", None)
+        if not isinstance(task_id, str):
+            return own, own, []
+        cached = self._gate_priorities.get((task_id, own))
+        if cached is not None:
+            return cached
+        try:
+            rows = self.conn.execute(_DESCENDANT_SQL, (task_id,)).fetchall()
+        except sqlite3.Error:
+            logger.debug("quota gate descendant walk failed for %s", task_id, exc_info=True)
+            rows = []
+        found = [(row[0], _coerce_priority(row[1])) for row in rows if row[0] != task_id]
+        top = max((p for _, p in found), default=own)
+        result = (own, top, sorted(i for i, p in found if p == top)) if top > own else (own, own, [])
+        self._gate_priorities[(task_id, own)] = result
+        return result
 
     def quota_verdict(self, provider: Optional[str], priority: int, model: Optional[str] = None) -> Optional[QuotaVerdict]:
         """The gate's refusal of ``provider`` (running ``model``, when given) for a
@@ -834,7 +896,8 @@ class RoutingContext:
         an unavailable one; after the first gate skip, pay-as-you-go providers
         are skipped too."""
         walk = _Walk()
-        priority = _task_priority(task)
+        # Effective, not stored: an open higher descendant passes a hold the card itself would not.
+        priority = self.gate_priority(task)[1]
         for tier, cand in entries:
             where = {"tier": tier} if tier else {}
             refusal = check.refusal(cand.provider)
@@ -867,14 +930,16 @@ class RoutingContext:
         for v in gated:
             seen.setdefault((v.provider, v.window), v)
         resets = [v.resets_at for v in seen.values() if v.resets_at]
-        note = "; ".join(v.describe() for v in seen.values()) + f" (card P{_task_priority(task)})"
+        own, eff, via = self.gate_priority(task)
+        raised = f", gate P{eff} via {format_gate_via(via)}" if via else ""
+        note = "; ".join(v.describe() for v in seen.values()) + f" (card P{own}{raised})"
         return RouteDecision("quota_held", lane=lane, requested_tier=requested_tier, candidate=candidate,
                              skipped=list(skipped or []), retry_at=min(resets) if resets else None, note=note)
 
     def _gate_fixed(self, task: Any, decision: RouteDecision) -> RouteDecision:
         """Pinned / profile routes have no alternative: a gated provider holds the card."""
         cand = decision.candidate
-        verdict = self.quota_verdict(cand.provider if cand else None, _task_priority(task),
+        verdict = self.quota_verdict(cand.provider if cand else None, self.gate_priority(task)[1],
                                      model=cand.model if cand else None)
         if verdict is None:
             return decision
@@ -1040,7 +1105,7 @@ class RoutingContext:
         """Reviewer model from ``kanban.routing.review``; None when no review
         candidates are configured (the run keeps the card pin / profile model).
         Deliberately ignores the card's pin and complexity: both describe the
-        implementer's run. The quota gate applies with the card's priority."""
+        implementer's run. The quota gate applies with the card's gate priority."""
         if not self.cfg.review:
             return None
         check = _ClassCheck.for_task(task, profile_home)
