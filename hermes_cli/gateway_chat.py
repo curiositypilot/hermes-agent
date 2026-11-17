@@ -211,6 +211,10 @@ async def run_gateway_chat(args, emitter=None):
                 policy["title"] = title
             policy.update(env_launch_flags())
             policy.update(client_env_policy(parameters))
+            if oneshot and source != "oneshot" and "oneshot" in parameters:
+                # The explicit --source replaced the ``oneshot`` label; the one-shot fact rides as its own
+                # flag. A gateway predating it gets nothing and keeps the session interactive.
+                policy["oneshot"] = True
             cwd = await asyncio.to_thread(_caller_cwd, args)
             if "cwd" in parameters:
                 policy["cwd"] = cwd

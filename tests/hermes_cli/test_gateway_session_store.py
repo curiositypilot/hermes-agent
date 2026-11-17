@@ -913,3 +913,52 @@ def test_clear_banner_shows_the_new_gateway_sessions_tools_and_short_label(store
     assert banner["session_id"] == "ab12cd34"
     assert sorted(t["function"]["name"] for t in banner["tools"]) == ["mcp__zeta__ro_probe", "read_file"]
     assert banner["get_toolset_for_tool"]("mcp__zeta__ro_probe") == "mcp-zeta"
+
+
+class _OneshotContractClient(FakeClient):
+    def __init__(self, parameters):
+        super().__init__()
+        self.parameters = parameters
+
+    async def rpc(self, method, *, _timeout=None, **params):
+        if method == "runtime.describe":
+            self.calls.append((method, params))
+            return {"session_create": {"parameters": self.parameters}}
+        return await super().rpc(method, _timeout=_timeout, **params)
+
+
+def _classic_create(monkeypatch, parameters, *, finite, source=None):
+    for name in ("HERMES_SINGLE_QUERY_SESSION", "HERMES_SESSION_SOURCE", "HERMES_SESSION_SOURCE_EXPLICIT"):
+        monkeypatch.delenv(name, raising=False)
+    if finite:
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    if source:
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", source)
+        monkeypatch.setenv("HERMES_SESSION_SOURCE_EXPLICIT", "1")
+    client = _OneshotContractClient(parameters)
+
+    @asynccontextmanager
+    async def connect():
+        yield client
+    conn = GatewayConnection(connect=connect)
+    conn.start(5)
+    try:
+        GatewaySessionStore(conn).create({})
+    finally:
+        conn.close()
+    return next(params for method, params in client.calls if method == "session.create")
+
+
+def test_classic_finite_run_under_explicit_source_sends_the_oneshot_flag(monkeypatch):
+    """Classic `hermes chat -Q --source tool` (t_f4bcefd3): stored as ``tool``, one-shot by the ``oneshot`` flag
+    when the gateway takes it; an older gateway, an interactive ``--source tool`` run and a plain finite run
+    (stored as ``oneshot``) send no flag."""
+    with_flag = ["cwd", "request_id", "source", "oneshot"]
+    params = _classic_create(monkeypatch, with_flag, finite=True, source="tool")
+    assert params["source"] == "tool" and params["oneshot"] is True
+    params = _classic_create(monkeypatch, ["cwd", "request_id", "source"], finite=True, source="tool")
+    assert params["source"] == "tool" and "oneshot" not in params
+    params = _classic_create(monkeypatch, with_flag, finite=False, source="tool")
+    assert params["source"] == "tool" and "oneshot" not in params
+    params = _classic_create(monkeypatch, with_flag, finite=True)
+    assert params["source"] == "oneshot" and "oneshot" not in params

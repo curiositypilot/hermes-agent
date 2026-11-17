@@ -51,6 +51,9 @@ class CanonicalCreateParams(ProfileParams):
     # `hermes chat --no-fallback`: a failure on the session's route fails the run instead of walking
     # `fallback_providers`. An older gateway refuses the field rather than silently dropping it.
     no_fallback: bool = False
+    # A finite `chat -q`/`-z` run stored under an explicit `--source` (e.g. `tool`): the session is one-shot
+    # (no clarify, no steering note) while the source label stays the caller's provenance.
+    oneshot: bool = False
     # The classic CLI's `-v`: the session agent's status lines are not quieted.
     verbose: bool = False
     # A shell-launched client's allowlisted environment (HERMES_* behaviour values, toolchain PATH/venv),
