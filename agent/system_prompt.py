@@ -574,9 +574,10 @@ def _guidance_parts(agent: Any) -> list[str]:
     parts.append(_tool_guidance_block(agent))  # None/empty entries are dropped by _join_tier
     if not agent.valid_tool_names:
         return parts
-    # Steering only lands inside tool results, so only reachable with tools; a one-shot has nobody to steer it.
+    # Steering only lands inside tool results, so only reachable with tools; a one-shot or cron run has nobody
+    # to steer it (cron/ has no steer path).
     from agent.oneshot_footprint import agent_is_oneshot
-    if not agent_is_oneshot(agent):
+    if not agent_is_oneshot(agent) and getattr(agent, "platform", None) != "cron":
         parts.append(STEER_CHANNEL_NOTE)
     # agent.tool_use_enforcement / agent.execution_guidance: "auto" (default)
     # matches the hardcoded model lists; true/false force; a list gives custom
@@ -735,6 +736,17 @@ def _context_files_part(agent: Any, ctx_len: Optional[int], soul_loaded: bool) -
         allow_install_tree_fallback=agent.platform in ("cli", "tui"), home_override=_agent_home(agent))]
 
 
+def _unattended(agent: Any) -> bool:
+    """No user can ask this session about Hermes (cron, subagent, one-shot, Kanban worker); every input
+    is fixed for the session, so the prompt stays byte-stable."""
+    from agent.delegation_context import owned_kanban_task
+    from agent.oneshot_footprint import agent_is_oneshot
+
+    return (getattr(agent, "platform", None) in ("cron", "subagent")
+            or (getattr(agent, "_delegate_depth", 0) or 0) > 0
+            or agent_is_oneshot(agent) or bool(owned_kanban_task()))
+
+
 def _join_tier(parts: list[Optional[str]]) -> str:
     """Join non-empty parts; None/blank entries are dropped."""
     return "\n\n".join(p.strip() for p in parts if p and p.strip())
@@ -764,6 +776,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # in the rendered index (pure string check — inherits the index's stability).
     if "skill_view" in (agent.valid_tool_names or set()) and "- hermes-agent:" in skills_prompt:
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
+    if _unattended(agent):  # the help line is for a user asking about Hermes; _join_tier drops ""
+        stable_parts[_help_guidance_slot] = ""
     stable_parts.extend(_alibaba_identity_part(agent))
     # Pinned skills are per-agent constants (resolved once), so they live in the stable prefix.
     stable_parts.extend(_auto_load_parts(agent))

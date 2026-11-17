@@ -172,7 +172,7 @@
   "cron.claude": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 1211,
+      "stable": 885,
       "volatile": 1127
     },
     "tool_tokens": 11134,
