@@ -685,7 +685,8 @@ def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
     if task is None:
         own, gate_p, via = None, None, ""
     else:
-        own, gate_p, via = ctx.gate_priority(task)
+        own, gate_p, ids = ctx.gate_priority(task)
+        via = kr.format_gate_via(ids)
     return {
         "mode": {"file": mode.path, "status": mode.status, "mode": mode.mode, "active": mode.active,
                  "min_priority": mode.min_priority, "reason": mode.reason, "since": mode.since,

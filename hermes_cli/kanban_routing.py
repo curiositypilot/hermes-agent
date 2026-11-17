@@ -36,9 +36,9 @@ Quota gate (``kanban.routing.quota_gate``): a provider whose live headroom
 (``data/quota/headroom.json``, written by the quota-snapshot cron) is below a
 level only takes cards whose gate priority meets that level's ``min_priority``
 (``LEVEL_GATE``: < 10% needs P2, < 3% needs P3). Gate priority is the max of
-the card's stored priority and its not-done, not-archived descendants; a done
-or archived descendant does not count, and neither do its children. Stored
-priority is not raised. A gated candidate is skipped
+the card's stored priority and its not-done, not-archived descendants (the
+walk passes through a done or archived node to its children). Stored priority
+is not raised. A gated candidate is skipped
 like an unavailable one, so the card moves to a provider with headroom; when
 every candidate is gated (or rate-limited with at least one gate skip) the card
 is held as ``quota_held`` — no failure counted, ``on_exhausted: profile`` does
@@ -762,42 +762,30 @@ def _task_priority(task: Any) -> int:
     return _coerce_priority(getattr(task, "priority", 0))
 
 
-def _gate_via_token(task_id: str) -> str:
-    """Full id at 12 characters or fewer; otherwise the first 8 plus an ellipsis."""
-    text = str(task_id)
-    return text if len(text) <= 12 else text[:8] + "…"
+GATE_VIA_SHOWN = 8
 
 
-def _format_gate_via(ids: list[str]) -> str:
-    """Raisers, ascending, at most three, then `` +N`` for the rest."""
-    ordered = sorted(set(ids))
-    shown = ",".join(_gate_via_token(i) for i in ordered[:3])
-    extra = len(ordered) - 3
-    return shown + (f" +{extra}" if extra > 0 else "")
+def format_gate_via(ids: list[str]) -> str:
+    """``via`` ids comma-joined, no spaces: the first 8, then ``,+N`` for the rest."""
+    extra = len(ids) - GATE_VIA_SHOWN
+    return ",".join(ids[:GATE_VIA_SHOWN]) + (f",+{extra}" if extra > 0 else "")
 
 
-# Not-done, not-archived descendants of every root, one read per routing tick.
-# The walk stops at a done or archived node, so its children do not count.
-# UNION (not UNION ALL) ends a cycle; a missing task row is dropped by the join.
+# Descendants of one card. UNION (not UNION ALL) ends a cycle. The walk goes
+# through done/archived nodes; only their own rows are dropped from the max.
+# A link to a missing task row is dropped by the join.
 _DESCENDANT_SQL = """
-WITH RECURSIVE gate_descendants(root_id, id) AS (
-    SELECT l.parent_id, l.child_id
-    FROM task_links l
-    JOIN tasks c ON c.id = l.child_id
-    WHERE c.status NOT IN ('done', 'archived')
-      AND l.child_id != l.parent_id
+WITH RECURSIVE gate_descendants(id) AS (
+    SELECT child_id FROM task_links WHERE parent_id = ?
     UNION
-    SELECT w.root_id, l.child_id
-    FROM gate_descendants w
-    JOIN task_links l ON l.parent_id = w.id
-    JOIN tasks c ON c.id = l.child_id
-    WHERE c.status NOT IN ('done', 'archived')
-      AND l.child_id != w.root_id
+    SELECT l.child_id
+    FROM task_links l
+    JOIN gate_descendants d ON d.id = l.parent_id
 )
-SELECT w.root_id AS root_id, c.id AS id, c.priority AS priority
-FROM gate_descendants w
-JOIN tasks c ON c.id = w.id
-WHERE c.status NOT IN ('done', 'archived')
+SELECT t.id AS id, t.priority AS priority
+FROM gate_descendants d
+JOIN tasks t ON t.id = d.id
+WHERE COALESCE(t.status, '') NOT IN ('done', 'archived')
 """
 
 
@@ -812,7 +800,7 @@ class RoutingContext:
         self._memo: dict[tuple[Optional[str], Optional[str], str], Availability] = {}
         self._quota: Optional[QuotaSnapshot] = None
         self._mode: Optional[QuotaMode] = None
-        self._descendants: Optional[dict[str, list[tuple[str, int]]]] = None
+        self._gate_priorities: dict[tuple[str, int], tuple[int, int, list[str]]] = {}
 
     def quota_mode(self) -> QuotaMode:
         """``mode.json``, read once per context (per dispatcher tick)."""
@@ -830,42 +818,32 @@ class RoutingContext:
             self._quota = read_headroom(self.cfg.quota_gate, now=self.now)
         return self._quota
 
-    def gate_priority(self, task: Any) -> tuple[int, int, str]:
+    def gate_priority(self, task: Any) -> tuple[int, int, list[str]]:
         """``(own, effective, via)`` for the quota gate.
 
-        ``own`` is the card's stored priority and is not written back.
-        ``effective`` is the max of that and the priority of not-done,
-        not-archived descendants. ``via`` names the descendants that raised
-        it (empty when nothing did): ascending, at most three, then `` +N``.
-        No row, or a walk that cannot run, leaves effective equal to own.
+        ``own`` is the card's stored priority and is never written back.
+        ``effective`` is the max of ``own`` and the priority of the card's
+        descendants that are not done or archived. ``via`` is the sorted ids of
+        the descendants at ``effective`` when ``effective > own``, else ``[]``.
+        One query per card per context.
         """
         own = _task_priority(task)
         task_id = getattr(task, "id", None)
-        rows: list[tuple[str, int]] = []
-        if isinstance(task_id, str):
-            rows = [pair for pair in self._descendant_priorities().get(task_id, []) if pair[0] != task_id]
-        if not rows:
-            return own, own, ""
-        top = max(p for _, p in rows)
-        if top <= own:
-            return own, own, ""
-        return own, top, _format_gate_via([i for i, p in rows if p == top])
-
-    def _descendant_priorities(self) -> dict[str, list[tuple[str, int]]]:
-        """Qualifying ``(id, priority)`` per root. One query for this context."""
-        if self._descendants is not None:
-            return self._descendants
-        grouped: dict[str, list[tuple[str, int]]] = {}
+        if not isinstance(task_id, str):
+            return own, own, []
+        cached = self._gate_priorities.get((task_id, own))
+        if cached is not None:
+            return cached
         try:
-            rows = self.conn.execute(_DESCENDANT_SQL).fetchall()
+            rows = self.conn.execute(_DESCENDANT_SQL, (task_id,)).fetchall()
         except sqlite3.Error:
-            logger.debug("quota gate descendant walk failed", exc_info=True)
-            self._descendants = {}
-            return self._descendants
-        for row in rows:
-            grouped.setdefault(row["root_id"], []).append((row["id"], _coerce_priority(row["priority"])))
-        self._descendants = grouped
-        return grouped
+            logger.debug("quota gate descendant walk failed for %s", task_id, exc_info=True)
+            rows = []
+        found = [(row[0], _coerce_priority(row[1])) for row in rows if row[0] != task_id]
+        top = max((p for _, p in found), default=own)
+        result = (own, top, sorted(i for i, p in found if p == top)) if top > own else (own, own, [])
+        self._gate_priorities[(task_id, own)] = result
+        return result
 
     def quota_verdict(self, provider: Optional[str], priority: int, model: Optional[str] = None) -> Optional[QuotaVerdict]:
         """The gate's refusal of ``provider`` (running ``model``, when given) for a
@@ -953,9 +931,8 @@ class RoutingContext:
             seen.setdefault((v.provider, v.window), v)
         resets = [v.resets_at for v in seen.values() if v.resets_at]
         own, eff, via = self.gate_priority(task)
-        note = "; ".join(v.describe() for v in seen.values()) + f" (card P{own})"
-        if eff > own:
-            note += f" (gate P{eff} via {via})"
+        raised = f", gate P{eff} via {format_gate_via(via)}" if via else ""
+        note = "; ".join(v.describe() for v in seen.values()) + f" (card P{own}{raised})"
         return RouteDecision("quota_held", lane=lane, requested_tier=requested_tier, candidate=candidate,
                              skipped=list(skipped or []), retry_at=min(resets) if resets else None, note=note)
 
