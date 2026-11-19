@@ -70,9 +70,12 @@ def append_worker_note(path, pid, text):
         logger.warning('managed worker log %s not written (%s)', path, type(exc).__name__)
 
 
-def drain_worker_stderr(stream, path, pid, scrub):
+def drain_worker_stderr(stream, path, pid, scrub, tail=None):
     """Thread body: read ``stream`` to EOF; ``scrub()`` returns this worker's exact secrets
-    (launch key, assignment secret) known so far. Never stops reading on a write failure."""
+    (launch key, assignment secret) known so far. Never stops reading on a write failure.
+
+    ``tail`` (a bounded ``deque``) also receives each non-blank redacted line, so the owner can
+    name the cause of a worker that dies before its hello frame (that cause exists only here)."""
     skipping = False
     warned = False
     try:
@@ -87,7 +90,10 @@ def drain_worker_stderr(stream, path, pid, scrub):
             skipping = not whole
             try:
                 line = _redact(chunk.decode('utf-8', 'replace'), scrub)
-                _append(path, f'[pid {pid}] ' + (line if whole else line[:KEPT_LINE_CHARS] + ' [truncated]\n'))
+                kept = line if whole else line[:KEPT_LINE_CHARS] + ' [truncated]\n'
+                if tail is not None and kept.strip():
+                    tail.append(kept.rstrip('\r\n'))  # before the disk write, which may fail
+                _append(path, f'[pid {pid}] ' + kept)
             except (OSError, ValueError) as exc:
                 # Keep draining regardless: a child blocked on a full stderr pipe would wedge.
                 if not warned:

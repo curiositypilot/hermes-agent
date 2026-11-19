@@ -196,7 +196,8 @@ def owner_attempt_note(conn, task_id, lost=None) -> str:
         lost = _latest_run_event(conn, task_id, 'worker_lost')
     reason = str(lost.get('reason') or '')
     if reason:
-        return f"managed worker lost: {reason[:80]}"
+        detail = str(lost.get('detail') or '')
+        return f"managed worker lost: {reason[:80]}" + (f" — stderr: {detail[:240]}" if detail else "")
     receipt = _owner_receipt(conn, task_id)
     if receipt is None:
         return ""

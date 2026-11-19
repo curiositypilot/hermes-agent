@@ -27,6 +27,10 @@ STOP_ACK_SECONDS = 30
 # How long a lost attempt's board note may hold up settling its admission (the note is
 # advisory; a busy board's write finishes in the background).
 LOSS_RECORD_WAIT_S = 10
+# A worker lost before hello: its last stderr lines (the only record of why, e.g. an env bootstrap
+# refusal) go into the board's worker_lost note, joined and cut to this many chars from the end.
+STDERR_TAIL_LINES = 3
+STDERR_DETAIL_CHARS = 240
 # Own session (POSIX): a worker whose owner died kills its whole group (managed_worker
 # _die_with_owner); on Windows it exits itself.
 # detached-spawn: ok — covered: the worker kills its own group when its owner dies (_die_with_owner)
@@ -174,6 +178,7 @@ class ManagedWorker:
         self._frames = deque()
         self._arrived = None
         self.stderr_drain = None
+        self.stderr_tail = deque(maxlen=STDERR_TAIL_LINES)
         # Exact secrets this worker was handed; the stderr sink scrubs them besides the patterns.
         self.secrets = []
 
@@ -225,8 +230,18 @@ class ManagedWorker:
         from agent.memory_provider import spawn_context_thread
         from gateway.session_managed_worker_log import drain_worker_stderr
         self.stderr_drain = spawn_context_thread(drain_worker_stderr, name='managed-stderr-drain',
-                                                 args=(self.process.stderr, path, self.process.pid, lambda: self.secrets))
+                                                 args=(self.process.stderr, path, self.process.pid, lambda: self.secrets,
+                                                       self.stderr_tail))
         self.stderr_drain.start()
+
+    def stderr_detail(self, wait):
+        """The child's last redacted stderr lines joined by `` | ``, or ``''``. Once the child has
+        exited its drain is at EOF within moments, so it gets up to ``wait`` s; a live child (a
+        hello timeout) is never waited on."""
+        if self.stderr_drain is not None and self.process.poll() is not None:
+            self.stderr_drain.join(timeout=wait)
+        detail = ' | '.join(self.stderr_tail)
+        return detail if len(detail) <= STDERR_DETAIL_CHARS else '…' + detail[1 - STDERR_DETAIL_CHARS:]
 
     def control(self, frame):
         if self.closed.is_set():
@@ -562,7 +577,7 @@ def _stopped_before_spawn(authority, ref, row):
     return True
 
 
-def _record_lost_attempt(authority, policy, exc, reason, scope):
+def _record_lost_attempt(authority, policy, exc, reason, scope, detail=None):
     """Start the board disposition (``worker_lost``) for a lost Kanban card attempt; the task, or None.
 
     A worker that dies in ``worker.adopt`` never writes ``worker_bound``/``worker_result``, so
@@ -575,7 +590,8 @@ def _record_lost_attempt(authority, policy, exc, reason, scope):
     from gateway.session_kanban import record_worker_loss
     from gateway.session_runtime_workers import track_mutation
     return track_mutation(authority, asyncio.to_thread(partial(record_worker_loss, policy, reason,
-                                                               pid=(scope or {}).get('pid'), bound=scope is not None)))
+                                                               pid=(scope or {}).get('pid'), bound=scope is not None,
+                                                               detail=detail)))
 
 
 async def _settle_lost(authority, row, scope, recording):
@@ -839,14 +855,18 @@ async def execute_managed(authority, ref, row, policy):
     except (Exception, asyncio.CancelledError) as exc:
         import logging
         reason = exc.reason if isinstance(exc, RuntimeStoreError) else type(exc).__name__
-        logging.getLogger(__name__).warning('Managed worker lost: %s', reason)
+        stopped = isinstance(exc, asyncio.CancelledError) or reason == 'managed_worker_stopped'
+        # Lost before hello: the child's own stderr is the only record of why (a bound worker's
+        # stderr is turn noise, and its interpreter books its own worker_result).
+        detail = '' if scope is not None or stopped else await asyncio.to_thread(worker.stderr_detail, 2)
+        logging.getLogger(__name__).warning('Managed worker lost: %s%s', reason, detail and f' (stderr: {detail})')
         if scope is None:
-            if isinstance(exc, asyncio.CancelledError) or (
-                    isinstance(exc, RuntimeStoreError) and exc.reason == 'managed_worker_stopped'):
+            if stopped:
                 # Stopped before the child ever received its bootstrap: nothing executed, so
                 # this settles like an ordinary interrupted turn (the finally kills the child).
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
-            _record_lost_attempt(authority, policy, exc, reason, scope)  # nothing bound: a late note is dropped, never misbooked
+            # nothing bound: a late note is dropped, never misbooked
+            _record_lost_attempt(authority, policy, exc, reason, scope, detail)
             raise
         await _settle_lost(authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope))
         live = authority.sessions[ref.session_id]
