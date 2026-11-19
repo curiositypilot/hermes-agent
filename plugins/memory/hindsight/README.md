@@ -97,6 +97,7 @@ Config file: `~/.hermes/hindsight/config.json`
 |-----|---------|-------------|
 | `auto_retain` | `true` | Automatically retain conversation turns |
 | `retain_contexts` | `["primary", "cron"]` | Agent contexts whose turns are auto-retained (`primary`, `cron`, `subagent`, `flush`); `[]` retains nothing automatically |
+| `auto_retain_skip_sources` | `[]` | Session sources (`sessions.source`: `oneshot`, `tool`, `cli`, `tui`, `gui`, `desktop`, `acp`, a messaging platform name; list or comma-separated) whose turns are never auto-retained. `["oneshot", "tool"]` drops agent-run `hermes chat -q`/`-z` and `--source tool` sessions; an explicit `--source cli` still retains, and the `hindsight_retain` tool is never gated |
 | `retain_kanban_workers` | `true` | Auto-retain turns of Kanban worker sessions (`HERMES_KANBAN_TASK` set) |
 | `retain_lineage_tags` | `true` | Tag auto-retained turns `session:<id>` / `parent:<id>`. Each tag set is its own consolidation scope; set `false` to let conversation facts consolidate together (ids stay in metadata) |
 | `retain_async` | `true` | Process retain asynchronously on the Hindsight server |

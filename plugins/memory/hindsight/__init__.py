@@ -52,7 +52,8 @@ from .settings import (
     _PROVIDER_DEFAULT_MODELS, _STREAM_ERROR_PREFIX, _VALID_BUDGETS, _daemon_llm_provider,
     _KANBAN_QUERY_BODY_CHARS, _apply_project_aliases, _kanban_recall_query, _kanban_recall_tags,
     _normalize_observation_scopes, _normalize_project_aliases, _normalize_retain_contexts,
-    _normalize_retain_tags, _observation_scope_tag_groups, _parse_bool_setting, _parse_int_setting,
+    _normalize_retain_tags, _normalize_skip_sources, _observation_scope_tag_groups, _parse_bool_setting,
+    _parse_int_setting,
     _parse_score_floor, _reranker_score, _resolve_bank_id_template,
     _DATED_RECALL_HEADER, _format_recall_lines, _format_tool_recall,
 )
@@ -1004,11 +1005,12 @@ class HindsightMemoryProvider(MemoryProvider):
         logger.debug("Hindsight config: auto_retain=%s, auto_recall=%s, retain_every_n=%d, "
                      "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, tags=%s, recall_tags=%s, "
                      "agent_context=%s, retain_contexts=%s, retain_kanban_workers=%s, retain_lineage_tags=%s, "
-                     "auto_retain_blocked=%s",
+                     "auto_retain_skip_sources=%s, auto_retain_blocked=%s",
                      self._auto_retain, self._auto_recall, self._retain_every_n_turns,
                      self._retain_async, self._retain_context, self._recall_max_tokens, self._recall_max_input_chars,
                      self._tags, self._recall_tags, self._agent_context, list(self._retain_contexts),
-                     self._retain_kanban_workers, self._retain_lineage_tags, self._auto_retain_block_reason)
+                     self._retain_kanban_workers, self._retain_lineage_tags,
+                     list(self._auto_retain_skip_sources), self._auto_retain_block_reason)
 
         if self._mode == "local_embedded":
             self._start_embedded_daemon()
@@ -1074,6 +1076,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # sessions retain, Kanban workers retain, and turns carry session:/parent: lineage tags.
         self._retain_contexts = _normalize_retain_contexts(cfg.get("retain_contexts"))
         self._retain_kanban_workers = _parse_bool_setting(cfg.get("retain_kanban_workers"), True)
+        self._auto_retain_skip_sources = _normalize_skip_sources(cfg.get("auto_retain_skip_sources"))
         # Each distinct tag set is its own consolidation scope on the server, so per-session tags
         # keep conversation facts from ever consolidating with each other. session_id and
         # parent_session_id stay in the item metadata either way.
@@ -1098,7 +1101,24 @@ class HindsightMemoryProvider(MemoryProvider):
             return f"agent_context={self._agent_context!r} not in retain_contexts {list(self._retain_contexts)}"
         if not self._retain_kanban_workers and (task := os.environ.get(_KANBAN_TASK_ENV, "").strip()):
             return f"Kanban worker ({_KANBAN_TASK_ENV}={task}) with retain_kanban_workers=false"
+        if self._auto_retain_skip_sources and (src := self._session_source()) in self._auto_retain_skip_sources:
+            return f"session source {src!r} in auto_retain_skip_sources"
         return None
+
+    def _session_source(self) -> str:
+        """This session's ``sessions.source``: the frozen launch policy of a gateway-owned turn (a
+        ``hermes chat -q`` runs as platform ``cli`` there), else the process's own label (``oneshot``
+        for an in-process ``-q``)."""
+        try:
+            from gateway.session_policy import active_policy
+        except ImportError:  # install without the gateway package: no owner-bound session
+            policy = None
+        else:
+            policy = active_policy()
+        if policy is not None:
+            return str(policy.source or "").lower()
+        from agent.session_source import session_source_for
+        return session_source_for(self._platform).lower()
 
     def _apply_recall_settings(self, cfg: dict) -> None:
         """Recall knobs are pure config too (``{}`` yields the defaults)."""

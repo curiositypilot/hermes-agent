@@ -50,6 +50,9 @@ _OBSERVATION_SCOPE_KEYWORDS = {"per_tag", "combined", "all_combinations"}
 # with skip_memory=True), so the default only has to name the contexts that do.
 _KNOWN_AGENT_CONTEXTS = {"primary", "cron", "subagent", "flush"}
 _DEFAULT_RETAIN_CONTEXTS = ("primary", "cron")
+# ``sessions.source`` labels local surfaces and automation write (hermes_state_local_migration
+# LEGACY_LOCAL_SOURCES plus the automation labels); messaging sessions carry their platform name.
+_KNOWN_SESSION_SOURCES = {"cli", "tui", "gui", "desktop", "acp", "oneshot", "tool", "cron", "kanban", "subagent"}
 # Assistant text the runtime substitutes for a failed stream; such a turn carries no knowledge.
 _STREAM_ERROR_PREFIX = "[stream error"
 _FALSE_STRINGS = {"0", "false", "no", "off"}
@@ -81,6 +84,17 @@ def _normalize_retain_contexts(value: Any) -> tuple[str, ...]:
         logger.warning("Unknown Hindsight retain_contexts %s (known: %s); those never match",
                        unknown, sorted(_KNOWN_AGENT_CONTEXTS))
     return contexts
+
+
+def _normalize_skip_sources(value: Any) -> tuple[str, ...]:
+    """``auto_retain_skip_sources`` (list or comma-separated) -> lower-cased session sources whose
+    turns are never auto-retained. Unset/blank/``[]`` skips none (the pre-key behaviour)."""
+    sources = tuple(s.lower() for s in _normalize_retain_tags(value or ""))
+    if unknown := [s for s in sources if s not in _KNOWN_SESSION_SOURCES]:
+        logger.warning("Unknown Hindsight auto_retain_skip_sources %s (known: %s); they match only a "
+                       "session of that exact source, e.g. a messaging platform name",
+                       unknown, sorted(_KNOWN_SESSION_SOURCES))
+    return sources
 
 
 def _parse_int_setting(value: Any, default: int) -> int:

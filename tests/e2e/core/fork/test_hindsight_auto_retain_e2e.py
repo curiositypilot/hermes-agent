@@ -14,6 +14,10 @@ gateway and proves the fixture bites: its canary reaches the fake Hindsight reta
 gateway is proven live, and only then the switched turn runs in the same home. A second flagless
 turn bounds the wait without a sleep: once its retain arrives, the switched turn's would have too.
 
+``test_skip_sources_drop_oneshot_turns_on_a_warm_gateway`` (intake t_4d646807) applies the same rule to
+``auto_retain_skip_sources: [oneshot, tool]``: ``chat -Q -q`` and ``-z`` with no switch are stored as
+source ``oneshot`` and must not reach Hindsight; ``--source cli`` controls before and after must.
+
 Fixture: ``FakeLLMServer`` as the model, ``FakeHindsightServer`` as the memory API (cloud mode,
 ``retain_contexts: [primary]``, ``retain_async: false``, ``auto_recall: false`` so a recall query
 cannot carry the canary either). Assert: no recorded request carries the switched turn's canary.
@@ -69,7 +73,7 @@ def _stop_gateway(h: Home) -> None:
                    text=True, timeout=60, stdin=subprocess.DEVNULL, check=False)
 
 
-def _home(tmp_path, llm: FakeLLMServer, hs: FakeHindsightServer) -> Home:
+def _home(tmp_path, llm: FakeLLMServer, hs: FakeHindsightServer, **hindsight_cfg) -> Home:
     cfg = custom_chat_config(llm.base_url)
     cfg["memory"] = {"provider": "hindsight"}
     h = Home(tmp_path).write(cfg, {"OPENAI_API_KEY": "sk-fake"})
@@ -78,7 +82,7 @@ def _home(tmp_path, llm: FakeLLMServer, hs: FakeHindsightServer) -> Home:
     (hindsight / "config.json").write_text(json.dumps({
         "mode": "cloud", "api_url": hs.base_url, "apiKey": "hs-fake", "bank_id": "e2e-bank",
         "retain_contexts": ["primary"], "retain_async": False, "auto_recall": False,
-        "retain_indicator": False,
+        "retain_indicator": False, **hindsight_cfg,
     }), encoding="utf-8")
     return h
 
@@ -115,5 +119,33 @@ def test_auto_retain_switch_reaches_warm_gateway(tmp_path, surface: str) -> None
             assert not leaked, (
                 f"HINDSIGHT_AUTO_RETAIN=0 turn through warm gateway pid {pid} reached Hindsight: "
                 f"{[(r['method'], r['path']) for r in leaked]}")
+        finally:
+            _stop_gateway(h)
+
+
+def test_skip_sources_drop_oneshot_turns_on_a_warm_gateway(tmp_path) -> None:
+    with FakeLLMServer(default_text=REPLY) as llm, FakeHindsightServer() as hs:
+        h = _home(tmp_path, llm, hs, auto_retain_skip_sources=["oneshot", "tool"])
+        try:
+            # (a) explicit --source cli control: auto-starts the gateway and proves the fixture bites.
+            control = _turn(h, ["chat", "-Q", "-q", "CLI-A say pong", "--source", "cli"])
+            assert control.returncode == 0 and REPLY in control.stdout, f"cli control failed\n{_describe(control)}"
+            _retained(hs, "CLI-A", f"the --source cli control turn; fixture does not bite\n{_describe(control)}")
+            pid = wait_until(lambda: live_gateway_pid_for_home(h.hermes_home), GATEWAY_LIVE_BUDGET,
+                             "a live gateway for the home after the cli control turn")
+            # (b) agent-run one-shots with no switch: stored as source oneshot.
+            for canary, argv in (("ONE-B", SURFACES["chat_Q"]), ("ONE-Z", SURFACES["z"])):
+                oneshot = _turn(h, argv(f"{canary} say pong"))
+                assert oneshot.returncode == 0 and REPLY in oneshot.stdout, (
+                    f"{canary} turn failed\n{_describe(oneshot)}")
+            # (c) a second cli control bounds the wait for any late retain of (b).
+            after = _turn(h, ["chat", "-Q", "-q", "CLI-C say pong", "--source", "cli"])
+            assert after.returncode == 0, f"second cli control failed\n{_describe(after)}"
+            _retained(hs, "CLI-C", f"the second cli control turn\n{_describe(after)}")
+            assert live_gateway_pid_for_home(h.hermes_home) == pid, "the turns did not share the warm gateway"
+            leaked = {c: hs.requests_containing(c) for c in ("ONE-B", "ONE-Z") if hs.requests_containing(c)}
+            assert not leaked, (
+                f"oneshot turns through warm gateway pid {pid} reached Hindsight despite auto_retain_skip_sources: "
+                f"{ {c: [(r['method'], r['path']) for r in rs] for c, rs in leaked.items()} }")
         finally:
             _stop_gateway(h)
