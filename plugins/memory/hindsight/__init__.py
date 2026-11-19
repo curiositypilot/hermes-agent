@@ -45,6 +45,7 @@ from .embedded import (
 )
 from . import state_lines
 from .envelope import agent_note_envelope, chat_envelope, first_line, lookup_session_title
+from .project_tags import gate_retain_tags
 from .recall_log import log_recalled
 from .settings import (
     _DEFAULT_API_URL, _DEFAULT_IDLE_TIMEOUT, _DEFAULT_LOCAL_URL, _DEFAULT_REFLECT_TIMEOUT, _DEFAULT_RETAIN_SOURCE,
@@ -706,7 +707,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_kanban_card_query", "description": "In Kanban workers (HERMES_KANBAN_TASK set), auto-recall with the card's title + the start of its body instead of the dispatcher's topic-free 'work kanban task <id>' message", "default": False},
             {"key": "recall_kanban_body_chars", "description": "Card-body characters appended to the title for recall_kanban_card_query (0 = title only). Longer queries dilute the reranker score", "default": _KANBAN_QUERY_BODY_CHARS},
             {"key": "recall_kanban_tags", "description": "Auto-recall tag filter for Kanban workers, replacing recall_tags there (comma-separated or list; '{tenant}' expands to the card's tenant and the tag is dropped for untenanted cards), e.g. 'project:{tenant},scope:personal'. Blank keeps recall_tags", "default": ""},
-            {"key": "recall_project_aliases", "description": "Renamed project slugs for the recall/reflect tools: a JSON object old -> new (e.g. {\"aperture-robotics\": \"movis\"}); each project:<old> tag in a tool call is rewritten to project:<new>", "default": {}},
+            {"key": "recall_project_aliases", "description": "Renamed project slugs for the retain/recall/reflect tools: a JSON object old -> new (e.g. {\"aperture-robotics\": \"movis\"}); each project:<old> tag in a tool call is rewritten to project:<new>", "default": {}},
+            {"key": "project_registry", "description": "Path to a project registry JSON ({\"projects\": [{\"slug\", \"aliases\"}]}): hindsight_retain rewrites a project:<alias> tag to its slug, and stores a registry slug the bank's project labels lack with a note instead of refusing it. Blank: only recall_project_aliases apply", "default": ""},
             {"key": "recall_kanban_tags_match", "description": "Tag matching mode for recall_kanban_tags ('any' also returns untagged memories)", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_prefer_observations", "description": "When recall_types mixes observation with raw world/experience facts, drop raw facts an included observation was consolidated from (applies to auto-recall and the hindsight_recall tool)", "default": False},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
@@ -1156,6 +1158,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # (fetched lazily on the first tagged tool call, cached; None = unknown -> no check).
         self._recall_project_aliases = _normalize_project_aliases(cfg.get("recall_project_aliases"))
         self._project_slugs_cache: tuple[float, frozenset | None] | None = None
+        self._project_registry = str(cfg.get("project_registry") or "").strip()
 
     def _kanban_first_turn_mode(self) -> bool:
         """True in a Kanban worker whose automatic recall is limited to its first turn."""
@@ -1716,12 +1719,25 @@ class HindsightMemoryProvider(MemoryProvider):
             metadata.update(agent_note_envelope(
                 platform=self._platform, occurred_at=str(occurred_at or "").strip(),
                 title=lookup_session_title(self._envelope_home(), self._session_id)))
-        item = self._build_retain_kwargs(content, metadata=metadata, tags=args.get("tags"),
+        tags, notes = args.get("tags"), []
+        if isinstance(tags, list) and tags:
+            tags, notes, refusal = gate_retain_tags(
+                [str(t) for t in tags], aliases=self._recall_project_aliases,
+                registry_path=self._project_registry, labels=self._project_labels)
+            if refusal:
+                return refusal
+        item = self._build_retain_kwargs(content, metadata=metadata, tags=tags,
                                          occurred_at=occurred_at, strategy=strategy)
         logger.debug("Tool hindsight_retain: bank=%s, content_len=%d", self._bank_id, len(content))
         self._retain_batch(item, bank_id=self._bank_id)
         logger.debug("Tool hindsight_retain: success")
-        return "Memory stored successfully."
+        return " ".join(["Memory stored successfully.", *notes])
+
+    def _project_labels(self, refresh: bool) -> frozenset | None:
+        """``_project_slugs``; ``refresh`` drops the cache first (a label added within the TTL)."""
+        if refresh:
+            self._project_slugs_cache = None
+        return self._project_slugs()
 
     def _client_accepts(self, method: str, kwarg: str) -> bool:
         """Whether the client's *method* takes *kwarg* (explicitly or via ``**kwargs``)."""

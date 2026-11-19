@@ -113,3 +113,75 @@ def test_auto_retain_never_sends_strategy(tmp_path, monkeypatch):
 def test_tool_retain_strategy_is_declared_in_config_schema():
     keys = {f["key"] for f in HindsightMemoryProvider().get_config_schema()}
     assert "tool_retain_strategy" in keys
+
+
+# -- project: tag gate (intake t_38883233) ---------------------------------------------------------
+
+def _labelled(p, *label_sets):
+    """Bank config fetches return each label set in turn (the last one repeats)."""
+    configs = [{"config": {"entity_labels": [{"key": "project", "values": [{"value": v} for v in labels]}]}}
+               for labels in label_sets]
+    p._client.aget_bank_config = AsyncMock(side_effect=lambda bank: configs.pop(0) if len(configs) > 1 else configs[0])
+    return p
+
+
+def _call(p, tags) -> str:
+    out = json.loads(p.handle_tool_call("hindsight_retain", {"content": "a fact", "tags": tags}))
+    p._retain_queue.join()
+    return out["result"]
+
+
+def test_tool_retain_rewrites_recall_alias_before_submit(tmp_path, monkeypatch):
+    p = _labelled(_provider(tmp_path, monkeypatch, recall_project_aliases={"aperture-robotics": "movis"}),
+                  ["movis", "car"])
+    result = _call(p, ["project:aperture-robotics", "scope:personal"])
+
+    assert p._client.aretain_batch.call_count == 1
+    assert _items(p)[-1]["tags"] == ["project:movis", "scope:personal"]
+    assert result.startswith("Memory stored successfully.") and "project:movis" in result
+
+
+def test_tool_retain_refuses_unknown_project_slug_and_stores_nothing(tmp_path, monkeypatch):
+    p = _labelled(_provider(tmp_path, monkeypatch), ["car", "land-geres"])
+    result = _call(p, ["project:honda-wheels"])
+
+    assert "project:honda-wheels is not a project label in this bank" in result
+    assert "land-geres" not in result  # no similarity guess a retry would store under (t_6e8802f5#1)
+    p._client.aretain_batch.assert_not_called()
+    assert _call(p, ["project:car"]) == "Memory stored successfully."
+    assert _items(p)[-1]["tags"] == ["project:car"]
+
+
+def test_tool_retain_label_fetch_failure_stores_tag_unchanged(tmp_path, monkeypatch):
+    p = _provider(tmp_path, monkeypatch)
+    p._client.aget_bank_config = AsyncMock(side_effect=OSError("connection refused"))
+    assert _call(p, ["project:honda-wheels"]) == "Memory stored successfully."
+    assert p._client.aretain_batch.call_count == 1
+    assert _items(p)[-1]["tags"] == ["project:honda-wheels"]
+
+
+def test_tool_retain_rechecks_stale_label_cache_before_refusing(tmp_path, monkeypatch):
+    p = _labelled(_provider(tmp_path, monkeypatch), ["car"], ["car", "new-tenant"])
+    assert _call(p, ["project:car"]) == "Memory stored successfully."  # caches the old set
+    assert _call(p, ["project:new-tenant"]) == "Memory stored successfully."
+    assert _items(p)[-1]["tags"] == ["project:new-tenant"]
+
+
+def test_tool_retain_resolves_registry_alias_and_stores_lagging_registry_slug(tmp_path, monkeypatch):
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({"projects": [
+        {"slug": "ai-factory", "aliases": ["ai-model-landscape"]}, {"slug": "fresh", "aliases": []}]}))
+    p = _labelled(_provider(tmp_path, monkeypatch, project_registry=str(registry)), ["ai-factory"])
+
+    assert "project:ai-factory" in _call(p, ["project:ai-model-landscape"])
+    assert _items(p)[-1]["tags"] == ["project:ai-factory"]
+    result = _call(p, ["project:fresh"])  # registry slug, bank profile not re-applied yet
+    assert result.startswith("Memory stored successfully.") and "re-apply the bank profile" in result
+    assert _items(p)[-1]["tags"] == ["project:fresh"]
+    assert "is not a project label" in _call(p, ["project:caravel"])
+    assert p._client.aretain_batch.call_count == 2
+
+
+def test_project_registry_is_declared_in_config_schema():
+    keys = {f["key"] for f in HindsightMemoryProvider().get_config_schema()}
+    assert "project_registry" in keys
