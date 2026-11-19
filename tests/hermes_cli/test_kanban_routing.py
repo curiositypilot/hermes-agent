@@ -279,6 +279,32 @@ def test_pool_availability_keeps_other_rows_without_env_rule(auth_home, monkeypa
     assert kr.pool_availability("anthropic", FABLE, now=1794960273).available is True
 
 
+def test_routing_pool_check_binds_assignee_secret_scope_under_multiplex(conn, kanban_home, monkeypatch):
+    """t_846f38f4: the multiplexed dispatch tick runs in a fresh Context with no secret scope, so
+    the routing seam must bind the assignee's scope or the token-less ``env:`` row stays capacity."""
+    import contextvars
+    from agent.secret_scope import set_multiplex_active
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    profile = kanban_home / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    _write_pool(profile, "anthropic", [OAUTH_ROW, ENV_ROW])
+    _pin_bench_clock(monkeypatch, 1794960273)  # 00:04:33, fable benched
+
+    def check():
+        return kr.RoutingContext(conn, _cfg()).availability(kr.TierCandidate(FABLE, "anthropic"), str(profile))
+
+    set_multiplex_active(True)
+    try:
+        unset = contextvars.Context().run(check)
+        profile.joinpath(".env").write_text("ANTHROPIC_API_KEY=elias-key\n", encoding="utf-8")
+        key_set = contextvars.Context().run(check)
+    finally:
+        set_multiplex_active(False)
+    assert unset.available is False and unset.until == FABLE_BENCH_UNTIL
+    assert key_set.available is True
+
+
 # ---------------------------------------------------------------------------
 # Decision
 # ---------------------------------------------------------------------------

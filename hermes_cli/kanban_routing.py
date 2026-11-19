@@ -362,6 +362,20 @@ def _home_scope(profile_home: Optional[str]):
         reset_hermes_home_override(token)
 
 
+@contextlib.contextmanager
+def _pool_scope(profile_home: Optional[str]):
+    """Home + secret scope of the profile whose pool is checked.
+
+    The dispatch tick runs detached from any turn, so under multiplexing an ``env:`` row's key
+    read (``_env_row_unset``) raises ``UnscopedSecretError`` and the token-less row stays counted.
+    """
+    from hermes_cli.kanban_db_dispatch import _worker_profile_scope
+    from hermes_constants import get_hermes_home
+
+    with _home_scope(profile_home), _worker_profile_scope(str(get_hermes_home()), bind_home=False):
+        yield
+
+
 def resolve_profile_home(assignee: Optional[str]) -> Optional[str]:
     if not assignee:
         return None
@@ -1074,7 +1088,7 @@ class RoutingContext:
             reason = "rate_limited on this board" + (" (fallback)" if source == "fallback" else "")
             result = Availability(False, reason, until=at + self.cfg.cooldown_seconds)
         else:
-            with _home_scope(profile_home):
+            with _pool_scope(profile_home):
                 result = pool_availability(cand.provider, cand.model, now=self.now)
         self._memo[memo_key] = result
         return result
