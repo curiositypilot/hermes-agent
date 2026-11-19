@@ -1,6 +1,5 @@
 """Worker-context rendering for ``build_worker_context``: the capped markdown sections a spawned
-worker reads about its task (header, attachments, prior attempts, parent handoffs, role
-history, comments).
+worker reads about its task (header, attachments, prior attempts, parent handoffs, comments).
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached late-bound via
 ``_kb`` so monkeypatching ``kanban_db.<name>`` keeps working.
@@ -248,29 +247,6 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
         if meta_line:
             lines.append(meta_line)
         lines.append("")
-
-
-def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, now: int) -> None:
-    """The assignee's 5 most recent completed runs on OTHER tasks — implicit
-    role continuity without wiring anything into SOUL.md / MEMORY.md."""
-    if not task.assignee:
-        return
-    role_rows = conn.execute(
-        "SELECT t.id, t.title, r.summary, r.ended_at "
-        "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
-        "WHERE r.profile = ? AND r.task_id != ? "
-        "  AND r.outcome = 'completed' "
-        "ORDER BY r.ended_at DESC LIMIT 5", (task.assignee, task.id),
-    ).fetchall()
-    if not role_rows:
-        return
-    lines.append(f"## Recent work by @{task.assignee}")
-    for row in role_rows:
-        first = _kb._first_line(row["summary"], 200) or "(no summary)"
-        lines.append(
-            f"- {row['id']} — {row['title']} ({_ctx_stamp(_kb._to_epoch(row['ended_at']) or 0, now)}): {first}"
-        )
-    lines.append("")
 
 
 def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:

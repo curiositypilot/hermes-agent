@@ -73,3 +73,31 @@ def test_header_25_children_shows_20_and_plus_5(db):
         assert cid in text
     for cid in ordered[20:]:
         assert cid not in text
+
+
+def test_context_omits_assignee_recent_work(db):
+    """Assignee history is unrelated to the card and must not ride every spawn.
+
+    Parent handoffs stay: they are the related-card channel.
+    """
+    kb, conn = db
+    other = kb.create_task(conn, title="other-card", assignee="w")
+    claimed = kb.claim_task(conn, other)
+    assert claimed is not None
+    assert kb.complete_task(
+        conn, other, summary="OTHER-SUMMARY", expected_run_id=claimed.current_run_id,
+    )
+    parent = kb.create_task(conn, title="parent-card", assignee="w")
+    claimed = kb.claim_task(conn, parent)
+    assert claimed is not None
+    assert kb.complete_task(
+        conn, parent, summary="PARENT-HANDOFF", expected_run_id=claimed.current_run_id,
+    )
+    mine = kb.create_task(conn, title="mine", assignee="w", parents=[parent])
+    ctx = kb.build_worker_context(conn, mine)
+    assert "Recent work by" not in ctx
+    assert "OTHER-SUMMARY" not in ctx
+    assert other not in ctx
+    assert "## Parent task results" in ctx
+    assert "PARENT-HANDOFF" in ctx
+    assert parent in ctx

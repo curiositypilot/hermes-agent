@@ -4175,15 +4175,15 @@ def schedule_task(
 
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Everything a worker should read about its task: header, body,
-    attachments, prior attempts, done-parent handoffs, the assignee's recent
-    work, comments. Lists are tail-capped and fields char-capped
-    (``_CTX_MAX_*``) so the prompt stays bounded on pathological boards."""
+    attachments, prior attempts, done-parent handoffs, comments. Lists are
+    tail-capped and fields char-capped (``_CTX_MAX_*``) so the prompt stays
+    bounded on pathological boards."""
     task = get_task(conn, task_id)
     if not task:
         raise ValueError(f"unknown task {task_id}")
     from hermes_cli.kanban_db_context import (
         _ctx_attachments, _ctx_comments, _ctx_header, _ctx_parent_results, _ctx_principles,
-        _ctx_prior_attempts, _ctx_role_history,
+        _ctx_prior_attempts,
     )
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
@@ -4192,7 +4192,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
-    _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)
     _ctx_principles(lines, task)
     return "\n".join(lines).rstrip() + "\n"
