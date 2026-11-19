@@ -17,7 +17,7 @@ CREATE_FIELDS = frozenset({'request_id', 'source', 'cwd', 'model', 'toolsets',
                            'yolo', 'safe_mode', 'ignore_user_config',
                            'skills', 'checkpoints', 'accept_hooks', 'pass_session_id', 'follow_profile_config',
                            'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env',
-                           'no_fallback'})
+                           'no_fallback', 'oneshot'})
 # Sections a ``follow_profile_config`` session re-reads from the owning profile's CURRENT config each
 # turn (main's Bot Chat row), credentials included: a frozen key never crosses a profile route change.
 FOLLOW_SECTIONS = ('model', 'providers', 'custom_providers', 'fallback_providers', 'fallback_model', 'model_aliases',
@@ -337,6 +337,13 @@ class LocalSessionPolicy:
         return json.loads(self.request_json).get('no_fallback', False)
 
     @property
+    def oneshot(self):
+        """A finite ``chat -q``/``-z`` session: stored as ``oneshot``, or under the caller's ``--source`` with the
+        frozen ``oneshot`` create flag. The source label is provenance; this is the one-shot fact
+        (``oneshot_footprint.is_single_query_session``, ``session_disabled_toolsets(oneshot=...)``)."""
+        return self.source == 'oneshot' or json.loads(self.request_json).get('oneshot') is True
+
+    @property
     def run_budget_seconds(self):
         """Frozen `agent.run_budget_seconds` (`--run-budget` folds into it); None = no budget."""
         from agent.agent_init import _normalize_run_budget_seconds
@@ -612,7 +619,8 @@ def _apply_launch_overrides(params, config):
                     _refuse('base_url', 'must be an http(s) URL without credentials, query or fragment')
             config.setdefault('model', {})[key] = value
     bad_flag = next((flag for flag in ('ignore_rules', 'yolo', 'checkpoints', 'accept_hooks', 'pass_session_id',
-                                      'follow_profile_config', 'cwd_explicit', 'verbose', 'no_fallback')
+                                      'follow_profile_config', 'cwd_explicit', 'verbose', 'no_fallback',
+                                      'oneshot')
                      if flag in params and type(params[flag]) is not bool), None)
     if bad_flag:
         _refuse(bad_flag, 'must be a boolean')

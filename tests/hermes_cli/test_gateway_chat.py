@@ -362,3 +362,46 @@ async def test_oneshot_z_writes_no_session_lines_to_stderr_like_main(monkeypatch
     assert await gateway_chat.run_gateway_chat(argparse.Namespace(query="q", quiet=True)) == 0
     err = capsys.readouterr().err
     assert "Session: stored-z" in err and "session_id: stored-z" in err
+
+
+@pytest.mark.asyncio
+async def test_finite_run_under_explicit_source_sends_the_oneshot_flag(monkeypatch, tmp_path):
+    """`hermes chat -q --source tool` (t_f4bcefd3): the session is stored as ``tool`` and its one-shot fact rides
+    the ``oneshot`` create flag, only when the gateway's contract lists it. A non-finite ``--source tool`` run and
+    a finite run without ``--source`` (stored as ``oneshot``) send no flag."""
+    from contextlib import asynccontextmanager
+    from hermes_cli import gateway_chat
+    from hermes_cli.gateway_chat_view import GatewayChatView
+    created, parameters = [], ["cwd", "request_id", "source", "oneshot"]
+
+    class Peer:
+        async def rpc(self, method, **params):
+            if method == "runtime.describe":
+                return {"session_create": {"sources": ["cli", "tool", "oneshot"], "parameters": parameters}}
+            created.append(params)
+            return {"stored_session_id": "stored"}
+
+    @asynccontextmanager
+    async def connected():
+        yield Peer()
+
+    async def rendered(self, query, *, oneshot):
+        return 0
+
+    monkeypatch.setattr(gateway_chat, "connect_gateway", connected)
+    monkeypatch.setattr(GatewayChatView, "run", rendered)
+    monkeypatch.chdir(tmp_path)
+
+    async def create(args):
+        assert await gateway_chat.run_gateway_chat(args) == 0
+        return created[-1]
+
+    finite_tool = argparse.Namespace(query="q", quiet=True, source="tool")
+    assert (await create(finite_tool))["source"] == "tool" and created[-1]["oneshot"] is True
+    plain = await create(argparse.Namespace(query="q", quiet=True))
+    assert plain["source"] == "oneshot" and "oneshot" not in plain
+    interactive = await create(argparse.Namespace(source="tool"))
+    assert interactive["source"] == "tool" and "oneshot" not in interactive
+    parameters.remove("oneshot")  # a gateway predating the flag: today's behaviour, never refused
+    older = await create(finite_tool)
+    assert older["source"] == "tool" and "oneshot" not in older

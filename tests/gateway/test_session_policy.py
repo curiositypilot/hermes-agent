@@ -540,3 +540,25 @@ def test_no_fallback_is_a_frozen_launch_option(tmp_path):
     plain = {'info': {'launch_request': json.loads(build_policy(dict(cwd=str(tmp_path)), {}).request_json)}}
     with pytest.raises(GatewayClientError, match='--no-fallback differs'):
         check_resume_policy(argparse.Namespace(no_fallback=True), plain)
+
+
+def test_oneshot_is_a_frozen_session_fact_apart_from_the_source_label(tmp_path):
+    """A finite `chat -q --source tool` run (t_f4bcefd3): the source stays the caller's provenance and the
+    one-shot fact rides the boolean ``oneshot`` create field; the ``oneshot`` label alone still implies it."""
+    import json
+    from gateway.session_policy import build_policy
+    from hermes_state_runtime import RuntimeStoreError
+    from tui_gateway.contracts.registry import CANONICAL_METHODS, canonical_param_problems
+
+    def policy(**params):
+        return build_policy(dict(cwd=str(tmp_path), **params), {})
+
+    tool = policy(source='tool', oneshot=True)
+    assert tool.oneshot is True and tool.source == 'tool' and json.loads(tool.request_json)['oneshot'] is True
+    assert policy(source='oneshot').oneshot is True
+    for params in ({'source': 'tool'}, {'source': 'cli'}, {'source': 'tool', 'oneshot': False}):
+        assert policy(**params).oneshot is False, params
+    with pytest.raises(RuntimeStoreError, match='invalid_params'):
+        policy(oneshot='yes')
+    contract = CANONICAL_METHODS['session.create']
+    assert canonical_param_problems(contract, {'request_id': 'r', 'source': 'tool', 'oneshot': True}) == []

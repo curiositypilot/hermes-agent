@@ -88,3 +88,18 @@ def test_gateway_owned_oneshot_session_keeps_skill_manage_and_takes_its_prompt_f
                                              skills_dir_override=skills)
     monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")  # inherited by a daemon a -q client auto-started
     assert shape("cli")[1] == interactive
+
+
+def test_gateway_session_under_an_explicit_source_is_one_shot_by_its_frozen_flag(tmp_path, monkeypatch):
+    """`hermes chat -q --source tool` (t_f4bcefd3): stored as ``tool``, one-shot by the ``oneshot`` create flag;
+    the same source without the flag is an interactive session."""
+    from gateway.session_policy import build_policy, policy_scope
+
+    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+
+    def single_query(**params):
+        with policy_scope(build_policy({"cwd": str(tmp_path), "model": "m", **params}, {})):
+            return oneshot_footprint.is_single_query_session()
+
+    assert single_query(source="tool", oneshot=True) is True
+    assert single_query(source="tool") is False

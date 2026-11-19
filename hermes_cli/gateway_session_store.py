@@ -174,6 +174,10 @@ class GatewaySessionStore:
         if title:
             params["title"] = title
         params.update(self.client_env())
+        from gateway.session_context import get_session_env
+        if (get_session_env("HERMES_SINGLE_QUERY_SESSION", "") == "1" and params["source"] != "oneshot"
+                and "oneshot" in self._create_params()):
+            params["oneshot"] = True  # a finite run under an explicit --source: still one-shot (see gateway_chat)
         snapshot = self.call("session.create", request_id=uuid.uuid4().hex, **params)
         warning = (snapshot.get("info") or {}).get("config_warning")
         if warning:
@@ -183,11 +187,15 @@ class GatewaySessionStore:
     def client_env(self):
         """This shell's ``client_env`` when the gateway takes it (one ``runtime.describe`` per store)."""
         from hermes_cli.gateway_chat import client_env_policy
+        return client_env_policy(self._create_params())
+
+    def _create_params(self):
+        """The gateway's ``session.create`` parameter names (one ``runtime.describe`` per store)."""
         if self._create_parameters is None:
             described = self.call("runtime.describe")
             contract = described.get("session_create") if isinstance(described, dict) else None
             self._create_parameters = list((contract or {}).get("parameters") or [])
-        return client_env_policy(self._create_parameters)
+        return self._create_parameters
 
     def branch(self, session_id, title=None):
         """``session.mutate branch``: the gateway forks the whole active transcript into a child it

@@ -32,8 +32,9 @@ def is_single_query_session() -> bool:
     """The finite ``-q`` marker, read through the session env so gateway-bound sessions never see it.
 
     A gateway-owned ``chat -q`` / ``-z`` session never has that env (only the client process set it): its
-    one-shot fact is the frozen launch policy's ``oneshot`` source, a property of the SESSION, not of one
-    admission, so the cached agent's tools[] and system prompt stay byte-stable across its turns."""
+    one-shot fact is the frozen launch policy's ``oneshot`` (the ``oneshot`` source, or the ``oneshot`` create flag
+    a finite run under an explicit ``--source`` sends), a property of the SESSION, not of one admission, so the
+    cached agent's tools[] and system prompt stay byte-stable across its turns."""
     try:
         from gateway.session_policy import active_policy
     except ImportError:  # install without the gateway package: no owner-bound session
@@ -41,7 +42,7 @@ def is_single_query_session() -> bool:
     else:
         policy = active_policy()
         if policy is not None:
-            return policy.source == "oneshot"
+            return policy.oneshot
     try:
         from gateway.session_context import get_session_env
     except Exception:

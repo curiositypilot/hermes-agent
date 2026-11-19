@@ -8653,6 +8653,11 @@
             "title": "No Fallback",
             "type": "boolean"
           },
+          "oneshot": {
+            "default": false,
+            "title": "Oneshot",
+            "type": "boolean"
+          },
           "verbose": {
             "default": false,
             "title": "Verbose",

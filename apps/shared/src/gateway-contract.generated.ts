@@ -4984,6 +4984,7 @@ export interface CanonicalCreateParams {
   cwd_explicit?: boolean | null
   run_budget?: number | null
   no_fallback?: boolean
+  oneshot?: boolean
   verbose?: boolean
   client_env?: Record<string, string> | null
 }
