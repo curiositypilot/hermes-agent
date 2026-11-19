@@ -151,9 +151,17 @@ def _exit_code(receipt, params, board_db):
     if receipt['status'] == 'unknown':
         # A worker that died at start or mid-turn booked its one-line cause: print it so the crash
         # text quotes it. A failed board read must not mask the refusal.
+        booked = {}
         with contextlib.suppress(Exception):
-            if line := worker_result(board_db, params).get('last_output'):
+            booked = worker_result(board_db, params)
+            if line := booked.get('last_output'):
                 print(line)
+        # A start failure ran no turn, so the owner retains nothing: its booked provider wall
+        # (75 requeue / 78 park) is the attempt's exit. Every other unknown stays a refusal.
+        from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE, KANBAN_TERMINAL_PROVIDER_EXIT_CODE
+        if booked.get('stage') == 'start' and booked.get('exit_code') in (
+                KANBAN_RATE_LIMIT_EXIT_CODE, KANBAN_TERMINAL_PROVIDER_EXIT_CODE):
+            return booked['exit_code']
         raise GatewayClientError('Kanban execution unknown; retained by owner')
     result = worker_result(board_db, params)
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
