@@ -31,6 +31,7 @@ from hermes_cli.auth import (  # resolve_external_process_provider_credentials i
     resolve_external_process_provider_credentials,
     has_usable_secret, is_actual_local_base_url, looks_like_openrouter_key, normalize_actual_base_url,
 )
+from hermes_cli.auth_constants import CODEX_RATE_LIMITED_CODE
 from hermes_cli import config as _config_mod
 from hermes_cli import models as _models  # attribute access keeps ``hermes_cli.models.<name>`` patches effective
 from hermes_constants import OPENROUTER_BASE_URL
@@ -431,7 +432,8 @@ def _anthropic_token_or_raise(*, model: str | None = None) -> str:
         # Read the pool directly: resolve_anthropic_token() hides that row behind the cooldown.
         if model and _anthropic_pool_holds_token():
             raise AuthError(f"Anthropic credentials are rate-limited for {model}; "
-                            "other Claude models remain available (see `hermes auth list`).")
+                            "other Claude models remain available (see `hermes auth list`).",
+                            provider="anthropic", code=CODEX_RATE_LIMITED_CODE, relogin_required=False)
         raise AuthError(_NO_ANTHROPIC_CREDENTIALS_MSG)
     return token
 
