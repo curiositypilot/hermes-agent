@@ -402,3 +402,118 @@ class TestPeelReferenceGuidanceRoundTrip:
         ]
         peeled = peel_reference_guidance(messages, self._GUIDANCE)
         assert peeled == messages[:-1]
+
+
+# ── Model-gated guidance follows the active model across failover (t_f58d6d0a) ──
+
+_GOOGLE = "# Google model operational directives"
+_ENFORCE = "# Tool-use enforcement"
+_EXEC = "# Execution discipline"
+_PAIRS = (
+    ("gemini-3.8-flash-tiered", "gemini", "claude-sonnet-5-5", "anthropic"),
+    ("grok-4.7", "xai", "claude-sonnet-5-5", "anthropic"),
+    ("claude-opus-5-5", "anthropic", "grok-4.7", "xai"),
+)
+
+
+def _guidance_agent(model, **overrides):
+    base = dict(
+        model=model, valid_tool_names={"terminal", "read_file"}, _oneshot_session=False,
+        _kanban_worker_guidance="", _tool_use_enforcement="auto", _execution_guidance="auto",
+        _cached_system_prompt=None, _cached_system_prompt_static=None,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _built(model, provider, *, memory="Memory: user prefers short answers.", labels=True, **overrides):
+    """(agent, prompt, static) with the stable tier from the real ``_guidance_parts``."""
+    from agent.system_prompt import _guidance_parts, _join_tier
+
+    agent = _guidance_agent(model, **overrides)
+    static = _join_tier(["You are Hermes.", *_guidance_parts(agent)])
+    tail = f"\n\nConversation started: Tuesday\nModel: {model}\nProvider: {provider}" if labels else ""
+    prompt = f"{static}\n\n{memory}{tail}"
+    agent._cached_system_prompt, agent._cached_system_prompt_static = prompt, static
+    return agent, prompt, static
+
+
+def _assert_static_is_prefix(agent):
+    static = agent._cached_system_prompt_static
+    assert static is None or agent._cached_system_prompt.startswith(static)
+
+
+def test_fallback_swaps_model_family_guidance():
+    agent, prompt, _ = _built("gemini-3.8-flash-tiered", "gemini")
+    assert _ENFORCE in prompt and _GOOGLE in prompt
+    rewrite_prompt_model_identity(agent, "claude-sonnet-5-5", "anthropic")
+    assert _ENFORCE not in agent._cached_system_prompt
+    assert _GOOGLE not in agent._cached_system_prompt
+
+    agent, prompt, _ = _built("grok-4.7", "xai")
+    assert _EXEC in prompt
+    rewrite_prompt_model_identity(agent, "claude-sonnet-5-5", "anthropic")
+    assert _EXEC not in agent._cached_system_prompt
+
+    # Every pair lands on exactly what a fresh build for the fallback gives.
+    for primary, p_provider, fallback, f_provider in _PAIRS:
+        agent, _, _ = _built(primary, p_provider)
+        rewrite_prompt_model_identity(agent, fallback, f_provider)
+        _, fresh, fresh_static = _built(fallback, f_provider)
+        assert agent._cached_system_prompt == fresh
+        assert agent._cached_system_prompt_static == fresh_static
+
+
+def test_guidance_swap_round_trip_is_byte_identical():
+    for primary, p_provider, fallback, f_provider in _PAIRS:
+        agent, prompt, static = _built(primary, p_provider)
+        rewrite_prompt_model_identity(agent, fallback, f_provider)
+        assert agent._cached_system_prompt != prompt
+        _assert_static_is_prefix(agent)
+        rewrite_prompt_model_identity(agent, primary, p_provider)
+        assert agent._cached_system_prompt == prompt
+        assert agent._cached_system_prompt_static == static
+        _assert_static_is_prefix(agent)
+
+
+def test_guidance_swap_noop_cases():
+    from agent.prompt_builder import STEER_CHANNEL_NOTE
+
+    def relabelled(prompt, old, new, old_p, new_p):
+        return prompt.replace(f"Model: {old}\nProvider: {old_p}", f"Model: {new}\nProvider: {new_p}")
+
+    # Same family: guidance bytes unchanged, labels rewritten.
+    agent, prompt, static = _built("claude-opus-5-5", "anthropic")
+    rewrite_prompt_model_identity(agent, "claude-sonnet-5-5", "anthropic")
+    assert agent._cached_system_prompt == relabelled(prompt, "claude-opus-5-5", "claude-sonnet-5-5",
+                                                     "anthropic", "anthropic")
+    assert agent._cached_system_prompt_static == static
+
+    # The anchor also in a memory section: ambiguous, so guidance stays; labels still move.
+    agent, prompt, static = _built("gemini-3.8-flash-tiered", "gemini", memory=STEER_CHANNEL_NOTE)
+    rewrite_prompt_model_identity(agent, "claude-sonnet-5-5", "anthropic")
+    assert agent._cached_system_prompt == relabelled(prompt, "gemini-3.8-flash-tiered", "claude-sonnet-5-5",
+                                                     "gemini", "anthropic")
+    assert _GOOGLE in agent._cached_system_prompt
+    assert agent._cached_system_prompt_static == static
+
+    # No Model: line: nothing to read the old model from.
+    agent, prompt, static = _built("gemini-3.8-flash-tiered", "gemini", labels=False)
+    rewrite_prompt_model_identity(agent, "claude-sonnet-5-5", "anthropic")
+    assert agent._cached_system_prompt == prompt
+    assert agent._cached_system_prompt_static == static
+
+    # Both gates forced off: no block is inserted for grok.
+    agent, prompt, _ = _built("claude-opus-5-5", "anthropic", _tool_use_enforcement=False,
+                              _execution_guidance=False)
+    rewrite_prompt_model_identity(agent, "grok-4.7", "xai")
+    assert agent._cached_system_prompt == relabelled(prompt, "claude-opus-5-5", "grok-4.7", "anthropic", "xai")
+    assert _ENFORCE not in agent._cached_system_prompt and _EXEC not in agent._cached_system_prompt
+
+    # No tools: guidance unchanged.
+    agent, prompt, static = _built("gemini-3.8-flash-tiered", "gemini")
+    agent.valid_tool_names = set()
+    rewrite_prompt_model_identity(agent, "claude-sonnet-5-5", "anthropic")
+    assert agent._cached_system_prompt == relabelled(prompt, "gemini-3.8-flash-tiered", "claude-sonnet-5-5",
+                                                     "gemini", "anthropic")
+    assert agent._cached_system_prompt_static == static

@@ -1741,21 +1741,20 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
 
 
 def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
-    """Rewrite the cached prompt's ``Model:``/``Provider:`` lines after a provider switch.
+    """Rewrite the cached prompt's model-gated guidance and ``Model:``/``Provider:`` lines after a provider switch.
 
-    Not persisted: the stored row keeps the primary's labels so a restored primary replays a
+    Not persisted: the stored row keeps the primary's bytes so a restored primary replays a
     byte-identical prompt (prefix cache intact). Only the LAST occurrence of each line is touched —
     earlier matches may be user content (memory snapshots, context files)."""
     sp = getattr(agent, "_cached_system_prompt", None)
     if not isinstance(sp, str) or not sp:
         return
+    from agent.system_prompt import swap_model_gated_guidance
+    sp = swap_model_gated_guidance(agent, sp, model)
     for label, value in (("Model", model), ("Provider", provider)):
-        if not value:
-            continue
-        matches = list(re.finditer(rf"(?m)^{label}: .*$", sp))
+        matches = list(re.finditer(rf"(?m)^{label}: .*$", sp)) if value else []
         if matches:
-            last = matches[-1]
-            sp = f"{sp[:last.start()]}{label}: {value}{sp[last.end():]}"
+            sp = f"{sp[:matches[-1].start()]}{label}: {value}{sp[matches[-1].end():]}"
     agent._cached_system_prompt = sp
 
 

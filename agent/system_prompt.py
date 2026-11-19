@@ -563,6 +563,12 @@ def _identity_parts(agent: Any, ctx_len: Optional[int]) -> tuple[list[str], bool
 
 def _guidance_parts(agent: Any) -> list[str]:
     """Universal + tool-aware + model-gated guidance blocks, each gated by its config.yaml key."""
+    parts = _ungated_guidance_parts(agent)
+    return parts + _model_gated_parts(agent, agent.model) if agent.valid_tool_names else parts
+
+
+def _ungated_guidance_parts(agent: Any) -> list[str]:
+    """The guidance blocks that do not depend on the model name."""
     parts: list[str] = []
     if agent.valid_tool_names:
         parts += [
@@ -578,18 +584,56 @@ def _guidance_parts(agent: Any) -> list[str]:
     from agent.oneshot_footprint import agent_is_oneshot
     if not agent_is_oneshot(agent):
         parts.append(STEER_CHANNEL_NOTE)
-    # agent.tool_use_enforcement / agent.execution_guidance: "auto" (default)
-    # matches the hardcoded model lists; true/false force; a list gives custom
-    # model-name substrings.  Execution guidance is an independent gate so
-    # DeepSeek/Kimi/Qwen-class models get it even with enforcement off.
-    if _model_gate(agent._tool_use_enforcement, agent.model, TOOL_USE_ENFORCEMENT_MODELS):
+    return parts
+
+
+def _model_gated_parts(agent: Any, model: Optional[str]) -> list[str]:
+    """The guidance blocks *model* gets; only called when the agent has tools.
+
+    agent.tool_use_enforcement / agent.execution_guidance: "auto" (default)
+    matches the hardcoded model lists; true/false force; a list gives custom
+    model-name substrings.  Execution guidance is an independent gate so
+    DeepSeek/Kimi/Qwen-class models get it even with enforcement off."""
+    parts: list[str] = []
+    if _model_gate(getattr(agent, "_tool_use_enforcement", "auto"), model, TOOL_USE_ENFORCEMENT_MODELS):
         parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
-        if any(g in (agent.model or "").lower() for g in ("gemini", "gemma")):
+        if any(g in (model or "").lower() for g in ("gemini", "gemma")):
             parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
-    if _model_gate(getattr(agent, "_execution_guidance", "auto"), agent.model, EXECUTION_GUIDANCE_MODELS):
+    if _model_gate(getattr(agent, "_execution_guidance", "auto"), model, EXECUTION_GUIDANCE_MODELS):
         from agent.prompt_builder import execution_guidance_text
         parts.append(execution_guidance_text(agent.valid_tool_names))
     return parts
+
+
+def swap_model_gated_guidance(agent: Any, prompt: str, model: str) -> str:
+    """Return *prompt* with the model-gated guidance of its last ``Model:`` line swapped for *model*'s.
+
+    A failover keeps the session prompt built for the primary; without this the fallback runs on
+    the primary's model-family guidance. The gated blocks sit right after the last ungated guidance
+    part (the anchor), so the swap replaces ``anchor + old blocks`` with ``anchor + new blocks``, and
+    only when both the anchor and that text occur exactly once: the reverse swap on restore then
+    returns the primary's bytes. ``agent._cached_system_prompt_static`` gets the same swap, else
+    None (``reconstruct_static_prefix`` rebuilds it)."""
+    old_models = re.findall(r"(?m)^Model: (.*)$", prompt)
+    if not old_models or not model or not getattr(agent, "valid_tool_names", None):
+        return prompt
+    old_parts, new_parts = _model_gated_parts(agent, old_models[-1]), _model_gated_parts(agent, model)
+    ungated = [p.strip() for p in _ungated_guidance_parts(agent) if p and p.strip()]
+    if old_parts == new_parts or not ungated:
+        return prompt
+    anchor = ungated[-1]
+    old, new = _join_tier([anchor, *old_parts]), _join_tier([anchor, *new_parts])
+
+    def _swap(text: Any) -> Optional[str]:
+        if isinstance(text, str) and text.count(anchor) == 1 and text.count(old) == 1:
+            return text.replace(old, new)
+        return None
+
+    swapped = _swap(prompt)
+    if swapped is None:
+        return prompt
+    agent._cached_system_prompt_static = _swap(getattr(agent, "_cached_system_prompt_static", None))
+    return swapped
 
 
 def _alibaba_identity_part(agent: Any) -> list[str]:
