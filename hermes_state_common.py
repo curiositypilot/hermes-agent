@@ -481,7 +481,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at REAL,
     end_reason TEXT,
     message_count INTEGER DEFAULT 0,
-    tool_call_count INTEGER DEFAULT 0,
+    tool_call_count INTEGER DEFAULT 0,  -- cumulative; compaction never lowers it; rewind and replace set it to the live transcript
     input_tokens INTEGER DEFAULT 0,
     output_tokens INTEGER DEFAULT 0,
     cache_read_tokens INTEGER DEFAULT 0,
