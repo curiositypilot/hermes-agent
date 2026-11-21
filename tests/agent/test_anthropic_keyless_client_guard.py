@@ -105,6 +105,40 @@ def test_empty_pool_says_no_credentials_not_rate_limited(benched_opus_home):
     assert "rate-limited" not in str(exc.value)
 
 
+def _rewrite_row(home, **fields):
+    data = json.loads((home / "auth.json").read_text())
+    data["credential_pool"]["anthropic"][0].update(fields)
+    (home / "auth.json").write_text(json.dumps(data))
+
+
+def test_credential_wide_bench_does_not_claim_other_models(benched_opus_home):
+    """t_8c736168: an aux 429 benched the whole row, yet the error said other models were fine."""
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_cli.runtime_provider import _anthropic_token_or_raise
+
+    _rewrite_row(benched_opus_home, last_status="exhausted", last_status_at=time.time(),
+                 last_error_code=429, model_cooldowns={})
+    with pytest.raises(AuthError, match="every Claude model") as exc:
+        _anthropic_token_or_raise(model=OPUS)
+    assert "remain available" not in str(exc.value)
+    assert is_rate_limited_auth_error(exc.value)
+
+
+def test_every_benched_model_is_named(benched_opus_home):
+    """09:21-13:00 on 2026-11-21 fable, opus and sonnet were all benched: name them, not "others are fine"."""
+    from hermes_cli.auth import AuthError
+    from hermes_cli.runtime_provider import _anthropic_token_or_raise
+
+    until = time.time() + 3000
+    sonnet, fable = "claude-sonnet-4-6", "claude-fable-5"
+    _rewrite_row(benched_opus_home, model_cooldowns={OPUS: until, sonnet: until, fable: until})
+    with pytest.raises(AuthError, match=f"{RATE_LIMITED} until ") as exc:
+        _anthropic_token_or_raise(model=OPUS)
+    message = str(exc.value)
+    assert f"also benched: {fable} until " in message and f"{sonnet} until " in message
+    assert "remain available" not in message
+
+
 def test_bench_auth_error_is_rate_limited_exit_75(benched_opus_home):
     """t_846f38f4: a per-model bench requeues the card (75), it is not a counted crash (1)."""
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error

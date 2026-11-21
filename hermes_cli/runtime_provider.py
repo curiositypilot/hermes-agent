@@ -410,30 +410,50 @@ def _anthropic_cfg_base_url(model_cfg: dict[str, Any]) -> str:
     return cfg_base_url if _anthropic_base_url_override_ok(cfg_base_url) else ""
 
 
-def _anthropic_pool_holds_token() -> bool:
-    """True when the Anthropic pool has a credential, ignoring model cooldowns.
+def _reset_label(epoch: float) -> str:
+    import time
+    from agent.retry_utils import format_reset_window
+    return f"{time.strftime('%H:%M %Z', time.localtime(epoch))} ({format_reset_window(max(0.0, epoch - time.time()))})"
 
-    ``resolve_anthropic_token()`` with no model reads ``_available_entries``, and
-    ``model_cooldown_until(entry, None)`` treats any active cooldown as blocking.
-    A single row benched for one model then looks like a missing login.
+
+def _anthropic_bench_message(model: str) -> str | None:
+    """Why the pool refused *model*, scoped to what is really benched; ``None`` when it holds no token.
+
+    ``resolve_anthropic_token()`` hides a benched row, so a cooldown looks like a missing login.
+    The scope matters: a credential-wide bench or every known model benched is not a per-model
+    limit, and "other Claude models remain available" sent diagnosis the wrong way (t_8c736168).
     """
-    return any(
-        str(getattr(entry, "access_token", "") or "").strip()
-        for entry in load_pool("anthropic").entries()
-    )
+    pool = load_pool("anthropic")
+    entries = pool.entries()
+    if not any(str(getattr(entry, "access_token", "") or "").strip() for entry in entries):
+        return None
+    known = {model, *(name for entry in entries for name in (entry.model_cooldowns or {}))}
+    state = pool.limit_state(sorted(known)) or {}
+    if state.get("scope") == "account":
+        return (f"Anthropic credentials are rate-limited for every Claude model until "
+                f"{_reset_label(state['resets_at'])}: the whole credential is benched, another "
+                "model will not help (see `hermes auth list`).")
+    cooled = state.get("models") or {}
+    message = f"Anthropic credentials are rate-limited for {model}"
+    if not cooled:  # the pool shows no bench to scope; claim nothing about other models
+        return message + " (see `hermes auth list`)."
+    if model in cooled:
+        message += f" until {_reset_label(cooled[model])}"
+    others = [f"{name} until {_reset_label(until)}" for name, until in sorted(cooled.items()) if name != model]
+    if others:
+        message += f"; also benched: {', '.join(others)}"
+    return message + "; Claude models not listed here are not benched (see `hermes auth list`)."
 
 
 def _anthropic_token_or_raise(*, model: str | None = None) -> str:
     from agent.anthropic_credentials import resolve_anthropic_token
     token = resolve_anthropic_token(model=model)
     if not token:
-        # A key the pool benched for *this* model is not a missing credential; telling the
-        # user to re-authenticate would send them chasing a cooldown that lifts on its own.
-        # Read the pool directly: resolve_anthropic_token() hides that row behind the cooldown.
-        if model and _anthropic_pool_holds_token():
-            raise AuthError(f"Anthropic credentials are rate-limited for {model}; "
-                            "other Claude models remain available (see `hermes auth list`).",
-                            provider="anthropic", code=CODEX_RATE_LIMITED_CODE, relogin_required=False)
+        # A benched key is not a missing credential; telling the user to re-authenticate
+        # would send them chasing a cooldown that lifts on its own.
+        if model and (benched := _anthropic_bench_message(model)):
+            raise AuthError(benched, provider="anthropic", code=CODEX_RATE_LIMITED_CODE,
+                            relogin_required=False)
         raise AuthError(_NO_ANTHROPIC_CREDENTIALS_MSG)
     return token
 
