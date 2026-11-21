@@ -15,6 +15,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -290,6 +291,50 @@ def test_build_sandbox_argv_shape(tmp_path):
         plan.close()
 
 
+@pytest.fixture
+def var_tmp_host_dir(tmp_path):
+    """A base dir for a fake host whose home resolves under /var/tmp (the run_tests.sh layout)."""
+    var_tmp = Path("/var/tmp")  # no-tmp: ok — the sandbox remounts this path; the test needs a home under it
+    if not var_tmp.is_dir():
+        pytest.skip("/var/tmp is missing")
+    if var_tmp.resolve() in tmp_path.resolve().parents:
+        yield tmp_path
+        return
+    base = Path(tempfile.mkdtemp(prefix="hermes-sbx-", dir=var_tmp))
+    try:
+        yield base
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_build_sandbox_binds_private_var_tmp(var_tmp_host_dir):
+    """Regression for intake t_f485baf2: ``/var/tmp`` (the test runner's scratch root) stayed
+    read-only under ``--ro-bind / /``; it is now a private per-run dir from the run's scratch."""
+    host = _fake_host(var_tmp_host_dir)
+    plan = kbs.build_sandbox(["true"], worker_env=host.env, workspace=host.ws, run_key="t_4-r1",
+                             hermes_root=host.root, home=host.home, bwrap="/usr/bin/bwrap", python="/py")
+    try:
+        argv = plan.bwrap_argv
+        private = plan.scratch_dir / ".var-tmp"
+        pair = ["--bind", str(private), "/var/tmp"]  # no-tmp: ok — asserts the sandbox mount target
+        at = next(i for i in range(len(argv)) if argv[i:i + 3] == pair)
+        assert private.is_dir()
+        root_bind = next(i for i in range(len(argv)) if argv[i:i + 3] == ["--bind", str(host.root), str(host.root)])
+        assert at < root_bind
+        # The home under /var/tmp is bound back right after, so the later masks hit the real tree.
+        assert argv[at + 3:at + 6] == ["--ro-bind", str(host.home), str(host.home)]
+    finally:
+        plan.close()
+
+    elsewhere = Path("/nonexistent-sandbox-home")  # tmp_path itself sits under /var/tmp in run_tests.sh
+    plan = kbs.build_sandbox(["true"], worker_env=host.env, workspace=host.ws, run_key="t_4-r2",
+                             hermes_root=host.root, home=elsewhere, bwrap="/usr/bin/bwrap", python="/py")
+    try:
+        assert (str(elsewhere), str(elsewhere)) not in _pairs(plan.bwrap_argv, "--ro-bind")
+    finally:
+        plan.close()
+
+
 def test_build_sandbox_fails_closed_without_bwrap(tmp_path, monkeypatch):
     host = _fake_host(tmp_path)
     monkeypatch.setattr(kbs.shutil, "which", lambda _name: None)
@@ -327,6 +372,7 @@ def test_worker_terminal_uv_finds_managed_uv_off_path(tmp_path, monkeypatch):
 @needs_bwrap
 def test_built_sandbox_hides_what_it_claims(bwrap_host_dir):
     host = _bwrap_fake_host(bwrap_host_dir)
+    probe = f"hermes-sbx-probe-{os.getpid()}-{uuid.uuid4().hex}"
     script = (
         "import os,socket,sys\n"
         "def rd(p):\n"
@@ -339,8 +385,8 @@ def test_built_sandbox_hides_what_it_claims(bwrap_host_dir):
         "def wr(p):\n"
         "    try: open(p,'a').close(); return 'WRITABLE'\n"
         "    except OSError as e: return type(e).__name__\n"
-        f"H={str(host.home)!r}; R={str(host.root)!r}\n"
-        "print(repr({'ssh': os.listdir(H+'/.ssh'), 'wallet': rd(R+'/.solana-wallet.json'),"
+        f"H={str(host.home)!r}; R={str(host.root)!r}; V={'/var/tmp/' + probe!r}\n"  # no-tmp: ok
+        "print(repr({'vartmp': wr(V), 'ssh': os.listdir(H+'/.ssh'), 'wallet': rd(R+'/.solana-wallet.json'),"
         " 'env': rd(R+'/.env'), 'own_env': rd(R+'/profiles/mine/.env'), 'own_auth': rd(R+'/profiles/mine/auth.json'),"
         " 'other_auth': rd(R+'/profiles/other/auth.json'), 'bak': rd(R+'/.env.bak-1'),"
         " 'gw': conn(R+'/gateway.sock'), 'tick': conn(R+'/state/gateway.loop-tick.1.sock'),"
@@ -367,8 +413,34 @@ def test_built_sandbox_hides_what_it_claims(bwrap_host_dir):
     assert seen["scratch"] == ["kanban-t_2-r1"]
     assert seen["bashrc"] != "WRITABLE" and seen["ws"] == "WRITABLE"
     assert seen["tmpdir"] == str(plan.scratch_dir) and seen["secret"] is None
+    # /var/tmp is private and writable: the write lands in the run's scratch, never on the host.
+    assert seen["vartmp"] == "WRITABLE"
+    assert (plan.scratch_dir / ".var-tmp" / probe).exists()
+    assert not (Path("/var/tmp") / probe).exists()  # no-tmp: ok — the host's /var/tmp stays untouched
     # Host files are untouched by the masks.
     assert (host.root / ".env").read_text().startswith("OPENROUTER_API_KEY=ok\nBINANCE_SECRET=leak")
+
+
+@needs_bwrap
+def test_runner_scratch_root_works_in_sandbox(bwrap_host_dir):
+    """Incident replay (t_2a9c152a gate, 2026-11-21): the runner's per-file temp root call raised
+    ``OSError(30, 'Read-only file system')`` inside the sandbox, so every file crashed."""
+    host = _bwrap_fake_host(bwrap_host_dir)
+    repo = str(Path(__file__).resolve().parents[2])
+    script = (
+        f"import sys, tempfile; sys.path.insert(0, {repo!r})\n"
+        "import scripts.run_tests_parallel as r\n"
+        "print(tempfile.mkdtemp(prefix='r-', dir=r._runner_scratch_root()))\n"
+    )
+    plan = kbs.build_sandbox([sys.executable, "-c", script], worker_env=host.env, workspace=host.ws,
+                             run_key="t_5-r1", hermes_root=host.root, home=host.home)
+    try:
+        proc = subprocess.run(plan.argv, capture_output=True, text=True, timeout=60, env=plan.outer_env,
+                              pass_fds=plan.pass_fds, check=False)
+    finally:
+        plan.close()
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1].startswith("/var/tmp/hermes-pytest-")  # no-tmp: ok
 
 
 @needs_bwrap
