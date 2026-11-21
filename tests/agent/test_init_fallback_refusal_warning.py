@@ -3,7 +3,8 @@
 One burned primary (an exhausted single-entry OpenRouter pool, for example) plus fallback
 entries that cannot resolve credentials raises the generic ``No LLM provider configured``
 RuntimeError. Without a WARNING naming each refused entry and its reason, the failure is
-indistinguishable from actual config loss in gateway.log.
+indistinguishable from actual config loss in gateway.log. The walker logs each raising entry
+at ERROR; the WARNING summary is the single record that names every refusal.
 """
 
 import logging
@@ -36,6 +37,10 @@ _LADDER_REASONS = (
 )
 
 
+# One ERROR per raising entry (kimi); a (None, None) entry such as deepseek logs none.
+_KIMI_ERRORS = ("Init-time fallback entry kimi failed: kimi auth handshake refused",)
+
+
 class _Pool:
     def __init__(self, available):
         self._available = available
@@ -48,17 +53,19 @@ class _Pool:
 
 
 @pytest.mark.parametrize(
-    "primary, ladder, pool_available, raise_match, expected",
+    "primary, ladder, pool_available, raise_match, expected, expected_errors",
     [
-        ("openrouter", _LADDER, True, "No LLM provider configured", _LADDER_REASONS),
+        ("openrouter", _LADDER, True, "No LLM provider configured", _LADDER_REASONS,
+         _KIMI_ERRORS),
         # Explicit non-OpenRouter primary: provider-specific missing-credentials error.
-        ("anthropic", _LADDER, True, "no API key was found", _LADDER_REASONS),
+        ("anthropic", _LADDER, True, "no API key was found", _LADDER_REASONS, _KIMI_ERRORS),
         # #119533: a burned primary pool with no ladder at all must still be named.
-        ("openrouter", [], False, "No LLM provider configured", ("credential pool exhausted",)),
+        ("openrouter", [], False, "No LLM provider configured", ("credential pool exhausted",),
+         ()),
     ],
 )
 def test_fully_refusing_ladder_warns_with_each_reason(
-    monkeypatch, caplog, primary, ladder, pool_available, raise_match, expected
+    monkeypatch, caplog, primary, ladder, pool_available, raise_match, expected, expected_errors
 ):
     """Primary resolves no client; deepseek resolves none (missing key), kimi raises."""
     from agent import agent_init
@@ -80,12 +87,14 @@ def test_fully_refusing_ladder_warns_with_each_reason(
         with pytest.raises(RuntimeError, match=raise_match):
             agent_init._routed_client_kwargs(_agent(primary), ladder, 60)
 
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert len(warnings) == 1
-    text = warnings[0].getMessage()
+    summaries = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(summaries) == 1
+    text = summaries[0].getMessage()
     assert primary in text
     for fragment in expected:
         assert fragment in text
+    errors = tuple(r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
+    assert errors == expected_errors
 
 
 def test_recovered_ladder_does_not_warn(monkeypatch, caplog):
