@@ -797,7 +797,8 @@ _JOB_DETAIL_LINES = (
     ("timezone", "  Timezone: {} (schedule runs on this zone's wall clock)"),
     ("workdir", "  Workdir: {}"),
     ("interpreter", "  Python: {}"),
-    ("data_class", "  Data class: {} (provider allowlist + fallback policy)"))
+    ("data_class", "  Data class: {} (provider allowlist + fallback policy)"),
+    ("memory_query", "  Memory query: {}"))
 
 
 def _print_job_details(job_data: dict[str, Any]) -> None:
@@ -862,7 +863,9 @@ def cron_edit(args):
     result = _cron_api(action="update", job_id=args.job_id,
                        schedule=getattr(args, "schedule", None),
                        prompt=getattr(args, "prompt", None), skills=final_skills,
-                       no_agent=getattr(args, "no_agent", None), **_job_api_kwargs(args))
+                       no_agent=getattr(args, "no_agent", None),
+                       # Edit-only: not in _JOB_ARG_FIELDS, which ``cron create`` shares.
+                       memory_query=getattr(args, "memory_query", None), **_job_api_kwargs(args))
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1

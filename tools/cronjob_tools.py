@@ -899,6 +899,10 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
     if a["data_class"] is not None:
         # CLI-only lane; update_job validates against kanban.data_policies, '' clears.
         updates["data_class"] = a["data_class"]
+    if a["memory_query"] is not None:
+        # CLI-only lane (absent from CRONJOB_SCHEMA, t_02a28ed9); '' clears, so recall falls
+        # back to the job prompt.
+        updates["memory_query"] = a["memory_query"].strip() or None
     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.
@@ -1069,6 +1073,7 @@ def cronjob(
     paused_reason: Optional[str] = None,
     pinned: Optional[bool] = None,
     interpreter: Optional[str] = None,
+    memory_query: Optional[str] = None,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int | str] = None) -> str:
     """Unified cron job management tool."""
