@@ -790,6 +790,31 @@ registry.register(
     check_fn=check_skills_requirements, emoji="📚")
 
 
+# Keys the model's skill_view copy omits (see _model_facing_skill_view).
+_MODEL_DROPPED_SKILL_VIEW_KEYS = frozenset(
+    {"description", "tags", "related_skills", "metadata", "compatibility", "usage_hint"})
+_READINESS_MISSING_KEYS = (
+    "missing_required_environment_variables", "missing_credential_files", "missing_required_commands")
+_READINESS_KEYS = frozenset({
+    "required_environment_variables", "required_commands", *_READINESS_MISSING_KEYS,
+    "setup_needed", "setup_skipped", "readiness_status"})
+
+
+def _model_facing_skill_view(payload: dict) -> dict:
+    """The model's copy of a successful SKILL.md result. ``content`` keeps the frontmatter, so the
+    keys that repeat it go; all-default readiness and a ``path`` that ``skill_dir`` already locates
+    go too. A drop-list: unknown keys pass through. ``skill_view()`` stays full for programmatic
+    callers (cron preflight, dedup, preload)."""
+    ready = (payload.get("readiness_status") == SkillReadinessStatus.AVAILABLE.value
+             and not payload.get("setup_needed") and not payload.get("setup_skipped")
+             and not any(payload.get(k) for k in _READINESS_MISSING_KEYS))
+    drop = _MODEL_DROPPED_SKILL_VIEW_KEYS | (_READINESS_KEYS if ready else frozenset())
+    if payload.get("skill_dir"):
+        drop |= {"path"}
+    return {k: v for k, v in payload.items() if k not in drop and v is not None}
+
+
+
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count/use on success (best-effort). Repeat-view dedup
     mirrors read_file's unchanged-stub: a result byte-identical to one already served for the
@@ -807,6 +832,8 @@ def _skill_view_with_bump(args, **kw):
         if isinstance(parsed, dict) and parsed.get("success"):
             if (stub := dedup_skill_view(dedup_task_id, name, args.get("file_path"), parsed, result)) is not None:
                 return stub
+            if "content" in parsed and "file" not in parsed:  # SKILL.md, not a linked file
+                result = _json(_model_facing_skill_view(parsed))
             if resolved := parsed.get("name") or name:  # qualified forms return the canonical name
                 from tools.skill_usage import bump_use, bump_view
                 bump_view(str(resolved))

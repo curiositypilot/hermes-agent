@@ -859,3 +859,99 @@ class TestStackedSkillCommands:
         assert loaded == ["skill-a"]
         assert missing == ["gone"]
         assert "gone" in msg
+
+
+
+class TestPreloadPayloadTrim:
+    """Preload/invocation copies drop the YAML frontmatter and list only supporting files the body
+    does not already name; the directory note and the parser anchors stay (t_a08b0435)."""
+
+    def test_preload_drops_frontmatter(self, tmp_path):
+        config_fm = (
+            "metadata:\n  hermes:\n    config:\n"
+            "      - key: trim.demo_path\n        description: Demo path\n        default: /tmp/demo\n"
+        )
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "fm-skill", frontmatter_extra=config_fm,
+                        body="Step one.\n\n---\n\nStep two after a rule.")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/fm-skill", "go")
+
+        assert msg is not None
+        assert "description: Description for fm-skill." not in msg
+        assert "name: fm-skill" not in msg
+        body_start = msg.index("# fm-skill")
+        assert "---" not in msg[:body_start]
+        assert "Step one.\n\n---\n\nStep two after a rule." in msg  # body-internal rule kept
+        assert "[Skill config" in msg and "trim.demo_path = /tmp/demo" in msg
+
+    def test_strip_frontmatter_must_not_strip(self):
+        from agent.skill_utils import strip_frontmatter
+
+        assert strip_frontmatter("---\nname: x\n---\n\n# X\n\nbody") == "# X\n\nbody"
+        plain = "# X\n\nIntro\n\n---\n\nAfter the rule."
+        assert strip_frontmatter(plain) == plain
+        unclosed = "---\nname: x\n# never closed"
+        assert strip_frontmatter(unclosed) == unclosed
+
+    def test_preload_lists_only_unnamed_supporting_files(self, tmp_path):
+        from agent.skill_commands import (
+            _SKILL_DIR_NOTE, _SUPPORTING_FILES_LOAD_LINE, _SUPPORTING_FILES_NOTE, _build_skill_message,
+        )
+
+        skill_dir = tmp_path / "files-skill"
+        skill_dir.mkdir()
+        files = {"references": ["references/a.md"], "scripts": ["scripts/b.py"]}
+        one_named = _build_skill_message(
+            {"name": "files-skill", "content": "Read `references/a.md` first.", "linked_files": files},
+            skill_dir, "[note]")
+        assert _SUPPORTING_FILES_NOTE in one_named
+        listed = one_named.split(_SUPPORTING_FILES_NOTE, 1)[1]
+        assert "- scripts/b.py" in listed and "- references/a.md" not in listed
+        assert _SUPPORTING_FILES_LOAD_LINE in listed
+
+        both_named = _build_skill_message(
+            {"name": "files-skill", "content": "Read references/a.md, then run scripts/b.py.",
+             "linked_files": files},
+            skill_dir, "[note]")
+        assert _SUPPORTING_FILES_NOTE not in both_named
+        assert _SUPPORTING_FILES_LOAD_LINE not in both_named
+        for msg in (one_named, both_named):
+            assert f"[Skill directory: {skill_dir}]\n{_SKILL_DIR_NOTE}" in msg
+
+    @pytest.mark.parametrize("body", [
+        "see `references/api.md`", "(references/api.md)", "Read references/api.md.",
+        "references/api.md:12 has it",
+    ])
+    def test_names_path_matches(self, body):
+        from agent.skill_commands import _names_path
+
+        assert _names_path(body, "references/api.md")
+
+    @pytest.mark.parametrize("body", [
+        "references/api.md.bak", "references/api.mdx", "old-references/api.md",
+        "other/references/api.md", "references/api alone",
+    ])
+    def test_names_path_rejects(self, body):
+        from agent.skill_commands import _names_path
+
+        assert not _names_path(body, "references/api.md")
+
+    @pytest.mark.parametrize("content", ["No file named here.", "Load references/a.md when needed."])
+    def test_strip_and_describe_still_parse_trimmed_blocks(self, tmp_path, content):
+        """Zero listed files (body names the only one) and one listed file both still parse."""
+        from agent.skill_commands import (
+            _SUPPORTING_FILES_NOTE, _build_skill_message, auto_load_activation_note,
+            describe_skill_invocation, strip_auto_loaded_skill_blocks,
+        )
+
+        skill_dir = tmp_path / "trim-skill"
+        skill_dir.mkdir()
+        block = _build_skill_message(
+            {"name": "trim-skill", "content": f"---\nname: trim-skill\n---\n\n{content}",
+             "linked_files": {"references": ["references/a.md"]}},
+            skill_dir, auto_load_activation_note("trim-skill"))
+        assert (_SUPPORTING_FILES_NOTE in block) == ("references/a.md" not in content)
+        turn = f"{block}\n\nwhat is the status?"
+        assert strip_auto_loaded_skill_blocks(turn) == "what is the status?"
+        assert describe_skill_invocation(turn) == "what is the status?"

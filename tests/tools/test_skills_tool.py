@@ -1186,3 +1186,63 @@ class TestTrustWarningSymlinkAware:
             self._log("sym", root / "sym" / "SKILL.md", [root], root)
 
         assert "outside the trusted" in caplog.text, caplog.text
+
+
+
+class TestModelFacingSkillView:
+    """The skill_view tool handler returns a slim copy of a successful SKILL.md result; the
+    skill_view() function keeps the full payload for programmatic callers (t_a08b0435)."""
+
+    @staticmethod
+    def _handler(args):
+        from tools.skills_tool import _skill_view_with_bump
+
+        with patch("tools.skill_usage.bump_view"), patch("tools.skill_usage.bump_use"):
+            return _skill_view_with_bump(args, task_id=None)
+
+    def test_handler_slims_main_result(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "slim-skill", frontmatter_extra="tags: [a, b]\n")
+            (skill_dir / "references").mkdir()
+            (skill_dir / "references" / "api.md").write_text("# API\n")
+            full = json.loads(skill_view("slim-skill"))
+            slim = json.loads(self._handler({"name": "slim-skill"}))
+
+        assert set(slim) == {"success", "name", "content", "skill_dir", "linked_files"}
+        assert slim["content"] == full["content"]
+        assert slim["content"].startswith("---\nname: slim-skill")
+        assert slim["linked_files"] == full["linked_files"]
+
+    def test_handler_keeps_readiness_when_setup_needed(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("MISSING_TRIM_KEY", raising=False)
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "gated-trim",
+                        frontmatter_extra="prerequisites:\n  env_vars: [MISSING_TRIM_KEY]\n")
+            full = json.loads(skill_view("gated-trim"))
+            slim = json.loads(self._handler({"name": "gated-trim"}))
+
+        readiness = {
+            "required_environment_variables", "required_commands",
+            "missing_required_environment_variables", "missing_credential_files",
+            "missing_required_commands", "setup_needed", "setup_skipped", "readiness_status",
+        }
+        assert readiness <= set(slim)
+        assert slim["missing_required_environment_variables"] == ["MISSING_TRIM_KEY"]
+        if "setup_note" in full:
+            assert slim["setup_note"] == full["setup_note"]
+
+    def test_handler_leaves_file_and_error_results(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "file-skill")
+            (skill_dir / "references").mkdir()
+            (skill_dir / "references" / "api.md").write_text("# API\nEndpoint info.\n")
+            file_args = {"name": "file-skill", "file_path": "references/api.md"}
+            assert self._handler(file_args) == skill_view("file-skill", file_path="references/api.md")
+            assert self._handler({"name": "no-such-skill"}) == skill_view("no-such-skill")
+
+    def test_skill_view_function_unchanged(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "full-skill")
+            full = json.loads(skill_view("full-skill"))
+
+        assert {"description", "tags", "path", "readiness_status"} <= set(full)

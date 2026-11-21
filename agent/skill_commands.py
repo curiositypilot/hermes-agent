@@ -11,7 +11,7 @@ from typing import Any, Dict, Mapping, Optional
 from hermes_constants import display_hermes_home
 from agent.prompt_cache_boundary import register_stable_prefix
 from agent.skill_preprocessing import load_skills_config as _load_skills_config, preprocess_skill_content
-from agent.skill_utils import AMBIGUOUS_SKILL_PREFIX
+from agent.skill_utils import AMBIGUOUS_SKILL_PREFIX, strip_frontmatter
 
 logger = logging.getLogger(__name__)
 
@@ -475,6 +475,12 @@ def _supporting_files(loaded_skill: dict[str, Any], skill_dir: Path | None) -> l
     return supporting
 
 
+def _names_path(body: str, path: str) -> bool:
+    """True when *body* names the skill-relative *path* as a whole token (not ``x.md.bak``,
+    ``old-x.md`` or ``other/x.md``); such files need no repeat in the supporting-files list."""
+    return re.search(r"(?<![\w./-])" + re.escape(path) + r"(?![\w/-]|\.\w)", body) is not None
+
+
 def _build_skill_message(
     loaded_skill: dict[str, Any],
     skill_dir: Path | None,
@@ -489,7 +495,9 @@ def _build_skill_message(
     content = preprocess_skill_content(
         str(loaded_skill.get("content") or ""), skill_dir, session_id, skills_cfg=_load_skills_config(),
     )
-    parts = [activation_note, "", content.strip()]
+    # Display copy only: _inject_skill_config below still parses the frontmatter from loaded_skill.
+    content = strip_frontmatter(content).strip()
+    parts = [activation_note, "", content]
     # Absolute skill dir lets the agent run bundled scripts without a skill_view() round-trip.
     if skill_dir:
         parts += ["", f"[Skill directory: {skill_dir}]", _SKILL_DIR_NOTE]
@@ -497,7 +505,7 @@ def _build_skill_message(
     setup_note = _setup_note(loaded_skill)
     if setup_note:
         parts += ["", f"{_SKILL_SETUP_HEADER}{setup_note}]"]
-    supporting = _supporting_files(loaded_skill, skill_dir)
+    supporting = [sf for sf in _supporting_files(loaded_skill, skill_dir) if not _names_path(content, sf)]
     if supporting and skill_dir:
         try:
             skill_view_target = str(skill_dir.relative_to(_skills_dir()))
