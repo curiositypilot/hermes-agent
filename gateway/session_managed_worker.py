@@ -607,8 +607,11 @@ def _owner_control_socket():
 async def _kanban_sandbox(authority, policy, command, env, cwd):
     """``(plan, note)`` for a Kanban card's worker under ``kanban.sandbox`` (read per spawn, in this
     process). The plan wraps ``command`` in the forwarder + bwrap launch; ``--chdir <workspace>``
-    moves the cwd off the tree, so the tree is pinned on PYTHONPATH first. A sandbox that applies
-    but cannot be built, or an unreadable config, fails the admission closed before any process
+    moves the cwd off the tree, so the tree is pinned on PYTHONPATH first. ``python -m`` puts the
+    cwd *ahead of* PYTHONPATH, so the command runs with ``-P`` (safe_path): otherwise a workspace
+    holding a top-level ``agent``/``pm``/... package (a fork worktree) shadows the pinned tree and
+    the worker boots the card's code, or dies at boot (t_aeedfe09). A sandbox that applies but
+    cannot be built, or an unreadable config, fails the admission closed before any process
     exists: ``RuntimeStoreError('sandbox_unavailable')``, never a bare spawn."""
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
     from hermes_cli.config_backend import ConfigBackendUnavailable
@@ -616,7 +619,8 @@ async def _kanban_sandbox(authority, policy, command, env, cwd):
 
     def build():
         worker_env = pin_hermes_tree_on_pythonpath(dict(os.environ if env is None else env), cwd)
-        return plan_for_managed_worker(json.loads(policy.kanban_json), command, worker_env=worker_env,
+        safe_command = [command[0], '-P', *command[1:]]
+        return plan_for_managed_worker(json.loads(policy.kanban_json), safe_command, worker_env=worker_env,
                                        profile_home=Path(str(authority.profile_id)),
                                        allow_control_socket=_owner_control_socket())
     try:

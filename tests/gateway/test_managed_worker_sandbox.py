@@ -217,7 +217,7 @@ def test_sandboxed_tenant_spawns_the_worker_inside_bwrap(spawn):
     spawn.run(_context(host))
     (argv, kw), = spawn.calls
     assert argv[:3] == [sys.executable, '-P', str(Path(kbs.__file__).resolve())]
-    assert argv[3:5] == ['exec', '/usr/bin/bwrap'] and argv[-3:] == WORKER_ARGV
+    assert argv[3:5] == ['exec', '/usr/bin/bwrap'] and argv[-4:] == [sys.executable, '-P', '-m', 'agent.managed_worker']
     assert '--unshare-pid' in argv and '--die-with-parent' in argv
     assert ('--chdir', str(host.ws)) in [(argv[i], argv[i + 1]) for i in range(len(argv) - 1)]
     setenv = dict(_pairs(argv, '--setenv'))
