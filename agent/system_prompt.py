@@ -544,6 +544,12 @@ def _memory_parts(agent: Any) -> list[str]:
                 _ext_mem_block = None
             if _ext_mem_block:
                 parts.append(_ext_mem_block)
+            # The provider block names its tools as if direct; say which ones sit behind the bridge.
+            from agent.memory_manager_tools import deferred_memory_tool_names
+            _deferred = sorted(deferred_memory_tool_names(agent))
+            if _ext_mem_block and _deferred:
+                parts.append(f"Deferred memory tools ({', '.join(_deferred)}) are not in your tool list: "
+                             "call them through tool_call with their exact name, never directly.")
     return parts
 
 

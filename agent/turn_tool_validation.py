@@ -100,8 +100,12 @@ def validate_tool_calls(
 
     # Repair mismatched tool names before validating (model hallucinations).
     repaired_ids = set()
+    # A deferred tool called directly is redirected, never fuzzy-repaired: hindsight_reflect
+    # would otherwise "repair" to hindsight_recall (difflib ratio 0.79 > 0.7 cutoff).
+    from agent.memory_manager_tools import deferred_memory_tool_names
+    deferred_names = deferred_memory_tool_names(agent)
     for tc in tool_calls:
-        if tc.function.name not in valid_names:
+        if tc.function.name not in valid_names and tc.function.name not in deferred_names:
             repaired = agent._repair_tool_call(tc.function.name)
             if repaired:
                 agent._vprint(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'",
@@ -145,7 +149,7 @@ def validate_tool_calls(
         _append_tool_error_results(
             messages, tool_calls,
             lambda tc: (
-                _invalid_tool_name_error_content(tc.function.name, valid_names)
+                _invalid_tool_name_error_content(tc.function.name, valid_names, deferred_names)
                 if tc.function.name not in valid_names
                 else "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
             ),
