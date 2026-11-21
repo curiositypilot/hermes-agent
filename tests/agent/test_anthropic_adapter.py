@@ -385,7 +385,7 @@ class TestResolveAnthropicToken:
         monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
 
         assert resolve_anthropic_token() == "pool-oauth-token"
-        assert captured == {"clear_expired": False, "refresh": False}
+        assert captured == {"clear_expired": False, "refresh": False, "model": None}
 
     def test_prefers_refreshable_claude_code_credentials_over_static_anthropic_token(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
