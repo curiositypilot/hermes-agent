@@ -166,6 +166,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--data-class", dest="data_class",
         help="Set the job's data class (kanban.data_policies.classes). Pass empty string "
             "to clear it.")
+    cron_edit.add_argument("--memory-query", dest="memory_query",
+        help="Auto-recall query that replaces the job prompt. A value starting with '/' "
+            "(e.g. /no-recall) turns auto-recall off. Pass empty string to clear (recall "
+            "on the job prompt again).")
     cron_edit.add_argument("--timezone",
         help="IANA zone for this job's schedule. Pass empty string to clear the pin "
             "(back to the profile timezone); next_run_at is recomputed in the new zone.")
