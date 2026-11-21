@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import logging
+import math
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# The retry loop's longest Retry-After wait: a candidate benched for less still gets its chance.
+_BENCH_SKIP_FLOOR_S = 600
 
 
 def _normalized_base_url(value: Any) -> str:
@@ -54,6 +60,49 @@ def resolve_entry_api_key(entry: dict[str, Any] | None) -> str | None:
         from agent.secret_scope import get_secret
         return (get_secret(key_env) or "").strip() or None
     return None
+
+
+def benched_pool_until(provider: str, model: str, pool: Any = None) -> float | None:
+    """Epoch at which *provider*'s credential pool reopens for *model* when every credential sits
+    in a cooldown longer than the retry loop's longest wait (``math.inf`` when no reopen time is
+    known); None when the candidate is usable or has no pool credentials.
+
+    The one "candidate is benched" rule for every fallback walker: the in-loop ladder
+    (``agent.chat_completion_helpers._candidate_pool_exhausted``, #89401) and the resolve-time
+    walkers (``skip_benched_entry``). *pool* is reused only when it belongs to *provider*.
+    """
+    provider = (provider or "").strip().lower()
+    if pool is None or (getattr(pool, "provider", "") or "").strip().lower() != provider:
+        try:
+            from agent.credential_pool import load_pool
+            pool = load_pool(provider)
+        except Exception:  # an unreadable pool must not drop the candidate: treat it as usable
+            logger.debug("benched check: could not load the %s pool", provider, exc_info=True)
+            return None
+    if pool is None or not pool.has_credentials() or pool.has_available(model=model):
+        return None
+    until = pool.next_available_at(model=model)
+    if until is None:
+        return math.inf
+    return until if until - time.time() > _BENCH_SKIP_FLOOR_S else None
+
+
+def skip_benched_entry(entry: dict[str, Any], provider: str, model: str) -> bool:
+    """True (logged) when a resolve-time fallback entry's credential pool is benched.
+
+    Without this check a benched OAuth pool still resolves through the singleton-token rung
+    (``runtime_provider._ladder_rungs``) and the run spends a call on the account that just
+    refused it. An entry carrying its own key does not use the pool and is never skipped.
+    """
+    if resolve_entry_api_key(entry):
+        return False
+    until = benched_pool_until(provider, model)
+    if until is None:
+        return False
+    ends = "an unknown time" if math.isinf(until) else (
+        datetime.fromtimestamp(until, UTC).strftime("%Y-%m-%d %H:%M:%SZ"))
+    logger.info("Fallback skip: %s/%s credential pool is benched until %s", provider, model, ends)
+    return True
 
 
 def effective_runtime_provider(
