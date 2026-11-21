@@ -180,6 +180,17 @@ class TestBuildJobPromptScansSkillContent:
         assert "[Skill config (from" in prompt
         assert f"cron_config.data_dir = {expected_value}" in prompt
 
+    def test_cron_prompt_drops_skill_frontmatter(self, cron_env):
+        """The cron copy carries the skill body, not its YAML frontmatter (t_a08b0435)."""
+        hermes_home, scheduler = cron_env
+        _plant_skill(hermes_home, "fm-cron", "# Cron body\n\nSummarize the feed.")
+
+        prompt = scheduler._build_job_prompt({"id": "job-fm", "skills": ["fm-cron"], "prompt": "run"})
+
+        assert "# Cron body\n\nSummarize the feed." in prompt
+        assert "name: fm-cron" not in prompt
+        assert "description: test" not in prompt
+
     def test_builtin_style_github_api_example_is_allowed(self, cron_env):
         hermes_home, scheduler = cron_env
         _plant_skill(

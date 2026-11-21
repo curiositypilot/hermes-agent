@@ -87,6 +87,15 @@ def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
     return frontmatter, body
 
 
+def strip_frontmatter(content: str) -> str:
+    """*content* without its YAML frontmatter block (leading blank lines dropped); unchanged when
+    there is no closed block. Display copies (preload, cron) use it; skill_view keeps the frontmatter."""
+    unbommed = content.removeprefix("\ufeff")
+    if not (unbommed.startswith("---") and re.search(r"\n---\s*\n", unbommed[3:])):
+        return content
+    return parse_frontmatter(unbommed)[1].lstrip("\r\n")
+
+
 def skill_matches_platform_list(platforms: Any) -> bool:
     """Return True when *platforms* is compatible with the current OS."""
     if not platforms:
