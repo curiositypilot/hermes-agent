@@ -2509,8 +2509,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     invocation for display."""
     from agent.inline_tool_executors import (
         InlineToolContext, apply_transform_tool_result, emit_terminal_post_tool_call,
-        resolve_invoke_tool_executor, tool_hook_ids
-    )
+        resolve_invoke_tool_executor, tool_hook_ids)
+    from agent.memory_manager_tools import assembled_memory_tool_defs
     if not isinstance(function_args, dict):
         function_args = {}
     hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
@@ -2566,8 +2566,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                 skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                tool_request_middleware_trace=list(_tool_middleware_trace),
+                disabled_toolsets=getattr(agent, "disabled_toolsets", None), tool_request_middleware_trace=list(_tool_middleware_trace),
+                extra_tool_defs=assembled_memory_tool_defs(agent),  # concurrent tool_search/describe catalog
             )
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True

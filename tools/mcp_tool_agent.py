@@ -130,9 +130,13 @@ def refresh_agent_mcp_tools(
     snapshot_generation = registry._generation
     from agent.delegation_backends import adopt_built_backend, saved_backend
     built_backend = saved_backend()
+    from agent.memory_manager_tools import assembled_memory_tool_defs
     from toolsets import agent_tool_surface
-    new_defs = agent_tool_surface(agent, list(
-        get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=quiet_mode) or []))
+    # A session that defers a memory-provider tool built its surface with the memory schemas
+    # inside assembly; the refresh does the same, and _reinject_post_build_tools skips them.
+    new_defs = agent_tool_surface(agent, list(get_tool_definitions(
+        enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=quiet_mode,
+        extra_tool_defs=assembled_memory_tool_defs(agent)) or []))
     new_names = {_def_name(t) for t in new_defs}
     # Post-build families re-appended on LOCALS only; live attributes untouched until publish.
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
@@ -360,7 +364,10 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     enabled = getattr(agent, "enabled_toolsets", None)
     try:
         get_mem_schemas = _schema_getter("_memory_manager", "get_all_tool_schemas")
-        if get_mem_schemas is not None:
+        # Memory tools routed through assembly (one is deferred) are already in tools_list or
+        # deliberately behind the bridge; re-appending would undo the deferral.
+        from agent.memory_manager_tools import memory_tools_assembled
+        if get_mem_schemas is not None and not memory_tools_assembled(agent):
             from agent.memory_manager_tools import memory_provider_tools_enabled  # same gate inject_memory_provider_tools uses
             if memory_provider_tools_enabled(
                     enabled, getattr(agent, "disabled_toolsets", None), memory_tool_present="memory" in name_set):

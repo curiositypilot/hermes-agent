@@ -210,18 +210,22 @@ def _clear_tool_defs_cache() -> None:
 
 
 def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_toolsets: Optional[list[str]] = None,
-                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> list[dict[str, Any]]:
+                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False,
+                         extra_tool_defs: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
     """Tool definitions for model API calls, filtered by toolset.
 
     enabled_toolsets None = all; disabled_toolsets are subtracted after enabling.
     quiet_mode suppresses status prints and enables memoization.
     skip_tool_search_assembly returns raw schemas for every enabled tool — only
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
+    extra_tool_defs are per-agent schemas outside the registry (memory-provider tools)
+    that go through sanitization and assembly like registry tools; they bypass the memo.
     """
     def compute():
         return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                         skip_tool_search_assembly=skip_tool_search_assembly)
-    if not quiet_mode:
+                                         skip_tool_search_assembly=skip_tool_search_assembly,
+                                         extra_tool_defs=extra_tool_defs)
+    if not quiet_mode or extra_tool_defs:
         return compute()
     cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly)
     # Cache the freshly-computed list, but hand callers a shallow copy so downstream mutations (e.g.
@@ -513,7 +517,8 @@ _TOOL_SEARCH_LISTING_FORMS = {
 
 
 def _compute_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_toolsets: Optional[list[str]] = None,
-                              quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> list[dict[str, Any]]:
+                              quiet_mode: bool = False, skip_tool_search_assembly: bool = False,
+                              extra_tool_defs: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     tools_to_include = _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode)
     # Selection is per schema, not per process/profile. Kanban's local checks
@@ -528,6 +533,10 @@ def _compute_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disa
     if not quiet_mode:
         print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(_last_resolved_tool_names)}"
               if filtered_tools else "🛠️  No tools selected (all filtered out or unavailable)")
+    if extra_tool_defs:  # after _last_resolved_tool_names: extras are not execute_code sandbox tools
+        _names = set(_last_resolved_tool_names)
+        filtered_tools = filtered_tools + [td for td in extra_tool_defs
+                                           if (td.get("function") or {}).get("name") not in _names]
     # Normalize schema shapes llama.cpp's grammar converter rejects (bare
     # "type": "object", string-valued nodes from malformed MCP servers).
     try:
@@ -737,7 +746,7 @@ def _emit_post_tool_call_hook(
 
 def _dispatch_bridge_tool(function_name: str, function_args: dict[str, Any],
                           enabled_toolsets: Optional[list[str]], disabled_toolsets: Optional[list[str]],
-                          ids: Optional[_CallIds] = None):
+                          ids: Optional[_CallIds] = None, extra_tool_defs: Optional[list[dict[str, Any]]] = None):
     """Handle a Tool Search bridge call (tool_search / tool_describe / tool_call).
 
     None when *function_name* is not a bridge tool; ``(result, None)`` for a
@@ -754,7 +763,8 @@ def _dispatch_bridge_tool(function_name: str, function_args: dict[str, Any],
     # session (subagent, kanban worker) can't reach the whole registry via the bridge.
     try:
         current_defs = get_tool_definitions(enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
-                                            quiet_mode=True, skip_tool_search_assembly=True) or []
+                                            quiet_mode=True, skip_tool_search_assembly=True,
+                                            extra_tool_defs=extra_tool_defs) or []
     except Exception:
         current_defs = []
     args = function_args or {}
@@ -914,6 +924,7 @@ def handle_function_call(
     skip_pre_tool_call_hook: bool = False, skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False, tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
     enabled_toolsets: Optional[list[str]] = None, disabled_toolsets: Optional[list[str]] = None,
+    extra_tool_defs: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     """Route a tool call through hooks/middleware to the registry; returns a JSON string.
 
@@ -921,7 +932,8 @@ def handle_function_call(
     enabled_tools picks execute_code's sandbox tools (default: the process-global
     ``_last_resolved_tool_names``). skip_pre_tool_call_hook: caller already fired
     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search
-    bridge catalog to this session's grant (None = unrestricted).
+    bridge catalog to this session's grant (None = unrestricted); extra_tool_defs adds the
+    session's non-registry schemas (deferred memory-provider tools) to that catalog.
     """
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
@@ -940,7 +952,8 @@ def handle_function_call(
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit
     # approval, guardrails) sees the real tool name, never the bridge.
-    bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets, ids)
+    bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets, ids,
+                                    extra_tool_defs=extra_tool_defs)
     if bridged is not None:
         result, underlying = bridged
         if underlying is None:

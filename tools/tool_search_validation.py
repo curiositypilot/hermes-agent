@@ -263,8 +263,10 @@ def not_deferrable_error(name: str, session_tool_names: Optional[Iterable[str]] 
     global blocklist, because a top-level session legitimately has these tools.
     """
     from tools.tool_search import _core_tool_names  # late: tool_search imports this module
-    if name in _core_tool_names() or _registry_entry(name) is not None:
-        if session_tool_names is not None and name not in set(session_tool_names):
+    session_names = set(session_tool_names) if session_tool_names is not None else None
+    # A non-registry tool the session carries eagerly (a memory-provider tool) is directly listed too.
+    if name in _core_tool_names() or _registry_entry(name) is not None or name in (session_names or ()):
+        if session_names is not None and name not in session_names:
             return unavailable_in_session_reason(name)
         return (f"'{name}' is a directly-listed tool, not a deferred one. "
                 "Call it directly instead of via tool_call.")

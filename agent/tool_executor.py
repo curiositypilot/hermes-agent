@@ -36,6 +36,7 @@ from agent.message_sanitization import coalesce_tool_call_id
 from agent.onboarding import observe_tool_result as observe_onboarding_result
 from agent import plugin_live_notes
 from agent.lsp import deferred as lsp_deferred
+from agent.memory_manager_tools import assembled_memory_tool_defs
 from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
     InlineToolContext,
@@ -370,11 +371,13 @@ def _tool_search_scoped_names(agent) -> frozenset:
 
     enabled = getattr(agent, "enabled_toolsets", None)
     disabled = getattr(agent, "disabled_toolsets", None)
+    extra_defs = assembled_memory_tool_defs(agent)  # deferred memory-provider tools join the scope
     cache_key = (
         _registry.current_scope_key(),
         getattr(_registry, "_generation", 0),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
+        _ts.session_tool_names(extra_defs or ()),
     )
     cached = getattr(agent, "_tool_search_scope_cache", None)
     if cached is not None and cached[0] == cache_key:
@@ -382,6 +385,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
     try:
         names = _ts.scoped_deferrable_names(model_tools.get_tool_definitions(
             enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=True, skip_tool_search_assembly=True,
+            extra_tool_defs=extra_defs,
         ) or [])
     except Exception:
         names = frozenset()
@@ -1735,6 +1739,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 tool_request_middleware_trace=list(middleware_trace),
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                extra_tool_defs=assembled_memory_tool_defs(agent),
             )
 
     return _SequentialDispatch(

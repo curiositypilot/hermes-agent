@@ -1123,10 +1123,14 @@ def _canonicalize_api_tool_calls(api_messages) -> None:
         am["tool_calls"] = new_tcs
 
 
-def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
+def _invalid_tool_name_error_content(name: str, valid_tool_names, deferred_names=()) -> str:
     """Error content for an unknown tool name. A blank name is a model echoing tool-call
     syntax seen in data (#47967) — dumping the catalog feeds that loop, so it gets a terse
-    error; a nonempty wrong name still gets the catalog to self-correct."""
+    error; a nonempty wrong name still gets the catalog to self-correct. A deferred tool
+    (memory-provider prompts still name it) is redirected to the tool_call bridge."""
+    if name in deferred_names:
+        return (f"Tool '{name}' is deferred, not directly callable. Call it through tool_call: "
+                f'{{"calls": [{{"name": "{name}", "arguments": {{...}}}}]}}')
     if not (name or "").strip():
         return (
             "Tool call rejected: the tool name was empty. If tool-call XML or JSON appeared in file "

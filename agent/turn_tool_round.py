@@ -58,6 +58,7 @@ def run_tool_round(
     Hermes; a failed canonical append ends the turn rather than running tools from
     process-only state."""
     from agent.conversation_loop import _invalid_tool_name_error_content
+    from agent.memory_manager_tools import deferred_memory_tool_names
 
     def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> ToolRoundVerdict:
         return ToolRoundVerdict(
@@ -120,7 +121,8 @@ def run_tool_round(
                 "name": tc.function.name,
                 "tool_call_id": coalesce_tool_call_id(tc),
                 "content": _invalid_tool_name_error_content(
-                    tc.function.name, agent.valid_tool_names
+                    tc.function.name, agent.valid_tool_names,
+                    deferred_memory_tool_names(agent),
                 ),
             })
         assistant_message.tool_calls = [
