@@ -155,7 +155,7 @@ def test_anthropic_fetch_honors_explicit_api_key_and_marks_model_scoped_windows(
                 "seven_day_sonnet": {"utilization": 40.0, "resets_at": "2026-10-09T12:00:00Z"}}
 
     monkeypatch.setattr(account_usage, "_get_json", fake_get_json)
-    monkeypatch.setattr(account_usage, "resolve_anthropic_token",
+    monkeypatch.setattr(account_usage, "resolve_anthropic_usage_token",
                         lambda **kw: (_ for _ in ()).throw(AssertionError("ambient token must not be consulted")))
 
     snapshot = fetch_account_usage("anthropic", api_key="sk-ant-oat-explicit-token")

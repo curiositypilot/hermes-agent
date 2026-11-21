@@ -648,17 +648,22 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[dict[s
     return None
 
 
-def _resolve_anthropic_pool_token(*, skip_borrowed: bool = False, model: Optional[str] = None) -> Optional[str]:
+def _resolve_anthropic_pool_token(
+    *, skip_borrowed: bool = False, model: Optional[str] = None, ignore_benches: bool = False,
+) -> Optional[str]:
     """First available Anthropic OAuth token from credential_pool, read-only: enumerates with ``clear_expired=False,
     refresh=False`` (never ``select()``) so diagnostic call sites (account_usage, ``hermes models``) never mutate
     auth.json or hit the network; refresh-on-expiry belongs to the API call path's pool recovery.
 
-    With *model*, only that model's cooldown benches a row; without it any cooldown does (conservative)."""
+    With *model*, only that model's cooldown benches a row; without it any cooldown does (conservative).
+    *ignore_benches* reads every non-DEAD row regardless of model cooldowns and ``exhausted`` marks."""
     try:
-        from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
-        entries, _pending = load_pool("anthropic")._available_entries(
-            clear_expired=False, refresh=False, model=model,
-        )
+        from agent.credential_pool import AUTH_TYPE_OAUTH, STATUS_DEAD, load_pool
+        pool = load_pool("anthropic")
+        if ignore_benches:
+            entries = [entry for entry in pool.entries() if entry.last_status != STATUS_DEAD]
+        else:
+            entries, _pending = pool._available_entries(clear_expired=False, refresh=False, model=model)
     except Exception:
         logger.debug("Failed to read Anthropic credential_pool", exc_info=True)
         return None
@@ -720,6 +725,19 @@ def resolve_anthropic_token(*, model: Optional[str] = None) -> Optional[str]:
         _resolve_anthropic_pool_token(skip_borrowed=True, model=model) or _resolve_claude_code_token_from_credentials(_read_creds()),
         model,
     )
+
+
+def resolve_anthropic_usage_token() -> Optional[str]:
+    """Token for the provider-wide usage read: ``resolve_anthropic_token()``'s source order, but the pool step
+    ignores model cooldowns and ``exhausted`` marks. ``/api/oauth/usage`` is not a model call, and the account is
+    benched exactly when its usage matters: honouring the bench blinded the quota snapshot (t_282f4dff)."""
+    _read_creds = functools.cache(read_claude_code_credentials)
+    token = _first_env("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+    if token:
+        return _prefer_refreshable_claude_code_token(token, _read_creds()) or token
+    return (_first_env("ANTHROPIC_API_KEY")
+            or _resolve_anthropic_pool_token(skip_borrowed=True, ignore_benches=True)
+            or _resolve_claude_code_token_from_credentials(_read_creds()))
 
 
 def run_oauth_setup_token() -> Optional[str]:

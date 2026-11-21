@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from agent.credential_pool_admin import CredentialPoolAdminMixin
+from agent.credential_pool_capacity import capacity_rows
 from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMixin, model_cooldown_until
 from agent.credential_pool_timestamps import _parse_absolute_timestamp
 from agent.credential_pool_rotation import _singleton_predates_entry, is_billing_bench, note_kept_billing_bench, rotation_is_refresh_only
@@ -1100,8 +1101,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             return list(self._entries)
 
     def _is_sole_credential(self) -> bool:
-        """DEAD entries never re-enter rotation, so <=1 non-DEAD entry means nothing to rotate to."""
-        return sum(1 for e in self._entries if e.last_status != STATUS_DEAD) <= 1
+        """<=1 row that can re-enter rotation (not DEAD, not a keyless api_key row) means nothing to rotate to."""
+        return len(capacity_rows(self._entries)) <= 1
 
     def _find(self, predicate: Callable[[PooledCredential], bool]) -> Optional[PooledCredential]:
         return next((e for e in self._entries if predicate(e)), None)
@@ -2105,9 +2106,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         pending_refresh: list[PooledCredential] = []
         sole_credential = self._is_sole_credential()
         for entry in self._entries:
-            # Borrowed credentials persist as metadata-only references and are
-            # hydrated from their live source on load; never lease an
-            # unhydrated duplicate as an empty key.
+            # Borrowed credentials persist as metadata-only references hydrated from their
+            # live source on load; never lease an unhydrated duplicate as an empty key.
             if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
                 continue
             synced = self._resync_stale_entry(entry)

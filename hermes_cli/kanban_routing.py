@@ -274,6 +274,7 @@ def pool_availability(provider: Optional[str], model: Optional[str], *, now: Opt
         from agent.credential_pool import (
             STATUS_DEAD, STATUS_EXHAUSTED, PooledCredential, _exhausted_until,
         )
+        from agent.credential_pool_capacity import env_row_unset
         from agent.credential_pool_model_cooldowns import model_cooldown_until
     except Exception as exc:  # pragma: no cover - import guard
         return Availability(True, f"pool check unavailable ({type(exc).__name__})")
@@ -289,7 +290,7 @@ def pool_availability(provider: Optional[str], model: Optional[str], *, now: Opt
             break
     if not raw_entries:
         return Availability(True, "no pool entries (not checked)")
-    usable = [e for e in raw_entries if not _env_row_unset(e)]
+    usable = [e for e in raw_entries if not env_row_unset(e)]
     if not usable:
         return Availability(False, "no usable credentials (env key unset)")
     entries = []
@@ -315,23 +316,6 @@ def pool_availability(provider: Optional[str], model: Optional[str], *, now: Opt
                 continue
         return Availability(True, "pool ok")
     return Availability(False, "credential pool exhausted", until=min(waits) if waits else None)
-
-
-def _env_row_unset(payload: dict) -> bool:
-    """An ``api_key`` row seeded from ``env:<VAR>`` with no key on disk and ``VAR`` unset.
-
-    ``CredentialPool._available_entries`` never leases such a row, so counting it would make a
-    benched model look available. Other token-less rows (borrowed/singleton) hydrate on load.
-    """
-    source = str(payload.get("source") or "")
-    if payload.get("auth_type") != "api_key" or payload.get("access_token") or not source.startswith("env:"):
-        return False
-    from agent.credential_pool import get_env_prefer_dotenv
-    from agent.secret_scope import UnscopedSecretError
-    try:
-        return not get_env_prefer_dotenv(source[len("env:"):])
-    except UnscopedSecretError:  # no profile scope to answer from: keep counting the row
-        return False
 
 
 def _profile_model(profile_home: Optional[str]) -> Optional[TierCandidate]:
@@ -367,7 +351,7 @@ def _pool_scope(profile_home: Optional[str]):
     """Home + secret scope of the profile whose pool is checked.
 
     The dispatch tick runs detached from any turn, so under multiplexing an ``env:`` row's key
-    read (``_env_row_unset``) raises ``UnscopedSecretError`` and the token-less row stays counted.
+    read (``env_row_unset``) raises ``UnscopedSecretError`` and the token-less row stays counted.
     """
     from hermes_cli.kanban_db_dispatch import _worker_profile_scope
     from hermes_constants import get_hermes_home
