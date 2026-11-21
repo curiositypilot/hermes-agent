@@ -38,6 +38,21 @@ def _last_streak_event(conn: sqlite3.Connection, task_id: str) -> tuple[Optional
     return (None, {}) if last is None else (last["kind"], _kb._json_dict(last["payload"]))
 
 
+def _record_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: str) -> None:
+    """``respawn_guarded`` once per streak (same reason; noise events ignored), so ``tail``
+    shows why the card looks stuck without a row per tick. Read and append share one
+    transaction: two dispatchers on a shared board cannot both open the streak."""
+    from hermes_cli import kanban_db as _kb
+
+    try:
+        with _kb.write_txn(conn):
+            kind, prev = _last_streak_event(conn, task_id)
+            if kind != "respawn_guarded" or prev.get("reason") != reason:
+                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": reason})
+    except sqlite3.Error:
+        _kb._log.debug("kanban dispatch: could not record guard for %s", task_id, exc_info=True)
+
+
 def _record_routing_hold(
     conn: sqlite3.Connection, task_id: str, route: Optional[RouteDecision],
     reason: str = "tier_exhausted",

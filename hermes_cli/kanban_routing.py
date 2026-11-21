@@ -58,6 +58,21 @@ and the dispatcher wakes cards parked in ``scheduled`` for quota (reason
 mentions quota, wake date no later than a day after the reset). Missing, stale
 or ``unknown`` mode falls back to the level gate. Off with the gate
 (``quota_gate.enabled: false``); ``hermes kanban route`` prints it either way.
+
+The 5 h session window stays out of the mode (it paces the week). Two gate
+rules protect it, because MB's chats share the Anthropic account (t_ca1570d0):
+
+* in-flight cap (``quota_gate.max_in_flight``, default ``{anthropic: 4}``):
+  running cards whose current run was routed to a provider, plus this tick's
+  spawns (``RoutingContext.note_spawn``), may not exceed its cap. A capped
+  candidate is skipped like a gated one; all capped = ``quota_held`` with no
+  ``retry_at`` (re-evaluated next tick). Needs no reading, so it bounds the
+  burn between the 10-min snapshots;
+* session floor (``quota_gate.session_floor``, default 0.30): while the
+  snapshot is fresh and Anthropic's session window has less headroom, Anthropic
+  cards need P3 on top of the mode (the higher requirement wins). No session
+  window in the snapshot (the usage API omits it at times) = no requirement:
+  the floor is inert and only the cap applies.
 """
 
 from __future__ import annotations
@@ -106,6 +121,9 @@ DEFAULT_QUOTA_MAX_AGE_SECONDS = 1800
 # ``((below headroom, min_priority), ...)``. Nothing pacing-shaped has ever been useful on the
 # non-Anthropic daily/monthly windows (design § 4.3), so this is a constant, not config.
 LEVEL_GATE: tuple[tuple[float, int], ...] = ((0.10, 2), (0.03, 3))
+DEFAULT_MAX_IN_FLIGHT: tuple[tuple[str, int], ...] = (("anthropic", 4),)
+DEFAULT_SESSION_FLOOR = 0.30
+SESSION_FLOOR_PRIORITY = 3
 
 
 @dataclass(frozen=True)
@@ -117,6 +135,13 @@ class QuotaGateConfig:
     payg_providers: tuple[str, ...] = ("openrouter",)
     mode_file: str = ""
     """``""`` = ``<HERMES_HOME>/data/quota/mode.json`` (quota mode, see module doc)."""
+    max_in_flight: tuple[tuple[str, int], ...] = DEFAULT_MAX_IN_FLIGHT
+    """``(provider, cap)`` pairs; empty = no in-flight cap (module doc)."""
+    session_floor: float = DEFAULT_SESSION_FLOOR
+    """Anthropic session headroom below which cards need P3; 0 = off."""
+
+    def in_flight_cap(self, provider: str) -> int:
+        return dict(self.max_in_flight).get(provider, 0)
 
 
 @dataclass
@@ -131,6 +156,33 @@ class RoutingConfig:
     auto_label: bool = False
     auto_label_per_tick: int = 3
     quota_gate: QuotaGateConfig = field(default_factory=QuotaGateConfig)
+
+
+def _parse_max_in_flight(raw: Any) -> tuple[tuple[str, int], ...]:
+    """``{provider: cap}``; ``{}`` or a non-mapping (null, 0) = off. A cap that is
+    not a positive int drops that provider."""
+    if not isinstance(raw, dict):
+        if raw not in (None, 0, False, ""):
+            logger.warning("kanban.routing.quota_gate.max_in_flight=%r is not a mapping; in-flight cap off", raw)
+        return ()
+    caps: dict[str, int] = {}
+    for name, value in raw.items():
+        try:
+            cap = int(value)
+        except (TypeError, ValueError):
+            logger.warning("kanban.routing.quota_gate.max_in_flight.%s=%r is not an int; ignored", name, value)
+            continue
+        if cap > 0 and not isinstance(value, bool):
+            caps[str(name).strip().lower()] = cap
+    return tuple(sorted(caps.items()))
+
+
+def _parse_session_floor(raw: Any) -> float:
+    try:
+        floor = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_SESSION_FLOOR
+    return floor if math.isfinite(floor) and 0.0 <= floor <= 1.0 else DEFAULT_SESSION_FLOOR
 
 
 def _parse_quota_gate(raw: Any) -> QuotaGateConfig:
@@ -152,6 +204,8 @@ def _parse_quota_gate(raw: Any) -> QuotaGateConfig:
         max_age_seconds=max_age if max_age > 0 else DEFAULT_QUOTA_MAX_AGE_SECONDS,
         payg_providers=tuple(str(p).strip().lower() for p in payg_list if str(p).strip()),
         mode_file=str(raw.get("mode_file") or "").strip(),
+        max_in_flight=_parse_max_in_flight(raw.get("max_in_flight", dict(DEFAULT_MAX_IN_FLIGHT))),
+        session_floor=_parse_session_floor(raw.get("session_floor", DEFAULT_SESSION_FLOOR)),
     )
 
 
@@ -459,6 +513,10 @@ def _pct(x: float) -> str:
     return f"{x * 100:.0f}%"
 
 
+def _hhmm(epoch: Optional[float]) -> str:
+    return time.strftime("%H:%M UTC", time.gmtime(epoch)) if epoch else "?"
+
+
 def _parse_iso_epoch(raw: Any) -> Optional[float]:
     if not raw:
         return None
@@ -487,6 +545,9 @@ class QuotaSnapshot:
     windows: dict[str, list[QuotaWindow]] = field(default_factory=dict)
     """provider -> its windows that carry a ``match`` (per-model gating); only for
     providers in ``providers``. Absent = every model is gated on the binding."""
+    sessions: dict[str, QuotaWindow] = field(default_factory=dict)
+    """provider -> its ``session`` (5 h) window, only for providers in ``providers``.
+    Kept apart from ``windows`` so the level gate never reads it (session floor only)."""
 
 
 class QuotaWindow(NamedTuple):
@@ -530,6 +591,20 @@ def _match_windows(entry: dict) -> list[QuotaWindow]:
     if sum(1 for w in out if w.match == "*") > 1:
         return []
     return out
+
+
+def _session_window(entry: dict) -> Optional[QuotaWindow]:
+    """The entry's ``session`` window (``match`` ``()``: it never gates a model by
+    prefix), or None when absent or its headroom is not a finite number."""
+    raw = entry.get("windows")
+    for w in raw if isinstance(raw, list) else ():
+        if not isinstance(w, dict) or w.get("name") != "session":
+            continue
+        headroom = w.get("headroom")
+        if isinstance(headroom, bool) or not isinstance(headroom, (int, float)) or not math.isfinite(headroom):
+            return None
+        return QuotaWindow("session", (), float(headroom), _parse_iso_epoch(w.get("resets_at")))
+    return None
 
 
 def _window_for(windows: list[QuotaWindow], model: str) -> Optional[QuotaWindow]:
@@ -596,6 +671,9 @@ def read_headroom(gate: QuotaGateConfig, *, now: Optional[float] = None) -> Quot
         windows = _match_windows(entry)
         if windows:
             snap.windows[name.strip().lower()] = windows
+        session = _session_window(entry)
+        if session is not None:
+            snap.sessions[name.strip().lower()] = session
     return snap
 
 
@@ -685,7 +763,9 @@ def required_priority(headroom: float, levels: tuple[tuple[float, int], ...] = L
 class QuotaVerdict:
     """One provider refused by the gate for one card. ``kind`` names what set the
     requirement: ``level`` (``headroom`` = binding-window headroom, ``below`` =
-    the ``LEVEL_GATE`` threshold) or ``mode`` (the Anthropic quota mode)."""
+    the ``LEVEL_GATE`` threshold), ``mode`` (the Anthropic quota mode), ``session``
+    (``headroom`` = session headroom, ``below`` = ``session_floor``) or ``inflight``
+    (``cap`` = ``(running, cap)``)."""
     provider: str
     headroom: float
     below: float
@@ -695,10 +775,16 @@ class QuotaVerdict:
     mode: Optional[str] = None
     window: Optional[str] = None
     """The headroom-file window that gated the model; None = the binding."""
+    cap: Optional[tuple[int, int]] = None
 
     def describe(self) -> str:
         if self.kind == "mode":
             return f"{self.provider} quota mode {self.mode} needs P{self.required}"
+        if self.kind == "inflight" and self.cap:
+            return f"in-flight cap {self.provider} {self.cap[0]}/{self.cap[1]}"
+        if self.kind == "session":
+            return (f"{self.provider} session {_pct(self.headroom)} left < {_pct(self.below)} floor, "
+                    f"resets {_hhmm(self.resets_at)}, needs P{self.required}")
         pool = f" {self.window}" if self.window else ""
         return f"{self.provider}{pool} headroom {_pct(self.headroom)} < {_pct(self.below)} needs P{self.required}"
 
@@ -823,6 +909,14 @@ JOIN tasks t ON t.id = d.id
 WHERE COALESCE(t.status, '') NOT IN ('done', 'archived')
 """
 
+# The routed payload of each running card's current run (latest ``routed`` event).
+_IN_FLIGHT_SQL = """
+SELECT (SELECT e.payload FROM task_events e
+        WHERE e.run_id = t.current_run_id AND e.kind = 'routed' ORDER BY e.id DESC LIMIT 1)
+FROM tasks t
+WHERE t.status = 'running' AND t.current_run_id IS NOT NULL
+"""
+
 
 class RoutingContext:
     """Per-tick routing state: config, board rate-limit history, memoised checks."""
@@ -836,6 +930,7 @@ class RoutingContext:
         self._quota: Optional[QuotaSnapshot] = None
         self._mode: Optional[QuotaMode] = None
         self._gate_priorities: dict[tuple[str, int], tuple[int, int, list[str]]] = {}
+        self._in_flight: Optional[dict[str, int]] = None
 
     def quota_mode(self) -> QuotaMode:
         """``mode.json``, read once per context (per dispatcher tick)."""
@@ -880,16 +975,84 @@ class RoutingContext:
         self._gate_priorities[(task_id, own)] = result
         return result
 
+    def in_flight(self) -> dict[str, int]:
+        """provider -> running cards whose current run was routed to it (one board
+        query per context) plus the spawns noted since (``note_spawn``)."""
+        if self._in_flight is None:
+            counts: dict[str, int] = {}
+            try:
+                rows = self.conn.execute(_IN_FLIGHT_SQL).fetchall()
+            except sqlite3.Error:
+                logger.debug("in-flight count failed; cap open this tick", exc_info=True)
+                rows = []
+            for row in rows:
+                try:
+                    payload = json.loads(row[0] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                provider = str(payload.get("provider") or "").strip().lower() if isinstance(payload, dict) else ""
+                if provider:
+                    counts[provider] = counts.get(provider, 0) + 1
+            self._in_flight = counts
+        return self._in_flight
+
+    def note_spawn(self, provider: Optional[str]) -> None:
+        """Count a spawn routed to ``provider`` made this tick (every spawning lane)."""
+        key = (provider or "").strip().lower()
+        if key:
+            counts = self.in_flight()
+            counts[key] = counts.get(key, 0) + 1
+
+    def inflight_verdict(self, provider: Optional[str]) -> Optional[QuotaVerdict]:
+        """Refusal of ``provider`` while its in-flight count is at ``max_in_flight``."""
+        gate = self.cfg.quota_gate
+        key = (provider or "").strip().lower()
+        cap = gate.in_flight_cap(key) if gate.enabled and key else 0
+        running = self.in_flight().get(key, 0) if cap else 0
+        if not cap or running < cap:
+            return None
+        return QuotaVerdict(key, 0.0, 0.0, 0, kind="inflight", window="in-flight", cap=(running, cap))
+
+    def session_window(self) -> Optional[QuotaWindow]:
+        """Anthropic's session window from a fresh snapshot, unless it has already
+        reset; None = no session requirement (fail-open, design § 4.1)."""
+        snap = self.quota()
+        window = snap.sessions.get(MODE_PROVIDER) if snap.status == "ok" else None
+        if window is None or (window.resets_at is not None and window.resets_at <= self.now):
+            return None
+        return window
+
+    def session_verdict(self, priority: int) -> Optional[QuotaVerdict]:
+        """Refusal of ``anthropic`` while its session headroom is below ``session_floor``."""
+        floor = self.cfg.quota_gate.session_floor
+        window = self.session_window()
+        if window is None or window.headroom >= floor or priority >= SESSION_FLOOR_PRIORITY:
+            return None
+        return QuotaVerdict(MODE_PROVIDER, window.headroom, floor, SESSION_FLOOR_PRIORITY, window.resets_at,
+                            kind="session", window="session")
+
     def quota_verdict(self, provider: Optional[str], priority: int, model: Optional[str] = None) -> Optional[QuotaVerdict]:
         """The gate's refusal of ``provider`` (running ``model``, when given) for a
         card of ``priority``, or None (gate off, headroom unknown, or the card's
         priority meets the requirement). ``anthropic`` is gated by the quota mode
         while it is fresh (``model`` ignored); everything else, and anthropic
         without a fresh mode, by the level gate on the model's window
-        (``gate_requirement``)."""
+        (``gate_requirement``). For ``anthropic`` the session floor applies on top:
+        the higher requirement wins (a tie keeps the mode/level verdict, whose
+        reset is the later one)."""
         gate = self.cfg.quota_gate
         if not gate.enabled or not provider:
             return None
+        base = self._week_verdict(provider, priority, model)
+        if provider.strip().lower() != MODE_PROVIDER:
+            return base
+        session = self.session_verdict(priority)
+        if session is not None and (base is None or session.required > base.required):
+            return session
+        return base
+
+    def _week_verdict(self, provider: str, priority: int, model: Optional[str]) -> Optional[QuotaVerdict]:
+        """Quota mode (anthropic, fresh) or level gate verdict; see ``quota_verdict``."""
         if provider.strip().lower() == MODE_PROVIDER:
             mode = self.quota_mode()
             if mode.active:
@@ -943,7 +1106,8 @@ class RoutingContext:
                 walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
                                      "reason": "quota: no paid fallthrough"})
                 continue
-            verdict = self.quota_verdict(cand.provider, priority, model=cand.model)
+            verdict = self.inflight_verdict(cand.provider) or self.quota_verdict(cand.provider, priority,
+                                                                                 model=cand.model)
             if verdict is not None:
                 walk.gated.append(verdict)
                 walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
@@ -961,10 +1125,12 @@ class RoutingContext:
     def _quota_held(self, task: Any, gated: list[QuotaVerdict], *, lane: str = "ready",
                     requested_tier: Optional[str] = None, skipped: Optional[list[dict]] = None,
                     candidate: Optional[TierCandidate] = None) -> RouteDecision:
-        seen: dict[tuple[str, Optional[str]], QuotaVerdict] = {}
+        seen: dict[tuple[str, Optional[str], str], QuotaVerdict] = {}
         for v in gated:
-            seen.setdefault((v.provider, v.window), v)
-        resets = [v.resets_at for v in seen.values() if v.resets_at]
+            seen.setdefault((v.provider, v.window, v.kind), v)
+        # A capped candidate frees up when a run ends, not at a reset: re-evaluate next tick.
+        capped = any(v.kind == "inflight" for v in seen.values())
+        resets = [] if capped else [v.resets_at for v in seen.values() if v.resets_at]
         own, eff, via = self.gate_priority(task)
         raised = f", gate P{eff} via {format_gate_via(via)}" if via else ""
         note = "; ".join(v.describe() for v in seen.values()) + f" (card P{own}{raised})"
@@ -972,10 +1138,10 @@ class RoutingContext:
                              skipped=list(skipped or []), retry_at=min(resets) if resets else None, note=note)
 
     def _gate_fixed(self, task: Any, decision: RouteDecision) -> RouteDecision:
-        """Pinned / profile routes have no alternative: a gated provider holds the card."""
+        """Pinned / profile routes have no alternative: a gated or capped provider holds the card."""
         cand = decision.candidate
-        verdict = self.quota_verdict(cand.provider if cand else None, self.gate_priority(task)[1],
-                                     model=cand.model if cand else None)
+        verdict = self.inflight_verdict(cand.provider if cand else None) or self.quota_verdict(
+            cand.provider if cand else None, self.gate_priority(task)[1], model=cand.model if cand else None)
         if verdict is None:
             return decision
         skipped = [*decision.skipped, {"model": cand.model, "provider": cand.provider,

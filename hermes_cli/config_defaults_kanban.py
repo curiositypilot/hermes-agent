@@ -145,6 +145,13 @@ KANBAN_DEFAULTS = {
                 # <HERMES_HOME>/data/quota/mode.json). "open" = Opus first in every tier + review
                 # lane and quota-parked cards woken.
                 "mode_file": "",
+                # In-flight cap per provider: running cards routed to it + this tick's spawns. The
+                # account is shared with chats, so a per-profile cap does not bound it. `0` = off;
+                # `{provider: 0}` = no cap for it (`{}` deep-merges back to this default).
+                "max_in_flight": {"anthropic": 4},
+                # Anthropic 5 h session headroom below this (fresh snapshot only) = cards need P3 on
+                # top of the quota mode, keeping the rest for chats. 0 = off.
+                "session_floor": 0.30,
             },
             # Force the quota mode until the week resets (closed|critical|tight|normal|open, or
             # null). Read by scripts/quota_mode.py, not by the dispatcher.
