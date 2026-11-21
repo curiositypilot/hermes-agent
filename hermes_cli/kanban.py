@@ -700,7 +700,23 @@ def _quota_gate_view(ctx: Any, cfg: Any, task: Any) -> dict:
         "gate_priority": gate_p,
         "gate_via": via,
         "providers": providers,
+        **_session_inflight_view(ctx, gate),
     }
+
+
+def _session_inflight_view(ctx: Any, gate: Any) -> dict:
+    """``in_flight`` (per capped provider: running / cap) and ``session`` (Anthropic
+    session floor: headroom, floor, P3 when below; None = no fresh session window)."""
+    from hermes_cli import kanban_routing as kr
+
+    counts = ctx.in_flight()
+    window = ctx.session_window()
+    session = None if window is None else {
+        "headroom": window.headroom, "floor": gate.session_floor,
+        "resets_at": int(window.resets_at) if window.resets_at else None,
+        "required_priority": kr.SESSION_FLOOR_PRIORITY if window.headroom < gate.session_floor else 0}
+    return {"in_flight": [{"provider": p, "running": counts.get(p, 0), "cap": cap} for p, cap in gate.max_in_flight],
+            "session": session, "session_floor": gate.session_floor}
 
 
 def _quota_windows_view(snap: Any, provider: str) -> dict:
@@ -744,6 +760,15 @@ def _print_quota_gate(q: dict) -> None:
                                        for lv in q.get("level_gate", [])))
     if q["payg_providers"]:
         print(f"  no paid fallthrough after a gate skip: {', '.join(q['payg_providers'])}")
+    for row in q.get("in_flight", []):
+        full = " (full: held)" if row["running"] >= row["cap"] else ""
+        print(f"  in-flight cap {row['provider']}: {row['running']}/{row['cap']}{full}")
+    s = q.get("session")
+    if s is None:
+        print(f"  session floor {q.get('session_floor', 0) * 100:.0f}%: no fresh anthropic session window -> inert")
+    else:
+        need = f"needs P{s['required_priority']}" if s["required_priority"] else "no requirement"
+        print(f"  session floor {s['floor'] * 100:.0f}%: anthropic session {s['headroom'] * 100:.0f}% left -> {need}")
     card_line = _card_gate_line(q)
     if card_line:
         print(f"  {card_line}")

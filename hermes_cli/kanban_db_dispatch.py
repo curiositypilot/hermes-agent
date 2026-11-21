@@ -32,7 +32,7 @@ from hermes_cli.kanban_sandbox import SandboxUnavailable, thin_client_preflight
 from hermes_cli.kanban_worker_log import current_run_section, spawn_marker_line
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli.kanban_db_dispatch_argv import _absolute_hermes_path, _is_windows_batch_shim, _module_hermes_argv
-from hermes_cli.kanban_db_dispatch_holds import _last_streak_event, _record_routing_hold
+from hermes_cli.kanban_db_dispatch_holds import _record_respawn_guard, _record_routing_hold
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -2137,19 +2137,6 @@ def _record_route(conn: sqlite3.Connection, task: Task, route: _kbr.RouteDecisio
         _kb._log.debug("kanban routing: could not record route for %s", task.id, exc_info=True)
 
 
-def _record_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: str) -> None:
-    """``respawn_guarded`` once per streak (same reason; noise events ignored), so ``tail``
-    shows why the card looks stuck without a row per tick. Read and append share one
-    transaction: two dispatchers on a shared board cannot both open the streak."""
-    try:
-        with _kb.write_txn(conn):
-            kind, prev = _last_streak_event(conn, task_id)
-            if kind != "respawn_guarded" or prev.get("reason") != reason:
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": reason})
-    except sqlite3.Error:
-        _kb._log.debug("kanban dispatch: could not record guard for %s", task_id, exc_info=True)
-
-
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2216,10 +2203,12 @@ def _dispatch_lane_task(
         return False
 
     def _count_spawn(name: str) -> None:
-        # Later rows in this tick respect the per-profile cap; subsequent
-        # ticks re-query from the DB.
+        # Later rows in this tick respect the per-profile and in-flight caps;
+        # subsequent ticks re-query from the DB.
         if per_profile_cap is not None and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
+        if routing is not None and route is not None and route.candidate is not None:
+            routing.note_spawn(route.candidate.provider)
 
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
@@ -2504,7 +2493,11 @@ def _routing_context(conn: sqlite3.Connection) -> Optional[_kbr.RoutingContext]:
     except Exception:
         _kb._log.debug("kanban routing: config unreadable; routing off this tick", exc_info=True)
         return None
-    return _kbr.RoutingContext(conn, cfg) if cfg.enabled else None
+    if not cfg.enabled:
+        return None
+    ctx = _kbr.RoutingContext(conn, cfg)
+    ctx.in_flight()  # snapshot before this tick's spawns: ``note_spawn`` adds those, the query must not
+    return ctx
 
 
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
