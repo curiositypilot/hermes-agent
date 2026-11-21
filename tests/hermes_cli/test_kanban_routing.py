@@ -13,6 +13,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -225,6 +226,83 @@ def test_pool_availability_never_writes_auth_json(auth_home):
     before = (kanban_home / "auth.json").read_text()
     kr.pool_availability("prov", "m", now=now)
     assert (kanban_home / "auth.json").read_text() == before
+
+
+FABLE = "claude-fable-5-2"
+FABLE_BENCH_UNTIL = 1794961199.98  # incident 2026-11-18: fable benched until 00:19:59 UTC
+OAUTH_ROW = {"id": "6afabf", "label": "oauth", "auth_type": "oauth", "source": "manual:hermes_pkce",
+             "access_token": "tok", "last_status": "ok",
+             "model_cooldowns": {FABLE: FABLE_BENCH_UNTIL, "claude-opus-5-5": 1794961200.0}}
+ENV_ROW = {"id": "2c315c", "label": "ANTHROPIC_API_KEY", "auth_type": "api_key",
+           "source": "env:ANTHROPIC_API_KEY", "last_status": "ok"}
+
+
+def _pin_bench_clock(monkeypatch, now: float) -> float:
+    """``model_cooldown_until`` reads the wall clock, not ``pool_availability(now=)``."""
+    from agent import credential_pool_model_cooldowns as mc
+    monkeypatch.setattr(mc, "time", SimpleNamespace(time=lambda: now))
+    return now
+
+
+def test_pool_availability_ignores_env_row_with_unset_var(auth_home, monkeypatch):
+    """t_846f38f4: a token-less ``env:`` row whose var is unset is not capacity."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _write_pool(auth_home, "anthropic", [OAUTH_ROW, ENV_ROW])
+    for now in (1794960273, 1794960645):  # 00:04:33 and 00:10:45, when the cards crashed
+        avail = kr.pool_availability("anthropic", FABLE, now=_pin_bench_clock(monkeypatch, now))
+        assert avail.available is False
+        assert avail.until == FABLE_BENCH_UNTIL
+    assert kr.pool_availability("anthropic", FABLE, now=_pin_bench_clock(monkeypatch, 1794961208)).available is True
+
+    _write_pool(auth_home, "anthropic", [ENV_ROW])
+    alone = kr.pool_availability("anthropic", FABLE, now=1794960273)
+    assert alone.available is False and alone.reason.startswith("no usable credentials")
+
+
+def test_pool_availability_counts_env_row_when_var_set(auth_home, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "set-in-env")
+    _write_pool(auth_home, "anthropic", [OAUTH_ROW, ENV_ROW])
+    assert kr.pool_availability("anthropic", FABLE, now=_pin_bench_clock(monkeypatch, 1794960273)).available is True
+
+
+def test_pool_availability_keeps_other_rows_without_env_rule(auth_home, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _pin_bench_clock(monkeypatch, 1794960273)
+    manual_key = {"id": "m1", "label": "m", "auth_type": "api_key", "source": "manual",
+                  "access_token": "k-on-disk", "last_status": "ok"}
+    _write_pool(auth_home, "anthropic", [OAUTH_ROW, manual_key])
+    assert kr.pool_availability("anthropic", FABLE, now=1794960273).available is True
+
+    borrowed = {"id": "cc", "label": "claude code", "auth_type": "oauth", "source": "claude_code",
+                "last_status": "ok"}
+    _write_pool(auth_home, "anthropic", [OAUTH_ROW, borrowed])
+    assert kr.pool_availability("anthropic", FABLE, now=1794960273).available is True
+
+
+def test_routing_pool_check_binds_assignee_secret_scope_under_multiplex(conn, kanban_home, monkeypatch):
+    """t_846f38f4: the multiplexed dispatch tick runs in a fresh Context with no secret scope, so
+    the routing seam must bind the assignee's scope or the token-less ``env:`` row stays capacity."""
+    import contextvars
+    from agent.secret_scope import set_multiplex_active
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    profile = kanban_home / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    _write_pool(profile, "anthropic", [OAUTH_ROW, ENV_ROW])
+    _pin_bench_clock(monkeypatch, 1794960273)  # 00:04:33, fable benched
+
+    def check():
+        return kr.RoutingContext(conn, _cfg()).availability(kr.TierCandidate(FABLE, "anthropic"), str(profile))
+
+    set_multiplex_active(True)
+    try:
+        unset = contextvars.Context().run(check)
+        profile.joinpath(".env").write_text("ANTHROPIC_API_KEY=elias-key\n", encoding="utf-8")
+        key_set = contextvars.Context().run(check)
+    finally:
+        set_multiplex_active(False)
+    assert unset.available is False and unset.until == FABLE_BENCH_UNTIL
+    assert key_set.available is True
 
 
 # ---------------------------------------------------------------------------

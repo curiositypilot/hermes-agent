@@ -105,6 +105,28 @@ def test_empty_pool_says_no_credentials_not_rate_limited(benched_opus_home):
     assert "rate-limited" not in str(exc.value)
 
 
+def test_bench_auth_error_is_rate_limited_exit_75(benched_opus_home):
+    """t_846f38f4: a per-model bench requeues the card (75), it is not a counted crash (1)."""
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+    from hermes_cli.runtime_provider import _anthropic_token_or_raise
+    from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
+
+    with pytest.raises(AuthError, match=RATE_LIMITED) as benched:
+        _anthropic_token_or_raise(model=OPUS)
+    assert is_rate_limited_auth_error(benched.value)
+    flags = credential_failure_flags(benched.value)
+    assert turn_exit_code(None, kanban_worker=True, **flags) == KANBAN_RATE_LIMIT_EXIT_CODE
+
+    (benched_opus_home / "auth.json").write_text(json.dumps({
+        "version": 1, "providers": {}, "credential_pool": {"anthropic": []},
+    }))
+    with pytest.raises(AuthError, match=NO_CREDENTIALS) as empty:
+        _anthropic_token_or_raise(model=OPUS)
+    assert not is_rate_limited_auth_error(empty.value)
+    assert turn_exit_code(None, kanban_worker=True, **credential_failure_flags(empty.value)) == 1
+
+
 def test_non_native_provider_still_builds_without_a_key(benched_opus_home):
     pytest.importorskip("anthropic")
     from agent.agent_init import _init_anthropic_client

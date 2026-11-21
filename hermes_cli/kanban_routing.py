@@ -263,7 +263,8 @@ def pool_availability(provider: Optional[str], model: Optional[str], *, now: Opt
     Mirrors ``CredentialPool._available_entries`` without its side effects
     (no persistence, no token refresh, no env seeding): DEAD rows never count,
     ``exhausted`` rows count again once their reset / TTL passes, and a
-    per-model bench blocks only that model.
+    per-model bench blocks only that model. An env-sourced ``api_key`` row whose
+    variable is unset holds no key the pool could lease, so it is not capacity.
     """
     if not provider:
         return Availability(True, "no provider pinned (not checked)")
@@ -288,8 +289,11 @@ def pool_availability(provider: Optional[str], model: Optional[str], *, now: Opt
             break
     if not raw_entries:
         return Availability(True, "no pool entries (not checked)")
+    usable = [e for e in raw_entries if not _env_row_unset(e)]
+    if not usable:
+        return Availability(False, "no usable credentials (env key unset)")
     entries = []
-    for payload in raw_entries:
+    for payload in usable:
         try:
             entries.append(PooledCredential.from_dict(key, payload))
         except Exception:
@@ -311,6 +315,23 @@ def pool_availability(provider: Optional[str], model: Optional[str], *, now: Opt
                 continue
         return Availability(True, "pool ok")
     return Availability(False, "credential pool exhausted", until=min(waits) if waits else None)
+
+
+def _env_row_unset(payload: dict) -> bool:
+    """An ``api_key`` row seeded from ``env:<VAR>`` with no key on disk and ``VAR`` unset.
+
+    ``CredentialPool._available_entries`` never leases such a row, so counting it would make a
+    benched model look available. Other token-less rows (borrowed/singleton) hydrate on load.
+    """
+    source = str(payload.get("source") or "")
+    if payload.get("auth_type") != "api_key" or payload.get("access_token") or not source.startswith("env:"):
+        return False
+    from agent.credential_pool import get_env_prefer_dotenv
+    from agent.secret_scope import UnscopedSecretError
+    try:
+        return not get_env_prefer_dotenv(source[len("env:"):])
+    except UnscopedSecretError:  # no profile scope to answer from: keep counting the row
+        return False
 
 
 def _profile_model(profile_home: Optional[str]) -> Optional[TierCandidate]:
@@ -339,6 +360,20 @@ def _home_scope(profile_home: Optional[str]):
         yield
     finally:
         reset_hermes_home_override(token)
+
+
+@contextlib.contextmanager
+def _pool_scope(profile_home: Optional[str]):
+    """Home + secret scope of the profile whose pool is checked.
+
+    The dispatch tick runs detached from any turn, so under multiplexing an ``env:`` row's key
+    read (``_env_row_unset``) raises ``UnscopedSecretError`` and the token-less row stays counted.
+    """
+    from hermes_cli.kanban_db_dispatch import _worker_profile_scope
+    from hermes_constants import get_hermes_home
+
+    with _home_scope(profile_home), _worker_profile_scope(str(get_hermes_home()), bind_home=False):
+        yield
 
 
 def resolve_profile_home(assignee: Optional[str]) -> Optional[str]:
@@ -1053,7 +1088,7 @@ class RoutingContext:
             reason = "rate_limited on this board" + (" (fallback)" if source == "fallback" else "")
             result = Availability(False, reason, until=at + self.cfg.cooldown_seconds)
         else:
-            with _home_scope(profile_home):
+            with _pool_scope(profile_home):
                 result = pool_availability(cand.provider, cand.model, now=self.now)
         self._memo[memo_key] = result
         return result
