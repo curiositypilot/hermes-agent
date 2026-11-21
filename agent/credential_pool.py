@@ -5,6 +5,7 @@ from __future__ import annotations
 from agent.credential_pool_admin import CredentialPoolAdminMixin
 from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMixin, model_cooldown_until
 from agent.credential_pool_timestamps import _parse_absolute_timestamp
+from agent.credential_pool_rotation import _singleton_predates_entry, is_billing_bench, note_kept_billing_bench, rotation_is_refresh_only
 
 import logging
 import os
@@ -454,23 +455,6 @@ def _next_billing_streak(extra: dict[str, Any], now: float) -> int:
     if now - prev_bench_end > BILLING_STREAK_CONTINUE_SECONDS:
         return 1
     return prev + 1
-
-
-def _singleton_predates_entry(state: Any, entry: PooledCredential) -> bool:
-    """True only when the auth.json singleton is PROVABLY older than *entry*.
-
-    Both sides stamp ``last_refresh`` on every successful rotation. When
-    either side lacks a parseable stamp this returns False (cannot prove),
-    which keeps the historical adopt-on-difference behavior (#70111) intact
-    for legacy writers.
-    """
-    entry_ts = _parse_absolute_timestamp(entry.last_refresh)
-    if entry_ts is None:
-        return False
-    state_ts = _parse_absolute_timestamp(state.get("last_refresh") if isinstance(state, dict) else None)
-    if state_ts is None:
-        return False
-    return state_ts < entry_ts
 
 
 def _normalize_error_context(error_context: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -1438,11 +1422,16 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                     "Pool entry %s: syncing %s tokens from auth.json (refreshed by another process)",
                     entry.id, display,
                 )
+                # The pair is always adopted (never replay a consumed refresh token); a refresh
+                # restores no credits, so only a re-login ends a billing bench (t_7f8066a9).
+                keep_bench = is_billing_bench(entry) and rotation_is_refresh_only(self.provider, entry, state)
                 field_updates: dict[str, Any] = {
                     "access_token": store_access or entry.access_token,
                     "refresh_token": store_refresh or entry.refresh_token,
-                    **_CLEAR_STATUS,
+                    **({} if keep_bench else _CLEAR_STATUS),
                 }
+                if keep_bench:
+                    note_kept_billing_bench(self.provider, entry)
                 if state.get("last_refresh"):
                     field_updates["last_refresh"] = state["last_refresh"]
                 return self._adopt(entry, **field_updates)
@@ -2493,7 +2482,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
 # --- Seeding --------------------------------------------------------------
 
 
-def _upsert_entry(entries: list[PooledCredential], provider: str, source: str, payload: dict[str, Any]) -> bool:
+def _upsert_entry(
+    entries: list[PooledCredential], provider: str, source: str, payload: dict[str, Any],
+    *, refresh_only: bool = False,
+) -> bool:
     matching_indices = [idx for idx, entry in enumerate(entries) if entry.source == source]
     existing_idx = matching_indices[0] if matching_indices else None
     duplicate_indices = set(matching_indices[1:])
@@ -2530,12 +2522,16 @@ def _upsert_entry(entries: list[PooledCredential], provider: str, source: str, p
                 field_updates[key] = value
         elif key in _EXTRA_KEYS and existing.extra.get(key) != value:
             extra_updates[key] = value
-    # A rotated token makes the old exhaustion/error state stale.
-    if token_changed and existing.last_status is not None:
+    # A rotated token makes the old exhaustion/error state stale, except a billing bench
+    # across a *refresh_only* rotation: a refresh restores no credits (t_7f8066a9).
+    keep_bench = token_changed and refresh_only and is_billing_bench(existing)
+    if keep_bench:
+        note_kept_billing_bench(provider, existing)
+    elif token_changed and existing.last_status is not None:
         field_updates.update(_CLEAR_STATUS)
     # ... and a new secret (re-auth, rotated key) must not inherit the old account's
-    # escalated billing bench.
-    drop_streak = token_changed and any(k in existing.extra for k in BILLING_STREAK_KEYS)
+    # escalated billing bench; a refresh of the same grant keeps its streak.
+    drop_streak = token_changed and not refresh_only and any(k in existing.extra for k in BILLING_STREAK_KEYS)
     if field_updates or extra_updates or drop_streak:
         if extra_updates or drop_streak:
             base_extra = _without_billing_streak(existing.extra) if drop_streak else existing.extra
@@ -2601,12 +2597,13 @@ class _Seeder:
         self.active_sources: set[str] = set()
         self.is_suppressed = _is_source_suppressed_fn()
 
-    def upsert(self, source: str, payload: dict[str, Any]) -> bool:
+    def upsert(self, source: str, payload: dict[str, Any], *, refresh_only: bool = False) -> bool:
         """Upsert unless suppressed (``hermes auth remove`` must stay stable across loads)."""
         if self.is_suppressed(self.provider, source):
             return False
         self.active_sources.add(source)
-        ingested = _upsert_entry(self.entries, self.provider, source, {"source": source, **payload})
+        ingested = _upsert_entry(
+            self.entries, self.provider, source, {"source": source, **payload}, refresh_only=refresh_only)
         self.changed |= ingested
         return ingested
 
@@ -2801,6 +2798,8 @@ def _seed_tokens_singleton(seed: _Seeder, auth_store: dict[str, Any]) -> None:
     else:
         base_url = auth_mod.DEFAULT_XAI_OAUTH_BASE_URL
         custom_label = ""
+    existing = next((e for e in seed.entries if e.source == "device_code"), None)
+    refresh_only = existing is not None and rotation_is_refresh_only(seed.provider, existing, state)
     seed.upsert("device_code", {
         "auth_type": AUTH_TYPE_OAUTH,
         "access_token": tokens.get("access_token", ""),
@@ -2808,7 +2807,7 @@ def _seed_tokens_singleton(seed: _Seeder, auth_store: dict[str, Any]) -> None:
         "base_url": base_url,
         "last_refresh": state.get("last_refresh"),
         "label": custom_label or label_from_token(tokens.get("access_token", ""), "device_code"),
-    })
+    }, refresh_only=refresh_only)
 
 
 def _seed_from_singletons(provider: str, entries: list[PooledCredential]) -> tuple[bool, set[str]]:
