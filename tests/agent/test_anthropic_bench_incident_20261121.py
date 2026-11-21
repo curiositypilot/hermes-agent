@@ -17,7 +17,7 @@ from unittest import mock
 import pytest
 
 FABLE, OPUS, SONNET = "claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5"
-OAUTH_TOKEN = "sk-ant-oat01-incident-dummy"
+OAUTH_TOKEN = "cc-incident-dummy"
 ROW_MARK_AT = 1795264632.0  # 12:37:12, auxiliary title_generation 429: whole row, no model, no reset time
 
 
@@ -108,7 +108,7 @@ def test_dead_only_row_gets_no_usage_token(write_pool):
 def test_two_keyed_rows_are_not_sole_and_keep_the_full_429_bench(write_pool):
     from agent.credential_pool import load_pool
 
-    second = _oauth_row(id="7b0c1d", label="anthropic-oauth-2", priority=1, access_token="sk-ant-oat01-second",
+    second = _oauth_row(id="7b0c1d", label="anthropic-oauth-2", priority=1, access_token="cc-second-dummy",
                         model_cooldowns={})
     write_pool([_oauth_row(row_mark=True, model_cooldowns={}), second, ENV_ROW])
     with _frozen(_at("13:17:10")):  # 40 min after the mark: inside the 60 min bench
