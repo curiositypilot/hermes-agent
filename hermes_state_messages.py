@@ -68,6 +68,11 @@ _ACTIVE_IDS_SQL = "SELECT id FROM messages WHERE session_id = ? AND active = 1 O
 _LIVE_IDENTITY_SQL = ("SELECT id, role, content, tool_call_id, tool_calls, message_uid FROM messages "
                       "WHERE session_id = ? AND active = 1 ORDER BY id LIMIT ?")
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
+# Compaction: tool_call_count is cumulative (the calls the session made), so it only grows; message_count is the live set.
+_COMPACT_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = COALESCE(tool_call_count, 0) + ?"
+_STORED_CALL_IDS_SQL = ("SELECT DISTINCT CASE WHEN j.type = 'object' THEN json_extract(j.value, '$.id') END FROM messages m, "
+    "json_each(CASE WHEN json_valid(m.tool_calls) THEN m.tool_calls ELSE '[]' END) j "
+    "WHERE m.session_id = ? AND m.role = 'assistant' AND m.tool_calls IS NOT NULL")
 _RESET_COUNTERS_SQL = "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?"
 _SET_DISPLAY_META_SQL = "UPDATE messages SET display_metadata = ? WHERE id = ?"
 _ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = ? AND active = 1"
@@ -107,6 +112,20 @@ def _tool_calls_len(raw: Any, scalar: int = 0) -> int:
     """Count of a stored ``tool_calls`` column: list length, *scalar* for a truthy non-list, else 0."""
     parsed = _parse_tool_calls(raw)
     return len(parsed) if isinstance(parsed, list) else (scalar if parsed else 0)
+
+
+def _new_tool_calls_after_compaction(conn, session_id: str, compacted_messages: list[dict[str, Any]]) -> int:
+    """Tool calls in *compacted_messages* whose provider id no stored row (active or not) holds, each id once.
+    Run before the insert. Carried copies and cloned tail rows were counted on append; an id-less call adds 0."""
+    seen = {row[0] for row in conn.execute(_STORED_CALL_IDS_SQL, (session_id,)).fetchall()}
+    new = 0
+    for msg in compacted_messages:
+        calls = _parse_tool_calls(msg.get("tool_calls"))
+        for call_id in (c.get("id") for c in (calls if isinstance(calls, list) else []) if isinstance(c, dict)):
+            if call_id and call_id not in seen:
+                seen.add(call_id)
+                new += 1
+    return new
 
 
 def _scrub_surrogates(value: Any) -> Any:
@@ -887,21 +906,17 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
         # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
         self._carry_parent_timestamps(conn, session_id, compacted_messages)
-        inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
+        new_tool_calls = _new_tool_calls_after_compaction(conn, session_id, compacted_messages)
+        inserted, _tool_calls = self._insert_message_rows(conn, session_id, compacted_messages)
         if clone_ids:
-            _ids, unseen_tool_calls = self._tail_rows_after_watermark(
-                conn,
-                f"SELECT id, tool_calls FROM messages WHERE id IN ({_placeholders(clone_ids)}) ORDER BY id",
-                tuple(clone_ids))
             self._clone_message_rows(conn, clone_ids)
             inserted += len(clone_ids)
-            tool_calls_total += unseen_tool_calls
         # A carried copy whose stored identity was computed differently lands in its own
         # display_order group and would project twice; re-fold before publishing (#122167).
         self._reconcile_display_orders(conn, session_id)
         conn.execute(
-            f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
-            (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
+            f"{_COMPACT_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
+            (inserted, new_tool_calls, *((patched_model_config,) if patch else ()), session_id))
         return inserted
 
     def archive_and_compact(self, session_id: str, compacted_messages: list[dict[str, Any]],
@@ -993,9 +1008,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         # cloned beside it (#137197); its carried dict then has no original below the watermark.
         carried_tail, weak_claims = self._carried_tail_ids(conn, tail_ids, compacted_messages)
         clone_ids = [row_id for row_id in tail_ids if row_id not in carried_tail]
-        _ids, tail_tool_calls = ([], 0) if not clone_ids else self._tail_rows_after_watermark(
-            conn, f"SELECT id, tool_calls FROM messages WHERE id IN ({_placeholders(clone_ids)}) ORDER BY id",
-            tuple(clone_ids))
+        new_tool_calls = _new_tool_calls_after_compaction(conn, session_id, compacted_messages)
         tail_below = tail_count - self._carried_tail_slots(carried_tail, len(compacted_messages), tail_count)
         # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
         # concurrent append would steal a LIMIT slot.
@@ -1022,16 +1035,15 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         # durable row's timestamp so display dedupe still collapses generations. Donors are active-only;
         # the rewound/archived originals above never donate, so this is a no-op for a clean compaction.
         self._carry_parent_timestamps(conn, session_id, compacted_messages)
-        inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
+        inserted, _tool_calls = self._insert_message_rows(conn, session_id, compacted_messages)
         if clone_ids:
             self._clone_message_rows(conn, clone_ids)
             inserted += len(clone_ids)
-            tool_calls_total += tail_tool_calls
         # A carried copy whose stored identity was computed differently lands in its own
         # display_order group and would project twice; re-fold before publishing (#122167).
         self._reconcile_display_orders(conn, session_id)
-        conn.execute(f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
-            (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
+        conn.execute(f"{_COMPACT_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
+            (inserted, new_tool_calls, *((patched_model_config,) if patch else ()), session_id))
         return inserted
 
     def _message_column_names(self, conn) -> list[str]:

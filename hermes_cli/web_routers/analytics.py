@@ -277,8 +277,9 @@ _MODEL_CARD_KEYS = (
 def _attach_tool_calls(db, cutoff: float, raw_rows: list[dict[str, Any]]) -> None:
     """Fill the ``tool_calls`` card metric for per-call rows, in place.
 
-    Tool calls are session-level data (``sessions.tool_call_count``), not per API
-    call, so they cannot come from ``session_model_usage``. Attribute each
+    Tool calls are session-level data (``sessions.tool_call_count``, cumulative
+    across compactions), not per API call, so they cannot come from
+    ``session_model_usage``. Attribute each
     session-window (model, billing_provider) tool-call total to the card of the
     pair its sessions row records — the session's last active route — falling
     back to any card of that model when the pair has no per-call row (route
