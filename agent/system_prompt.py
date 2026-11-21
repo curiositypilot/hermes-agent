@@ -322,12 +322,8 @@ def _worker_skill_categories() -> frozenset[str]:
     as ``tools.tool_search._worker_defer_tools_from``); ``[]`` → off."""
     from hermes_cli.config_defaults import DEFAULT_CONFIG
     default = frozenset(DEFAULT_CONFIG["kanban"]["worker_skill_categories"])
-    try:
-        from hermes_cli.config import load_config_readonly
-        kanban_cfg = (load_config_readonly() or {}).get("kanban")
-    except Exception:  # an unreadable config must not cost the worker its skills index
-        logger.debug("Could not read kanban.worker_skill_categories", exc_info=True)
-        return default
+    from hermes_cli.config import load_config_readonly
+    kanban_cfg = (load_config_readonly() or {}).get("kanban")
     if not isinstance(kanban_cfg, dict) or "worker_skill_categories" not in kanban_cfg:
         return default
     raw = kanban_cfg.get("worker_skill_categories")
