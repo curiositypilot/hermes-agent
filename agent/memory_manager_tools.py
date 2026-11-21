@@ -106,12 +106,8 @@ def memory_provider_tool_defs(agent: Any) -> list[dict[str, Any]]:
 def _defers_memory_tool(defs: list[dict[str, Any]]) -> bool:
     """Whether tool_search is on and names one of ``defs`` in its defer set (incl.
     ``kanban.worker_defer_tools`` inside a dispatcher-owned worker)."""
-    try:
-        from tools.tool_search import load_config
-        cfg = load_config()
-    except Exception:
-        logger.debug("tool_search config unavailable; memory tools stay eager", exc_info=True)
-        return False
+    from tools.tool_search import load_config_readonly  # falls back to defaults itself
+    cfg = load_config_readonly()
     return cfg.enabled != "off" and any(_tool_name(td) in cfg.effective_defer_tools for td in defs)
 
 
