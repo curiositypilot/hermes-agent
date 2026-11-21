@@ -55,6 +55,22 @@ def _sentence(text: object) -> str:
     return str(text).strip().rstrip(".") + "."
 
 
+def _live_rows(provider_id: str, pool: Optional[Any] = None) -> list:
+    """Rows that can re-enter rotation (``agent.credential_pool_capacity``): a loaded *pool*'s, else
+    the persisted rows (no seeding, no writes), an ``env:`` row whose variable is unset dropped."""
+    from agent.credential_pool import STATUS_DEAD, PooledCredential
+    from agent.credential_pool_capacity import capacity_rows, env_row_unset
+    from hermes_cli.auth import read_credential_pool
+
+    with contextlib.suppress(Exception):
+        if pool is not None:
+            return capacity_rows(pool.entries())
+        entries = [PooledCredential.from_dict(provider_id, e) for e in read_credential_pool(provider_id)
+                   if isinstance(e, dict) and not env_row_unset(e)]
+        return [e for e in entries if e.last_status != STATUS_DEAD]
+    return []
+
+
 def pool_cooldown_message(provider_id: str) -> Optional[str]:
     """The "all N credentials … are cooling down" error when the provider's pool is fully benched.
 
@@ -65,14 +81,9 @@ def pool_cooldown_message(provider_id: str) -> Optional[str]:
     the cooldown and its reset time instead; ``None`` when the pool is empty or a credential is
     usable (the caller keeps the missing-credential diagnostic).
     """
-    from agent.credential_pool import STATUS_DEAD, PooledCredential, _exhausted_until
-    from hermes_cli.auth import read_credential_pool
+    from agent.credential_pool import _exhausted_until
 
-    entries = []
-    with contextlib.suppress(Exception):
-        entries = [PooledCredential.from_dict(provider_id, e)
-                   for e in read_credential_pool(provider_id) if isinstance(e, dict)]
-    live = [e for e in entries if e.last_status != STATUS_DEAD]
+    live = _live_rows(provider_id)
     if not live:
         return None
     now = time.time()
@@ -128,24 +139,9 @@ def pool_billing_message(
     ``pool_cooldown_message``). ``None`` when the pool is empty, a credential is usable, no entry is
     currently benched, or none carries a billing verdict.
     """
-    from agent.credential_pool import (
-        FAILURE_REASON_BILLING,
-        STATUS_DEAD,
-        STATUS_EXHAUSTED,
-        PooledCredential,
-        _exhausted_until,
-    )
+    from agent.credential_pool import FAILURE_REASON_BILLING, STATUS_EXHAUSTED, _exhausted_until
 
-    entries: list = []
-    with contextlib.suppress(Exception):
-        if pool is not None:
-            entries = list(pool.entries())
-        else:
-            from hermes_cli.auth import read_credential_pool
-
-            entries = [PooledCredential.from_dict(provider_id, e)
-                       for e in read_credential_pool(provider_id) if isinstance(e, dict)]
-    live = [e for e in entries if getattr(e, "last_status", None) != STATUS_DEAD]
+    live = _live_rows(provider_id, pool)
     if not live:
         return None
     now = time.time()

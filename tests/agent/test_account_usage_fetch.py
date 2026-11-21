@@ -76,7 +76,7 @@ class _RoutingClient:
 def test_anthropic_utilization_is_percent_at_every_value(monkeypatch, utilization):
     # /api/oauth/usage reports utilization in percent (0-100). A "<= 1 means fraction" guess turned
     # a fresh 1% session into 100% and held kanban cards on false quota (t_e1b8bf33).
-    monkeypatch.setattr("agent.account_usage.resolve_anthropic_token", lambda: "sk-ant-oat01-test")
+    monkeypatch.setattr("agent.account_usage.resolve_anthropic_usage_token", lambda: "sk-ant-oat01-test")
     monkeypatch.setattr(
         "agent.account_usage.httpx.Client",
         lambda timeout=15.0: _Client({"five_hour": {"utilization": utilization,

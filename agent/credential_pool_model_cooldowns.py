@@ -119,11 +119,12 @@ class CredentialPoolModelCooldownMixin:
         {model: epoch}}`` for the given *models* no usable entry can serve until a model cooldown
         ends. Read-only: never clears or persists a cooldown.
         """
-        from agent.credential_pool import STATUS_DEAD, _exhausted_until
+        from agent.credential_pool import _exhausted_until
+        from agent.credential_pool_capacity import capacity_rows
 
         now = time.time()
         with self._lock:
-            live = [entry for entry in self._entries if entry.last_status != STATUS_DEAD]
+            live = capacity_rows(self._entries)
             sole = len(live) <= 1
             benched = {entry.id: until for entry in live
                        if (until := _exhausted_until(entry, sole_credential=sole)) and until > now}

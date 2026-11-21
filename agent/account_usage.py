@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import httpx
 
-from agent.anthropic_credentials import _is_oauth_token, resolve_anthropic_token
+from agent.anthropic_credentials import _is_oauth_token, resolve_anthropic_usage_token
 from hermes_cli.auth import AuthError, _read_codex_tokens, resolve_codex_runtime_credentials
 from hermes_cli.auth_codex import _codex_pool_route_base_url
 from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -847,7 +847,7 @@ def _fetch_anthropic_account_usage(
     # report THAT credential's usage. An API key answers the OAuth usage endpoint with
     # 401, so only an OAuth-shaped token reaches the fetch.
     explicit = str(api_key or "").strip()
-    token = explicit or (resolve_anthropic_token() or "").strip()
+    token = explicit or (resolve_anthropic_usage_token() or "").strip()
     if not token:
         return None
     if not _is_oauth_token(token):
