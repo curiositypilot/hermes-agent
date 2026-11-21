@@ -1238,12 +1238,15 @@ def _current_session_platform_hint() -> str:
 def build_skills_system_prompt(
     available_tools: set[str] | None = None, available_toolsets: set[str] | None = None,
     compact_categories: frozenset[str] | None = None, skills_dir_override: Path | None = None,
+    full_categories: frozenset[str] | None = None,
 ) -> str:
     """Compact skill index for the system prompt.
 
     Same-named skills resolve like skill_view: project > local > create_dir > external_dirs, and a
     same-tier duplicate is listed under its exact relative path (``agent.skill_utils.resolve_skill_catalog``).
     ``compact_categories`` (coding posture) demotes categories to a names-only line — nothing is ever hidden.
+    ``full_categories`` (Kanban workers) is the opposite allowlist: when non-empty, every category whose top
+    path segment is not in it is demoted the same way, in union with ``compact_categories``.
     ``skills_dir_override`` makes home resolution EXPLICIT: a build thread that never bound the HERMES_HOME
     ContextVar would otherwise leak the default profile's skills into a bot's prompt.
     """
@@ -1264,7 +1267,7 @@ def build_skills_system_prompt(
         if not skills_dir.exists() and not extra_roots:
             return ""
         return _build_skills_system_prompt_inner(
-            skills_dir, extra_roots, available_tools, available_toolsets, compact_categories)
+            skills_dir, extra_roots, available_tools, available_toolsets, compact_categories, full_categories)
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
@@ -1300,6 +1303,7 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]],
     compact_categories: frozenset[str] | None, unloadable: list[str] = (),
+    full_categories: frozenset[str] | None = None,
 ) -> str:
     """Render the ## Skills block; "" when there is nothing to list. *unloadable* names (different skills
     sharing a name AND relative path within one tier — one root or several) get a rename note instead of a row skill_view would refuse."""
@@ -1307,12 +1311,21 @@ def _render_skills_index(
         return ""
     # Demoted categories collapse to one names-only line. NEVER drop entries — agent-created skills are the
     # model's project memory and it won't rediscover them via skills_list. Nested categories follow their parent.
-    demoted = frozenset(cat for cat in skills_by_category if cat.split("/", 1)[0] in (compact_categories or frozenset()))
-    hidden_note = (
-        "\n(Categories marked [names only] are outside the current coding "
-        "context, so their descriptions are omitted — the skills work "
-        "normally and load with skill_view(name) as usual.)"
-    ) if demoted else ""
+    by_posture = frozenset(cat for cat in skills_by_category if cat.split("/", 1)[0] in (compact_categories or ()))
+    by_scope = frozenset(cat for cat in skills_by_category
+                         if full_categories and cat.split("/", 1)[0] not in full_categories)
+    demoted = by_posture | by_scope
+    if by_scope:
+        hidden_note = ("\n(Categories marked [names only] are rarely needed by Kanban workers, so their descriptions "
+                       "are omitted. Load one with skill_view(name) when its name matches your task.)")
+    elif by_posture:
+        hidden_note = (
+            "\n(Categories marked [names only] are outside the current coding "
+            "context, so their descriptions are omitted — the skills work "
+            "normally and load with skill_view(name) as usual.)"
+        )
+    else:
+        hidden_note = ""
     if unloadable:
         hidden_note += (f"\n(A copy of {', '.join(unloadable)} is not listed: it shares both its name and its path "
                         "with a different skill in the same skills directory tier (e.g. another external_dirs entry), "
@@ -1365,6 +1378,7 @@ def _oneshot_prompt_variant() -> bool:
 def _build_skills_system_prompt_inner(
     skills_dir: Path, extra_roots: list[tuple[int, Path]], available_tools: set[str] | None,
     available_toolsets: set[str] | None, compact_categories: frozenset[str] | None,
+    full_categories: frozenset[str] | None = None,
 ) -> str:
     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
     _platform_hint = _current_session_platform_hint()
@@ -1383,6 +1397,7 @@ def _build_skills_system_prompt_inner(
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
+        tuple(sorted(full_categories or ())),
         _oneshot_prompt_variant(), tuple(plugin_rows),
     )
     snapshot = _load_skills_snapshot(skills_dir, manifest)
@@ -1448,7 +1463,7 @@ def _build_skills_system_prompt_inner(
             logger.debug("Could not write skills prompt snapshot: %s", e)
 
     unloadable = sorted({e["name"] for e in visible_entries if not e["load_name"]})
-    result = _render_skills_index(skills_by_category, compact_categories, unloadable)
+    result = _render_skills_index(skills_by_category, compact_categories, unloadable, full_categories)
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)

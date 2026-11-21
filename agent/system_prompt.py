@@ -310,8 +310,35 @@ def _skills_prompt(agent: Any) -> str:
         _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd())
     except Exception:
         _compact_cats = frozenset()
+    _full_cats = _worker_skill_categories() if owned_kanban_task() else frozenset()
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
-                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
+                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent),
+                                         full_categories=_full_cats or None)
+
+
+def _worker_skill_categories() -> frozenset[str]:
+    """``kanban.worker_skill_categories`` as a category set; empty = no scoping. Absent key → the
+    DEFAULT_CONFIG list; a bare scalar or non-list → one warning plus that default (same contract
+    as ``tools.tool_search._worker_defer_tools_from``); ``[]`` → off."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    default = frozenset(DEFAULT_CONFIG["kanban"]["worker_skill_categories"])
+    try:
+        from hermes_cli.config import load_config_readonly
+        kanban_cfg = (load_config_readonly() or {}).get("kanban")
+    except Exception:  # an unreadable config must not cost the worker its skills index
+        logger.debug("Could not read kanban.worker_skill_categories", exc_info=True)
+        return default
+    if not isinstance(kanban_cfg, dict) or "worker_skill_categories" not in kanban_cfg:
+        return default
+    raw = kanban_cfg.get("worker_skill_categories")
+    is_list_text = isinstance(raw, str) and raw.strip().startswith("[")
+    if raw is None or not (isinstance(raw, (list, tuple, set)) or is_list_text):
+        logger.warning(
+            "kanban.worker_skill_categories is %r, expected a YAML list of skill categories "
+            "(e.g. [devops, dogfood]; [] shows every category in full) - using the default list.", raw)
+        return default
+    from agent.skill_utils import parse_config_string_list
+    return frozenset(c.strip() for c in parse_config_string_list(raw) if c and c.strip())
 
 
 def _auto_load_parts(agent: Any) -> list[str]:
