@@ -323,9 +323,12 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # gate on job MODE before classifying, or a script's own wording ("429", "timed out") would
     # blame the wrong subsystem.
     if not job.get("no_agent"):
+        # The provider the run failed on (run_job stamps it), not the pin: an unpinned job that fell
+        # back has no pin, and provider-scoped codes (xAI's spending limit) need the real one.
+        provider = job.get("_failed_provider") or job.get("provider") or ""
         notice = provider_failure_notice(
-            job_name, job_id, classify_cron_failure_reason(text, provider=job.get("provider") or ""),
-            backup_provider_phrase=_fallback_chain_phrase(job), provider=job.get("provider"))
+            job_name, job_id, classify_cron_failure_reason(text, provider=provider),
+            backup_provider_phrase=_fallback_chain_phrase(job), provider=provider or None)
         if notice is not None:
             return notice
 
@@ -1841,9 +1844,11 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
             if not fallback_permits(fb_provider, data_class):
                 logger.info("Job '%s': fallback %s skipped (data class %s)", job_id, fb_provider, data_class)
                 continue
+            from hermes_cli.fallback_config import (
+                effective_runtime_provider, resolve_entry_api_key, skip_benched_entry)
+            if skip_benched_entry(entry, fb_provider, fb_model):
+                continue
             try:
-                from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
-
                 fb_kwargs = {"requested": fb_provider, "target_model": fb_model}
                 if entry.get("base_url"):
                     fb_kwargs["explicit_base_url"] = entry["base_url"]
@@ -2715,6 +2720,8 @@ def run_job(
         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
         # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
         # tail can schedule a bounded automatic re-run instead of waiting a full period.
+        if isinstance(_failed_on := getattr(agent, "provider", None), str) and _failed_on:
+            job["_failed_provider"] = _failed_on  # read by the failure notice's classifier
         try:
             from cron.unreachable_retry import is_model_unreachable_failure
             if is_model_unreachable_failure(e, agent):
