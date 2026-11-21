@@ -95,7 +95,8 @@ def _run_xai_oauth_login_from_setup() -> bool:
         creds = _xai_oauth_device_code_login(open_browser=not _is_remote_session())
         _save_xai_oauth_tokens(
             creds["tokens"], discovery=creds.get("discovery"), redirect_uri=creds.get("redirect_uri", ""),
-            last_refresh=creds.get("last_refresh"), auth_mode="oauth_device_code", set_active=False)
+            last_refresh=creds.get("last_refresh"), auth_mode="oauth_device_code", set_active=False,
+            login=True)
         # Mirror model/dashboard re-login: clear device_code suppression so the pool can seed
         # from the singleton after a prior `auth remove`.
         unsuppress_credential_source("xai-oauth", "device_code")

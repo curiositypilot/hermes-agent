@@ -910,3 +910,92 @@ def test_pool_sync_back_preserves_active_provider(tmp_path, monkeypatch):
     state = raw_after["providers"]["xai-oauth"]["tokens"]
     assert state["access_token"] == new_access
     assert state["refresh_token"] == "rt-rotated"
+
+
+# ---------------------------------------------------------------------------
+# Login stamp: the pool ends a billing bench only for a login after it (t_7f8066a9)
+# ---------------------------------------------------------------------------
+
+
+def _xai_state(hermes_home: Path) -> dict:
+    return json.loads((hermes_home / "auth.json").read_text())["providers"]["xai-oauth"]
+
+
+def test_login_save_stamps_logged_in_at_and_a_refresh_save_keeps_it(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    _save_xai_oauth_tokens({"access_token": "a-login", "refresh_token": "r-login"}, login=True,
+                           set_active=False)
+    stamp = _xai_state(hermes_home)["logged_in_at"]
+    assert stamp.endswith("Z")
+
+    _save_xai_oauth_tokens({"access_token": "a-refresh", "refresh_token": "r-refresh"},
+                           last_refresh="2099-01-01T00:00:00Z", set_active=False)
+    state = _xai_state(hermes_home)
+    assert state["tokens"]["access_token"] == "a-refresh"
+    assert state["logged_in_at"] == stamp
+
+
+def test_default_save_writes_no_login_stamp(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    _save_xai_oauth_tokens({"access_token": "a2", "refresh_token": "r2"}, set_active=False)
+
+    assert "logged_in_at" not in _xai_state(hermes_home)
+
+
+def _cli_login() -> None:
+    from types import SimpleNamespace
+
+    from hermes_cli.auth import _login_xai_oauth
+
+    _login_xai_oauth(SimpleNamespace(no_browser=True, timeout=3), None, force_new_login=True)
+
+
+def _setup_login() -> None:
+    from hermes_cli.setup_tts import _run_xai_oauth_login_from_setup
+
+    assert _run_xai_oauth_login_from_setup() is True
+
+
+def _dashboard_login() -> None:
+    import hermes_cli.web_routers.oauth as rt_oauth
+    import hermes_cli.web_server_oauth as web_oauth
+
+    sid, sess = rt_oauth._new_oauth_session("xai-oauth", "device_code")
+    sess.update(device_code="dc", expires_at=time.time() + 600, interval=1)
+    try:
+        web_oauth._xai_device_poller(sid)
+    finally:
+        web_oauth._oauth_sessions.pop(sid, None)
+    assert sess["status"] == "approved", sess.get("error_message")
+
+
+@pytest.mark.parametrize("login", [_cli_login, _setup_login, _dashboard_login],
+                         ids=["hermes-model", "setup", "dashboard"])
+def test_every_interactive_login_path_stamps_logged_in_at(tmp_path, monkeypatch, login):
+    """A login path that forgets ``login=True`` would leave a re-login unable to end a bench."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True)
+    (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    tokens = {"access_token": _jwt_with_exp(int(time.time()) + 7200), "refresh_token": "rt-login",
+              "id_token": "", "token_type": "Bearer"}
+    monkeypatch.setattr("hermes_cli.auth._xai_oauth_device_code_login", lambda **_k: {
+        "tokens": tokens, "discovery": {"token_endpoint": "https://auth.x.ai/token"},
+        "redirect_uri": "", "base_url": DEFAULT_XAI_OAUTH_BASE_URL, "last_refresh": "2026-11-21T10:00:00Z"})
+    monkeypatch.setattr("hermes_cli.auth._xai_oauth_discovery",
+                        lambda *_a, **_k: {"token_endpoint": "https://auth.x.ai/token"})
+    monkeypatch.setattr("hermes_cli.auth._xai_oauth_poll_device_token", lambda *_a, **_k: dict(tokens))
+    monkeypatch.setattr("hermes_cli.auth._update_config_for_provider", lambda *_a, **_k: "config.yaml")
+    monkeypatch.setattr("hermes_cli.auth._is_remote_session", lambda: True)
+
+    login()
+
+    state = _xai_state(hermes_home)
+    assert state["tokens"]["refresh_token"] == "rt-login"
+    assert state.get("logged_in_at"), "login path did not pass login=True"

@@ -326,7 +326,7 @@ def _xai_device_poller(session_id: str, sess: dict[str, Any]) -> None:
             return
         # set_active=False: persist without hijacking an existing active chat provider.
         _save_xai_oauth_tokens(
-            tokens, discovery=discovery, auth_mode="oauth_device_code", set_active=False,
+            tokens, discovery=discovery, auth_mode="oauth_device_code", set_active=False, login=True,
             last_refresh=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         )
         # Mirror `hermes auth add xai-oauth`: first credential may become active; never overwrite.

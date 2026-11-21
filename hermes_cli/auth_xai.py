@@ -127,12 +127,14 @@ def _write_through_xai_oauth_to_global_root(state: dict[str, Any]) -> None:
 def _save_xai_oauth_tokens(
     tokens: dict[str, Any], *, discovery: Optional[dict[str, Any]] = None, redirect_uri: str = "",
     last_refresh: Optional[str] = None, auth_mode: str = "oauth_device_code",
-    set_active: bool = True,
+    set_active: bool = True, login: bool = False,
 ) -> None:
     """Persist xAI OAuth tokens; *set_active* also promotes ``xai-oauth`` to ``active_provider``.
 
     Pass ``set_active=False`` for side-tool bootstrap (TTS/setup, tools config, dashboard, refresh)
-    so inference routing is unchanged.
+    so inference routing is unchanged. Interactive logins pass ``login=True`` to stamp
+    ``logged_in_at``: the pool ends a billing bench only for a login after it, never for a
+    refresh, which restores no credits (``agent/credential_pool_rotation.py``).
     """
     from hermes_cli.auth import _auth_store_lock, _global_auth_file_path, _load_auth_store, _load_provider_state_with_source, _same_path, _save_auth_store, _store_provider_state, _utc_now_z, _write_through_xai_oauth_to_global_root
     if last_refresh is None:
@@ -145,6 +147,8 @@ def _save_xai_oauth_tokens(
         state, source_path = _load_provider_state_with_source(auth_store, "xai-oauth")
         state = state if state is not None else {}
         state.update(tokens=tokens, last_refresh=last_refresh, auth_mode=auth_mode)
+        if login:
+            state["logged_in_at"] = _utc_now_z()
         if discovery:
             state["discovery"] = discovery
         if redirect_uri:
@@ -491,7 +495,7 @@ def _login_xai_oauth(args, pconfig: ProviderConfig, *, force_new_login: bool = F
     _save_xai_oauth_tokens(
         creds["tokens"], discovery=creds.get("discovery"),
         redirect_uri=creds.get("redirect_uri", ""), last_refresh=creds.get("last_refresh"),
-        auth_mode="oauth_device_code",
+        auth_mode="oauth_device_code", login=True,
     )
     # Explicit re-login re-enables the credential: clear the ``device_code`` suppression marker left
     # by ``hermes auth remove xai-oauth``. Deliberately NOT inside _save_xai_oauth_tokens — the
