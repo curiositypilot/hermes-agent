@@ -992,3 +992,49 @@ class TestConversationStartedTwoLine:
         vol = self._volatile(agent)
         assert "Conversation started:" not in vol
         assert "as of the last context rebuild" not in vol
+
+
+_DEFAULT_WORKER_CATEGORIES = ("devops", "dogfood", "hardware", "note-taking", "software-development",
+                              "autonomous-ai-agents", "web")
+
+
+@pytest.mark.parametrize("owned, kanban_cfg, expect_scoped, expect_warning", [
+    (True, None, True, False),                                       # key absent -> default list
+    (False, None, False, False),                                     # same config, not a worker
+    (True, {"worker_skill_categories": []}, False, False),           # [] turns scoping off
+    (True, {"worker_skill_categories": "devops"}, True, True),       # scalar typo -> warn + default
+])
+def test_worker_skill_categories_gate(monkeypatch, tmp_path, caplog, owned, kanban_cfg, expect_scoped, expect_warning):
+    """Only an owned Kanban worker gets the scoped index, and the default list keeps exactly the seven
+    categories workers load in full (pinned: a truncated default would demote one of them)."""
+    import logging
+
+    from agent import prompt_builder
+    from agent import system_prompt as sp
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for category in (*_DEFAULT_WORKER_CATEGORIES, "research"):
+        d = tmp_path / "skills" / category / f"{category}-skill"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(f"---\nname: {category}-skill\ndescription: about {category}\n---\n")
+    config = {"kanban": kanban_cfg} if kanban_cfg is not None else {}
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+    monkeypatch.setattr(sp, "owned_kanban_task", lambda: "t_worker" if owned else "")
+    monkeypatch.setattr("agent.coding_context.coding_compact_skill_categories", lambda **_kw: frozenset())
+    prompt_builder.clear_skills_system_prompt_cache(clear_snapshot=True)
+    agent = _make_agent(valid_tool_names={"skill_view"})
+
+    with caplog.at_level(logging.WARNING, logger="agent.system_prompt"):
+        index = sp._skills_prompt(agent)
+    prompt_builder.clear_skills_system_prompt_cache(clear_snapshot=True)
+
+    warnings = [r for r in caplog.records if "worker_skill_categories" in r.getMessage()]
+    assert len(warnings) == (1 if expect_warning else 0)
+    assert ("[names only]" in index) is expect_scoped
+    for category in _DEFAULT_WORKER_CATEGORIES:
+        assert f"about {category}" in index
+    if expect_scoped:
+        assert "research [names only]: research-skill" in index
+        assert "about research" not in index
+    else:
+        assert "about research" in index

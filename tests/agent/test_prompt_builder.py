@@ -297,6 +297,57 @@ class TestBuildSkillsSystemPrompt:
         full = build_skills_system_prompt()
         assert "Write threads" in full
 
+
+    @staticmethod
+    def _scoped_tree(tmp_path):
+        for rel, desc in (("devops/a", "Alpha ops"), ("devops/sub/b", "Bravo nested"),
+                          ("devops-extra/c", "Charlie extra"), ("research/d", "Delta research"),
+                          ("research/e", "Echo research")):
+            d = tmp_path / "skills" / rel
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(f"---\nname: {rel.rsplit('/', 1)[-1]}\ndescription: {desc}\n---\n")
+
+    @staticmethod
+    def _index_names(prompt):
+        import re
+        body = prompt.split("<available_skills>", 1)[1].split("</available_skills>", 1)[0]
+        names = set()
+        for line in body.splitlines():
+            if "[names only]:" in line:
+                names |= {n.strip() for n in line.split("[names only]:", 1)[1].split(",")}
+            elif m := re.match(r"\s*- ([^:]+)", line):
+                names.add(m.group(1).strip())
+        return names
+
+    def test_full_categories_demote_the_rest(self, monkeypatch, tmp_path):
+        """Kanban-worker allowlist: categories outside it keep their names, lose descriptions.
+        Top-segment equality: devops/sub follows devops, devops-extra does not."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._scoped_tree(tmp_path)
+        unscoped = build_skills_system_prompt()
+        scoped = build_skills_system_prompt(full_categories=frozenset({"devops"}))
+        assert "Alpha ops" in scoped and "Bravo nested" in scoped
+        for desc in ("Charlie extra", "Delta research", "Echo research"):
+            assert desc not in scoped
+        assert "research [names only]: d, e" in scoped
+        assert self._index_names(scoped) == self._index_names(unscoped) == {"a", "b", "c", "d", "e"}
+        assert "rarely needed by Kanban workers" in scoped
+        assert "outside the current coding" not in scoped
+
+    def test_full_categories_unset_or_empty_and_posture_note_unchanged(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._scoped_tree(tmp_path)
+        baseline = build_skills_system_prompt()
+        assert "[names only]" not in baseline
+        assert build_skills_system_prompt(full_categories=None) == baseline
+        assert build_skills_system_prompt(full_categories=frozenset()) == baseline
+        # Cache key: an unscoped build after a scoped one is not served the scoped text.
+        build_skills_system_prompt(full_categories=frozenset({"devops"}))
+        assert build_skills_system_prompt() == baseline
+        posture = build_skills_system_prompt(compact_categories=frozenset({"research"}))
+        assert "outside the current coding" in posture
+        assert "rarely needed by Kanban workers" not in posture
+
     def test_skills_block_loads_by_trigger_not_by_default(self, monkeypatch, tmp_path):
         """Progressive disclosure: the interactive block tells the model to load a skill when its
         description names the task and to open references only on demand — not to load anything

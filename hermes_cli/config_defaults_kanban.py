@@ -49,6 +49,15 @@ KANBAN_DEFAULTS = {
         # Extra tools deferred only inside a dispatcher-owned worker
         # (tool_search.py effective_defer_tools, gated on owned_kanban_task()); [] turns it off.
         "worker_defer_tools": ["delegate_task", "session_search"],
+        # Skill categories a dispatcher-owned worker sees with descriptions in the skills index
+        # (agent/system_prompt.py _skills_prompt, gated on owned_kanban_task()); every other
+        # category becomes one names-only line, so each skill stays loadable by name. These are
+        # the categories workers loaded in 7 d (2026-11, t_60b5f1cc) plus two one-skill
+        # categories where names-only saves nothing. [] shows every category in full.
+        "worker_skill_categories": [
+            "devops", "dogfood", "hardware", "note-taking", "software-development",
+            "autonomous-ai-agents", "web",
+        ],
         # Worker sandbox (hermes_cli/kanban_sandbox.py): "off" | "bwrap" (bubblewrap, Linux), read at
         # every spawn. Run `hermes kanban sandbox-selftest` on the host before turning it on.
         "sandbox": "off",
