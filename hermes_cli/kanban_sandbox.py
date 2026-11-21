@@ -15,7 +15,9 @@ Hindsight docker work). Policy, ported from the 2026-10 sandbox prototype (decis
 - Private ``/tmp`` and a per-run scratch dir: the shared ``~/.hermes/cache/scratch`` (which holds
   other sessions' ``hermes_rpc_*.sock`` kernel sockets) is covered by a tmpfs and only this run's
   ``kanban-<task>-r<run>`` subdir is bound back; ``TMPDIR`` and :func:`hermes_constants.get_scratch_dir`
-  both resolve to it (``HERMES_SANDBOX_SCRATCH_DIR``).
+  both resolve to it (``HERMES_SANDBOX_SCRATCH_DIR``). ``/var/tmp`` is private too, bound from the
+  run's ``<scratch>/.var-tmp``: disk-backed, because the test runner and ``tests/conftest.py`` keep
+  their scratch roots under ``/var/tmp`` and a full run writes gigabytes.
 - tmpfs over ``~/.ssh ~/.config/gh ~/.gnupg ~/.hermes/mcp-tokens ~/.hermes/.wallet-backups
   $XDG_RUNTIME_DIR`` (the last hides the systemd user bus, which can run commands on the host).
 - ``/dev/null`` over wallets, the Telegram user session, ``.anthropic_oauth.json``, project
@@ -258,6 +260,22 @@ def _git_common_dir(workspace: Path) -> Optional[Path]:
     return Path(path) if out.returncode == 0 and path and os.path.isdir(path) else None
 
 
+def _private_var_tmp_binds(scratch: Path, home: Path) -> list[str]:
+    """A private, disk-backed ``/var/tmp`` from ``<scratch>/.var-tmp`` (the test runner's scratch
+    root; tmpfs would be RAM-backed). The dot name survives ``rm -rf "$TMPDIR"/*``, which would
+    otherwise delete the mount source. A home under ``/var/tmp`` is bound back read-only so the
+    later masks still apply to the real home tree, not to writable mount-point stubs."""
+    var_tmp = Path("/var/tmp")  # no-tmp: ok — the sandbox's private /var/tmp, backed by run scratch
+    if not var_tmp.is_dir():
+        return []
+    private = scratch / ".var-tmp"
+    private.mkdir(exist_ok=True)
+    binds = ["--bind", str(private), str(var_tmp)]
+    if _is_under(home, var_tmp):
+        binds += ["--ro-bind", str(home), str(home)]
+    return binds
+
+
 def _is_under(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
@@ -359,6 +377,7 @@ def build_sandbox(
         "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
         "--tmpfs", "/tmp",  # no-tmp: ok — a private, empty /tmp inside the sandbox
     ]
+    a += _private_var_tmp_binds(scratch, home)
     # Read-write grants first: a later mask must win over any grant that contains it.
     rw = [hermes_root, *(home / d for d in RW_HOME_DIRS)]
     if ws.is_dir():
@@ -639,6 +658,13 @@ def _probe(spec: dict) -> list[dict]:
         check("private tmp is empty and writable", entries == [".probe"], ",".join(entries)[:80])
     except OSError as exc:
         check("private tmp is empty and writable", False, str(exc))
+    private_var_tmp = Path("/var/tmp")  # no-tmp: ok — probes the sandbox's private /var/tmp
+    try:
+        (private_var_tmp / ".probe").write_text("ok", encoding="utf-8")
+        entries = sorted(os.listdir(private_var_tmp))
+        check("private /var/tmp is empty and writable", entries == [".probe"], ",".join(entries)[:80])
+    except OSError as exc:
+        check("private /var/tmp is empty and writable", False, str(exc))
     bashrc = Path(spec["home"]) / ".bashrc"
     try:
         with open(bashrc, "a", encoding="utf-8"):
