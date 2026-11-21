@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.agent import test_anthropic_keyless_client_guard as _keyless_guard
 from tests.gateway.test_managed_turn_contract import assignment
 
 BASE_URL = 'https://api.minimax.io/anthropic'
@@ -313,3 +314,18 @@ def test_keyless_worker_on_a_fallback_never_sends_its_key_to_the_primary_endpoin
     assert primary and fallback_key not in primary
     assert all(fallback_key != key for key, _ in clients)
     assert built['api_key'] is None
+
+
+OPUS = _keyless_guard.OPUS
+benched_opus_home = _keyless_guard.benched_opus_home  # the shared pytest fixture
+
+
+def test_benched_anthropic_worker_starts_on_its_fallback(tmp_path, monkeypatch, benched_opus_home):
+    """Incident replay (intake t_c772c3dc): route resolution walks the benched Anthropic primary to
+    its fallback, ``worker_route`` returns {} and the real agent is built key-less on Anthropic. Its
+    init-time chain must bind the fallback instead of raising the bench's AuthError."""
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'fake-or-' + secrets.token_hex(8))
+    frame = _routed_frame(tmp_path, monkeypatch, OPUS, {'provider': 'anthropic'})
+    agent = _constructed_agent(_with_turn_chain(frame, [FALLBACK]), monkeypatch)
+    assert (agent.provider, agent.model) == (FALLBACK['provider'], FALLBACK['model'])
+    assert agent._anthropic_client is None and agent.client is not None

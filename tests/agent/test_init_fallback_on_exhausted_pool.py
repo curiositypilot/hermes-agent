@@ -437,3 +437,88 @@ def test_init_openrouter_no_chain_keeps_generic_sentence(monkeypatch):
     with pytest.raises(RuntimeError, match="No LLM provider configured") as exc:
         _build(lambda provider, model=None, **_: (None, None), None)
     assert "This route cannot fall back" not in str(exc.value)
+
+
+# --- a benched native Anthropic primary walks the init chain (intake t_c772c3dc) ---------------
+# A managed worker builds its agent key-less when route resolution landed on a fallback
+# (``worker_route`` returns {}, #139155). The anthropic_messages branch raised AuthError before
+# the chain was ever consulted, so every Kanban start died during a bench.
+
+from tests.agent import test_anthropic_keyless_client_guard as _keyless_guard
+
+EXPLICIT_KEY, OPUS, RATE_LIMITED = _keyless_guard.EXPLICIT_KEY, _keyless_guard.OPUS, _keyless_guard.RATE_LIMITED
+benched_opus_home = _keyless_guard.benched_opus_home  # the shared pytest fixture
+
+SONNET = "claude-sonnet-4-6"
+OR_ENTRY = {"provider": "openrouter", "model": "x-model"}
+
+
+def _benched_agent(chain, seen, api_key=None):
+    """A real AIAgent on the benched OPUS primary. Only openrouter is stubbed; anthropic entries
+    go through the real resolver against the fixture's auth store."""
+    from agent import auxiliary_client
+    real = auxiliary_client.resolve_provider_client
+
+    def resolve(provider, model=None, **kw):
+        seen.append(provider)
+        if provider == "openrouter":
+            return _mock_client(base_url="https://openrouter.ai/api/v1"), model
+        return real(provider, model=model, **kw)
+
+    with patch("agent.auxiliary_client.resolve_provider_client", side_effect=resolve), \
+         patch("model_tools.get_tool_definitions", return_value=_make_tool_defs()), \
+         patch("model_tools.check_toolset_requirements", return_value={}), \
+         patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+        return AIAgent(provider="anthropic", model=OPUS, api_mode="anthropic_messages", api_key=api_key,
+                       base_url="https://api.anthropic.com", quiet_mode=True, skip_context_files=True,
+                       skip_memory=True, fallback_model=chain)
+
+
+def test_benched_anthropic_primary_walks_init_fallback(benched_opus_home):
+    agent = _benched_agent([OR_ENTRY], [])
+    assert (agent.provider, agent.model) == ("openrouter", "x-model")
+    assert agent.api_mode == "chat_completions"
+    assert agent._anthropic_client is None and agent.client is not None
+    assert agent._fallback_activated is True
+
+
+def test_benched_anthropic_primary_skips_benched_anthropic_entry(benched_opus_home):
+    seen = []
+    agent = _benched_agent([{"provider": "anthropic", "model": OPUS}, OR_ENTRY], seen)
+    assert seen[:2] == ["anthropic", "openrouter"]
+    assert agent.provider == "openrouter" and agent._anthropic_client is None
+
+
+def test_benched_anthropic_primary_falls_back_to_anthropic_model(benched_opus_home):
+    seen = []
+    agent = _benched_agent([{"provider": "anthropic", "model": SONNET}, OR_ENTRY], seen)
+    assert "openrouter" not in seen
+    assert (agent.provider, agent.model, agent.api_mode) == ("anthropic", SONNET, "anthropic_messages")
+    assert agent._anthropic_client is not None and agent.client is None
+
+
+def test_benched_anthropic_primary_no_chain_raises(benched_opus_home):
+    from hermes_cli.auth import AuthError
+    with pytest.raises(AuthError, match=RATE_LIMITED):
+        _benched_agent([], [])
+
+
+def test_benched_anthropic_primary_pinned_raises(benched_opus_home, monkeypatch):
+    """A pinned Kanban route keeps its exit-75 requeue: the chain is never walked."""
+    from hermes_cli.auth import AuthError
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_x")
+    monkeypatch.setenv("HERMES_KANBAN_PINNED", "1")
+    monkeypatch.setenv("HERMES_DATA_CLASS", "internal")  # dispatcher-resolved class for the worker
+    seen = []
+    with pytest.raises(AuthError, match=RATE_LIMITED):
+        _benched_agent([OR_ENTRY], seen)
+    assert seen == []
+
+
+def test_benched_anthropic_primary_with_explicit_key_does_not_walk(benched_opus_home):
+    pytest.importorskip("anthropic")
+    seen = []
+    agent = _benched_agent([OR_ENTRY], seen, api_key=EXPLICIT_KEY)
+    assert seen == []
+    assert (agent.provider, agent.model) == ("anthropic", OPUS)
+    assert agent._anthropic_client is not None and not agent._fallback_activated

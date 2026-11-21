@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 
 def test_explicit_client_kwargs_injects_command_for_any_external_process_profile(monkeypatch):
-    from agent.agent_init import _explicit_client_kwargs
+    from agent.agent_init_client_kwargs import _explicit_client_kwargs
     from providers.base import ProviderProfile
 
     profile = ProviderProfile(name="test-process-provider", auth_type="external_process")

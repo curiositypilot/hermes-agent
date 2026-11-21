@@ -199,7 +199,8 @@ def worker_route(policy, construct):
     is not the route: a per-model api_mode (opencode-go Responses models) and a resolved endpoint
     (Bedrock's regional URL) come only from resolution. A fallback entry's route belongs to another
     provider and model, so the primary never carries it; the agent's own fallback chain switches them
-    together (#139155).
+    together (#139155): its init-time walk (``walk_init_fallback_chain``) binds the entry for a
+    key-less primary on either wire mode, OpenAI-wire or native Anthropic.
 
     A primary AuthError walks the chain the agent will actually get: the owner's per-turn
     ``construct_v1`` chain (an ordinary session's refreshed profile fallbacks) when it was sent,

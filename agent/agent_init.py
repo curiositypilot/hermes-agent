@@ -20,9 +20,10 @@ from contextlib import suppress
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
+from agent.agent_init_client_kwargs import _explicit_client_kwargs
 from agent.agent_init_fallback import _init_fallback_chain, walk_init_fallback_chain
 from agent.agent_init_params import _CALLBACK_PARAMS, _GATEWAY_IDENTITY_PARAMS, _PASSTHROUGH_PARAMS
 from agent.agent_runtime_helpers import _ra
@@ -735,39 +736,6 @@ def _init_bedrock_client(agent, base_url):
         print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock, {agent._bedrock_region}{_gr_label})")
 
 
-def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> dict[str, Any]:
-    """OpenAI-client kwargs from explicit CLI/gateway credentials (auth already resolved)."""
-    _parsed_url = urlparse(base_url)
-    client_kwargs = {"api_key": api_key, "base_url": base_url}
-    if _parsed_url.query:
-        client_kwargs["base_url"] = urlunparse(_parsed_url._replace(query=""))
-        client_kwargs["default_query"] = {k: v[0] for k, v in parse_qs(_parsed_url.query).items()}
-    if _provider_timeout is not None:
-        client_kwargs["timeout"] = _provider_timeout
-    # ACP/subprocess providers take launch kwargs instead of HTTP credentials. Keyed on the profile's
-    # auth_type, not a vendor slug: every external_process plugin gets this launch path (#102421).
-    from hermes_cli.runtime_provider_backends import _is_external_process_provider
-
-    if _is_external_process_provider(agent.provider):
-        client_kwargs["command"] = agent.acp_command
-        client_kwargs["args"] = agent.acp_args
-    from agent.provider_route_hooks import route_answer
-    _headers_for = _host_default_headers_factory(base_url)
-    if _headers_for is not None:
-        client_kwargs["default_headers"] = _headers_for(api_key, base_url)
-    elif _route_headers := route_answer("client_headers", provider=str(agent.provider or ""), base_url=base_url, scope=agent,
-                                        api_key=api_key if isinstance(api_key, str) else ""):
-        client_kwargs["default_headers"] = _route_headers
-    elif "default_headers" not in client_kwargs:
-        # Static profile.default_headers (Vercel AI Gateway attribution, Kimi UA on non-kimi.com endpoints).
-        with suppress(Exception):
-            from providers import get_provider_profile as _gpf
-            _ph = _gpf(agent.provider)
-            if _ph and _ph.default_headers:
-                client_kwargs["default_headers"] = dict(_ph.default_headers)
-    return client_kwargs
-
-
 def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[dict[str, Any]]:
     """OpenAI-client kwargs via the centralized provider router (no explicit creds).
 
@@ -808,12 +776,8 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     if _refused_entries or _pool_exhausted:
         # Neutral wording: the explicit-provider branch below raises the provider-specific
         # missing-credentials message, not the generic "No LLM provider configured" one.
-        logger.warning(
-            "Init-time provider resolution failed: primary %r unresolvable (%s); fallback entries refused: %s",
-            agent.provider,
-            "credential pool exhausted" if _pool_exhausted else "no usable credentials",
-            "; ".join(f"{_p} ({_r})" for _p, _r in _refused_entries) or "none configured",
-        )
+        _log_init_resolution_failure(
+            agent, "credential pool exhausted" if _pool_exhausted else "no usable credentials", _refused_entries)
     # A burned pool is billing, not setup (#94785, #56810): name it before the missing-key
     # branch. A suppressed openrouter route names its missing key, not the first-run sentence.
     if _pool_exhausted:
@@ -879,17 +843,34 @@ def _apply_openai_header_policy(agent, client_kwargs: dict[str, Any]) -> None:
         logger.debug("custom-provider TLS resolution skipped", exc_info=True)
 
 
+def _log_init_resolution_failure(agent, reason: str, refused: list) -> None:
+    logger.warning(
+        "Init-time provider resolution failed: primary %r unresolvable (%s); fallback entries refused: %s",
+        agent.provider, reason, "; ".join(f"{_p} ({_r})" for _p, _r in refused) or "none configured",
+    )
+
+
+def _print_prebound_fallback_banner(agent) -> None:
+    """Banner for an init-time fallback that bound the MoA facade or a native client itself."""
+    if not agent.quiet_mode:
+        _kind = "MoA preset" if agent.provider == "moa" else f"fallback model ({agent.provider})"
+        print(f"🤖 AI Agent initialized with {_kind}: {agent.model}")
+
+
 def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_timeout):
     """OpenAI-wire client: resolve kwargs, apply header/TLS policy, construct."""
     if api_key and base_url:
         client_kwargs = _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout)
     else:
         client_kwargs = _routed_client_kwargs(agent, fallback_model, _provider_timeout)
-        if client_kwargs is None:  # init-time fallback bound the MoA facade or a native client
-            if not agent.quiet_mode:
-                _kind = "MoA preset" if agent.provider == "moa" else f"fallback model ({agent.provider})"
-                print(f"🤖 AI Agent initialized with {_kind}: {agent.model}")
+        if client_kwargs is None:
+            _print_prebound_fallback_banner(agent)
             return
+    _construct_openai_client(agent, client_kwargs, base_url, _provider_timeout)
+
+
+def _construct_openai_client(agent, client_kwargs, base_url, _provider_timeout):
+    """Bind resolved OpenAI-wire kwargs: wire mode, Bedrock/header/TLS policy, the client itself."""
     from hermes_cli.providers import is_actual_route
     if is_actual_route(agent.provider, client_kwargs.get("base_url", "")):
         agent.api_mode = "chat_completions"
@@ -898,7 +879,7 @@ def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_time
     try:
         from agent.bedrock_adapter import configure_bedrock_openai_client_kwargs
         configure_bedrock_openai_client_kwargs(client_kwargs, timeout=_provider_timeout)
-    except Exception:
+    except Exception:  # health: allow BLE001 -- moved verbatim from _init_openai_client; re-raises on a bedrock-mantle route
         if agent.provider == "bedrock" and "bedrock-mantle." in str(client_kwargs.get("base_url", "")):
             raise
 
@@ -915,8 +896,33 @@ def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_time
             from gateway.warning_notifications import warning_notifications_enabled
             _print_key_banner(client_kwargs.get("api_key", "none"), "API key",
                               warn_missing=warning_notifications_enabled(agent.platform))
-    except Exception as e:
+    except Exception as e:  # health: allow BLE001 -- moved verbatim from _init_openai_client; re-raises as RuntimeError
         raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
+
+
+def _init_anthropic_or_fallback(agent, api_key, base_url, fallback_model, _provider_timeout):
+    """A key-less native Anthropic primary whose token is missing or benched walks the init-time
+    fallback chain, as a key-less OpenAI-wire primary does in ``_routed_client_kwargs``. A managed
+    worker whose route resolved to a fallback is built exactly so (``worker_route`` returns {}).
+    The walk applies the same filters (Kanban pin, ``--no-fallback``, data class, chat-only); an
+    empty or fully refused chain re-raises the original AuthError (rate-limit text, exit-75 requeue).
+    """
+    from hermes_cli.auth_constants import AuthError
+    try:
+        _init_anthropic_client(agent, api_key, base_url, _provider_timeout)
+        return
+    except AuthError as exc:
+        if agent.provider != "anthropic" or api_key:
+            raise
+        _refused = []
+        _taken, _fb_kwargs = walk_init_fallback_chain(agent, fallback_model, _provider_timeout, _refused)
+        if not _taken:
+            _log_init_resolution_failure(agent, str(exc), _refused)
+            raise
+    if _fb_kwargs is None:
+        _print_prebound_fallback_banner(agent)
+        return
+    _construct_openai_client(agent, _fb_kwargs, None, _provider_timeout)
 
 
 def _build_client(agent, api_key, base_url, fallback_model):
@@ -926,46 +932,13 @@ def _build_client(agent, api_key, base_url, fallback_model):
     agent._is_anthropic_oauth = False
     _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
     if agent.api_mode == "anthropic_messages":
-        _init_anthropic_client(agent, api_key, base_url, _provider_timeout)
+        _init_anthropic_or_fallback(agent, api_key, base_url, fallback_model, _provider_timeout)
     elif agent.provider == "moa":
         _init_moa_client(agent, api_key)
     elif agent.api_mode == "bedrock_converse":
         _init_bedrock_client(agent, base_url)
     else:
         _init_openai_client(agent, api_key, base_url, fallback_model, _provider_timeout)
-
-
-def _lazy_headers(module: str, name: str, pass_key: bool = False, pass_base: bool = False):
-    """Header factory ``(api_key, base_url) -> dict`` importing ``module.name`` at call time.
-    ``pass_key`` forwards ``(key, base_url=base)``; ``pass_base`` forwards ``(base)``."""
-    def factory(key, base):
-        import importlib
-        fn = getattr(importlib.import_module(module), name)
-        if pass_key:
-            return fn(key, base_url=base)
-        return fn(base) if pass_base else fn()
-    return factory
-
-
-# Host → default_headers factory for explicit base_url client construction. Ordered: first
-# host match wins; no match falls back to the provider profile's declared headers.
-_HOST_DEFAULT_HEADERS: list[tuple[str, Callable[[Any, str], dict[str, str]]]] = [
-    ("openrouter.ai", _lazy_headers("agent.auxiliary_client", "build_or_headers")),
-    ("integrate.api.nvidia.com",
-     _lazy_headers("agent.auxiliary_client", "build_nvidia_nim_headers", pass_base=True)),
-    ("api.routermint.com", _lazy_headers("agent.client_lifecycle", "_routermint_headers")),
-    ("api.kimi.com", lambda _k, _b: {"User-Agent": "claude-code/0.1.0"}),
-    ("portal.qwen.ai", _lazy_headers("agent.client_lifecycle", "_qwen_portal_headers")),
-    ("chatgpt.com", _lazy_headers("agent.codex_headers", "codex_cloudflare_headers", pass_key=True)),
-    ("x.ai", _lazy_headers("tools.xai_http", "hermes_xai_default_headers")),
-]
-
-
-def _host_default_headers_factory(base_url: str):
-    for host, factory in _HOST_DEFAULT_HEADERS:
-        if base_url_host_matches(base_url, host):
-            return factory
-    return None
 
 
 def _client_kwargs_from_routed(client, timeout) -> dict[str, Any]:
