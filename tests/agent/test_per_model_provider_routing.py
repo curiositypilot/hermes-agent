@@ -38,3 +38,37 @@ def test_per_model_match_is_spelling_tolerant_and_follows_model_switch(routing_c
     assert cch._provider_preferences_for_agent(agent)["only"] == ["openai"]
     agent.model = "claude-fable-5-1"
     assert cch._provider_preferences_for_agent(agent)["only"] == ["anthropic"]
+
+
+def test_zdr_flag_is_read_from_config_and_can_be_pinned_per_model(monkeypatch):
+    cfg = {"provider_routing": {"zdr": True, "sort": "price",
+                                "models": {"openai/gpt-6-astra": {"zdr": True, "only": ["openai"]}}}}
+    import hermes_cli.config as config_mod
+    monkeypatch.setattr(config_mod, "load_config_readonly", lambda: cfg)
+
+    # Flat config flag reaches every model …
+    assert cch._provider_preferences_for_agent(_agent("moonshotai/kimi-k2.6"))["zdr"] is True
+    # … and a per-model entry still overlays it alongside its own pins.
+    pinned = cch._provider_preferences_for_agent(_agent("openai/gpt-6-astra"))
+    assert pinned["zdr"] is True and pinned["only"] == ["openai"]
+
+
+def test_zdr_is_omitted_when_not_configured(routing_cfg):
+    """Absent/false zdr must not appear in the payload — OpenRouter treats a present
+    key as an explicit policy demand, so a stray false would change routing."""
+    assert "zdr" not in cch._provider_preferences_for_agent(_agent("moonshotai/kimi-k2.6"))
+    routing_cfg["provider_routing"]["zdr"] = False
+    assert "zdr" not in cch._provider_preferences_for_agent(_agent("moonshotai/kimi-k2.6"))
+
+
+def test_zdr_forwards_only_the_bool_true_and_per_model_false_wins(monkeypatch):
+    cfg = {"provider_routing": {"zdr": True, "models": {"openai/gpt-6-astra": {"zdr": False},
+                                                        "z-ai/glm-5.3-flash": {"zdr": "true"}}}}
+    import hermes_cli.config as config_mod
+    monkeypatch.setattr(config_mod, "load_config_readonly", lambda: cfg)
+    assert "zdr" not in cch._provider_preferences_for_agent(_agent("openai/gpt-6-astra"))
+    assert "zdr" not in cch._provider_preferences_for_agent(_agent("z-ai/glm-5.3-flash"))
+    cfg["provider_routing"] = {"zdr": "yes", "models": {"z-ai/glm-5.3-flash": {"zdr": True, "only": ["fireworks"]}}}
+    assert "zdr" not in cch._provider_preferences_for_agent(_agent("moonshotai/kimi-k2.6"))
+    pinned = cch._provider_preferences_for_agent(_agent("z-ai/glm-5.3-flash"))
+    assert pinned["zdr"] is True and pinned["only"] == ["fireworks"]
