@@ -17,6 +17,11 @@ normal runtime:
   the chosen model on every routed run (``routed`` event, ``run_id`` scoped),
   which is what makes this lookup possible.
 
+Escalation looks for capacity elsewhere, so a walk never escalates onto a
+provider it already found unavailable at a lower tier (a bigger model on the
+same exhausted subscription only spends that quota faster); candidates within
+one tier are still tried (XL Fable -> XL Opus).
+
 Nothing here writes to ``auth.json`` or refreshes tokens; routing never costs
 an API call. A provider with no pool entries (key inline in config, local
 proxy) is treated as available — the worker's own error handling still
@@ -1076,15 +1081,23 @@ class RoutingContext:
         the assignee profile's home, so the router never picks a provider the
         profile's worker then denies. A quota-gated candidate is skipped like
         an unavailable one; after the first gate skip, pay-as-you-go providers
-        are skipped too."""
+        are skipped too. A provider ``availability()`` found unavailable at one
+        tier is not escalated onto at a later tier (same-tier candidates are
+        still tried); that skip adds no wait, the first skip already did."""
         walk = _Walk()
         # Effective, not stored: an open higher descendant passes a hold the card itself would not.
         priority = self.gate_priority(task)[1]
+        unavailable_at: dict[str, str] = {}  # provider -> lowest tier where availability() refused it
         for tier, cand in entries:
             where = {"tier": tier} if tier else {}
             refusal = check.refusal(cand.provider)
             if refusal:
                 walk.skipped.append({**where, "model": cand.model, "provider": cand.provider, "reason": refusal})
+                continue
+            seen_at = unavailable_at.get(cand.provider or "")
+            if seen_at and tier in TIER_ORDER and TIER_ORDER.index(tier) > TIER_ORDER.index(seen_at):
+                walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
+                                     "reason": f"no escalation: {cand.provider} unavailable at tier {seen_at}"})
                 continue
             if walk.gated and self._is_payg(cand.provider):
                 walk.skipped.append({**where, "model": cand.model, "provider": cand.provider,
@@ -1104,6 +1117,8 @@ class RoutingContext:
             walk.skipped.append({**where, "model": cand.model, "provider": cand.provider, "reason": avail.reason})
             if avail.until:
                 walk.waits.append(avail.until)
+            if cand.provider and tier in TIER_ORDER:
+                unavailable_at.setdefault(cand.provider, tier)
         return walk
 
     def _quota_held(self, task: Any, gated: list[QuotaVerdict], *, lane: str = "ready",

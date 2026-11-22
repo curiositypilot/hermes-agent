@@ -713,6 +713,61 @@ def test_unrouted_rate_limit_is_escaped_by_routing(conn, monkeypatch, all_assign
 
 
 # ---------------------------------------------------------------------------
+# No escalation onto a provider already unavailable at a lower tier (t_9375becf)
+# ---------------------------------------------------------------------------
+
+_OPUS = {"model": "claude-opus-5-5", "provider": "anthropic"}
+_FABLE = {"model": "claude-fable-5-2", "provider": "anthropic"}
+_LIVE_TIERS = {"M": [_OPUS], "L": [_OPUS], "XL": [_FABLE, _OPUS]}
+
+
+def _seed_hit(conn, model, provider, ended_at):
+    tid = kb.create_task(conn, title=f"hit {model} {ended_at}", assignee="w", complexity="M")
+    _seed_rate_limited_run(conn, tid, model=model, provider=provider, ended_at=ended_at)
+
+
+def test_no_escalation_onto_rate_limited_provider(conn, monkeypatch):
+    _pool(monkeypatch)
+    now = time.time()
+    _seed_hit(conn, "claude-opus-5-5", "anthropic", int(now) - 60)
+    ctx = kr.RoutingContext(conn, _cfg(tiers=_LIVE_TIERS, cooldown_seconds=900), now=now)
+
+    m = ctx.decide(_task(complexity="M"))
+    assert m.source == "exhausted" and m.retry_at == int(now) - 60 + 900
+    assert {"tier": "XL", "model": "claude-fable-5-2", "provider": "anthropic",
+            "reason": "no escalation: anthropic unavailable at tier M"} in m.skipped
+    xl = ctx.decide(_task(complexity="XL"))
+    assert xl.source == "tier" and xl.tier == "XL" and xl.candidate.model == "claude-fable-5-2"
+
+    # Escalation onto another provider is kept.
+    other = {**_LIVE_TIERS, "XL": [{"model": "x-1", "provider": "prov-x"}]}
+    d = kr.RoutingContext(conn, _cfg(tiers=other, cooldown_seconds=900), now=now).decide(_task(complexity="M"))
+    assert d.source == "tier" and d.tier == "XL" and d.candidate.model == "x-1"
+
+
+# Incident 2026-11-21 (UTC): Fable's board hit expired 10 s before Opus's, so M cards walked
+# M -> L -> XL onto claude-fable-5-2 on the same exhausted Anthropic account.
+# (tick, fable hit ended_at, opus hit ended_at, expected retry_at); the board holds only the
+# hits up to each tick, as in the replay.
+_INCIDENT_9375_TICKS = (
+    (1795267031, 1795266121, 1795266181, 1795267081),  # 13:17:11; hits 13:02:01, 13:03:01
+    (1795269034, 1795268124, 1795268185, 1795269085),  # 13:50:34; hits 13:35:24, 13:36:25
+)
+
+
+def test_incident_20261121_m_cards_not_escalated_to_fable(conn, monkeypatch):
+    _pool(monkeypatch)
+    cfg = _cfg(tiers=_LIVE_TIERS, cooldown_seconds=900)
+    for now, fable_at, opus_at, retry_at in _INCIDENT_9375_TICKS:
+        _seed_hit(conn, "claude-fable-5-2", "anthropic", fable_at)
+        _seed_hit(conn, "claude-opus-5-5", "anthropic", opus_at)
+        m = kr.RoutingContext(conn, cfg, now=now).decide(_task(complexity="M"))
+        assert m.source == "exhausted" and m.retry_at == retry_at, m.label()
+        xl = kr.RoutingContext(conn, cfg, now=now).decide(_task(complexity="XL"))
+        assert xl.source == "tier" and xl.candidate.model == "claude-fable-5-2"
+
+
+# ---------------------------------------------------------------------------
 # In-process fallbacks arm the cooldown (provider_fallback events)
 # ---------------------------------------------------------------------------
 
