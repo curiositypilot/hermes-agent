@@ -5,9 +5,17 @@ model, so a generic 429 for one Claude model says nothing about the same
 credential's standing for its sibling models. Such a 429 is recorded as a
 cooldown on the requested model only, beside the credential-wide status that
 auth, billing and payment failures keep benching the whole credential with.
+
+An account-wide 429 is the exception: a subscription window wall (unified-limit
+claim ``five_hour`` / ``seven_day``, or, without those headers, an OAuth row's
+"exceed your account's rate limit" body) refuses every model until the window
+resets, so it benches the whole credential like a billing failure does
+(t_e0c3a616). A ``seven_day_<family>`` claim stays a per-model cooldown.
 """
 from __future__ import annotations
 
+import logging
+import re
 import time
 from typing import Any, Dict, Iterable, Optional, TYPE_CHECKING
 
@@ -17,6 +25,11 @@ if TYPE_CHECKING:
 # A usage-window plan limit: this model is refused until the allowance resets; every other model
 # (a Free or non-Large one) stays usable on the same credential.
 FAILURE_REASON_USAGE_WINDOW = "usage_window"
+# The OAuth subscription wall's body. API-key rows get the same wording for per-model limits, so it
+# only decides scope on an OAuth row whose 429 carried no unified-limit header verdict.
+_ACCOUNT_WALL_MESSAGE_RE = re.compile(r"exceed your account's rate limit", re.IGNORECASE)
+
+logger = logging.getLogger(__name__)
 
 
 def pool_failure_reason(reason: Any, error_context: Optional[dict[str, Any]], billing_unverified: bool) -> str:
@@ -56,35 +69,97 @@ def merge_model_cooldowns(*maps: Any) -> dict[str, float]:
     return merged
 
 
+def _is_account_wide_429(error_context: Optional[dict[str, Any]], entry: Optional[PooledCredential]) -> bool:
+    """A 429 that walls the whole credential: header verdict first, else the OAuth account-wall body."""
+    context = error_context if isinstance(error_context, dict) else {}
+    scope = context.get("rate_limit_scope")
+    if scope:
+        return scope == "account"
+    message = context.get("message")
+    return (
+        getattr(entry, "auth_type", None) == "oauth"
+        and isinstance(message, str) and bool(_ACCOUNT_WALL_MESSAGE_RE.search(message))
+    )
+
+
 class CredentialPoolModelCooldownMixin:
     def token_is_blocked(self, token: str, *, model: Optional[str] = None) -> bool:
-        """Whether a pool cooldown blocks *token* for *model*.
+        """Whether a pool cooldown blocks *token* for *model*: a model cooldown, or a credential-wide
+        429 bench (an account wall refuses every model).
 
         Closes the paths that hand out a native Anthropic token without
         selecting it from the pool (env / borrowed credentials). Tokens the
         pool does not know fail open: no row can attribute a cooldown to them.
         """
         with self._lock:
-            return any(
+            return self.account_wall_until(token) is not None or any(
                 entry.runtime_api_key == token and model_cooldown_until(entry, model) is not None
                 for entry in self._entries
             )
 
+    def account_wall_until(self, token: Optional[str]) -> Optional[float]:
+        """End of an active credential-wide 429 bench on a row holding *token*, else ``None``.
+
+        Billing 429s and auth benches are not walls: they keep their own handling.
+        """
+        from agent.credential_pool import (
+            FAILURE_REASON_BILLING, FAILURE_REASON_BILLING_UNVERIFIED, STATUS_EXHAUSTED, _exhausted_until,
+        )
+
+        if not token:
+            return None
+        now = time.time()
+        with self._lock:
+            sole = self._is_sole_credential()
+            walls = [
+                until for entry in self._entries
+                if entry.runtime_api_key == token and entry.last_status == STATUS_EXHAUSTED
+                and entry.last_error_code == 429
+                and entry.failure_reason not in (FAILURE_REASON_BILLING, FAILURE_REASON_BILLING_UNVERIFIED)
+                and (until := _exhausted_until(entry, sole_credential=sole)) and until > now
+            ]
+        return max(walls) if walls else None
+
     def _is_model_scoped_failure(
         self, status_code: Optional[int], model: Optional[str], failure_reason: Optional[str],
+        error_context: Optional[dict[str, Any]] = None, entry: Optional[PooledCredential] = None,
     ) -> bool:
         """Anthropic per-model 429s and a usage-window plan limit: the credential stays valid for
         every other model. (Fork: a Codex model entitlement 400 no longer benches anything, see
-        error_classifier.)"""
+        error_classifier.)
+
+        An account-wide Anthropic 429 is not model-scoped (logged here): the unified-limit header
+        verdict ``rate_limit_scope == "account"`` (claim ``five_hour`` / ``seven_day``), or, with no
+        header verdict, an OAuth *entry* whose body says "exceed your account's rate limit".
+        ``rate_limit_scope == "model"`` (a ``seven_day_<family>`` claim) stays model-scoped, and so
+        does an API-key row without headers, whose per-model limits use the same wording.
+        """
         from agent.credential_pool import FAILURE_REASON_BILLING, FAILURE_REASON_BILLING_UNVERIFIED
 
         if not model:
             return False
         if failure_reason == FAILURE_REASON_USAGE_WINDOW:
             return True
-        return (
+        if not (
             self.provider == "anthropic" and status_code == 429
             and failure_reason not in (FAILURE_REASON_BILLING, FAILURE_REASON_BILLING_UNVERIFIED)
+        ):
+            return False
+        if _is_account_wide_429(error_context, entry):
+            self._log_account_wall(entry, error_context)
+            return False
+        return True
+
+    @staticmethod
+    def _log_account_wall(entry: Optional[PooledCredential], error_context: Optional[dict[str, Any]]) -> None:
+        from agent.credential_pool import _normalize_error_context
+
+        reset_at = _normalize_error_context(error_context).get("reset_at")
+        until = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(reset_at)) if reset_at else "the provider TTL"
+        label = (entry.label or entry.id[:8]) if entry is not None else "?"
+        logger.info(
+            "credential pool: %s account-wide rate limit (claim=%s) until %s; benching all models",
+            label, (error_context or {}).get("rate_limit_claim") or "none", until,
         )
 
     def _cool_down_model(

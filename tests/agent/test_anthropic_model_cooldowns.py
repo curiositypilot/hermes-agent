@@ -113,3 +113,142 @@ def test_pool_token_refuses_model_with_its_own_cooldown(oauth_pool, tmp_path):
     auth.write_text(json.dumps(data))
     assert resolve_anthropic_token(model=SONNET) is None
     assert resolve_anthropic_token(model=MODEL_B) == OAUTH_TOKEN
+
+
+# --- Account-wide subscription walls (t_e0c3a616) ------------------------------------------------
+
+ACCOUNT_MSG = "This request would exceed your account's rate limit. Please try again later."
+ALL_MODELS = (OPUS, SONNET, FABLE)
+
+
+def _write_row(tmp_path, auth_type, token, now=None):
+    import time
+    now = time.time() if now is None else now
+    row = {"id": "row", "label": "row", "auth_type": auth_type, "priority": 0, "source": "manual",
+           "access_token": token}
+    if auth_type == "oauth":
+        row["expires_at_ms"] = int((now + 86400) * 1000)
+    (tmp_path / "hermes-root" / "auth.json").write_text(json.dumps({"credential_pool": {"anthropic": [row]}}))
+    from agent.credential_pool import load_pool
+    return load_pool("anthropic")
+
+
+def _assert_walled(pool, reset):
+    from agent.credential_pool import STATUS_EXHAUSTED
+    row = pool.entries()[0]
+    assert row.last_status == STATUS_EXHAUSTED
+    assert row.last_error_reset_at == reset
+    assert not row.model_cooldowns
+    for model in ALL_MODELS:
+        assert pool.select(model=model) is None
+
+
+def test_oauth_account_wall_benches_every_model(pool, tmp_path, monkeypatch):
+    import time
+    from agent.anthropic_credentials import resolve_anthropic_token
+    from agent.credential_pool import load_pool
+
+    reset = time.time() + 3 * 3600
+    oauth = _write_row(tmp_path, "oauth", OAUTH_TOKEN)
+    assert oauth.mark_exhausted_and_rotate(
+        status_code=429, error_context={"message": ACCOUNT_MSG, "reset_at": reset},
+        api_key_hint=OAUTH_TOKEN, failure_reason="rate_limit", model=OPUS,
+    ) is None
+    _assert_walled(oauth, reset)
+    fresh = load_pool("anthropic")
+    assert fresh.limit_state(list(ALL_MODELS))["scope"] == "account"
+    # The env path hands out the same token without selecting it: the account bench must gate it.
+    monkeypatch.setenv("ANTHROPIC_TOKEN", OAUTH_TOKEN)
+    assert resolve_anthropic_token(model=SONNET) is None
+    assert resolve_anthropic_token() == OAUTH_TOKEN  # model-less diagnostics keep the token
+
+
+def test_account_wall_error_names_the_account_not_other_models(pool, tmp_path, monkeypatch):
+    import time
+    from hermes_cli.auth import AuthError
+    from hermes_cli.runtime_provider import _anthropic_token_or_raise
+
+    oauth = _write_row(tmp_path, "oauth", OAUTH_TOKEN)
+    oauth.mark_exhausted_and_rotate(
+        status_code=429, error_context={"message": ACCOUNT_MSG, "reset_at": time.time() + 3600},
+        api_key_hint=OAUTH_TOKEN, failure_reason="rate_limit", model=OPUS,
+    )
+    monkeypatch.setenv("ANTHROPIC_TOKEN", OAUTH_TOKEN)
+    with pytest.raises(AuthError) as raised:
+        _anthropic_token_or_raise(model=SONNET)
+    text = str(raised.value)
+    assert text.startswith("Anthropic account is rate-limited until ") and " UTC " in text
+    assert "remain available" not in text and "not listed here" not in text
+
+
+def _unified_error(claim, reset, message=ACCOUNT_MSG):
+    from unittest.mock import MagicMock
+    err = Exception(f"HTTP 429: {message}")
+    err.body = {"type": "error", "error": {"type": "rate_limit_error", "message": message}}
+    err.response = MagicMock(headers={
+        "anthropic-ratelimit-unified-status": "rejected",
+        "anthropic-ratelimit-unified-representative-claim": claim,
+        "anthropic-ratelimit-unified-reset": str(int(reset)),
+    })
+    return err
+
+
+@pytest.mark.parametrize("auth_type, token", [("api_key", KEY), ("oauth", OAUTH_TOKEN)])
+@pytest.mark.parametrize("claim, account_wide", [("five_hour", True), ("seven_day", True), ("seven_day_opus", False)])
+def test_unified_claim_decides_scope(pool, tmp_path, auth_type, token, claim, account_wide):
+    import time
+    from agent.agent_runtime_helpers import extract_api_error_context
+
+    reset = int(time.time()) + 7200
+    row_pool = _write_row(tmp_path, auth_type, token)
+    row_pool.mark_exhausted_and_rotate(
+        status_code=429, error_context=extract_api_error_context(_unified_error(claim, reset)),
+        api_key_hint=token, failure_reason="rate_limit", model=OPUS,
+    )
+    if account_wide:
+        _assert_walled(row_pool, reset)
+    else:  # a model-family claim stays a model cooldown, even with the account body on an OAuth row
+        row = row_pool.entries()[0]
+        assert row.last_status is None
+        assert row.model_cooldowns == {OPUS: reset}
+        assert row_pool.select(model=OPUS) is None
+        assert row_pool.select(model=SONNET) is not None
+
+
+@pytest.mark.parametrize("message", [
+    "This request would exceed the rate limit for your organization (org) of 50,000 input tokens per minute",
+    "Number of request tokens has exceeded your per-minute rate limit",
+    "rate limit for your organization's account",
+    "",
+])
+def test_other_oauth_429_bodies_stay_model_scoped(pool, tmp_path, message):
+    oauth = _write_row(tmp_path, "oauth", OAUTH_TOKEN)
+    oauth.mark_exhausted_and_rotate(
+        status_code=429, error_context={"message": message}, api_key_hint=OAUTH_TOKEN,
+        failure_reason="rate_limit", model=OPUS,
+    )
+    row = oauth.entries()[0]
+    assert row.last_status is None and OPUS in row.model_cooldowns
+    assert oauth.select(model=SONNET) is not None
+
+
+# 2026-11-21 incident: logs/agent.log + data/quota/history.jsonl (session window 100% at 04:58,
+# resets 08:00; 100% at 09:11, resets 13:00). (instant, failed model, window reset), all UTC epochs.
+INCIDENT_20261121 = [
+    (1795237448, OPUS, 1795248000),    # 05:04:08 opus
+    (1795237534, SONNET, 1795248000),  # 05:05:34 sonnet, same wall
+    (1795253453, OPUS, 1795266000),    # 09:30:53 opus
+    (1795254055, SONNET, 1795266000),  # 09:40:55 sonnet fallback onto the same walled row
+]
+
+
+@pytest.mark.parametrize("now, model, reset", INCIDENT_20261121)
+def test_incident_20261121_account_wall_replay(pool, tmp_path, monkeypatch, now, model, reset):
+    import time
+    monkeypatch.setattr(time, "time", lambda: float(now))
+    oauth = _write_row(tmp_path, "oauth", OAUTH_TOKEN, now=now)
+    oauth.mark_exhausted_and_rotate(
+        status_code=429, error_context={"message": ACCOUNT_MSG, "reset_at": reset},
+        api_key_hint=OAUTH_TOKEN, failure_reason="rate_limit", model=model,
+    )
+    _assert_walled(oauth, reset)
