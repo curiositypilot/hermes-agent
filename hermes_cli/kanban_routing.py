@@ -20,7 +20,11 @@ normal runtime:
 Escalation looks for capacity elsewhere, so a walk never escalates onto a
 provider it already found unavailable at a lower tier (a bigger model on the
 same exhausted subscription only spends that quota faster); candidates within
-one tier are still tried (XL Fable -> XL Opus).
+one tier are still tried (XL Fable -> XL Opus). The rule is keyed on provider and
+assumes one usable credential per provider (``TierCandidate`` carries none), the
+same assumption as the board cooldown and ``payg_providers``. Quota-gate skips are
+not recorded: provider-wide verdicts already gate the higher tiers in the same
+walk, and a ``match``-window verdict is a separate pool.
 
 Nothing here writes to ``auth.json`` or refreshes tokens; routing never costs
 an API call. A provider with no pool entries (key inline in config, local
@@ -1083,7 +1087,11 @@ class RoutingContext:
         an unavailable one; after the first gate skip, pay-as-you-go providers
         are skipped too. A provider ``availability()`` found unavailable at one
         tier is not escalated onto at a later tier (same-tier candidates are
-        still tried); that skip adds no wait, the first skip already did."""
+        still tried); that skip adds no wait, the first skip already did. Keyed on
+        provider: one usable credential per provider is assumed (``TierCandidate``
+        has no credential identity). Quota-gate skips are not recorded there: a
+        provider-wide verdict gates every tier of this walk anyway, and a
+        ``match``-window verdict belongs to its own pool."""
         walk = _Walk()
         # Effective, not stored: an open higher descendant passes a hold the card itself would not.
         priority = self.gate_priority(task)[1]
@@ -1251,7 +1259,14 @@ class RoutingContext:
         if hit is not None:
             at, source = hit
             reason = "rate_limited on this board" + (" (fallback)" if source == "fallback" else "")
-            result = Availability(False, reason, until=at + self.cfg.cooldown_seconds)
+            until = at + self.cfg.cooldown_seconds
+            # The board's 900 s is a guess; the pool's bench is the account's own reset, and
+            # this until feeds the hold retry_at that mutes stranded_in_ready (t_d2cb1f25).
+            with _pool_scope(profile_home):
+                pool = pool_availability(cand.provider, cand.model, now=self.now)
+            if not pool.available and pool.until and pool.until > until:
+                until = pool.until
+            result = Availability(False, reason, until=until)
         else:
             with _pool_scope(profile_home):
                 result = pool_availability(cand.provider, cand.model, now=self.now)

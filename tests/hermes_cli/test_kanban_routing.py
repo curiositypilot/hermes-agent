@@ -66,10 +66,11 @@ def _use_routing(monkeypatch, **over):
 def _pool(monkeypatch, blocked: dict[str, str] | None = None):
     """Stub the pool check: providers in ``blocked`` are unavailable with that reason."""
     blocked = blocked or {}
+    until = time.time() + 600  # fixed per stub: a hold's retry_at must not drift between ticks
 
     def fake(provider, model, *, now=None):
         if provider in blocked:
-            return kr.Availability(False, blocked[provider], until=time.time() + 600)
+            return kr.Availability(False, blocked[provider], until=until)
         return kr.Availability(True, "pool ok")
 
     monkeypatch.setattr(kr, "pool_availability", fake)
@@ -596,6 +597,17 @@ def test_routing_hold_reemits_on_lifecycle_or_new_note(conn, monkeypatch, all_as
     assert holds[-1].payload.get("note")
 
 
+def test_routing_hold_reemits_on_new_retry_at(conn):
+    """A later retry_at is a new row (stranded_in_ready muting reads the newest); the same one is not."""
+    from hermes_cli import kanban_db_dispatch_holds as holds_mod
+
+    tid = kb.create_task(conn, title="m", assignee="w", complexity="M")
+    for retry_at in (1795267081, 1795267081, 1795269085, 1795269085):
+        route = kr.RouteDecision("exhausted", requested_tier="M", retry_at=retry_at)
+        holds_mod._record_routing_hold(conn, tid, route)
+    assert [(h.payload or {}).get("retry_at") for h in _routing_holds(conn, tid)] == [1795267081, 1795269085]
+
+
 def test_routing_hold_swallows_only_sqlite_errors(conn, monkeypatch):
     """A DB error writing the hold is logged and skipped; any other error is a bug and raises."""
     import sqlite3
@@ -765,6 +777,34 @@ def test_incident_20261121_m_cards_not_escalated_to_fable(conn, monkeypatch):
         assert m.source == "exhausted" and m.retry_at == retry_at, m.label()
         xl = kr.RoutingContext(conn, cfg, now=now).decide(_task(complexity="XL"))
         assert xl.source == "tier" and xl.candidate.model == "claude-fable-5-2"
+
+
+def test_board_hit_until_takes_later_pool_bench(conn, monkeypatch):
+    """A board hit's retry_at is the later of ended_at + cooldown and the pool's own bench (t_d2cb1f25)."""
+    now = time.time()
+    hit = int(now) - 60
+    _seed_hit(conn, "claude-opus-5-5", "anthropic", hit)
+    cfg = _cfg(tiers=_LIVE_TIERS, cooldown_seconds=900)
+    cases = (
+        (kr.Availability(False, "credential pool exhausted", until=hit + 2000), hit + 2000),
+        (kr.Availability(True, "pool ok"), hit + 900),
+        (kr.Availability(False, "credential pool exhausted", until=hit + 100), hit + 900),
+        (kr.Availability(False, "credential pool exhausted", until=None), hit + 900),
+    )
+    for pool, retry_at in cases:
+        monkeypatch.setattr(kr, "pool_availability", lambda provider, model, *, now=None, _p=pool: _p)
+        m = kr.RoutingContext(conn, cfg, now=now).decide(_task(complexity="M"))
+        assert m.source == "exhausted" and m.retry_at == retry_at, (pool, m.label())
+        assert m.skipped[0]["reason"] == "rate_limited on this board"
+
+
+def test_mode_gate_on_m_also_holds_xl_same_provider(conn, monkeypatch, tmp_path):
+    """A provider-wide quota verdict gating M opus also gates XL Fable: no escalation onto the account."""
+    cfg = _tight_gate(tmp_path, monkeypatch, tiers={"M": [_OPUS], "XL": [_FABLE]}, escalate=True)
+    d = _decide(conn, cfg, _card(conn, "m", 0, complexity="M"))
+    assert d.source == "quota_held", d.label()
+    assert [(s["model"], s["reason"]) for s in d.skipped] == [
+        ("claude-opus-5-5", f"quota: {_TIGHT}"), ("claude-fable-5-2", f"quota: {_TIGHT}")]
 
 
 # ---------------------------------------------------------------------------
