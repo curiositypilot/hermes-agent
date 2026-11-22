@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 
 from hermes_cli import auth as auth_mod
 from agent.credential_pool import (  # custom_provider_pool_key_candidates is read via origin by runtime_provider_custom
-    CredentialPool, PooledCredential, credential_pool_matches_provider, custom_provider_pool_key_candidates,
-    load_pool,
+    STATUS_DEAD, CredentialPool, PooledCredential, credential_pool_matches_provider,
+    custom_provider_pool_key_candidates, load_pool,
 )
 from agent.secret_scope import get_secret_str
 from hermes_cli.auth import (  # resolve_external_process_provider_credentials is read via origin by runtime_provider_backends
@@ -410,10 +410,22 @@ def _anthropic_cfg_base_url(model_cfg: dict[str, Any]) -> str:
     return cfg_base_url if _anthropic_base_url_override_ok(cfg_base_url) else ""
 
 
-def _reset_label(epoch: float) -> str:
+def _reset_label(epoch: float, *, utc: bool = False) -> str:
     import time
     from agent.retry_utils import format_reset_window
-    return f"{time.strftime('%H:%M %Z', time.localtime(epoch))} ({format_reset_window(max(0.0, epoch - time.time()))})"
+    clock = time.strftime('%H:%M UTC', time.gmtime(epoch)) if utc else time.strftime('%H:%M %Z', time.localtime(epoch))
+    return f"{clock} ({format_reset_window(max(0.0, epoch - time.time()))})"
+
+
+def _anthropic_account_wall(pool, entries) -> float | None:
+    """End of the credential-wide 429 bench (an account-wide subscription wall) behind the refused
+    token, or ``None``: the token the resolver hands out before its cooldown gate, else every live
+    row walled. Auth and billing benches are not walls."""
+    from agent.anthropic_credentials import resolve_anthropic_token
+    if until := pool.account_wall_until(resolve_anthropic_token()):
+        return until
+    walls = [pool.account_wall_until(entry.runtime_api_key) for entry in entries if entry.last_status != STATUS_DEAD]
+    return min(walls) if walls and all(walls) else None
 
 
 def _anthropic_bench_message(model: str) -> str | None:
@@ -427,6 +439,9 @@ def _anthropic_bench_message(model: str) -> str | None:
     entries = pool.entries()
     if not any(str(getattr(entry, "access_token", "") or "").strip() for entry in entries):
         return None
+    if walled := _anthropic_account_wall(pool, entries):
+        return (f"Anthropic account is rate-limited until {_reset_label(walled, utc=True)}: the subscription "
+                "window is spent for every Claude model, another model will not help (see `hermes auth list`).")
     known = {model, *(name for entry in entries for name in (entry.model_cooldowns or {}))}
     state = pool.limit_state(sorted(known)) or {}
     if state.get("scope") == "account":
