@@ -57,7 +57,9 @@ def _record_routing_hold(
     conn: sqlite3.Connection, task_id: str, route: Optional[RouteDecision],
     reason: str = "tier_exhausted",
 ) -> None:
-    """``routing_held`` once per streak: same reason, note and tier; noise events ignored."""
+    """``routing_held`` once per streak: same reason, note, tier and retry_at; noise events
+    ignored. A changed ``retry_at`` is a new row: ``stranded_in_ready`` muting reads the newest
+    one, so a stale earlier value would unmute while the card is still benched (t_d2cb1f25)."""
     from hermes_cli import kanban_db as _kb
 
     try:
@@ -69,7 +71,7 @@ def _record_routing_hold(
                 payload["retry_at"] = int(route.retry_at)
         kind, prev = _last_streak_event(conn, task_id)
         if kind == "routing_held" and all(
-            prev.get(k) == payload.get(k) for k in ("reason", "note", "requested_tier")
+            prev.get(k) == payload.get(k) for k in ("reason", "note", "requested_tier", "retry_at")
         ):
             return
         with _kb.write_txn(conn):
