@@ -877,9 +877,8 @@ def _handle_complete(args: dict, **kw) -> str:
             # blocks or crashes the run instead of retrying. See #22923.
             return tool_error(
                 f"kanban_complete could not preserve the declared artifacts: {artifact_err}. "
-                f"Your task is still in-flight and its scratch workspace was kept. Fix the "
-                f"artifact path or storage error, then retry kanban_complete with the same "
-                f"handoff.")
+                f"Your task is still in-flight; fix or drop the listed artifact path and call "
+                f"kanban_complete again with the same handoff.")
         except kb.LiveClaimError as claim_err:
             # Env-less caller (orchestrator, another session) on a card a dispatcher
             # worker is executing: refusing here is what keeps that worker's run open.
@@ -1047,9 +1046,8 @@ def _handle_request_review(args: dict, **kw) -> str:
             # the model treats the tool_error as terminal.
             return tool_error(
                 f"kanban_request_review could not preserve the declared artifacts: {artifact_err}. "
-                f"Your task is still in-flight (no state change) and its scratch workspace was "
-                f"kept. Fix the artifact path or storage error, then retry "
-                f"kanban_request_review with the same handoff.")
+                f"Your task is still in-flight (no state change); fix or drop the listed "
+                f"artifact path and call kanban_request_review again with the same handoff.")
         _check(ok, f"could not request review for {tid}: "
                    f"{fail_reason or 'unknown id or not in running/ready'}")
         return _ok_landed(kb, conn, tid, "review")
