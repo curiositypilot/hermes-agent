@@ -360,8 +360,10 @@ def record_start_failure(frame, exc):
     if context is None:
         return
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
+    # ``stage`` lets the submitter end with this booked 75/78 although the owner settles the receipt
+    # ``unknown`` (``kanban_worker_client._exit_code``): a start failure ran no turn to retain.
     _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)),
-                          _failure_line(frame, exc, 'start'))
+                          _failure_line(frame, exc, 'start'), stage='start')
 
 
 def record_execute_failure(frame, exc):
@@ -401,7 +403,7 @@ def _failure_line(frame, exc, stage):
     return redact_for_egress(f'managed worker {stage} failed: {type(exc).__name__}: {msg}')[:_FAILURE_LINE_MAX]
 
 
-def _record_worker_result(context, code, last_output):
+def _record_worker_result(context, code, last_output, *, stage=None):
     _TURNS_DONE.set()
     from agent.runtime_session_store import owner_view_pid
     from hermes_cli.kanban_db_connect import connect_closing
@@ -410,9 +412,11 @@ def _record_worker_result(context, code, last_output):
         if _bound_worker_matches(conn, context):
             # Closing a run clears its claim/PID and replaces metadata; keep the
             # result in the immutable attempt event stream instead.
-            kb._append_event(conn, context['task_id'], 'worker_result',
-                {'pid': owner_view_pid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
-                 'last_output': last_output}, run_id=context['run_id'])
+            payload = {'pid': owner_view_pid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
+                       'last_output': last_output}
+            if stage is not None:
+                payload['stage'] = stage
+            kb._append_event(conn, context['task_id'], 'worker_result', payload, run_id=context['run_id'])
 
 
 def record_worker_loss(policy, reason, *, pid=None, bound=False):

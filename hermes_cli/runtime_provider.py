@@ -467,6 +467,8 @@ def _anthropic_token_or_raise(*, model: str | None = None) -> str:
         # A benched key is not a missing credential; telling the user to re-authenticate
         # would send them chasing a cooldown that lifts on its own.
         if model and (benched := _anthropic_bench_message(model)):
+            # The rate-limit code makes callers read it as quota: a Kanban start failure books 75
+            # (requeue) instead of a crash that spends the card's failure budget.
             raise AuthError(benched, provider="anthropic", code=CODEX_RATE_LIMITED_CODE,
                             relogin_required=False)
         raise AuthError(_NO_ANTHROPIC_CREDENTIALS_MSG)

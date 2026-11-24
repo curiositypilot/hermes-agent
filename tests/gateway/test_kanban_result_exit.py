@@ -59,11 +59,20 @@ def _credential_failures():
     from hermes_cli.auth_constants import CODEX_RATE_LIMITED_CODE
     wrapped = RuntimeError("agent init failed")
     wrapped.__cause__ = AuthError("refresh revoked", provider="nous", relogin_required=True)
+    from agent.auxiliary_unavailable import (
+        ProviderCredentialsExhaustedError, ProviderNotConfiguredError, missing_provider_credentials_message)
+    not_configured = ProviderNotConfiguredError(missing_provider_credentials_message("nous"))
+    wrapped_not_configured = RuntimeError("agent init failed")
+    wrapped_not_configured.__cause__ = ProviderNotConfiguredError(missing_provider_credentials_message("nous"))
     return [
         (AuthError("quota", provider="openai-codex", code=CODEX_RATE_LIMITED_CODE), kb.KANBAN_RATE_LIMIT_EXIT_CODE),
         (AuthError("relogin", provider="nous", relogin_required=True), kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE),
         (wrapped, kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE),
         (RuntimeError("unknown startup failure"), 1),
+        (not_configured, kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE),
+        (wrapped_not_configured, kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE),
+        (ProviderCredentialsExhaustedError("x", provider="anthropic"), kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        (ValueError("not a credential failure"), 1),
     ]
 
 
@@ -76,6 +85,7 @@ def test_managed_start_failure_books_the_one_shot_credential_exit(tmp_path, monk
 
     session_kanban.record_start_failure(frame, error)
     assert session_kanban.worker_exit_code(path, context) == expected
+    assert session_kanban.worker_result(path, context)["stage"] == "start"
 
 
 def test_start_failure_books_redacted_cause_line(tmp_path, monkeypatch):
@@ -133,6 +143,7 @@ def test_turn_exception_books_cause_line(tmp_path, monkeypatch):
     result = session_kanban.worker_result(path, context)
     assert result["last_output"] == "managed worker turn failed: RuntimeError: boom"
     assert result["exit_code"] == 1
+    assert "stage" not in result
 
 
 def _execute_frame(context, api_key=None):
@@ -218,3 +229,60 @@ def test_execute_books_failure_then_reraises_the_original(monkeypatch):
     with pytest.raises(ValueError, match="managed_attachment_unavailable") as raised:
         managed_worker.execute(frame, None)
     assert seen == [(frame, raised.value)]
+
+
+# The five 2026-11-18 ``worker_result`` rows of the critics pinned ``nous:grok-4.7`` (task, run), copied
+# verbatim from the board. Each was booked exit 1, so ``repin-held`` never saw a ``terminal_provider``.
+_NOUS_INCIDENT_LINE = ("managed worker start failed: ProviderNotConfiguredError: Provider 'nous' is set in "
+                       "config.yaml but no credentials were found. Run `hermes auth add nous` to sign in, or "
+                       "switch to a different provider with `hermes model`.")
+_NOUS_INCIDENT = [("t_caa8ddcf", 10407, _NOUS_INCIDENT_LINE), ("t_d7e613dd", 10413, _NOUS_INCIDENT_LINE),
+                  ("t_de93206b", 10411, _NOUS_INCIDENT_LINE), ("t_de93206b", 10414, _NOUS_INCIDENT_LINE),
+                  ("t_d7e613dd", 10415, _NOUS_INCIDENT_LINE)]
+# The reset time in the bench message moves with the clock (t_8c736168 scoped it); pin both ends.
+_ANTHROPIC_INCIDENT_PREFIX = ("managed worker start failed: AuthError: Anthropic credentials are rate-limited for "
+                              "claude-fable-5-2 until ")
+_ANTHROPIC_INCIDENT_SUFFIX = "; Claude models not listed here are not benched (see `hermes auth list`)."
+
+
+@pytest.mark.parametrize("task_id, run_id, line", _NOUS_INCIDENT)
+def test_incident_t_caa8ddcf_nous_start_failure_reaches_78(tmp_path, monkeypatch, task_id, run_id, line):
+    """The owner settles a start failure ``unknown``; the submitter now ends with the booked 78
+    (sticky park, ``terminal_provider``) instead of raising ``Kanban execution unknown`` (exit 1)."""
+    from agent.auxiliary_unavailable import ProviderNotConfiguredError
+    from hermes_cli import kanban_worker_client
+    path, context = _bound_claim(tmp_path, monkeypatch)
+    prefix = "managed worker start failed: ProviderNotConfiguredError: "
+    error = ProviderNotConfiguredError(line.removeprefix(prefix))
+
+    session_kanban.record_start_failure({"policy": {"kanban_json": json.dumps(context)}}, error)
+    assert session_kanban.worker_result(path, context)["last_output"] == line
+    assert kanban_worker_client._exit_code({"status": "unknown"}, context, str(path)) == kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE
+
+
+def test_incident_t_caa8ddcf_anthropic_model_cooldown_reaches_75(tmp_path, monkeypatch):
+    """Same night, 23 start failures: a pool row benched for one Claude model. The resolver's real
+    error now reads as quota, so the attempt requeues (75) without spending the failure budget."""
+    import time
+    import hermes_constants
+    from hermes_cli import kanban_worker_client
+    from hermes_cli.auth import AuthError
+    from hermes_cli.runtime_provider import _anthropic_token_or_raise
+    path, context = _bound_claim(tmp_path, monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "no-claude"))
+    for name in ("ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+    now = time.time()
+    (tmp_path / "auth.json").write_text(json.dumps({"version": 1, "providers": {}, "credential_pool": {"anthropic": [{
+        "id": "oat1", "label": "subscription", "priority": 0, "last_status": "ok", "auth_type": "oauth",
+        "source": "manual:hermes_pkce", "access_token": "oauth-fixture", "refresh_token": "refresh-fixture",
+        "expires_at_ms": int((now + 6 * 3600) * 1000), "model_cooldowns": {"claude-fable-5-2": now + 3000}}]}}))
+    with pytest.raises(AuthError) as raised:
+        _anthropic_token_or_raise(model="claude-fable-5-2")
+
+    session_kanban.record_start_failure({"policy": {"kanban_json": json.dumps(context)}}, raised.value)
+    last_output = session_kanban.worker_result(path, context)["last_output"]
+    assert last_output.startswith(_ANTHROPIC_INCIDENT_PREFIX) and last_output.endswith(_ANTHROPIC_INCIDENT_SUFFIX)
+    assert kanban_worker_client._exit_code({"status": "unknown"}, context, str(path)) == kb.KANBAN_RATE_LIMIT_EXIT_CODE

@@ -182,3 +182,21 @@ def test_explicit_api_key_builds_on_a_benched_model(benched_opus_home):
     assert client is not None
     assert agent._anthropic_api_key == EXPLICIT_KEY
     client.close()
+
+
+def test_model_cooldown_reads_as_quota_and_missing_login_does_not(benched_opus_home):
+    """Kanban start failures and the cron preflight read quota from ``is_rate_limited_auth_error``:
+    the model cooldown must requeue (75), a missing login must not look like a quota wall."""
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_cli.runtime_provider import _anthropic_token_or_raise
+
+    with pytest.raises(AuthError, match=RATE_LIMITED) as benched:
+        _anthropic_token_or_raise(model=OPUS)
+    assert is_rate_limited_auth_error(benched.value)
+
+    (benched_opus_home / "auth.json").write_text(json.dumps({
+        "version": 1, "providers": {}, "credential_pool": {"anthropic": []},
+    }))
+    with pytest.raises(AuthError, match=NO_CREDENTIALS) as missing:
+        _anthropic_token_or_raise(model=OPUS)
+    assert not is_rate_limited_auth_error(missing.value)
