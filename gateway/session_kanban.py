@@ -419,10 +419,11 @@ def _record_worker_result(context, code, last_output, *, stage=None):
             kb._append_event(conn, context['task_id'], 'worker_result', payload, run_id=context['run_id'])
 
 
-def record_worker_loss(policy, reason, *, pid=None, bound=False):
+def record_worker_loss(policy, reason, *, pid=None, bound=False, detail=None):
     """Append a run-scoped ``worker_lost`` event for this attempt to the card's board.
 
     Dropped when the card has moved past the run (it says nothing about the current attempt).
+    ``detail`` (the redacted stderr tail of a worker lost before hello) is kept only when set.
     Never raises: the caller's own loss handling must not depend on the board write.
     """
     try:
@@ -437,10 +438,11 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False):
                                (context['task_id'],)).fetchone()
             if row is None or row[0] != 'running' or row[1] != run_id:
                 return
-            kb._append_event(conn, context['task_id'], 'worker_lost',
-                             {'reason': str(reason)[:200], 'claim_lock': context['claim_lock'],
-                              'run_id': run_id, 'pid': pid, 'bound': bool(bound)},
-                             run_id=run_id)
+            payload = {'reason': str(reason)[:200], 'claim_lock': context['claim_lock'],
+                       'run_id': run_id, 'pid': pid, 'bound': bool(bound)}
+            if detail:
+                payload['detail'] = str(detail)[:300]
+            kb._append_event(conn, context['task_id'], 'worker_lost', payload, run_id=run_id)
     except Exception:
         import logging
         logging.getLogger(__name__).exception('kanban worker_lost record failed')

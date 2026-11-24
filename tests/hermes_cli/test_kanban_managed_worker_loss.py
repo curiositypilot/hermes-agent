@@ -310,3 +310,15 @@ def test_a_loss_recorded_against_a_superseded_run_is_dropped(board):
     board.conn.commit()
     record_worker_loss(policy, "managed_worker_failed", pid=1234, bound=False)
     assert count() == 1
+
+
+
+@pytest.mark.parametrize("lost", [{"reason": "EOFError"}, {"reason": "EOFError", "detail": ""}],
+                         ids=["no-detail-key", "empty-detail"])
+def test_a_loss_without_a_stderr_detail_keeps_the_bare_note(lost):
+    assert kanban_owner_recovery.owner_attempt_note(None, "t_any", lost) == "managed worker lost: EOFError"
+
+
+def test_a_loss_with_a_stderr_detail_names_it():
+    note = kanban_owner_recovery.owner_attempt_note(None, "t_any", {"reason": "EOFError", "detail": "boom"})
+    assert note == "managed worker lost: EOFError — stderr: boom"
