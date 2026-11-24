@@ -106,6 +106,7 @@ Config file: `~/.hermes/hindsight/config.json`
 | `retain_tags` | — | Default tags applied to retained memories; merged with per-call tool tags |
 | `retain_source` | — | Opt-in `metadata.source` attached to retained memories (identifies the storing client, e.g. `hermes`). Empty by default — no attribution tag ships unless you set it. |
 | `tool_retain_strategy` | — | Bank retain-strategy name sent on `hindsight_retain` tool items, together with an agent-note source envelope (`source_kind: agent-note`, `trust: agent`, session title). Empty sends neither; auto-retained turns never carry a strategy |
+| `project_registry` | — | Path to a project registry JSON (`{"projects": [{"slug", "aliases"}]}`). `hindsight_retain` rewrites a `project:<alias>` tag to its slug, and stores a registry slug the bank's `project` labels lack with a note instead of refusing it |
 | `retain_indicator` | `true` | Show a `👁️ Hindsight — saving to memory…` status line when a turn is saved. Turn off for customer-facing agents. |
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
 | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
@@ -113,7 +114,12 @@ Config file: `~/.hermes/hindsight/config.json`
 Auto-retain also skips turns whose assistant text is empty or a `[stream error …]` placeholder,
 and the environment variable `HINDSIGHT_AUTO_RETAIN=0` switches it off for one process (probe and
 test launchers). Each skipped turn logs one debug line with the reason. Explicit
-`hindsight_retain` tool calls are never gated.
+`hindsight_retain` tool calls are never gated by these rules.
+
+`hindsight_retain` checks its `project:` tags instead: each is rewritten through
+`recall_project_aliases` and `project_registry`, then a slug that is not a value of the bank's
+`project` entity label is refused and nothing is stored. A miss re-fetches the labels once (a
+label added within the one-hour cache), and an unreachable bank config stores the tag unchecked.
 
 ### Integration
 
