@@ -1,4 +1,5 @@
 import asyncio
+import json
 import pytest
 
 from pathlib import Path
@@ -757,9 +758,10 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
 
 @pytest.mark.asyncio
 async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_path, monkeypatch):
-    """Missing artifact paths are silently skipped — they may have been
-    referenced by name only. The notifier must not crash and must still
-    deliver any artifacts that do exist."""
+    """A declared artifact whose stored copy vanished before delivery (pruned
+    or deleted by hand) is skipped. The notifier must not crash and must still
+    deliver the artifacts that do exist. Completion itself refuses a missing
+    declared path, so the ghost is created by removing its staged copy."""
     import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_notify as kbn
@@ -773,6 +775,8 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
 
     real_pdf = tmp_path / "real.pdf"
     real_pdf.write_bytes(b"%PDF-fake")
+    ghost_pdf = tmp_path / "ghost.pdf"
+    ghost_pdf.write_bytes(b"%PDF-ghost")
 
     conn = kbc.connect()
     try:
@@ -789,12 +793,14 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     os.environ["HERMES_KANBAN_TASK"] = tid
     try:
-        kt._handle_complete({
+        out = json.loads(kt._handle_complete({
             "summary": "one real, one ghost",
-            "artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"],
-        })
+            "artifacts": [str(real_pdf), str(ghost_pdf)],
+        }))
     finally:
         os.environ.pop("HERMES_KANBAN_TASK", None)
+    assert out["ok"] is True, out
+    (kb.task_attachments_dir(tid) / "ghost.pdf").unlink()
 
     runner = object.__new__(GatewayRunner)
     runner._owns_kanban_dispatcher_lock = lambda: True

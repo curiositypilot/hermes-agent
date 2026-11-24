@@ -283,6 +283,25 @@ def test_complete_reports_registered_attachments(worker_env):
     assert readback["attachments"] == d["attachments"]
 
 
+def test_complete_refuses_missing_artifact_and_stays_in_flight(worker_env, tmp_path):
+    """A declared path that cannot be copied refuses the call; the error tells
+    the worker the task is still in-flight, never that a scratch dir was kept
+    (worktree and dir cards have none)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_complete({
+        "summary": "done",
+        "artifacts": [str(tmp_path / "cache" / "scratch" / "gone.png")],
+    }))
+    assert "still in-flight" in out["error"]
+    assert "not found" in out["error"]
+    assert "scratch workspace was kept" not in out["error"]
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
 def test_request_review_rejects_unknown_reviewer_without_mutation(monkeypatch, worker_env, tmp_path):
     """#106163: a non-profile ``reviewer`` (e.g. the literal "reviewer") must be
     refused with an error the model sees, leaving the task running under the

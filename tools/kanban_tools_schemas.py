@@ -153,11 +153,10 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "else uploads as a file) so the deliverable "
                 "lands with the completion notification. Skip "
                 "intermediate scratch files and references that "
-                "are not the deliverable. The path must exist "
-                "on disk at completion. Files inside a managed scratch "
-                "workspace are copied to durable task attachments before "
-                "cleanup; a missing declared scratch artifact keeps the "
-                "task in-flight so you can fix the path and retry. "
+                "are not the deliverable. Every declared path must be "
+                "an existing regular file ≤25 MB. It is copied into the "
+                "task's durable attachments, wherever it lives. A missing, "
+                "directory or oversize path refuses the call. "
                 "Paths in metadata are not uploaded."
             ),
         },
@@ -269,14 +268,12 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
                 "files this handoff names — generated charts, "
                 "PDFs, spreadsheets, images, archives. Examples: "
                 "['~/.hermes/cache/scratch/q3-revenue.png', '~/.hermes/cache/scratch/report.pdf']. "
-                "A review handoff is the last implementer "
-                "transition, so the kernel copies these into the "
-                "task's durable attachments before the reviewer's "
-                "completion cleans the scratch workspace up, and "
-                "the gateway notifier uploads them as native "
-                "attachments to the subscribed chat. A missing "
-                "declared scratch artifact keeps the task in place "
-                "so you can fix the path and retry."
+                "The gateway notifier uploads them as native "
+                "attachments to the subscribed chat. Every declared "
+                "path must be an existing regular file ≤25 MB. It is "
+                "copied into the task's durable attachments, wherever "
+                "it lives. A missing, directory or oversize path "
+                "refuses the call."
             ),
         },
     },
