@@ -145,6 +145,16 @@ def test_kanban_guidance_keeps_rules_no_other_text_carries():
     assert bullets and all(ln.startswith("- Do not ") for ln in bullets), bullets
 
 
+def test_kanban_guidance_comment_bullet_says_done_cards_never_respawn():
+    """The comment bullet promises a 'next spawn'; a done card has none, so the
+    bullet itself must route hand-offs to kanban_create (intake t_178afeba)."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    bullet = next(ln for ln in KANBAN_GUIDANCE.splitlines()
+                  if "Comments are the inter-agent protocol" in ln)
+    assert "done or archived" in bullet and "kanban_create" in bullet
+
+
 @pytest.mark.parametrize("stores", [(True, True), (False, True), (True, False), (False, False)])
 @pytest.mark.parametrize("names", [
     set(), {"memory"}, {"memory", "skill_view", "skills_list"},

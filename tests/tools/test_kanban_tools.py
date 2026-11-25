@@ -1284,6 +1284,56 @@ def test_worker_can_comment_on_foreign_task(worker_env):
         conn.close()
 
 
+def _comment_target(state: str) -> str:
+    """A foreign task moved into ``state`` through the kanban_db API."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title=f"target-{state}")
+        if state == "running":
+            kb.claim_task(conn, tid)
+        elif state == "blocked":
+            assert kb.block_task(conn, tid, reason="needs a human", kind="needs_input")
+        elif state in ("done", "archived"):
+            assert kb.complete_task(conn, tid, result="shipped")
+            if state == "archived":
+                assert kb.archive_task(conn, tid)
+        assert kb.get_task(conn, tid).status == state
+        return tid
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("state", ["done", "archived"])
+def test_comment_on_done_task_warns_but_writes(worker_env, state):
+    """No worker spawns on a done/archived card, so a hand-off comment there is
+    read by nobody: the result warns, but the comment still lands (record-only
+    notes on done cards are legitimate) — intake t_178afeba."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+    target = _comment_target(state)
+    d = json.loads(kt._handle_comment({"task_id": target, "body": "please fix the run sheet"}))
+    assert d["ok"] is True and d["comment_id"]
+    assert d["status"] == state
+    assert state in d["warning"] and "no worker" in d["warning"] and "kanban_create" in d["warning"]
+    conn = kbc.connect()
+    try:
+        assert [c.body for c in kb.list_comments(conn, target)] == ["please fix the run sheet"]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("state", ["ready", "blocked", "running"])
+def test_comment_on_live_task_has_no_warning(worker_env, state):
+    from tools import kanban_tools as kt
+    target = _comment_target(state)
+    d = json.loads(kt._handle_comment({"task_id": target, "body": "handoff note"}))
+    assert d["ok"] is True and d["comment_id"]
+    assert "warning" not in d and "status" not in d
+
+
 def test_worker_unblock_rejects_foreign_task_id(worker_env):
     """A worker cannot unblock any task — kanban_unblock is orchestrator-only.
 
