@@ -273,11 +273,11 @@ class TestSchemas:
         # The plugin serves several profiles; never name one user in the shared schema.
         assert "MB" not in desc
 
-    def test_get_tool_schemas_returns_three(self, provider):
+    def test_every_tool_schema_has_a_handler(self, provider):
         schemas = provider.get_tool_schemas()
-        assert len(schemas) == 3
         names = {s["name"] for s in schemas}
-        assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect"}
+        assert len(names) == len(schemas) and names == set(provider._TOOL_HANDLERS)
+        assert {"hindsight_retain", "hindsight_recall", "hindsight_reflect", "hindsight_invalidate"} <= names
 
     def test_context_mode_returns_no_tools(self, provider_with_config):
         p = provider_with_config(memory_mode="context")

@@ -167,7 +167,7 @@ class TestModes:
         assert _prefetch(root, rows) == f"{_PREAMBLE}\n\n{PLAIN_HITS}"
         assert _prefetch(root, rows, recall_state_lines="off") == f"{_PREAMBLE}\n\n{PLAIN_HITS}"
         assert _tool(root, rows, recall_state_lines="off") == "\n".join(
-            f"{i}. {TEXTS[u]}" for i, u in enumerate(HITS, 1))
+            f"{i}. {{{u}}} {TEXTS[u]}" for i, u in enumerate(HITS, 1))
         assert _jsonl(root) == []
 
     def test_shadow_serves_plain_and_logs_one_row(self, root):
@@ -217,8 +217,8 @@ class TestToolPath:
             "- [2026-10-20] X: moved | X moved",
             "",
             _DATED_RECALL_HEADER,
-            "1. [2026-10-03] [older than x status 2026-10-20] text",
-            "2. unrelated note",
+            "1. [2026-10-03] {hx} [older than x status 2026-10-20] text",
+            "2. {h4} unrelated note",
         ])
         [row] = _jsonl(root)
         assert row["path"] == "tool" and row["lines"] == [
