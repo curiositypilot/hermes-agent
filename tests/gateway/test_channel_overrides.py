@@ -160,3 +160,14 @@ def test_fallback_providers_round_trip_through_platform_config():
 
     assert cfg.channel_overrides["c1"].fallback_providers == chain
     assert PlatformConfig.from_dict(cfg.to_dict()).channel_overrides["c1"].fallback_providers == chain
+
+
+def test_data_class_round_trips_through_platform_config():
+    cfg = PlatformConfig.from_dict({"enabled": True, "channel_overrides": {
+        "1720": {"model": "m", "data_class": "local-only"}, "4003": {"system_prompt": "p"}}})
+
+    assert cfg.channel_overrides["1720"].data_class == "local-only"
+    assert cfg.channel_overrides["4003"].data_class is None
+    round_tripped = PlatformConfig.from_dict(cfg.to_dict()).channel_overrides
+    assert round_tripped["1720"].data_class == "local-only"
+    assert "data_class" not in round_tripped["4003"].to_dict()

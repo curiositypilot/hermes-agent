@@ -272,7 +272,7 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = Non
     )
     if not (task_provider and task_provider != "auto" and task_model) or (
         task_provider == (agent.provider or "") and task_model == (agent.model or "")  # same as parent
-    ):
+    ) or not _review_route_permitted(task_provider, agent.provider):
         return parent
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -289,6 +289,16 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = Non
     except Exception as e:
         _warn_review_routing_fallback(agent, task_provider, task_model, e)
         return parent
+
+
+def _review_route_permitted(task_provider: str, parent_provider: Optional[str]) -> bool:
+    """Whether the bound data class admits the configured review provider. A refused route runs on
+    the parent runtime (the ``_enforce_data_class_on_task_route`` reroute contract) instead of a
+    routed fork that ``_init_fallback_chain`` would deny, losing the review (a local-only chat's
+    review must not reach a cloud vendor either way). An unresolvable class raises: fail closed."""
+    from agent.auxiliary_client import _policy_provider_label
+    from agent.provider_policy import auxiliary_permits, current_data_class
+    return auxiliary_permits(_policy_provider_label(task_provider), current_data_class(), parent_provider or "")
 
 
 def _warn_review_routing_fallback(agent: Any, task_provider: str, task_model: str, error: Exception) -> None:

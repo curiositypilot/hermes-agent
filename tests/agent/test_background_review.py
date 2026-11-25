@@ -996,3 +996,50 @@ def test_turn_exit_log_carries_fork_origin_tag():
     assert len(records) == 2
     assert "origin=" not in records[0], records[0]
     assert "origin=background_review" in records[1], records[1]
+
+
+_POLICY_CONFIG = """
+kanban:
+  data_policies:
+    default: internal
+    classes:
+      internal: {providers: any, fallback: true, auxiliary: any}
+      local-only: {providers: [custom], fallback: false, auxiliary: same_provider_or_fail}
+"""
+
+
+def _review_route_under(tmp_path, monkeypatch, data_class):
+    """``_resolve_review_runtime`` for a local ``custom`` parent with the review task pinned to anthropic."""
+    import agent.background_review as bg
+    from agent.provider_policy import bind_data_class, reset_data_class
+    from types import SimpleNamespace
+
+    (tmp_path / "config.yaml").write_text(_POLICY_CONFIG, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for name in ("HERMES_KANBAN_TASK", "HERMES_DATA_CLASS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw: {
+        "provider": kw["requested"], "model": kw["target_model"], "base_url": "https://api.anthropic.com"})
+    agent = SimpleNamespace(
+        provider="custom", model="huihui-local.gguf",
+        _current_main_runtime=lambda: {"base_url": "http://127.0.0.1:8081/v1", "api_key": "no-key"})
+    task_cfg = {"provider": "anthropic", "model": "claude-sonnet-5-5"}
+    token = bind_data_class(data_class) if data_class else None
+    try:
+        return bg._resolve_review_runtime(agent, task_cfg)
+    finally:
+        if token is not None:
+            reset_data_class(token)
+
+
+def test_review_route_outside_bound_class_keeps_parent_runtime(tmp_path, monkeypatch):
+    runtime = _review_route_under(tmp_path, monkeypatch, "local-only")
+    assert runtime["routed"] is False
+    assert runtime["provider"] == "custom"
+    assert runtime["base_url"] == "http://127.0.0.1:8081/v1"
+
+
+def test_review_route_unbound_still_routes(tmp_path, monkeypatch):
+    runtime = _review_route_under(tmp_path, monkeypatch, None)
+    assert runtime["routed"] is True
+    assert runtime["provider"] == "anthropic"

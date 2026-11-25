@@ -377,13 +377,18 @@ def persist_home_channel(home: HomeChannel, *, enabled_if_new: bool = False) -> 
 
 @dataclass
 class ChannelOverride:
-    """Per-channel model/provider/system_prompt/fallback_providers override
-    (``platforms.<name>.channel_overrides[channel_id]``)."""
+    """Per-channel model/provider/system_prompt/fallback_providers/data_class override
+    (``platforms.<name>.channel_overrides[channel_id]``).
+
+    ``data_class`` names a ``kanban.data_policies.classes`` key bound for every turn, slash command
+    and background job of the chat, so its auxiliary calls follow that class; an unknown class fails
+    the turn closed (``ProviderDenied``)."""
     model: Optional[str] = None
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
     # Same shape as the top-level key; replaces the profile chain for this chat ([] disables fallback).
     fallback_providers: Optional[list] = None
+    data_class: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}

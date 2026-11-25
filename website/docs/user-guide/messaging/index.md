@@ -341,15 +341,28 @@ platforms:
         fallback_providers:        # this channel's own chain
           - provider: openrouter
             model: openai/gpt-5-nano
+      "555555555555555555":        # a privacy channel on a local model
+        provider: custom:local-llm
+        model: my-local-model
+        data_class: local-only     # a kanban.data_policies class (below)
+
+kanban:
+  data_policies:
+    classes:
+      local-only:
+        providers: [custom]
+        fallback: false
+        auxiliary: same_provider_or_fail
 ```
 
 Details:
 
-- `model`, `provider`, `system_prompt`, and `fallback_providers` are optional — set only `model`, only `system_prompt`, or any combination. Unset fields fall back to the global defaults.
+- `model`, `provider`, `system_prompt`, `fallback_providers` and `data_class` are optional — set only `model`, only `system_prompt`, or any combination. Unset fields fall back to the global defaults.
 - Lookup order is exact channel/thread id first, then the **parent** channel/forum id — so Discord threads inherit their parent channel's override automatically.
 - Resolution priority for the model is: session `/model` override → `channel_overrides` → global config. A user running `/model` in a chat still wins over the channel default.
 - The `system_prompt` override replaces the global gateway prompt for that channel (it is ephemeral — injected per turn, not stored in history).
 - `fallback_providers` takes the same entries as the top-level key and replaces the global chain for that channel; `[]` disables fallback there. A custom endpoint entry carries its own `base_url` (and `key_env` when it needs a key), as in [Fallback Providers](../features/fallback-providers.md#custom-endpoint-fallback).
+- `data_class` binds a `kanban.data_policies.classes` entry for every turn, slash command and background job in that channel, so auxiliary calls (compression, titles, vision, web extraction, the background review) obey the class: with `auxiliary: same_provider_or_fail` they run on the channel's main provider instead of the configured `auxiliary.*` routes. An unknown class fails the turn closed.
 
 ## Security
 

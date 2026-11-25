@@ -3966,8 +3966,10 @@ class GatewayRunner(
         """Set session context variables (contextvars, not os.environ, so concurrent messages can't
         overwrite each other). Returns reset tokens for ``_clear_session_env`` in a ``finally``."""
         from gateway.session_context import set_session_vars
+        from gateway.session_data_class import bind_channel_data_class
         from gateway.session_detached import session_env_source
         source = session_env_source(self, context.source)
+        class_tokens = bind_channel_data_class(self, source)  # first: an unknown class fails closed
         # Can async tools wake a later turn here? Default True (CLI/unknown); api_server declares False.
         _adapter = (getattr(self, "adapters", None) or {}).get(source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
@@ -3975,28 +3977,26 @@ class GatewayRunner(
         from gateway.session_api_turn import api_session_vars
         _history_delivery = api_session_vars().get("session_history_delivery")
         return set_session_vars(
-            platform=source.platform.value,
-            chat_id=source.chat_id,
-            chat_type=str(source.chat_type) if source.chat_type else "",
-            chat_name=source.chat_name or "",
+            platform=source.platform.value, chat_id=source.chat_id,
+            chat_type=str(source.chat_type) if source.chat_type else "", chat_name=source.chat_name or "",
             thread_id=str(source.thread_id) if source.thread_id else "",
             user_id=str(source.user_id) if source.user_id else "",
             user_id_alt=str(source.user_id_alt) if source.user_id_alt else "",
             user_name=str(source.user_name) if source.user_name else "",
-            scope_id=str(getattr(source, "scope_id", "") or ""),
+            scope_id=str(getattr(source, "scope_id", "") or ""), session_key=context.session_key,
             parent_chat_id=str(getattr(source, "parent_chat_id", "") or ""),
-            session_key=context.session_key,
             # A cached agent binds HERMES_SESSION_ID only on the turn that built it; every later turn
             # (and a command it yields to the background) must still see its own session.
             session_id=context.session_id or "",
             message_id=str(source.message_id) if source.message_id else "",
-            profile=getattr(source, "profile", "") or "",
-            async_delivery=_async_delivery,
-            cron_session="", session_history_delivery=_history_delivery)
+            profile=getattr(source, "profile", "") or "", async_delivery=_async_delivery,
+            cron_session="", session_history_delivery=_history_delivery) + class_tokens
 
     def _clear_session_env(self, tokens: list) -> None:
-        """Restore session context variables to their pre-handler values."""
+        """Restore session context variables and the chat's data class (``clear_session_vars`` skips it)."""
         from gateway.session_context import clear_session_vars
+        from gateway.session_data_class import reset_channel_data_class
+        reset_channel_data_class(tokens)
         clear_session_vars(tokens)
 
     @_contextmanager
