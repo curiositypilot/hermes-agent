@@ -6,8 +6,10 @@ as replaced, but the tool surface had no invalidate path and recall showed no id
 stayed live. These drive the real provider against a fake bank that records call order.
 """
 
+import importlib.util
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -51,7 +53,7 @@ class FakeBank:
     async def _get(self, bank_id, memory_id):
         self.calls.append(("get", memory_id))
         if memory_id not in self.facts:
-            raise LookupError(f"404 {memory_id}")
+            raise sys.modules["hindsight_client_api.exceptions"].ApiException(status=404, reason="Not Found")
         return dict(self.facts[memory_id])
 
     async def _patch(self, bank_id, memory_id, request):
@@ -73,6 +75,23 @@ class FakeBank:
 
     def patches(self):
         return [c for c in self.calls if c[0] == "patch"]
+
+
+@pytest.fixture(autouse=True)
+def _sdk_exceptions(monkeypatch):
+    """The real SDK's exception module when installed, else the one class the tool catches."""
+    if importlib.util.find_spec("hindsight_client_api") is not None:
+        return
+    client_api, exceptions = ModuleType("hindsight_client_api"), ModuleType("hindsight_client_api.exceptions")
+
+    class ApiException(Exception):
+        def __init__(self, status=None, reason=None, **kwargs):
+            super().__init__(f"({status})\nReason: {reason}")
+
+    exceptions.ApiException = ApiException
+    client_api.exceptions = exceptions
+    monkeypatch.setitem(sys.modules, "hindsight_client_api", client_api)
+    monkeypatch.setitem(sys.modules, "hindsight_client_api.exceptions", exceptions)
 
 
 @pytest.fixture
@@ -139,6 +158,14 @@ def test_observation_and_decision_are_refused_finding_and_unlabelled_are_patched
     assert lines[2].startswith(f"invalidated {FINDING[:8]}") and lines[3].startswith(f"invalidated {STALE[:8]}")
     assert [c[1] for c in bank.patches()] == [FINDING, STALE]
     assert all(c[2]["reason"].startswith("agent-correction:") for c in bank.patches())
+
+
+def test_missing_fact_fails_with_one_line_error_and_other_ids_still_run(setup):
+    p, _ = setup
+    missing = "00000000-0000-4000-8000-000000000000"
+    lines = _call(p, "hindsight_invalidate", {"ids": [missing, STALE], "reason": "r"})["result"].splitlines()
+    assert lines[0] == "failed 00000000: ApiException: (404)"
+    assert lines[1].startswith(f"invalidated {STALE[:8]}")
 
 
 def test_missing_reason_is_a_tool_error(setup):

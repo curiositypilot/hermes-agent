@@ -12,12 +12,9 @@ named id is invalidated (an already-invalidated fact counts, so a retry is safe)
 
 from __future__ import annotations
 
-import logging
 import re
 from collections import OrderedDict
 from typing import Any
-
-logger = logging.getLogger(__name__)
 
 # Server parity: overrides orchestrator ``_XDOC_CORR_INVALIDATE_LABELS``. Any other status label
 # (decision, lesson, ...) is a choice the user made; it changes through ``memory-system retire``.
@@ -76,6 +73,15 @@ def _field(fact: Any, name: str) -> Any:
     return fact.get(name) if isinstance(fact, dict) else getattr(fact, name, None)
 
 
+def _bank_errors() -> tuple:
+    """What a bank call raises for a bad id or an unreachable server: the SDK's ApiException
+    (404, 400, ...), aiohttp transport errors, timeouts. Anything else is a bug and propagates."""
+    import aiohttp
+    from hindsight_client_api.exceptions import ApiException
+
+    return ApiException, aiohttp.ClientError, OSError, TimeoutError
+
+
 def _error(exc: Exception) -> str:
     """One line: the SDK's ApiException text carries headers and body on later lines."""
     return f"{type(exc).__name__}: {(str(exc).strip().splitlines() or [''])[0][:200]}"
@@ -98,11 +104,10 @@ def _invalidate_one(provider, ref: str, reason: str) -> tuple[str, str]:
     short = ref[:8]
     if not full:
         return "refused", f"refused {short}: unknown id; run hindsight_recall first"
-    bank = provider._bank_id
+    bank, errors = provider._bank_id, _bank_errors()
     try:
         fact = provider._run_hindsight_operation(lambda c: c.memory.get_memory(bank, full))
-    except Exception as exc:  # per-id boundary: one bad id must not hide the others' outcomes
-        logger.warning("hindsight_invalidate: GET %s failed", full, exc_info=True)
+    except errors as exc:  # reported per id: one bad id must not hide the others' outcomes
         return "failed", f"failed {short}: {_error(exc)}"
     text = str(_field(fact, "text") or "")[:80]
     if _field(fact, "state") == "invalidated":
@@ -116,8 +121,7 @@ def _invalidate_one(provider, ref: str, reason: str) -> tuple[str, str]:
                "reason": f"agent-correction: {reason[:_REASON_MAX]} (session {provider._session_id})"}
     try:
         provider._run_hindsight_operation(lambda c: c.memory.update_memory(bank, full, request))
-    except Exception as exc:  # per-id boundary, as above
-        logger.warning("hindsight_invalidate: PATCH %s failed", full, exc_info=True)
+    except errors as exc:
         return "failed", f"failed {short}: {_error(exc)}"
     return "invalidated", f"invalidated {short}: {text}"
 
