@@ -17,6 +17,7 @@ import itertools
 @pytest.fixture
 def make_provider(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_DATA_CLASS", "internal")  # fake worker task ids resolve no card class
     monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
 
     def make(**config):

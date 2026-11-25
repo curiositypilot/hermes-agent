@@ -57,6 +57,7 @@ def _clean_env(tmp_path, monkeypatch):
         "HINDSIGHT_AUTO_RETAIN", "HERMES_KANBAN_TASK",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HERMES_DATA_CLASS", "internal")  # what the dispatcher hands a worker beside its task id
 
     # On Windows pathlib.Path.home() resolves USERPROFILE/HOMEDRIVE+HOMEPATH,
     # not the POSIX HOME alias that these tests historically monkeypatched.
@@ -1060,9 +1061,8 @@ def kanban_card(tmp_path, monkeypatch):
     home = tmp_path / "kanban-home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
-    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
-    monkeypatch.delenv("HERMES_TENANT", raising=False)
+    for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_TENANT"):
+        monkeypatch.delenv(name, raising=False)
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
 
