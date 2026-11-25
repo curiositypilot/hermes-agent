@@ -33,6 +33,9 @@ class _Runner(GatewayRunner):
     def _evict_cached_agent(self, _session_key):
         pass
 
+    def _channel_override_for(self, _source):  # the bare object() source has no platform/chat
+        return None
+
     def _resolve_profile_home_for_source(self, _source):
         return getattr(self, "routed_home", gateway_run._gateway_config_home())
 

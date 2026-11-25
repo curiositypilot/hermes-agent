@@ -68,6 +68,7 @@ def _make_runner():
     runner.config = MagicMock()
     runner.config.group_sessions_per_user = True
     runner.config.thread_sessions_per_user = False
+    runner.config.platforms = {}  # no channel_overrides: a MagicMock one carries a bogus data_class
     runner.session_store = None
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()

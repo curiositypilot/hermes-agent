@@ -81,6 +81,7 @@ def _make_runner() -> GatewayRunner:
     runner._draining = False
     runner.adapters = {}
     runner.config = MagicMock()
+    runner.config.platforms = {}  # no channel_overrides: a MagicMock one carries a bogus data_class
     runner.session_store = None
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()

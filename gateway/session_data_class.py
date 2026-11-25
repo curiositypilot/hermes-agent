@@ -26,8 +26,7 @@ class _DataClassToken:
 
 def channel_data_class(runner: Any, source: Any) -> Optional[str]:
     """The ``data_class`` of ``source``'s channel override, or None (the common, cheap case)."""
-    from gateway.slash_commands_model import GatewayModelCommandsMixin
-    override = GatewayModelCommandsMixin._channel_override_for(runner, source)
+    override = runner._channel_override_for(source)
     label = getattr(override, "data_class", None)
     return str(label).strip() or None if label else None
 
@@ -47,23 +46,34 @@ def reset_channel_data_class(tokens: Optional[list]) -> None:
             reset_data_class(item.token)
 
 
-@contextmanager
 def channel_data_class_scope(runner: Any, source: Any, inner):
-    """Enter ``inner`` (the profile scope, whose home owns ``data_policies``), then bind the class."""
+    """``inner`` (the profile scope) as is when the chat sets no class, else ``inner`` then the bind
+    (the profile home owns ``data_policies``)."""
+    label = channel_data_class(runner, source)
+    return _bound_scope(inner, label) if label else inner
+
+
+def async_channel_data_class_scope(runner: Any, source: Any, inner):
+    """``async with`` twin of :func:`channel_data_class_scope`."""
+    label = channel_data_class(runner, source)
+    return _async_bound_scope(inner, label) if label else inner
+
+
+@contextmanager
+def _bound_scope(inner, label: str):
     with inner:
-        tokens = bind_channel_data_class(runner, source)
+        token = bind_data_class(label)
         try:
             yield
         finally:
-            reset_channel_data_class(tokens)
+            reset_data_class(token)
 
 
 @asynccontextmanager
-async def async_channel_data_class_scope(runner: Any, source: Any, inner):
-    """``async with`` twin of :func:`channel_data_class_scope`."""
+async def _async_bound_scope(inner, label: str):
     async with inner:
-        tokens = bind_channel_data_class(runner, source)
+        token = bind_data_class(label)
         try:
             yield
         finally:
-            reset_channel_data_class(tokens)
+            reset_data_class(token)
