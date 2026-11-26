@@ -343,17 +343,17 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             self._clear_session_env(_session_env_tokens)
 
     def _profile_scope_for_source(self, source: SessionSource):
-        """``_profile_runtime_scope`` for ``source``'s profile when a secret scope is required.
+        """``_profile_runtime_scope`` for ``source``'s profile plus its channel ``data_class`` (``session_data_class``).
 
-        Under multiplexing config/skills/memory resolve to the source profile's home AND credentials
-        come from its secret scope (never process-global ``os.environ``). A standalone gateway
-        (``multiplex_profiles`` off) still binds once a hosted room has flipped the process-wide
-        credential guard — see ``_standalone_launch_scope``."""
+        Under multiplexing config/skills/memory resolve to the source profile's home AND credentials come
+        from its secret scope (never ``os.environ``); a standalone gateway (``multiplex_profiles`` off)
+        still binds once a hosted room flipped the process-wide credential guard (``_standalone_launch_scope``)."""
         from gateway.run import _profile_runtime_scope
+        from gateway.session_data_class import channel_data_class_scope
         from gateway.session_policy import local_desktop_turn
         home = self._profile_scope_key_for_source(source)
-        return local_desktop_turn(self, source, _profile_runtime_scope(home) if home is not None
-                                  else self._standalone_launch_scope())
+        inner = _profile_runtime_scope(home) if home is not None else self._standalone_launch_scope()
+        return channel_data_class_scope(self, source, local_desktop_turn(self, source, inner))
 
     def _profile_scope_key_for_source(self, source: SessionSource) -> Optional[Path]:
         """Profile home ``_profile_scope_for_source`` binds for ``source``, or ``None`` when it falls
@@ -371,11 +371,11 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         the routed runtime when a bot serves another profile's chat; every handler reading
         home-relative state (pending writes, memory store, config) binds the runtime here (#119915)."""
         from gateway.run import _async_profile_runtime_scope
-        home = self._profile_scope_key_for_source(source)
-        if home is not None:
-            return _async_profile_runtime_scope(home)
+        from gateway.session_data_class import async_channel_data_class_scope
         from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
-        return async_launch_profile_scope_if_multiplexed()
+        home = self._profile_scope_key_for_source(source)
+        inner = _async_profile_runtime_scope(home) if home is not None else async_launch_profile_scope_if_multiplexed()
+        return async_channel_data_class_scope(self, source, inner)
 
     @staticmethod
     def _standalone_launch_scope():
@@ -554,7 +554,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot.
                     # See #60955.
-                    fallback_model=self._refresh_fallback_model(),
+                    fallback_model=self._fallback_chain_for(source),
                 )
                 try:
                     return agent.run_conversation(user_message=enriched_prompt, task_id=task_id)

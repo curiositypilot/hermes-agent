@@ -16,6 +16,7 @@ def _make_runner(proxy_url=None):
     runner.adapters = {}
     runner.config = MagicMock()
     runner.config.streaming = StreamingConfig()
+    runner.config.platforms = {}  # no channel_overrides: a MagicMock one carries a bogus data_class
     runner._running_agents = {}
     runner._session_run_generation = {}
     runner._session_model_overrides = {}
