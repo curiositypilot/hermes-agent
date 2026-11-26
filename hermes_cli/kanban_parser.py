@@ -342,6 +342,8 @@ _SPECS = [
              help="Replace the completion gate: local-only, test:<command>, OWNER/REPO, or exact "
                   "GitHub PR URL. Cannot be used on done/archived tasks or with --result; on a "
                   "running task the worker's next complete/review sees stale ownership once."),
+        _arg("--tenant", help="Move the task to this tenant (refused on a running task; a restricted "
+                              "data class the old tenant gave it is pinned, never loosened)"),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
     _cmd("block", [

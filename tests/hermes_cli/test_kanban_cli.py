@@ -211,6 +211,121 @@ def test_kanban_edit_completion_contract_unchanged_is_noop(kanban_home):
     assert _edited_events(task_id) == []
 
 
+def _edit_tenant(task_id, tenant, result=None):
+    return kc._cmd_edit(argparse.Namespace(
+        task_id=task_id, title=None, body=None, priority=None, result=result,
+        summary=None, metadata=None, completion_contract=None, tenant=tenant,
+    ))
+
+
+def _task_row(task_id):
+    with kbc.connect_closing() as conn:
+        return kb.get_task(conn, task_id)
+
+
+def test_kanban_edit_sets_tenant(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="moved", tenant="a")
+
+    kc.run_slash(f"edit {task_id} --tenant b")
+
+    assert _task_row(task_id).tenant == "b"
+    [event] = _edited_events(task_id)
+    assert event.payload["fields"] == ["tenant"]
+    assert event.payload["tenant"] == {"from": "a", "to": "b"}
+    assert "data_class_pinned" not in event.payload
+
+
+def test_kanban_edit_tenant_refuses_running(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="live", tenant="a", assignee="worker")
+        assert kb.claim_task(conn, task_id, claimer="worker") is not None
+
+    assert _edit_tenant(task_id, "b") != 0
+
+    assert _task_row(task_id).tenant == "a"
+    assert _edited_events(task_id) == []
+
+
+def test_kanban_edit_tenant_on_done_task(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="closed", tenant="a")
+        assert kb.complete_task(conn, task_id, result="done")
+
+    assert _edit_tenant(task_id, "b") == 0
+
+    assert _task_row(task_id).tenant == "b"
+
+
+def test_kanban_edit_tenant_empty_rejected(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="kept", tenant="a")
+
+    assert _edit_tenant(task_id, " ") == 2
+
+    assert _task_row(task_id).tenant == "a"
+    assert _edited_events(task_id) == []
+
+
+def test_kanban_edit_tenant_with_result_rejected(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="kept", tenant="a")
+        assert kb.complete_task(conn, task_id, result="done")
+
+    assert _edit_tenant(task_id, "b", result="new result") == 2
+
+    assert _task_row(task_id).tenant == "a"
+
+
+def test_kanban_edit_tenant_unchanged_is_noop(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="same", tenant="a")
+
+    assert _edit_tenant(task_id, "a") == 0
+
+    assert _edited_events(task_id) == []
+
+
+@pytest.fixture
+def policy_home(kanban_home):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  data_policies:\n    default: internal\n"
+        "    tenant_defaults: {work: confidential}\n"
+        "    classes:\n      internal: {providers: any, fallback: true, auxiliary: any}\n"
+        "      confidential: {providers: [anthropic], fallback: false, auxiliary: same_provider_or_fail}\n",
+        encoding="utf-8",
+    )
+    return kanban_home
+
+
+def test_edit_tenant_pins_restricted_class(policy_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="work card", tenant="work")
+        assert kb.edit_task(conn, task_id, tenant="x")
+
+    task = _task_row(task_id)
+    assert (task.tenant, task.data_class) == ("x", "confidential")
+    [event] = _edited_events(task_id)
+    assert event.payload["fields"] == ["tenant", "data_class"]
+    assert event.payload["data_class_pinned"] == "confidential"
+
+
+@pytest.mark.parametrize(("old", "new", "explicit"), [
+    ("x", "y", None),  # both unrestricted
+    ("x", "work", None),  # the new tenant resolves tighter on its own
+    ("work", "x", "internal"),  # an explicit class already decides
+])
+def test_edit_tenant_does_not_pin(policy_home, old, new, explicit):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="card", tenant=old, data_class=explicit)
+        assert kb.edit_task(conn, task_id, tenant=new)
+
+    task = _task_row(task_id)
+    assert (task.tenant, task.data_class) == (new, explicit)
+    [event] = _edited_events(task_id)
+    assert "data_class_pinned" not in event.payload
+
+
 def test_worker_link_preserves_foreign_child_rules(kanban_home, monkeypatch):
     with kbc.connect_closing() as conn:
         worker = kb.create_task(conn, title="worker")
