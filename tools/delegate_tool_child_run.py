@@ -751,6 +751,7 @@ def _scratch_roots() -> list[str]:
     profile switch or a changed ``tempfile.tempdir`` is honoured."""
     import tempfile
     from hermes_constants import get_hermes_home
+    # no-tmp: ok — classifies existing paths as throwaway, never writes there
     roots = [get_hermes_home() / "cache", tempfile.gettempdir(), "/tmp", "/var/tmp"]
     return list(dict.fromkeys(os.path.realpath(r) for r in roots))
 
