@@ -1109,6 +1109,14 @@ def _handle_comment(args: dict, **kw) -> str:
     author = _persisted_identity()
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        # A done/archived card never spawns again, so a hand-off comment there is
+        # read by nobody. Warn, never refuse: record-only notes on done cards are legit.
+        status = kb.get_task(conn, tid).status
+        if status in ("done", "archived"):
+            return _ok(task_id=tid, comment_id=cid, status=status, warning=(
+                f"{tid} is {status}: no worker spawns on a done or archived card, so nobody "
+                "will act on this comment. Fine for a record-only note; to hand off work, "
+                "kanban_create a follow-up instead."))
         return _ok(task_id=tid, comment_id=cid)
 
 
