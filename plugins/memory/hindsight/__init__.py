@@ -45,6 +45,7 @@ from .embedded import (
 )
 from . import state_lines
 from .envelope import agent_note_envelope, chat_envelope, first_line, lookup_session_title
+from .invalidate import INVALIDATE_SCHEMA, SUPERSEDES_PARAM, new_id_store, remember_ids, supersede, tool_invalidate
 from .project_tags import gate_retain_tags
 from .recall_log import log_recalled
 from .settings import (
@@ -291,6 +292,7 @@ RETAIN_SCHEMA = {
                 "('yesterday', 'last Tuesday', 'on March 3rd') so Hindsight can "
                 "anchor it on the timeline. Omit for timeless facts/preferences."
             )},
+            "supersedes": SUPERSEDES_PARAM,
         },
         "required": ["content"],
     },
@@ -602,6 +604,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # recall_kanban_first_turn: set when the worker's one recall starts (any outcome).
         self._kanban_first_turn_done = False
         self._call_timeout = threading.local()  # per-thread override of the operation timeout
+        self._recall_ids = new_id_store()  # id8 -> (full id, type) of rows hindsight_recall served
         self._apply_recall_settings({})
 
     @property
@@ -1723,7 +1726,7 @@ class HindsightMemoryProvider(MemoryProvider):
     # -- tools -------------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return [] if self._memory_mode == "context" else [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        return [] if self._memory_mode == "context" else [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA, INVALIDATE_SCHEMA]
 
     def _tool_retain(self, args: dict) -> str:
         content = args["content"]
@@ -1746,12 +1749,15 @@ class HindsightMemoryProvider(MemoryProvider):
                 registry_path=self._project_registry, labels=self._project_labels)
             if refusal:
                 return refusal
+        superseded, blocked = supersede(self, args.get("supersedes"), content)
+        if blocked:
+            return blocked
         item = self._build_retain_kwargs(content, metadata=metadata, tags=tags,
                                          occurred_at=occurred_at, strategy=strategy)
         logger.debug("Tool hindsight_retain: bank=%s, content_len=%d", self._bank_id, len(content))
         self._retain_batch(item, bank_id=self._bank_id)
         logger.debug("Tool hindsight_retain: success")
-        return " ".join(["Memory stored successfully.", *notes])
+        return " ".join(["Memory stored successfully.", *superseded, *notes])
 
     def _project_labels(self, refresh: bool) -> frozenset | None:
         """``_project_slugs``; ``refresh`` drops the cache first (a label added within the TTL)."""
@@ -1834,6 +1840,7 @@ class HindsightMemoryProvider(MemoryProvider):
         kept = results
         if self._recall_tool_relative_floor and self._recall_min_relative_reranker:
             kept = self._apply_relative_floor(results, self._recall_min_relative_reranker)
+        remember_ids(self._recall_ids, kept)
         text = state_lines.decorate(self._recall_state_lines, "tool", query, kept, lambda marks: (
             _format_tool_recall(kept, self._recall_show_dates, len(results) - len(kept), marks)))
         return "\n".join([*notes, text])
@@ -1852,6 +1859,7 @@ class HindsightMemoryProvider(MemoryProvider):
         "hindsight_retain": ("content", _tool_retain, "Failed to store memory"),
         "hindsight_recall": ("query", _tool_recall, "Failed to search memory"),
         "hindsight_reflect": ("query", _tool_reflect, "Failed to reflect"),
+        "hindsight_invalidate": ("reason", tool_invalidate, "Failed to invalidate memory"),
     }
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
@@ -1919,6 +1927,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._parent_session_id = str(parent_session_id).strip()
         self._session_id, self._document_id = new_id, _mint_document_id(new_id)
         self._session_turns = []
+        self._recall_ids.clear()
         self._session_assistant_texts = _lookup_session_assistant_texts(
             self._handed_hermes_home, self._session_id
         )

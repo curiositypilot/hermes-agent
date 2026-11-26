@@ -181,11 +181,18 @@ def _format_tool_recall(results: list, show_dates: bool, dropped: int = 0, prefi
     """hindsight_recall tool body: numbered ``N. text`` lines, ``N. [YYYY-MM-DD] text`` plus the
     dated-facts header on top with *show_dates* (undated rows stay plain). With no rows it is the
     fallback line alone; *dropped* > 0 (relative floor) appends one note line in both cases.
-    *prefixes* maps a row's 0-based position to its state-lines mark, placed after the date."""
+    *prefixes* maps a row's 0-based position to its state-lines mark, placed after the date.
+    A row with an id carries ``{id8}`` (its first 8 chars) after the date, before the mark: the
+    handle hindsight_invalidate / retain ``supersedes`` take. Auto-recall lines stay id-free."""
     if results:
         dated = (_recall_date(r) if show_dates else "" for r in results)
         marks = prefixes or {}
-        lines = [f"{i}. [{d}] {marks.get(i - 1, '')}{r.text}" if d else f"{i}. {marks.get(i - 1, '')}{r.text}"
+
+        def body(i: int, r) -> str:
+            rid = str(getattr(r, "id", None) or "")
+            return ("{" + rid[:8] + "} " if rid else "") + marks.get(i - 1, "") + r.text
+
+        lines = [f"{i}. [{d}] {body(i, r)}" if d else f"{i}. {body(i, r)}"
                  for i, (r, d) in enumerate(zip(results, dated), 1)]
         if show_dates:
             lines.insert(0, _DATED_RECALL_HEADER)
