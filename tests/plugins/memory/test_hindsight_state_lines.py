@@ -116,6 +116,7 @@ def _hit(uid, mentioned_at=None):
 def root(tmp_path, monkeypatch):
     """Default Hermes root for the index + JSONL (tmp); returns it."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_DATA_CLASS", "internal")  # fake worker task ids resolve no card class
     monkeypatch.setattr(state_lines, "get_default_hermes_root", lambda: tmp_path)
     monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
     return tmp_path

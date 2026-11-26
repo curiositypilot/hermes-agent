@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
+from agent.provider_policy import current_data_class
 from agent.secret_scope import UnscopedSecretError, get_secret
 from hermes_cli.config import cfg_get
 from hermes_constants import get_default_hermes_root, get_hermes_home
@@ -44,6 +45,7 @@ from .embedded import (
     _may_rewrite_profile_env,
 )
 from . import state_lines
+from .data_class_gate import policy_egress_block
 from .envelope import agent_note_envelope, chat_envelope, first_line, lookup_session_title
 from .invalidate import INVALIDATE_SCHEMA, SUPERSEDES_PARAM, new_id_store, remember_ids, supersede, tool_invalidate
 from .project_tags import gate_retain_tags
@@ -1090,6 +1092,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # agent-note envelope. Blank/absent sends neither (items as before the key existed).
         self._tool_retain_strategy = str(cfg.get("tool_retain_strategy") or "").strip() or None
         self._auto_retain_block_reason: str | None = None
+        self._server_llm_provider = str(cfg.get("server_llm_provider") or "").strip().lower() or None
 
     def _resolve_auto_retain_block(self) -> str | None:
         """Why auto-retain is off for this whole process/session, or None. Evaluated once at
@@ -1109,6 +1112,10 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._auto_retain_skip_sources and (src := self._session_source()) in self._auto_retain_skip_sources:
             return f"session source {src!r} in auto_retain_skip_sources"
         return None
+
+    def _policy_egress_block(self, kind: str, log: str = "") -> str | None:
+        """data_class_gate's verdict for *kind*; per call, since the gateway binds the class per turn."""
+        return policy_egress_block(kind, current_data_class, self._mode, self._server_llm_provider, log=log)
 
     def _session_source(self) -> str:
         """This session's ``sessions.source``: the frozen launch policy of a gateway-owned turn (a
@@ -1382,6 +1389,8 @@ class HindsightMemoryProvider(MemoryProvider):
         deliberate search whose relevance the model judges itself, and the reranker's
         absolute scores are not calibrated across queries (the tool's opt-in relative
         floor, ``recall_tool_relative_floor``, runs in ``_tool_recall``)."""
+        if self._policy_egress_block("recall", log="Recall"):
+            return []
         kwargs: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
         kanban_tags = self._kanban_recall_context()[1] if auto else []
         if kanban_tags:
@@ -1423,6 +1432,8 @@ class HindsightMemoryProvider(MemoryProvider):
         return [r for r in results if (s := _reranker_score(r)) is None or s >= cut]
 
     def _reflect(self, query: str, overrides: dict | None = None) -> str | None:
+        if self._policy_egress_block("reflect", log="Prefetch"):  # the reflect tool is refused earlier
+            return None
         resp = self._run_hindsight_operation(
             lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget,
                                            **(overrides or {})),
@@ -1672,7 +1683,9 @@ class HindsightMemoryProvider(MemoryProvider):
         why = ("auto_retain disabled" if not self._auto_retain
                else "shutting down" if self._shutting_down.is_set()
                else self._auto_retain_block_reason
-               or self._turn_skip_reason(assistant_content))
+               or self._turn_skip_reason(assistant_content)
+               # Before buffering: on_session_switch flushes _session_turns without a re-check.
+               or self._policy_egress_block("retain"))
         if why:
             logger.debug("sync_turn: skipped (%s)", why)
             return
@@ -1854,20 +1867,22 @@ class HindsightMemoryProvider(MemoryProvider):
         logger.debug("Tool hindsight_reflect: response_len=%d", len(text))
         return text or "No relevant memories found."
 
-    # tool name -> (required arg, handler, user-facing failure prefix)
+    # tool name -> (required arg, handler, user-facing failure prefix, data-class egress kind)
     _TOOL_HANDLERS = {
-        "hindsight_retain": ("content", _tool_retain, "Failed to store memory"),
-        "hindsight_recall": ("query", _tool_recall, "Failed to search memory"),
-        "hindsight_reflect": ("query", _tool_reflect, "Failed to reflect"),
-        "hindsight_invalidate": ("reason", tool_invalidate, "Failed to invalidate memory"),
+        "hindsight_retain": ("content", _tool_retain, "Failed to store memory", "retain"),
+        "hindsight_recall": ("query", _tool_recall, "Failed to search memory", "recall"),
+        "hindsight_reflect": ("query", _tool_reflect, "Failed to reflect", "reflect"),
+        "hindsight_invalidate": ("reason", tool_invalidate, "Failed to invalidate memory", "recall"),
     }
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name not in self._TOOL_HANDLERS:
             return tool_error(f"Unknown tool: {tool_name}")
-        required, handler, failure = self._TOOL_HANDLERS[tool_name]
+        required, handler, failure, egress = self._TOOL_HANDLERS[tool_name]
         if not args.get(required, ""):
             return tool_error(f"Missing required parameter: {required}")
+        if blocked := self._policy_egress_block(egress):  # before the {"result": ...} wrap
+            return tool_error(f"{failure}: {blocked}")
         try:
             return json.dumps({"result": handler(self, args)})
         except Exception as e:
@@ -1974,17 +1989,10 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = None
         # The module-global loop is intentionally NOT stopped: it's shared by every
         # provider in the process (one per gateway chat session); stopping it would
-        # strand siblings' aiohttp sessions ("Unclosed client session"). Daemon
+        # strand siblings' aiohttp sessions ("Unclosed client session", #11923). Daemon
         # thread, reclaimed at process exit.
 
 
-# The module-global background event loop (_loop / _loop_thread) is intentionally NOT stopped here. It is
-# shared across every HindsightMemoryProvider instance in the process — the plugin loader creates a new
-# provider per AIAgent, and the gateway creates one AIAgent per concurrent chat session. Stopping the loop
-# from one provider's shutdown() strands the aiohttp ClientSession + TCPConnector owned by every sibling
-# provider on a dead loop, which surfaces as the "Unclosed client session" / "Unclosed connector" warnings
-# reported in #11923. The loop runs on a daemon thread and is reclaimed on process exit; per-session cleanup
-# happens via self._client.aclose() above.
 def register(ctx) -> None:
     """Register Hindsight as a memory provider plugin."""
     ctx.register_memory_provider(HindsightMemoryProvider())
