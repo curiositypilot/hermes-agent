@@ -116,7 +116,8 @@ def _invalidate_one(provider, ref: str, reason: str) -> tuple[str, str]:
         return "refused", f"refused {short}: observation; invalidate its source facts instead"
     if status := _blocking_status(_field(fact, "entities")):
         return "refused", (f"refused {short}: status:{status} fact; change it with "
-                           f"`memory-system retire {full} --new <replacement id> --why <reason>`")
+                           f"`memory-system retire {full} --new <replacement full UUID> --why <reason>` "
+                           "in the terminal (it takes full UUIDs, not 8-char ids)")
     request = {"state": "invalidated",
                "reason": f"agent-correction: {reason[:_REASON_MAX]} (session {provider._session_id})"}
     try:
