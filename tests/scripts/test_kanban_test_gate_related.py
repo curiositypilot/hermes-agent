@@ -31,12 +31,16 @@ TREE = [
 ]
 
 
+def _write(root: Path, files: dict[str, str]) -> None:
+    for rel, content in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
-    for rel in TREE:
-        path = tmp_path / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("")
+    _write(tmp_path, dict.fromkeys(TREE, ""))
     monkeypatch.setattr(gate, "ROOT", tmp_path)
     return tmp_path
 
@@ -136,3 +140,50 @@ def test_gateway_run_does_not_select_prompt_surface(repo):
     assert "tests/ci/test_prompt_surface.py" not in selected
     assert "tests/agent/test_run_agent.py" in selected
 
+
+
+def test_importer_fallback_when_no_stem_match(repo):
+    _write(repo, {
+        "tests/pkg/test_a.py": "from pkg.session_x import Y\n",
+        "tests/pkg/test_b.py": "from pkg import session_x as m\n",
+        "tests/pkg/test_p.py": "from pkg import (\n    other,\n    session_x,\n)\n",
+        "tests/other/test_d.py": 'def t(monkeypatch):\n    monkeypatch.setattr("pkg.session_x.attr", 1)\n',
+        "tests/pkg/test_c.py": "from pkg.session_x_log import Z\n",
+        "tests/pkg/test_e.py": "import mypkg.session_x\n",
+        "tests/pkg/test_f.py": "from pkg import session_xy\n",
+        "tests/e2e/x/test_g.py": "from pkg.session_x import Y\n",
+    })
+    notes: list[str] = []
+    assert gate.related_tests({"pkg/session_x.py"}, notes) == [
+        "tests/other/test_d.py",
+        "tests/pkg/test_a.py",
+        "tests/pkg/test_b.py",
+        "tests/pkg/test_p.py",
+    ]
+    assert notes == ["importer fallback: pkg/session_x.py -> 4 file(s)"]
+
+
+def test_importer_fallback_skipped_when_stem_matches(repo):
+    _write(repo, {"tests/tools/test_bar.py": "from tools.foo import x\n"})
+    assert gate.related_tests({"tools/foo.py"}) == [
+        "tests/ci/test_prompt_surface.py",
+        "tests/tools/test_foo.py",
+    ]
+
+
+def test_root_module_importer_needs_import_form(repo):
+    _write(repo, {
+        "tests/test_h.py": "import lonely\n",
+        "tests/test_i.py": 'from unittest.mock import patch\n\n@patch("lonely.f")\ndef t(f):\n    pass\n',
+        "tests/test_j.py": 'x = "lonely"\n# lonely\n',
+    })
+    assert gate.related_tests({"lonely.py"}) == ["tests/test_h.py", "tests/test_i.py"]
+
+
+def test_incident_t_edada6ea_replay():
+    """Real repo: the module's tests are test_managed_worker_*.py, which no stem rule selects."""
+    selected = gate.related_tests({
+        "gateway/session_managed_worker.py",
+        "tests/gateway/test_managed_worker_sandbox_safe_path.py",
+    })
+    assert "tests/gateway/test_managed_worker_sandbox.py" in selected
