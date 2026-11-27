@@ -746,6 +746,32 @@ def _build_child_goal_message(goal: str, images: list[str], child) -> Any:
         return goal
 
 
+def _scratch_roots() -> list[str]:
+    """Throwaway locations: Hermes cache (scratch + terminal), the temp dir, /tmp, /var/tmp. Per call, so a
+    profile switch or a changed ``tempfile.tempdir`` is honoured."""
+    import tempfile
+    from hermes_constants import get_hermes_home
+    # no-tmp: ok — classifies existing paths as throwaway, never writes there
+    roots = [get_hermes_home() / "cache", tempfile.gettempdir(), "/tmp", "/var/tmp"]
+    return list(dict.fromkeys(os.path.realpath(r) for r in roots))
+
+
+def _kept_paths(paths: list[str], roots: list[str]) -> list[str]:
+    """Sorted ``paths`` not inside any of ``roots``; whole-component match, so ``/tmpfoo`` is not under ``/tmp``."""
+    def _inside(path: str, root: str) -> bool:
+        try:
+            return os.path.commonpath([path, root]) == root
+        except ValueError:  # mixed absolute/relative or different drives
+            return False
+    return sorted(p for p in paths if not any(_inside(p, r) for r in roots))
+
+
+_KEPT_FILES_NOTE = (
+    "\n\n[NOTE: subagent kept files outside the scratch dir: {paths}{more}. Kept output belongs on a card with a "
+    "review or QA child: file one now naming these paths, or say in your reply why they are scratch.]"
+)
+
+
 @dataclass
 class _ChildRun:
     """State of one child run, shared by every phase of ``_run_single_child``.
@@ -837,6 +863,8 @@ class _ChildRun:
             summary=redact_child_text(summary, force=False) if summary is not None else None,
         )
         _append_missed_steer(entry, late_steer)
+        # A child that wrote a kept file and then timed out or raised still left the file behind.
+        self.append_kept_files_note(entry)
         return self.attach_worktree(entry)
 
     def close_steering(self) -> Optional[str]:
@@ -1045,6 +1073,26 @@ class _ChildRun:
                 entry["summary"] = entry["summary"] + reminder
             else:
                 entry["stale_paths"] = mod_paths
+
+    def append_kept_files_note(self, entry: dict[str, Any]) -> None:
+        """Tell the parent which files this child left outside scratch (system.md § Delegation: kept output
+        belongs on a card). Skipped for the dispatcher-owned Kanban worker, whose own card is the record of its
+        work; cron runs and children that merely inherit ``HERMES_KANBAN_TASK`` still get the note."""
+        from agent.delegation_context import owned_kanban_task
+        if owned_kanban_task():
+            return
+        with _quiet("kept-files note failed", exc_info=True):
+            paths = file_state.written_by(self.child_task_id)
+            if self.worktree_info and self.worktree_info.get("path"):
+                # The ``worktree`` payload already reports these.
+                paths = _kept_paths(paths, [os.path.realpath(self.worktree_info["path"])])
+            kept = _kept_paths(paths, _scratch_roots())
+            if not kept:
+                return
+            entry["kept_files"] = kept[:20]
+            if entry.get("summary"):
+                more = f" (+{len(kept) - 8} more)" if len(kept) > 8 else ""
+                entry["summary"] = entry["summary"] + _KEPT_FILES_NOTE.format(paths=", ".join(kept[:8]), more=more)
 
     def account_background_processes(self, entry: dict[str, Any]) -> None:
         """Name the child's background processes on the result BEFORE ``cleanup`` kills them: handed-off ones now
