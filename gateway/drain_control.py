@@ -83,11 +83,17 @@ RESTART_WAIT_WS_METHODS = frozenset({
     "session.info", "session.list", "prompt.submit", "prompt.receipt", "session.interrupt",
     "approval.pending", "approval.received", "approval.respond", "clarify.respond", "clarify.lock",
 })
+# Cron verbs that observe or stop a fire the owner already admitted, which the drain waits for
+# (``gateway.session_cron.operation`` lets them through a drain for the same reason). Refusing
+# them makes the firer pause the job as unverified on every restart that overlaps a fire.
+# ``cron.submit`` is new work and stays refused.
+_DRAIN_CRON_OBSERVE_METHODS = frozenset({"cron.recover", "cron.status", "cron.cancel"})
 
 
 def ws_method_refused_while_draining(runner, method) -> bool:
     """True when an interactive WebSocket verb must be refused because *runner* is draining."""
-    return bool(getattr(runner, "_draining", False)) and method not in RESTART_WAIT_WS_METHODS
+    return (bool(getattr(runner, "_draining", False)) and method not in RESTART_WAIT_WS_METHODS
+            and method not in _DRAIN_CRON_OBSERVE_METHODS)
 
 _DRAIN_REQUEST_FILENAME = ".drain_request.json"
 # Drain-gated lifecycle actions complete in minutes; an hour bounds the wedge a leaked

@@ -201,6 +201,41 @@ async def test_restart_wait_ws_serves_the_parked_turn_and_refuses_every_other_ve
 
 
 @pytest.mark.asyncio
+async def test_restart_wait_ws_answers_cron_observation_but_refuses_submit(tmp_path, monkeypatch):
+    """A cron firer's socket is interactive, so a restart's wait admits it: the owner must still
+    answer recover/status/cancel for a fire it may hold (refusing them paused the job as unverified,
+    t_dc001b38), while a new submit stays refused."""
+    from gateway.session_authority import SessionAuthority
+    from gateway.session_controls import AuthorityConnection
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(tmp_path / "state.db")
+    runner = SimpleNamespace(_draining=True, _running=True,
+                             session_runtime_descriptor={"state": "draining", "drain_reason": "restart_wait"})
+    authority = SessionAuthority(runner, profile_id="p", instance_id="owner", db=db,
+                                 epoch=begin_runtime_epoch(db, instance_id="owner"))
+    firer = AuthorityConnection(authority, object(), {"user_id": "human"}, operator=True)
+    fire = {"job_id": "580e25b75ad8", "request_id": "287b3be72e2c473398d97a6f3661cfe4", "extra_prompt": None}
+
+    async def call(method, params):
+        return await firer.dispatch({"id": 1, "method": method, "params": params})
+
+    try:
+        recovered = await call("cron.recover", fire)
+        assert recovered.get("result", {}).get("status") == "missing", recovered
+        receipt = {"session_id": "s-none", "admission_id": "a-none"}
+        for method in ("cron.status", "cron.cancel"):
+            answered = await call(method, receipt)
+            assert answered.get("error", {}).get("message") != "runtime_draining", (method, answered)
+        assert (await call("cron.submit", fire))["error"]["message"] == "runtime_draining"
+        for method, params in [("config.set", {"key": "model", "value": "x"}), ("session.save", {"session_id": "s"})]:
+            assert (await call(method, params))["error"]["message"] == "runtime_draining", method
+    finally:
+        await firer.close()
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_restart_wait_queues_only_interactive_input(tmp_path, monkeypatch):
     """Only the interactive WS submit commits queued input during the wait; a2a, kanban and hosted
     rooms call ``authority.submit`` directly and keep the plain refusal, so none of them can read a
