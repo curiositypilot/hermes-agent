@@ -8,13 +8,20 @@ module ``<dir>/<stem>.py``, the ``test_<stem>*.py`` files under the nearest mirr
 ``e2e`` or ``docker`` directory are dropped: those suites have their own CI jobs and need sandboxes or
 images. The full suite (~50 min) is too slow to gate every card; CI still runs it. A change that can
 alter the rendered prompt or tool schemas also selects ``tests/ci/test_prompt_surface.py`` (its stem
-never matches a changed module). Base ref:
+never matches a changed module).
+
+Importer fallback: a changed source module with no stem match (and before ``CROSS_DIR_TESTS``) selects
+every ``tests/**/test_*.py`` (minus SKIP_PARTS) that imports or patches it by its dotted path
+(``a.b.c``, ``from a.b import c``); a root module ``m.py`` counts only in an import statement or a
+quoted ``"m.`` string. Without it, ``gateway/session_managed_worker.py`` (tested by
+``test_managed_worker_*.py``) selected nothing and the gate passed (t_3096260b). Base ref:
 ``KANBAN_TEST_BASE`` or ``main``. No related tests -> exit 0 with a note (docs-only diffs). Runs
 through ``scripts/run_tests.sh`` so CI isolation rules apply.
 """
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -100,15 +107,50 @@ def _mirror_tests(source: str) -> set[str]:
     return set()
 
 
-def related_tests(files: set[str]) -> list[str]:
+def _importer_pattern(source: str) -> re.Pattern[str]:
+    parts = PurePosixPath(source).with_suffix("").parts
+    if len(parts) == 1:
+        name = re.escape(parts[0])
+        return re.compile(rf"(?m)^\s*(?:from|import)\s+{name}\b|['\"]{name}\.")
+    dotted = re.escape(".".join(parts))
+    package, leaf = re.escape(".".join(parts[:-1])), re.escape(parts[-1])
+    return re.compile(rf"(?<![\w.]){dotted}(?!\w)"
+                      rf"|\bfrom\s+{package}\s+import\s+(?:\([\w\s,]*?|[\w \t,]*?)\b{leaf}\b")
+
+
+def _importer_tests(sources: list[str]) -> dict[str, set[str]]:
+    """Test files (minus SKIP_PARTS) that reference each source module, from one scan of ``tests/``."""
+    patterns = {s: _importer_pattern(s) for s in sources}
+    found: dict[str, set[str]] = {s: set() for s in sources}
+    for path in (ROOT / "tests").rglob("test_*.py"):
+        rel = path.relative_to(ROOT).as_posix()
+        if SKIP_PARTS.intersection(PurePosixPath(rel).parts) or not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for source, pattern in patterns.items():
+            if pattern.search(text):
+                found[source].add(rel)
+    return found
+
+
+def related_tests(files: set[str], fallback_notes: list[str] | None = None) -> list[str]:
     tests = {f for f in files if f.startswith("tests/") and Path(f).name.startswith("test_") and f.endswith(".py")}
+    unmatched: list[str] = []
     for f in files:
         if f.endswith(".py") and not f.startswith("tests/") and Path(f).stem not in {"__init__", "conftest"}:
-            tests |= _mirror_tests(f)
+            mirror = _mirror_tests(f)
+            if not mirror:
+                unmatched.append(f)
+            tests |= mirror
             mapped = CROSS_DIR_TESTS.get(f) or ()
             for target in mapped:
                 if not SKIP_PARTS.intersection(PurePosixPath(target).parts) and (ROOT / target).is_file():
                     tests.add(target)
+    if unmatched:
+        for source, importers in sorted(_importer_tests(unmatched).items()):
+            tests |= importers
+            if fallback_notes is not None:
+                fallback_notes.append(f"importer fallback: {source} -> {len(importers)} file(s)")
     if any(_affects_prompt_surface(f) for f in files) and (ROOT / PROMPT_SURFACE_TEST).is_file():
         tests.add(PROMPT_SURFACE_TEST)
     return sorted(tests)
@@ -116,7 +158,10 @@ def related_tests(files: set[str]) -> list[str]:
 
 def main() -> int:
     base = os.environ.get("KANBAN_TEST_BASE", "main")
-    tests = related_tests(changed_files(base))
+    notes: list[str] = []
+    tests = related_tests(changed_files(base), notes)
+    for note in notes:
+        print(f"kanban test gate: {note}", file=sys.stderr, flush=True)
     if not tests:
         print(f"kanban test gate: no tests relate to the diff against {base}; nothing to run")
         return 0
