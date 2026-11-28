@@ -52,9 +52,19 @@ def _lift_pause(job_id, pause):
             pass
 
 
+def _draining_refusal(exc):
+    """True when *exc* is the owner's ``runtime_draining`` refusal of a submit: over the socket
+    (``GatewayRPCError``, whose str is the reason code) or from the in-process owner."""
+    from hermes_cli.gateway_client import GatewayRPCError
+    from hermes_state_runtime import RuntimeStoreError
+    if isinstance(exc, RuntimeStoreError):
+        return exc.reason == 'runtime_draining'
+    return isinstance(exc, GatewayRPCError) and str(exc) == 'runtime_draining'
+
+
 def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id=None):
     from gateway.session_cron import owner_for_home, operation
-    from hermes_cli.gateway_client import connect_gateway
+    from hermes_cli.gateway_client import connect_gateway, outside_restart_wait
     from hermes_constants import get_hermes_home
     from utils import atomic_json_write
 
@@ -90,6 +100,10 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             if owner is not None or isinstance(exc, GatewayRPCError):
                 state = await call('recover', params)
                 if state['status'] == 'missing':
+                    if _draining_refusal(exc):
+                        # A definite pre-admission refusal by a draining owner (restart wait):
+                        # nothing ran, so the unreachable ladder re-runs it with the notice held.
+                        job['_model_unreachable'] = True
                     error = f'{type(exc).__name__}: {exc}'
                     result = [False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error]
                     record['refusal'] = result
@@ -125,8 +139,11 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             delay = min(delay * 2, 2.0)
 
     async def remote():
-        async with connect_gateway() as client:
-            return await observe(lambda op, data: client.rpc('cron.' + op, **data))
+        # Never into a restart's after-turn wait: that owner refuses new work, so the dial fails
+        # before anything is submitted and the unreachable ladder re-runs the fire.
+        with outside_restart_wait():
+            async with connect_gateway() as client:
+                return await observe(lambda op, data: client.rpc('cron.' + op, **data))
 
     try:
         if owner is not None:
@@ -144,9 +161,12 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
         if attempted:
             raise CronExecutionUnknown(f'Cron execution unverified; reconcile {journal}: {exc}') from exc
         from cron.unreachable_retry import is_gateway_unavailable_presubmit
-        if is_gateway_unavailable_presubmit(exc):
-            # Nothing was submitted and the owner is draining (update fence) or still starting:
-            # the unreachable ladder re-runs the fire and holds the notice meanwhile.
+        from websockets.exceptions import WebSocketException
+        # A failed handshake before observe() ran: the restart wait opened between discovery and
+        # the dial, and the ticket's refuse policy closed the socket.
+        if is_gateway_unavailable_presubmit(exc) or isinstance(exc, WebSocketException):
+            # Nothing was submitted and the owner is draining (update fence, restart wait) or
+            # still starting: the unreachable ladder re-runs the fire and holds the notice meanwhile.
             job['_model_unreachable'] = True
         error = f'{type(exc).__name__}: {exc}'
         return False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error
