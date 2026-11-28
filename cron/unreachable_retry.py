@@ -82,6 +82,19 @@ def is_gateway_unavailable_presubmit(exc: BaseException) -> bool:
             and getattr(exc, "state", None) in _TRANSIENT_GATEWAY_STATES)
 
 
+def is_owner_draining_refusal(exc: BaseException) -> bool:
+    """True when the owner refused ``cron.submit`` because it is draining for a restart: over the
+    socket (``GatewayRPCError('runtime_draining')``) or in process (``RuntimeStoreError`` with that
+    reason). Paired with a verified ``missing`` recover, the fire was never admitted, so the same
+    bounded ladder applies. Every other refusal (retired, permission, conflict) alerts at once."""
+    from hermes_cli.gateway_client import GatewayRPCError
+    from hermes_state_runtime import RuntimeStoreError
+
+    if isinstance(exc, GatewayRPCError):
+        return str(exc) == "runtime_draining"
+    return isinstance(exc, RuntimeStoreError) and exc.reason == "runtime_draining"
+
+
 def _ladder_applies(job: dict[str, Any]) -> bool:
     """The ladder's applicability gate: recurring, not paused, and enabled in config."""
     return is_recurring(job) and job.get("state") != "paused" and retry_enabled()
