@@ -107,6 +107,11 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                     error = f'{type(exc).__name__}: {exc}'
                     result = [False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error]
                     record['refusal'] = result
+                    from cron.unreachable_retry import is_owner_draining_refusal
+                    if is_owner_draining_refusal(exc):
+                        # A restart drain refused the fire and recover verified nothing was
+                        # admitted: the unreachable ladder re-runs it and holds the notice.
+                        job['_model_unreachable'] = True
                     record['job'] = dict(job)
                     save()
                     return tuple(result)
