@@ -45,8 +45,14 @@ ITERATION_BUDGET_WARNING_TEMPLATE = (
 )
 
 
-def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
-    """Append the opt-in one-shot warning to the newest tool result."""
+def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any, api_call_count: Any = None) -> bool:
+    """Append the opt-in one-shot warning to the newest tool result.
+
+    The turn loop stops on whichever runs out first, ``api_call_count`` vs ``max_iterations``
+    or ``iteration_budget``; execute_code-only rounds refund the budget but not the call
+    count, so consumption is the larger of the two. ``api_call_count`` = calls made this
+    turn; default ``agent._api_call_count`` (current after a tool round, stale at turn start).
+    """
     import os
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
@@ -63,18 +69,24 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
     if ratio is None and kanban_worker:
         ratio = 0.9
     budget = getattr(agent, "iteration_budget", None)
+    if ratio is None or budget is None or getattr(agent, "_iteration_budget_warning_injected", False):
+        return False
+    max_iterations = getattr(agent, "max_iterations", None)
+    maximum = budget.max_total
+    if isinstance(max_iterations, int) and not isinstance(max_iterations, bool):
+        maximum = min(maximum, max_iterations)
+    if api_call_count is None:
+        api_call_count = getattr(agent, "_api_call_count", 0)
+    used = max(budget.used, int(api_call_count or 0))
     if (
-        ratio is None
-        or budget is None
-        or budget.max_total <= 1
+        budget.max_total <= 1
         or budget.max_total >= sys.maxsize
-        or getattr(agent, "_iteration_budget_warning_injected", False)
-        or budget.used < min(ratio * budget.max_total, budget.max_total - 1)
+        or maximum <= 1
+        or maximum >= sys.maxsize
+        or used < min(ratio * maximum, maximum - 1)
     ):
         return False
-    notice = ITERATION_BUDGET_WARNING_TEMPLATE.format(
-        used=budget.used, maximum=budget.max_total
-    )
+    notice = ITERATION_BUDGET_WARNING_TEMPLATE.format(used=used, maximum=maximum)
     if kanban_worker:
         notice += (
             " While tools are still available, call kanban_complete only if all task "
@@ -186,7 +198,8 @@ def prepare_iteration(
         _maybe_inject_run_budget_wrapup(agent, messages)
 
     # Appended to the newest tool result; never a synthetic user/system row.
-    _maybe_inject_iteration_budget_warning(agent, messages)
+    # This turn's count: agent._api_call_count may still hold the previous turn's.
+    _maybe_inject_iteration_budget_warning(agent, messages, api_call_count)
 
     request_logger = getattr(agent, "logger", None) or logger  # same name as the origin module
     # Per-agent validation cursor skips re-parsing tool_call args already validated.
