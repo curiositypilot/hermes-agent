@@ -83,13 +83,15 @@ def test_presubmit_predicate(exc, expected):
 def test_fire_dials_outside_restart_wait(tmp_path, monkeypatch):
     seen = []
 
-    @asynccontextmanager
-    async def connect():
-        seen.append(gateway_client._REFUSE_RESTART_WAIT.get())
-        raise GatewayUnavailableError("Gateway draining: restart_wait", "draining", "restart_wait")
-        yield  # pragma: no cover - never reached
+    class Dial:
+        async def __aenter__(self):
+            seen.append(gateway_client._REFUSE_RESTART_WAIT.get())
+            raise GatewayUnavailableError("Gateway draining: restart_wait", "draining", "restart_wait")
 
-    monkeypatch.setattr(gateway_client, "connect_gateway", connect)
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(gateway_client, "connect_gateway", Dial)
     with jobs.use_cron_store(tmp_path / "cron"):
         job = jobs.create_job(prompt="inbox", schedule="every 1h", deliver="local")
         success, *_ = scheduler_authority.run_canonical_job(job)
